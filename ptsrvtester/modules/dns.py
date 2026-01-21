@@ -16,10 +16,10 @@ from ptlibs.ptjsonlib import PtJsonLib
 from ._base import BaseModule, BaseArgs, Out
 
 class VULNS(Enum):
-    ZoneTransfer = "PTV-SNMPv2-ZONETRANFER"
-    Subdomains = "PTV-SNMPv3-SUBDOMAINS"
-    DNSSEC = "PTV-SNMPv2-DNSSEC"
-    ZoneWalk = "PTV-SNMPv3-ZONEWALK"
+    ZoneTransfer = "PTV-DNS-ZONETRANSFER"
+    Subdomains = "PTV-DNS-SUBDOMAINS"
+    DNSSEC = "PTV-DNS-DNSSEC"
+    ZoneWalk = "PTV-DNS-ZONEWALK"
 
 
 class info(NamedTuple):
@@ -336,7 +336,7 @@ class DNS(BaseModule):
                 self.ptprint(f"Error: Query timeout for {ip}", out=Out.WARNING)
            
 
-        return results if results else []
+        return results
 
     def resolveDNS(self, name):
         """
@@ -384,16 +384,19 @@ class DNS(BaseModule):
             self.ptprint(f"Error: {e.__class__} {e}", out=Out.ERROR)
         else:
             for host in zone:
-                found_domains.append(f"{host}.{self.args.domain}")
                 if str(host) != '@':
                     A_records = self.resolveDNS(str(host) + "." + self.args.domain)
                     if A_records: 
-                        found_domains.remove(f"{host}.{self.args.domain}") 
                         for item in A_records:
                             answer = ','.join([str(item)]) 
-                        found_domains.append(f"{host}.{self.args.domain};{answer}")
+                        domain_entry = f"{host}.{self.args.domain};{answer}"
+                        found_domains.append(domain_entry)
                         fulldomain = f"{str(host)}.{self.args.domain}"
                         self.ptprint(f"{fulldomain:<50} {answer}")
+                    else:
+                        found_domains.append(f"{host}.{self.args.domain}")
+                else:
+                    found_domains.append(f"{host}.{self.args.domain}")
             return found_domains
 
 

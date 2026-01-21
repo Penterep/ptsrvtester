@@ -19,7 +19,7 @@ class VULNS(Enum):
     Write_2 = "PTV-SNMPv2-WRITEACCESS"
     Write_3 = "PTV-SNMPv3-WRITEACCESS"
     Readmib_3 = "PTV-SNMPv3-READINGMIB"
-    Readmib_2 = "PTV-SNMPv3-READINGMIB"
+    Readmib_2 = "PTV-SNMPv2-READINGMIB"
 
 class Credential(NamedTuple):
     username: str | None
@@ -127,7 +127,7 @@ class SNMPArgs(BaseArgs):
         snmpv2_brute_parser.add_argument("-o", "--output",  help="File to save the output results.")
 
         user_group1 = snmpv2_brute_parser.add_mutually_exclusive_group(required=True)
-        user_group1.add_argument("-c", "--single-community", help="Single community string")
+        user_group1.add_argument("-c", "--single-community", "--community", help="Single community string")
         user_group1.add_argument("-cf", "--community-file", help="File containing community strings")
 
         # SNMPv2 Write Permission
@@ -137,7 +137,7 @@ class SNMPArgs(BaseArgs):
         snmpv2_write_parser.add_argument("-v", "--value", default="Testvalue123", help="Value to write to the specified OID (default: 'Testvalue123')")
 
         user_group2 = snmpv2_write_parser.add_mutually_exclusive_group(required=True)
-        user_group2.add_argument("-c", "--single-community", help="Single community string")
+        user_group2.add_argument("-c", "--single-community", "--community", help="Single community string")
         user_group2.add_argument("-cf", "--community-file", help="File containing community strings")
 
         # SNMPv2 GetBulk (Walk)
@@ -149,7 +149,7 @@ class SNMPArgs(BaseArgs):
         snmpv2_getbulk_parser.add_argument("-o","--output", help="File to save the output results.")
 
         user_group3 = snmpv2_getbulk_parser.add_mutually_exclusive_group(required=True)
-        user_group3.add_argument("-c", "--single-community", help="Single community string")
+        user_group3.add_argument("-c", "--single-community", "--community", help="Single community string")
         user_group3.add_argument("-cf", "--community-file", help="File containing community strings")
 
         # SNMPv3 User Enumeration
@@ -244,7 +244,7 @@ class SNMP(BaseModule):
             self.results.Bulk3 = asyncio.run(self.getBulk_SNMPv3())
         
         else:
-            self.ptprint("Unknown command for DNS module.", out=Out.WARNING)
+            self.ptprint("Unknown command for SNMP module.", out=Out.WARNING)
 
      # Map protocol OIDs to human-readable names
     PROTOCOL_NAMES = {
@@ -968,11 +968,8 @@ class SNMP(BaseModule):
             self.ptprint("Be aware that authentication protocol was not provided, so it is set as usmHMACSHAAuthProtocol", out=Out.INFO)
             self.args.auth_protocols = usmHMACSHAAuthProtocol
 
-        if self.args.priv_protocols:
-            self.args.priv_protocols = PROTOCOL_OBJECTS.get(self.args.priv_protocols, None)
-
         if not self.args.priv_protocols:
-            self.ptprint("Be aware that private protocol was not provided, so it is set as usmDESPrivProtocol", out=Out.INFO)
+            self.ptprint("Be aware that private protocol was not provided, so it is set as usmAesCfb128Protocol", out=Out.INFO)
             self.args.priv_protocols = usmAesCfb128Protocol
 
         Protocols = AuthPrivProtocols(self.args.auth_protocols, self.args.priv_protocols)
@@ -1026,7 +1023,7 @@ class SNMP(BaseModule):
                 results= "success"
 
         if self.args.output:
-            self.args.write_to_file(results)
+            self.write_to_file(results)
         return results
     
     def output(self) -> None:

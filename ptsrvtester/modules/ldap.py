@@ -39,7 +39,7 @@ class LDAPArgs(BaseArgs):
     command:str
     use_ssl:bool = False
     spray:bool = False
-    output_file:str = None
+    output:str = None
     base_dn:str = None
     upn_domain:str=None
     username_file:str = None
@@ -206,7 +206,7 @@ class LDAP(BaseModule):
             self.results.Writetest = self.ldap_check_write_access()
         
         else:
-            self.ptprint("Unknown command for DNS module.", out=Out.WARNING)
+            self.ptprint("Unknown command for LDAP module.", out=Out.WARNING)
         
 
     def drawLine(self):
@@ -219,7 +219,7 @@ class LDAP(BaseModule):
         """
             File Output.
         """
-        with open(self.args.output_file, 'a') as f:
+        with open(self.args.output, 'a') as f:
             if isinstance(message_or_messages, str):
                 # If it's a single message, write it directly
                 f.write(message_or_messages + '\n')
@@ -300,7 +300,7 @@ class LDAP(BaseModule):
         if not conn.bind() ==True:
             return None
 
-        if self.args.output_file:
+        if self.args.output:
                 self.write_to_file(str(server_info)) 
 
         result = {
@@ -403,7 +403,7 @@ class LDAP(BaseModule):
                 })
         
         # If output file path is specified, write the retrieved server information to the file
-        if self.args.output_file:
+        if self.args.output:
             self.write_to_file(str(conn.entries))
                 
         conn.unbind()
@@ -501,10 +501,10 @@ class LDAP(BaseModule):
             if valid_users:
 
                 # If output file path is specified, write the retrieved server information to the file
-                if self.args.output_file:
+                if self.args.output:
                     self.write_to_file(valid_users)
 
-                self.print_title("Valid users found:", out=Out.INFO)
+                self.print_title("Valid users found:")
                 for u in valid_users:
                     self.ptprint(f"  - {u}")
             else:
@@ -582,13 +582,13 @@ class LDAP(BaseModule):
         if valid_credentials:
 
             # If output file path is specified, write the retrieved server information to the file
-            if self.args.output_file:
+            if self.args.output:
                 results = [f"Username: {cred.username}, Password: {cred.password}" for cred in valid_credentials]
                 self.write_to_file(results)
 
             self.print_title("Valid credentials found:")
-            for user, password in valid_credentials:
-                self.ptprint(f"Username: {user:<50} Password: {password}")
+            for cred in valid_credentials:
+                self.ptprint(f"Username: {cred.username:<50} Password: {cred.password}")
 
             return valid_credentials
         

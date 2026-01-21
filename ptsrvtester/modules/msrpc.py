@@ -268,7 +268,7 @@ class MSRPC(BaseModule):
             self.results.Pipes = self.enumerate_pipes()
             
         else:
-            self.ptprint("Unknown command for LDAP module.", out=Out.WARNING)
+            self.ptprint("Unknown command for MSRPC module.", out=Out.WARNING)
 
     def drawLine(self):
         self.ptprint('-' * 75)
@@ -584,7 +584,7 @@ class MSRPC(BaseModule):
                     self.ptprint(f"    Share: {share['shi1_netname']}")
                 smb.logoff()
                 result = ["True", "True"]
-                return True
+                return result
             except Exception as e:
                 self.ptprint(f"Anonymous login successful, but IPC$ access failed: {e}", out=Out.INFO)
                 smb.logoff()
@@ -651,7 +651,7 @@ class MSRPC(BaseModule):
             dce = rpctransport.get_dce_rpc()
             dce.connect()
             dce.bind(uuid)
-            self.ptprint("SUCCESS: {username}:{Password}", out=Out.OK)
+            self.ptprint(f"SUCCESS: {username}:{password}", out=Out.OK)
             dce.disconnect()
             return True
         except Exception as e:

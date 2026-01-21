@@ -29,6 +29,8 @@ source ~/.zshrc
 ptsrvtester snmp detection --ip 192.168.1.1
 ptsrvtester dns whois -d example.com
 ptsrvtester ldap banner -ip 192.168.1.1
+ptsrvtester dhcp info --interface eth0
+ptsrvtester xrdp bruteforce --target 192.168.1.1 --username admin --wordlist passwords.txt
 ptsrvtester <module> -h     for help for module use
 ```
 
@@ -46,6 +48,8 @@ ptsrvtester <module> -h     for help for module use
                          smtp   SMTP testing module
                          pop3   POP3 testing module
                          imap   IMAP testing module
+                         dhcp   DHCP testing module
+                         xrdp   XRDP testing module
 
    -v        --version          Show script version and exit
    -h        --help             Show this help message and exit
@@ -122,6 +126,19 @@ ptsrvtester <module> -h     for help for module use
 - NTLM authentication inspection
 - Credential brute-force
 
+**DHCP Module**
+- DHCP server information retrieval
+- DHCP starvation attack testing
+- DHCP DoS/flood attack testing
+- Network interface based testing
+
+**XRDP Module**
+- XRDP server brute-force testing
+- Credential testing via GUI automation
+- Multi-threaded password testing
+- CVE-2024-39917 exploitation (no rate limiting)
+- Requires Linux with Xorg, xfreerdp3, and wmctrl
+
 ```
 
 ## Dependencies
@@ -134,14 +151,31 @@ ldap3>=2.9.1
 ptlibs>=1.0.20,<2
 pysnmp>=7.1.20
 python-whois>=0.9.5
-paramiko
-beautifulsoup4
-httpx
-h2
-lxml
-ssh_audit
-ntlm-auth
+paramiko>=4.0.0
+beautifulsoup4>=4.14.0
+httpx>=0.28.0
+h2>=4.3.0
+lxml>=6.0.0
+ssh_audit>=3.3.0
+ntlm-auth>=1.5.0
+scapy>=2.6.1
+dhcppython>=0.1.4
+pillow>=12.0.0
+python-xlib>=0.33
+pynput>=1.8.0
+XWindows>=0.0.7
 ```
+
+### Additional System Requirements
+
+For DHCP module:
+- Root/sudo privileges (for network packet manipulation)
+
+For XRDP module:
+- Linux with Xorg (not Wayland)
+- `xfreerdp3` command available
+- `wmctrl` command available
+- Disable screen saver/lock during use
 
 
 ## License

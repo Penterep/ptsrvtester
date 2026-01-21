@@ -172,7 +172,7 @@ def valid_target(target: str, port_required: bool = False, domain_allowed: bool 
     if len(split) > 1:
         try:
             port = int(split[1])
-            if port <= 0 and port >= 65536:
+            if port <= 0 or port >= 65536:
                 raise ValueError
         except:
             raise argparse.ArgumentError(None, "Invalid PORT number")

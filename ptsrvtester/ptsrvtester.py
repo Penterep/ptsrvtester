@@ -35,6 +35,10 @@ from .modules.ssh import SSH
 from .modules.smtp import SMTP
 from .modules.pop3 import POP3
 from .modules.imap import IMAP
+from .modules.dhcp import DHCP
+from .modules.xrdp import XRDP
+
+SCRIPTNAME = "ptsrvtester"
 
 MODULES = {
     "snmp": SNMP,
@@ -46,6 +50,8 @@ MODULES = {
     "smtp": SMTP,
     "pop3": POP3,
     "imap": IMAP,
+    "dhcp": DHCP,
+    "xrdp": XRDP,
 }
 
 
@@ -82,6 +88,8 @@ def get_help():
             ["smtp", "<options>", "", "SMTP testing module"],
             ["pop3", "<options>", "", "POP3 testing module"],
             ["imap", "<options>", "", "IMAP testing module"],
+            ["dhcp", "<options>", "", "DHCP testing module"],
+            ["xrdp", "<options>", "", "XRDP testing module"],
             ["", " ", "", ""],
             ["-v", "--version", "", "Show script version and exit"],
             ["-h", "--help", "", "Show this help message and exit"],
@@ -136,8 +144,6 @@ def parse_args() -> BaseArgs:
 
 
 def main() -> None:
-    global SCRIPTNAME
-    SCRIPTNAME = "ptsrvtester"
     args = parse_args()
 
     script = Ptsrvtester(args)

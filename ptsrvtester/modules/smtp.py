@@ -596,10 +596,13 @@ class SMTP(BaseModule):
             # print(status, "\n", time.time() - start_time)
             if status != 550:
                 user_email = re.findall(r"<(.*?)>", self.bytes_to_str(reply))
-                enumerated_users.append(user_email)
-                self.ptdebug(
-                    user_email[0],
-                )
+                # Bug fix: findall returns a list, we need to extend not append
+                # to avoid list[list[str]] which causes TypeError in join()
+                if user_email:
+                    enumerated_users.extend(user_email)
+                    self.ptdebug(
+                        user_email[0],
+                    )
                 if method == "EXPN" and len(user_email) > 1:
                     for alias in user_email[1:]:
                         total_aliases += len(user_email[1:])
@@ -708,11 +711,14 @@ class SMTP(BaseModule):
         spf_result = {ns: []}
         try:
             for record in ["SPF", "TXT"]:
-                spf_result[ns].append(self._rdata_to_str(rdata))
+                data = resolver.resolve(domain, record)
+                for rdata in data:
+                    spf_result[ns].append(self._rdata_to_str(rdata))
         except dns.resolver.NoAnswer as e:
             pass
         except dns.resolver.Timeout as e:
             pass
+        return spf_result
 
     def _rdata_to_str(self, rdata):
         str_rdata = str(rdata)

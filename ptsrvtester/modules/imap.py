@@ -62,6 +62,32 @@ class IMAPArgs(ArgsWithBruteforce):
     anonymous: bool
     ntlm: bool
 
+    @staticmethod
+    def get_help():
+        return [
+            {"description": ["IMAP Testing Module"]},
+            {"usage": ["ptsrvtester imap <options> <target>"]},
+            {"usage_example": [
+                "ptsrvtester imap --tls -iAN 127.0.0.1",
+                "ptsrvtester imap -u admin -P passwords.txt 127.0.0.1:143"
+            ]},
+            {"options": [
+                ["-i", "--info", "", "Grab banner, ID and CAPABILITY"],
+                ["-A", "--anonymous", "", "Check anonymous authentication"],
+                ["-N", "--ntlm", "", "Inspect NTLM authentication"],
+                ["", "", "", ""],
+                ["", "--tls", "", "Use implicit SSL/TLS"],
+                ["", "--starttls", "", "Use explicit SSL/TLS"],
+                ["", "", "", ""],
+                ["-u", "--user", "", "Single username for bruteforce"],
+                ["-U", "--users-file", "", "File with usernames"],
+                ["-p", "--passw", "", "Single password for bruteforce"],
+                ["-P", "--passw-file", "", "File with passwords"],
+                ["", "", "", ""],
+                ["-h", "--help", "", "Show this help message and exit"],
+            ]}
+        ]
+
     def add_subparser(self, name: str, subparsers) -> None:
         """Adds a subparser of IMAP arguments"""
         examples = """example usage:

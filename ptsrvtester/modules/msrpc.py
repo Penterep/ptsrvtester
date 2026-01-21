@@ -91,6 +91,29 @@ class MSRPCArgs(BaseArgs):
     output: str 
     threads: int
 
+    @staticmethod
+    def get_help():
+        return [
+            {"description": ["MSRPC Testing Module"]},
+            {"usage": ["ptsrvtester msrpc <command> <options>"]},
+            {"usage_example": [
+                "ptsrvtester msrpc enumerate-epm --ip 192.168.1.1",
+                "ptsrvtester msrpc brute-pipe --ip 192.168.1.1 --pipe svcctl -ul users.txt",
+                "ptsrvtester msrpc brute-smb --ip 192.168.1.1 -ul users.txt -pl passwords.txt"
+            ]},
+            {"options": [
+                ["enumerate-epm", "<options>", "", "Enumerate registered EPM endpoints"],
+                ["enumerate-mgmt", "<options>", "", "Enumerate MGMT interface UUIDs"],
+                ["brute-pipe", "<options>", "", "Brute-force credentials for named pipe"],
+                ["brute-smb", "<options>", "", "Brute-force SMB credentials"],
+                ["brute-tcp", "<options>", "", "Brute-force credentials via TCP"],
+                ["brute-http", "<options>", "", "Brute-force credentials via RPC over HTTP"],
+                ["anon-smb", "<options>", "", "Check anonymous SMB access"],
+                ["enumerate-pipes", "<options>", "", "Enumerate accessible named pipes"],
+                ["", "", "", ""],
+                ["-h", "--help", "", "Show this help message and exit"],
+            ]}
+        ]
 
     def add_subparser(self, name: str, subparsers) -> None:
         """Adds a subparser of MSRPC arguments"""
@@ -299,6 +322,8 @@ class MSRPC(BaseModule):
         self.ptprint(f"Enumerating EPM endpoints at {self.args.ip}:{self.args.port}", title=True)
         self.drawDoubleLine()
 
+        tmp_endpoints = {}
+        
         try:
             rpctransport = transport.DCERPCTransportFactory(f'ncacn_ip_tcp:{self.args.ip}[{self.args.port}]')
 
@@ -309,7 +334,6 @@ class MSRPC(BaseModule):
             # Enumeration trough all endpoints registrated on the machine's Endpoint Mapper
             entries = epm.hept_lookup(None, dce=dce)
 
-            tmp_endpoints = {}
             output_lines = []
 
             for entry in entries:
@@ -361,8 +385,7 @@ class MSRPC(BaseModule):
 
         except Exception as e:
             self.ptprint(f"Error during EPM enumeration: {e}", out=Out.WARNING)
-
-        return tmp_endpoints
+            return tmp_endpoints
     
 
     def enumerate_mgmt(self) -> list[str]:
@@ -777,7 +800,7 @@ class MSRPC(BaseModule):
                 self.ptjsonlib.add_vulnerability(VULNS.WeakCreds_TCP.value, "Bruteforcing RPC credentials for specific UUID", cred_str)
         
         if (self.results.HTTP_Brute != None):
-            if len(self.results.HTTP_Brute2) != 0:
+            if len(self.results.HTTP_Brute) != 0:
                 cred_str = credentials_to_string(self.results.HTTP_Brute)
                 self.ptjsonlib.add_vulnerability(VULNS.WeakCreds_HTTP.value, "Bruteforcing HTTP credentials", cred_str)
 

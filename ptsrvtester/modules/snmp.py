@@ -71,6 +71,29 @@ class SNMPArgs(BaseArgs):
     oid_format: bool = False
     value: str = "Testvalue123"
 
+    @staticmethod
+    def get_help():
+        return [
+            {"description": ["SNMP Testing Module"]},
+            {"usage": ["ptsrvtester snmp <command> <options>"]},
+            {"usage_example": [
+                "ptsrvtester snmp detection --ip 192.168.1.1",
+                "ptsrvtester snmp snmpv2-brute --community-file communities.txt --ip 192.168.1.1",
+                "ptsrvtester snmp snmpv3-brute --username-file users.txt --password-file passwords.txt --ip 192.168.1.1"
+            ]},
+            {"options": [
+                ["detection", "<options>", "", "Detect SNMP versions"],
+                ["snmpv2-brute", "<options>", "", "SNMPv2 dictionary attack"],
+                ["snmpv2-write", "<options>", "", "Test SNMPv2 write permission"],
+                ["snmpv2-walk", "<options>", "", "SNMPv2 MIB walk"],
+                ["snmpv3-enum", "<options>", "", "SNMPv3 user enumeration"],
+                ["snmpv3-brute", "<options>", "", "SNMPv3 credentials bruteforce"],
+                ["snmpv3-walk", "<options>", "", "SNMPv3 MIB walk"],
+                ["snmpv3-write", "<options>", "", "Test SNMPv3 write permissions"],
+                ["", "", "", ""],
+                ["-h", "--help", "", "Show this help message and exit"],
+            ]}
+        ]
 
     def add_subparser(self, name: str, subparsers) -> None:
         """Adds a subparser of SNMP arguments"""

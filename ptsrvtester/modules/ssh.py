@@ -103,6 +103,33 @@ class SSHArgs(ArgsWithBruteforce):
     bad_authkeys: str | None
     privkeys: str | None
 
+    @staticmethod
+    def get_help():
+        return [
+            {"description": ["SSH Testing Module"]},
+            {"usage": ["ptsrvtester ssh <options> <target>"]},
+            {"usage_example": [
+                "ptsrvtester ssh -ia --bad-pubkeys ./hostkeys/ 127.0.0.1",
+                "ptsrvtester ssh -u admin -P passwords.txt 127.0.0.1:22",
+                "ptsrvtester ssh --ssh-audit 127.0.0.1"
+            ]},
+            {"options": [
+                ["-i", "--info", "", "Get service banner and host key"],
+                ["-a", "--auth-methods", "", "Get supported authentication methods"],
+                ["-H", "--bad-pubkeys", "", "Check for static/known host keys"],
+                ["-A", "--bad-authkeys", "", "Check for static user SSH keys"],
+                ["", "--ssh-audit", "", "Run ssh-audit for CVEs and config"],
+                ["", "", "", ""],
+                ["-u", "--user", "", "Single username for bruteforce"],
+                ["-U", "--users-file", "", "File with usernames"],
+                ["-p", "--passw", "", "Single password for bruteforce"],
+                ["-P", "--passw-file", "", "File with passwords"],
+                ["", "--privkeys", "", "Directory with private keys"],
+                ["", "", "", ""],
+                ["-h", "--help", "", "Show this help message and exit"],
+            ]}
+        ]
+
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """example usage:
   ptsrvtester ssh -h

@@ -110,6 +110,35 @@ class SMTPArgs(ArgsWithBruteforce):
     open_relay: bool
     interactive: bool
 
+    @staticmethod
+    def get_help():
+        return [
+            {"description": ["SMTP Testing Module"]},
+            {"usage": ["ptsrvtester smtp <options> <target>"]},
+            {"usage_example": [
+                "ptsrvtester smtp -e ALL -sd -w wordlist.txt mail.example.com:25",
+                "ptsrvtester smtp --info --ntlm 127.0.0.1"
+            ]},
+            {"options": [
+                ["", "--info", "", "Gather basic information"],
+                ["", "--ntlm", "", "Inspect NTLM authentication"],
+                ["-e", "--enumerate", "", "User enumeration (VRFY/EXPN/RCPT/ALL)"],
+                ["-w", "--wordlist", "", "Wordlist for enumeration"],
+                ["-sd", "--slow-down", "", "Test slow-down protection"],
+                ["-mc", "--max-connections", "", "Max connections test"],
+                ["", "--open-relay", "", "Test open relay"],
+                ["-i", "--interactive", "", "Interactive SMTP CLI"],
+                ["", "", "", ""],
+                ["-b", "--blacklist-test", "", "Test against blacklists"],
+                ["-s", "--spf-test", "", "Test SPF records"],
+                ["", "", "", ""],
+                ["", "--tls", "", "Use implicit SSL/TLS"],
+                ["", "--starttls", "", "Use explicit SSL/TLS"],
+                ["", "", "", ""],
+                ["-h", "--help", "", "Show this help message and exit"],
+            ]}
+        ]
+
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """example usage:
   ptsrvtester smtp -h

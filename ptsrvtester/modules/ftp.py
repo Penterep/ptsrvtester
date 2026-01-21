@@ -143,6 +143,34 @@ class FTPArgs(ArgsWithBruteforce):
     bounce: Target | None
     bounce_file: str | None
 
+    @staticmethod
+    def get_help():
+        return [
+            {"description": ["FTP Testing Module"]},
+            {"usage": ["ptsrvtester ftp <options> <target>"]},
+            {"usage_example": [
+                "ptsrvtester ftp --starttls -iAal 127.0.0.1",
+                "ptsrvtester ftp -u admin -P passwords.txt 127.0.0.1:21"
+            ]},
+            {"options": [
+                ["-i", "--info", "", "Grab banner and inspect commands"],
+                ["-A", "--anonymous", "", "Check anonymous authentication"],
+                ["-a", "--access", "", "Check read/write access"],
+                ["-l", "--access-list", "", "Display directory listing"],
+                ["-b", "--bounce", "", "FTP bounce attack"],
+                ["", "--active", "", "Use active mode"],
+                ["", "--tls", "", "Use implicit SSL/TLS"],
+                ["", "--starttls", "", "Use explicit SSL/TLS"],
+                ["", "", "", ""],
+                ["-u", "--user", "", "Single username for bruteforce"],
+                ["-U", "--users-file", "", "File with usernames"],
+                ["-p", "--passw", "", "Single password for bruteforce"],
+                ["-P", "--passw-file", "", "File with passwords"],
+                ["", "", "", ""],
+                ["-h", "--help", "", "Show this help message and exit"],
+            ]}
+        ]
+
     def add_subparser(self, name: str, subparsers) -> None:
         """Adds a subparser of FTP arguments"""
 

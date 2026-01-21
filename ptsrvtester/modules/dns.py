@@ -51,6 +51,31 @@ class DNSArgs(BaseArgs):
     command: str
     threads: int
 
+    @staticmethod
+    def get_help():
+        return [
+            {"description": ["DNS Testing Module"]},
+            {"usage": ["ptsrvtester dns <command> <options>"]},
+            {"usage_example": [
+                "ptsrvtester dns whois -d example.com",
+                "ptsrvtester dns lookup -d example.com",
+                "ptsrvtester dns zone-transfer -d example.com"
+            ]},
+            {"options": [
+                ["info", "<options>", "", "Retrieve DNS server information"],
+                ["reverse-dns", "<options>", "", "Perform reverse DNS lookup"],
+                ["zone-transfer", "<options>", "", "Attempt DNS zone transfer"],
+                ["lookup", "<options>", "", "Query and display DNS records"],
+                ["whois", "<options>", "", "Perform WHOIS lookup"],
+                ["brute-subdomains", "<options>", "", "Brute-force subdomain enumeration"],
+                ["dnssec", "<options>", "", "Check DNSSEC status"],
+                ["zone-walk", "<options>", "", "DNS zone walking using NSEC/NSEC3"],
+                ["zone-walk-complete", "<options>", "", "Complete zone walking using NSEC"],
+                ["", "", "", ""],
+                ["-h", "--help", "", "Show this help message and exit"],
+            ]}
+        ]
+
     def add_subparser(self, name: str, subparsers) -> None:
         """Adds a subparser of SNMP arguments"""
 

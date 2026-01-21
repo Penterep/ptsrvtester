@@ -73,16 +73,15 @@ def get_help():
             "ptsrvtester <module> -h     for help for module use"
         ]},
         {"options": [
-            ["<module>", "", "", "Select module to use"],
-            ["", " ", " snmp", "SNMP testing module"],
-            ["", " ", " dns", "DNS testing module"],
-            ["", " ", " ldap", "LDAP testing module"],
-            ["", " ", " msrpc", "MSRPC testing module"],
-            ["", " ", " ftp", "FTP testing module"],
-            ["", " ", " ssh", "SSH testing module"],
-            ["", " ", " smtp", "SMTP testing module"],
-            ["", " ", " pop3", "POP3 testing module"],
-            ["", " ", " imap", "IMAP testing module"],
+            ["snmp", "<options>", "", "SNMP testing module"],
+            ["dns", "<options>", "", "DNS testing module"],
+            ["ldap", "<options>", "", "LDAP testing module"],
+            ["msrpc", "<options>", "", "MSRPC testing module"],
+            ["ftp", "<options>", "", "FTP testing module"],
+            ["ssh", "<options>", "", "SSH testing module"],
+            ["smtp", "<options>", "", "SMTP testing module"],
+            ["pop3", "<options>", "", "POP3 testing module"],
+            ["imap", "<options>", "", "IMAP testing module"],
             ["", " ", "", ""],
             ["-v", "--version", "", "Show script version and exit"],
             ["-h", "--help", "", "Show this help message and exit"],
@@ -101,8 +100,15 @@ def parse_args() -> BaseArgs:
     
     # Check for help flag before argparse processing
     if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
-        # Only show main help if no module is specified
-        if len(sys.argv) <= 2:
+        # Check if module is specified
+        if len(sys.argv) >= 2 and sys.argv[1] in MODULES:
+            # Show module-specific help
+            module_name = sys.argv[1]
+            module_help = MODULES[module_name].module_args().get_help()
+            ptprinthelper.help_print(module_help, f"{SCRIPTNAME} {module_name}", __version__)
+            sys.exit(0)
+        elif len(sys.argv) <= 2:
+            # Show main help
             ptprinthelper.help_print(get_help(), SCRIPTNAME, __version__)
             sys.exit(0)
 

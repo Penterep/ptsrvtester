@@ -55,6 +55,26 @@ class LDAPArgs(BaseArgs):
     test_value:str = None
     threads:int
 
+    @staticmethod
+    def get_help():
+        return [
+            {"description": ["LDAP Testing Module"]},
+            {"usage": ["ptsrvtester ldap <command> <options>"]},
+            {"usage_example": [
+                "ptsrvtester ldap banner -ip 192.168.1.1",
+                "ptsrvtester ldap search -ip 192.168.1.1 -bd \"dc=example,dc=com\"",
+                "ptsrvtester ldap userenum -ip 192.168.1.1 -ul usernames.txt"
+            ]},
+            {"options": [
+                ["banner", "<options>", "", "Retrieve LDAP server banner"],
+                ["search", "<options>", "", "Perform LDAP search query"],
+                ["userenum", "<options>", "", "Enumerate valid LDAP users"],
+                ["bruteforce", "<options>", "", "Brute-force LDAP credentials"],
+                ["writetest", "<options>", "", "Test write permissions"],
+                ["", "", "", ""],
+                ["-h", "--help", "", "Show this help message and exit"],
+            ]}
+        ]
 
     def add_subparser(self, name: str, subparsers) -> None:
         """Adds a subparser of SNMP arguments"""

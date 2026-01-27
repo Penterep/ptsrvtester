@@ -87,7 +87,8 @@ class BaseModule(ABC):
             colortext = True
             category = Out.TITLE.value
         else:
-            colortext = False
+            # Out.INFO should have colored text (yellow) for headings
+            colortext = (out == Out.INFO)
             category = out.value
 
         ptprinthelper.ptprint(string, category, True, flush=True, colortext=colortext, end=end)
@@ -121,7 +122,8 @@ class BaseModule(ABC):
             colortext = True
             category = Out.TITLE.value
         else:
-            colortext = False
+            # Out.INFO should have colored text (yellow) for headings
+            colortext = (out == Out.INFO)
             category = out.value
 
         ptprinthelper.ptprint(string, category, True, flush=True, colortext=colortext, end=end)

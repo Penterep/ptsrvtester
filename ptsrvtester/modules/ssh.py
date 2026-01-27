@@ -10,6 +10,7 @@ from ptlibs.threads import ptthreads
 from ssh_audit import ssh_audit
 
 from ._base import BaseModule, BaseArgs, Out
+from ptlibs.ptprinthelper import get_colored_text
 from .utils.helpers import (
     Target,
     Creds,
@@ -23,6 +24,11 @@ from .utils.helpers import (
 
 
 # region data classes
+
+
+class TestFailedError(Exception):
+    """Custom exception for run-all mode: test failed but continue with next test."""
+    pass
 
 
 class PrivKeyDetails(NamedTuple):
@@ -227,9 +233,34 @@ class SSH(BaseModule):
         self.ptjsonlib = ptjsonlib
         self.results: SSHResults
 
+    def _is_run_all_mode(self) -> bool:
+        """True when only target is given (no test switches). Run all tests in sequence."""
+        return not (
+            self.args.info
+            or self.args.auth_methods
+            or self.args.ssh_audit
+            or self.args.bad_pubkeys
+            or self.args.bad_authkeys
+            or self.do_brute
+        )
+
+    def _fail(self, msg: str) -> None:
+        """In run-all mode: raise TestFailedError. Otherwise: end_error + SystemExit."""
+        if hasattr(self, 'run_all_mode') and self.run_all_mode:
+            raise TestFailedError(msg)
+        else:
+            self.ptjsonlib.end_error(msg, self.args.json)
+            raise SystemExit
+
     def run(self) -> None:
         self.results = SSHResults()
+        self.run_all_mode = self._is_run_all_mode()
 
+        if self.run_all_mode:
+            self._run_all_tests()
+            return
+
+        # Normal mode: run only specified tests
         if self.args.info:
             self.results.info = self.info(self.args.auth_methods)
 
@@ -248,6 +279,26 @@ class SSH(BaseModule):
         if self.do_brute:
             self.results.brute = self.bruteforce()
 
+    def _run_all_tests(self) -> None:
+        """Run all tests in sequence. On failure: print error, continue with next."""
+        # 1. Info (with auth_methods=True)
+        try:
+            self.results.info = self.info(True)
+        except TestFailedError as e:
+            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            return
+        except Exception as e:
+            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            return
+
+        # 2. ssh-audit (if available)
+        try:
+            self.results.ssh_audit = self.run_ssh_audit()
+        except TestFailedError as e:
+            self.ptprint(f"SSH-audit test failed: {e}", Out.ERROR)
+        except Exception as e:
+            self.ptprint(f"SSH-audit test failed: {e}", Out.ERROR)
+
     def info(self, auth_methods: bool) -> InfoResult:
         """Grab banner and host key, optionally also query the authentication methods"""
         # Raw banner
@@ -259,12 +310,11 @@ class SSH(BaseModule):
             banner = sock.recv(4096).strip().splitlines()[0].decode()
             sock.close()
         except Exception as e:
-            self.ptjsonlib.end_error(
+            msg = (
                 f"Failed to grab banner from the server "
-                + f"{self.args.target.ip}:{self.args.target.port}: {e}",
-                self.args.json,
+                + f"{self.args.target.ip}:{self.args.target.port}: {e}"
             )
-            raise SystemExit
+            self._fail(msg)
 
         # Host key
         try:
@@ -273,12 +323,11 @@ class SSH(BaseModule):
             host_key = trans.get_remote_server_key()
             host_key = host_key.get_name() + " " + host_key.get_base64()
         except Exception as e:
-            self.ptjsonlib.end_error(
+            msg = (
                 f"Failed to establish SSH connection with server "
-                + f"{self.args.target.ip}:{self.args.target.port}: {e}",
-                self.args.json,
+                + f"{self.args.target.ip}:{self.args.target.port}: {e}"
             )
-            raise SystemExit
+            self._fail(msg)
 
         # Authentication methods
         am = None
@@ -493,36 +542,41 @@ class SSH(BaseModule):
 
         # Server information
         if info := self.results.info:
-            self.ptprint("Server information", title=True)
+            self.ptprint("Server information", Out.INFO)
 
-            self.ptprint(f"Banner:", Out.INFO)
-            self.ptprint(f"{info.banner}")
+            self.ptprint("Banner", Out.INFO)
+            self.ptprint(f"    {info.banner}")
             properties["banner"] = info.banner
 
-            self.ptprint(f"Host key:", Out.INFO)
-            self.ptprint(info.host_key)
+            self.ptprint("Host key", Out.INFO)
+            self.ptprint(f"    {info.host_key}")
             properties["hostKey"] = info.host_key
 
             if info.auth_methods is not None:
-                self.ptprint(f"Authentication methods:", Out.INFO)
-                self.ptprint(", ".join(info.auth_methods))
+                self.ptprint("Authentication methods", Out.INFO)
+                for method in info.auth_methods:
+                    if method.lower() == "password":
+                        icon = get_colored_text("[✗]", color="VULN")
+                    else:
+                        icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} {method}", Out.TEXT)
                 properties["authMethods"] = info.auth_methods
 
         # ssh-audit results
         if ssh_audit := self.results.ssh_audit:
 
             if ssh_audit.err is not None:
-                self.ptprint(f"ssh-audit scan failed with error: {ssh_audit.err}", title=True)
+                self.ptprint(f"ssh-audit scan failed with error: {ssh_audit.err}", Out.INFO)
                 properties["sshauditStatus"] = ssh_audit.err
             else:
-                self.ptprint(f"ssh-audit scan results", title=True)
+                self.ptprint("ssh-audit scan results", Out.INFO)
                 properties["sshauditStatus"] = "ok"
 
                 json_lines: list[str] = []
-                self.ptprint(f"Identified {len(ssh_audit.cves)} CVEs", Out.INFO)
+                self.ptprint(f"    Identified {len(ssh_audit.cves)} CVEs", Out.TEXT)
                 for cve in ssh_audit.cves:
                     cve_str = f"{cve.name} ({cve.severity}): {cve.description}"
-                    self.ptprint(cve_str)
+                    self.ptprint(f"        {cve_str}")
                     json_lines.append(cve_str)
 
                 if len(json_lines) > 0:
@@ -532,16 +586,32 @@ class SSH(BaseModule):
 
                 json_lines = []
                 self.ptprint(
-                    f"Identified {len(ssh_audit.cryptofindings)} insecure SSH configurations",
-                    Out.INFO,
+                    f"    Identified {len(ssh_audit.cryptofindings)} insecure SSH configurations",
+                    Out.TEXT,
                 )
                 for find in ssh_audit.cryptofindings:
+                    # Replace CRITICAL with [✗] Error, WARNING with [!] Warning
+                    if find.level.upper() == "CRITICAL":
+                        level_icon = get_colored_text("[✗]", color="VULN")
+                        level_text = "Error"
+                    elif find.level.upper() == "WARNING":
+                        level_icon = get_colored_text("[!]", color="WARNING")
+                        level_text = "Warning"
+                    else:
+                        level_icon = ""
+                        level_text = find.level.upper()
+                    
                     find_str = (
+                        f"{level_icon} {level_text} {find.category}/{find.action}: {find.name}"
+                        + (f" ({find.notes})" if find.notes else "")
+                    )
+                    self.ptprint(f"        {find_str}", Out.TEXT)
+                    # For JSON, keep original format
+                    json_str = (
                         f"{find.level.upper()} {find.category}/{find.action}: {find.name}"
                         + (f" ({find.notes})" if find.notes else "")
                     )
-                    self.ptprint(find_str)
-                    json_lines.append(find_str)
+                    json_lines.append(json_str)
 
                 if len(json_lines) > 0:
                     self.ptjsonlib.add_vulnerability(
@@ -550,11 +620,11 @@ class SSH(BaseModule):
 
         # Bad host key
         if badpubkey := self.results.bad_pubkey:
-            self.ptprint(f"Known static (bad) host key: {badpubkey.bad}", title=True)
+            self.ptprint(f"Known static (bad) host key: {badpubkey.bad}", Out.INFO)
 
             if badpubkey.bad:
-                self.ptprint(f"Matched key path:", Out.INFO)
-                self.ptprint(badpubkey.path)
+                self.ptprint("    Matched key path", Out.INFO)
+                self.ptprint(f"        {badpubkey.path}")
                 self.ptjsonlib.add_vulnerability(
                     VULNS.BadHostKey.value,
                     f"matched key from: {self.args.bad_pubkeys}",
@@ -565,15 +635,15 @@ class SSH(BaseModule):
         if (badauthkeys := self.results.bad_authkeys) is not None:
             self.ptprint(
                 f"Known static (bad) auth keys: {len(badauthkeys) > 0}",
-                title=True,
+                Out.INFO,
             )
 
             if len(badauthkeys) > 0:
-                self.ptprint("Matched keys:", Out.INFO)
+                self.ptprint("    Matched keys", Out.INFO)
 
                 json_lines = []
                 for authkey in badauthkeys:
-                    self.ptprint(authkey)
+                    self.ptprint(f"        {authkey}")
                     json_lines.append(authkey)
 
                 self.ptjsonlib.add_vulnerability(
@@ -605,9 +675,9 @@ class SSH(BaseModule):
                         else:
                             cred_str = f"user: {cred.user}, keypath: {privkey.keypath}"
                     else:
-                        cred_str = f"user: {cred.user}, password: {cred.passw}"
+                        cred_str = f"user: {cred.user}, password: {cred.password}"
 
-                    self.ptprint(cred_str)
+                    self.ptprint(f"    {cred_str}")
                     json_lines.append(cred_str)
 
                 if self.args.user is not None:

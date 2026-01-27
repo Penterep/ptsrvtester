@@ -19,6 +19,7 @@
 """
 
 import argparse
+import re
 import sys
 
 from ptlibs import ptprinthelper, ptjsonlib
@@ -107,7 +108,32 @@ def parse_args() -> BaseArgs:
     """
     
     # Check for help flag before argparse processing
-    if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
+    # Case 1: No arguments at all - show main help
+    if len(sys.argv) == 1:
+        ptprinthelper.help_print(get_help(), SCRIPTNAME, __version__)
+        sys.exit(0)
+    
+    # Normalize module name to lowercase (case-insensitive module names)
+    if len(sys.argv) >= 2 and not sys.argv[1].startswith("-"):
+        sys.argv[1] = sys.argv[1].lower()
+    
+    # Case 2: Only module specified without arguments - show module help
+    if len(sys.argv) == 2 and sys.argv[1] in MODULES:
+        module_name = sys.argv[1]
+        module_help = MODULES[module_name].module_args().get_help()
+        ptprinthelper.help_print(module_help, f"{SCRIPTNAME} {module_name}", __version__)
+        sys.exit(0)
+    
+    # Case 2b: Non-existent module (e.g. ptsrvtester FOO) - show banner, error, and our help
+    if len(sys.argv) == 2 and sys.argv[1] not in MODULES and not sys.argv[1].startswith("-"):
+        ptprinthelper.print_banner(SCRIPTNAME, __version__, False)
+        print(f"\n\033[31m[✗]\033[0m Error: Unknown module '{sys.argv[1]}'")
+        print(f"\nAvailable modules: {', '.join(MODULES.keys())}")
+        print(f"\nUse 'ptsrvtester -h' for help.\n")
+        sys.exit(2)
+    
+    # Case 3: Help flag present
+    if "-h" in sys.argv or "--help" in sys.argv or "--h" in sys.argv or "-help" in sys.argv:
         # Check if module is specified
         if len(sys.argv) >= 2 and sys.argv[1] in MODULES:
             # Show module-specific help
@@ -115,12 +141,39 @@ def parse_args() -> BaseArgs:
             module_help = MODULES[module_name].module_args().get_help()
             ptprinthelper.help_print(module_help, f"{SCRIPTNAME} {module_name}", __version__)
             sys.exit(0)
-        elif len(sys.argv) <= 2:
+        else:
             # Show main help
             ptprinthelper.help_print(get_help(), SCRIPTNAME, __version__)
             sys.exit(0)
 
-    parser = argparse.ArgumentParser(add_help=True)
+    # Shared error message storage
+    shared_error = {'message': None}
+    
+    # Custom ArgumentParser that stores error message
+    class CustomArgumentParser(argparse.ArgumentParser):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.error_message = None
+            # Override parser_class for subparsers
+            if 'parser_class' not in kwargs:
+                kwargs['parser_class'] = CustomArgumentParser
+            
+        def error(self, message):
+            # Store error message in both instance and shared storage
+            self.error_message = message
+            shared_error['message'] = message
+            raise SystemExit(2)
+        
+        def parse_args(self, *args, **kwargs):
+            try:
+                return super().parse_args(*args, **kwargs)
+            except argparse.ArgumentError as e:
+                # Store the error message before it gets lost
+                self.error_message = e.message
+                # Re-raise to let argparse handle it normally
+                raise
+    
+    parser = CustomArgumentParser(add_help=True)
 
     parser.add_argument(
         "-v", "--version", action="version", version=f"%(prog)s {__version__}", help="print version"
@@ -129,13 +182,68 @@ def parse_args() -> BaseArgs:
     parser.add_argument("--debug", action="store_true", help="enable debug messages")
 
     # Subparser for every application module
-    subparsers = parser.add_subparsers(required=True, dest="module")
+    subparsers = parser.add_subparsers(required=True, dest="module", parser_class=CustomArgumentParser)
     for name, module in MODULES.items():
         module.module_args().add_subparser(name, subparsers)
 
     # First parse to get the module name, second parse to get the module-specific arguments
-    args = parser.parse_args(namespace=BaseArgs)
-    args = parser.parse_args(namespace=MODULES[args.module].module_args())
+    try:
+        args = parser.parse_args(namespace=BaseArgs)
+        args = parser.parse_args(namespace=MODULES[args.module].module_args())
+    except (SystemExit, argparse.ArgumentError) as e:
+        # Argparse error occurred
+        error_code = e.code if isinstance(e, SystemExit) else 2
+        
+        if error_code != 0:  # 0 means success (e.g., --version was called)
+            # Print banner first
+            ptprinthelper.print_banner(SCRIPTNAME, __version__, False)
+            
+            # Get error message
+            error_msg = None
+            if isinstance(e, argparse.ArgumentError):
+                error_msg = e.message
+            elif isinstance(e, SystemExit):
+                # Check shared error message (set by any CustomArgumentParser instance)
+                if shared_error['message']:
+                    error_msg = shared_error['message']
+                # Fallback to parser error message
+                elif hasattr(parser, 'error_message') and parser.error_message:
+                    error_msg = parser.error_message
+            
+            # Make error message user-friendly for invalid options
+            if error_msg and "unrecognized arguments:" in error_msg:
+                match = re.search(r"unrecognized arguments:\s*(.+)", error_msg)
+                invalid = match.group(1).strip() if match else error_msg
+                error_msg = f"Invalid option(s): {invalid}"
+            elif error_msg and "the following arguments are required:" in error_msg:
+                # "required: target" is misleading when user typed invalid option (e.g. -dfsdfs)
+                # Only flag as invalid if option looks suspicious: -xxx with >2 letters (not -i, -sd)
+                invalid_arg = None
+                if len(sys.argv) >= 3 and sys.argv[1] in MODULES:
+                    for arg in sys.argv[2:]:
+                        if arg.startswith("-") and not arg.startswith("--"):
+                            if len(arg) > 4:
+                                invalid_arg = arg
+                                break
+                if invalid_arg:
+                    error_msg = f"Invalid option: {invalid_arg}"
+            
+            # Always show error message
+            if error_msg:
+                print(f"\n\033[31m[✗]\033[0m Error: {error_msg}")
+            else:
+                print(f"\n\033[31m[✗]\033[0m Error: Invalid arguments")
+            
+            # Same behavior as non-existent module: show our help or module help
+            if len(sys.argv) >= 2 and sys.argv[1] in MODULES:
+                # Invalid switch with valid module: show full module help
+                module_name = sys.argv[1]
+                module_help = MODULES[module_name].module_args().get_help()
+                ptprinthelper.help_print(module_help, f"{SCRIPTNAME} {module_name}", __version__)
+            else:
+                # No valid module: show help hint
+                print(f"\nUse 'ptsrvtester -h' for help.\n")
+        sys.exit(error_code)
 
     ptprinthelper.print_banner(SCRIPTNAME, __version__, args.json)
     
@@ -147,7 +255,18 @@ def main() -> None:
     args = parse_args()
 
     script = Ptsrvtester(args)
-    script.run()
+    try:
+        script.run()
+    except argparse.ArgumentError as e:
+        # Module raised ArgumentError - show banner, error, and module help (same as parse_args)
+        ptprinthelper.print_banner(SCRIPTNAME, __version__, False)
+        print(f"\n\033[31m[✗]\033[0m Error: {e.message}")
+        if hasattr(args, 'module') and args.module in MODULES:
+            module_help = MODULES[args.module].module_args().get_help()
+            ptprinthelper.help_print(module_help, f"{SCRIPTNAME} {args.module}", __version__)
+        else:
+            print(f"\nUse 'ptsrvtester -h' for help.\n")
+        sys.exit(2)
 
 
 if __name__ == "__main__":

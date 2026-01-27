@@ -306,7 +306,7 @@ class XRDP(BaseModule):
 
     def run(self) -> None:
         """Execute the XRDP brute-force attack"""
-        self.ptprint(f"XRDP Brute-force Attack", Out.TITLE, title=True)
+        self.ptprint(f"XRDP Brute-force Attack", Out.INFO)
         self.ptprint(f"Target: {self.args.target}:{self.args.port}", Out.INFO)
         self.ptprint(f"Username: {self.args.username}", Out.INFO)
         self.ptprint(f"Threads: {self.args.threads}", Out.INFO)

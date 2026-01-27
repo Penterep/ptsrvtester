@@ -635,7 +635,7 @@ class LDAP(BaseModule):
             )
 
             if success:
-                self.ptprint(f"SUCCESS: Write access confirmed on '{self.args.attribute}' at {self.args.target_dn}", out=Out.OK)
+                self.ptprint(f"Write access is allowed", out=Out.VULN)
                 self.ptprint("Note: Attribute was modified for testing purposes. Don't forget to revert it back if necessary.", out=Out.INFO)
                 atribute = self.args.attribute
                 username  = self.args.user
@@ -649,8 +649,11 @@ class LDAP(BaseModule):
                 return result
 
             else:
-                self.ptprint(f"FAIL: No write access to '{self.args.attribute}' at {self.args.target_dn}", out=Out.ERROR)
-                self.ptprint(f"Details: {conn.result['description']} - {conn.result.get('message', '')}")
+                self.ptprint(f"Write access is denied", out=Out.NOTVULN)
+                if conn.result:
+                    description = conn.result.get('description', '')
+                    message = conn.result.get('message', '')
+                    self.ptprint(f"Details: {description} - {message}")
                 return []
         except Exception as e:
             self.ptprint(f"Error: {e}", out=Out.WARNING)

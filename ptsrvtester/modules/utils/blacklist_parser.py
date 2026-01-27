@@ -12,11 +12,14 @@ class BlacklistParser:
         self.verbose_mode = verbose_mode
         self.result = None
 
+    BLACKLIST_TIMEOUT = 15.0
+
     def _get_auth_keys(self):
         try:
             auth_key = httpx.get(
                 "https://mxtoolbox.com/api/v1/user",
                 headers={"Accept": "application/json, text/javascript, */*; q=0.01"},
+                timeout=self.BLACKLIST_TIMEOUT,
             ).json()
         except Exception as e:
             raise ValueError("BlacklistParser: Could not retrieve json")
@@ -61,7 +64,7 @@ class BlacklistParser:
             "Tempauthorization": auth_key,
         }
         cookie = {"MxVisitorUID": auth_visitor_id}
-        client = httpx.Client(http2=True)
+        client = httpx.Client(http2=True, timeout=self.BLACKLIST_TIMEOUT)
         if self.verbose_mode:
             self.ptdebug("Retrieving server response ...", title=True)
         response = client.get(
@@ -98,7 +101,7 @@ class BlacklistParser:
             elif table_row[0] in ["LISTED", "TIMEOUT"]:
                 status = get_colored_text(table_row[0], color="VULN")
             else:
-                stats = table_row[0]
+                status = table_row[0]
             self.ptdebug(f"{status}", end=" " * (max_width[0] - len(table_row_before_colors) + 5))
             self.ptdebug(f"{table_row[1]}", end=" " * (max_width[1] - len(table_row[1]) + 2))
             self.ptdebug(f"{table_row[2]}", end=" " * (max_width[2] - len(table_row[2]) + 7))

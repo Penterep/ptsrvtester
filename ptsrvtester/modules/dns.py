@@ -360,10 +360,14 @@ class DNS(BaseModule):
             name_servers = dns.resolver.resolve(domain, 'NS')
             for name_server in name_servers:
                 A_records = self.resolveDNS(str(name_server))
-                for item in A_records:
-                    answer = ','.join([str(item)])
-                mapping[str(name_server)] = answer
-                self.ptprint("{:<50} {:<15}".format(str(name_server).rstrip('.'), answer))     
+                if A_records:
+                    for item in A_records:
+                        answer = ','.join([str(item)])
+                    mapping[str(name_server)] = answer
+                    self.ptprint("{:<50} {:<15}".format(str(name_server).rstrip('.'), answer))
+                else:
+                    mapping[str(name_server)] = "No A record"
+                    self.ptprint("{:<50} {:<15}".format(str(name_server).rstrip('.'), "No A record"))
             return mapping
         
         except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.Timeout) as e:
@@ -561,6 +565,10 @@ class DNS(BaseModule):
         try:
             # Get authoritative nameservers for the domain
             ns_response = dns.resolver.resolve(domain, dns.rdatatype.NS)
+            if not ns_response.rrset or len(ns_response.rrset) == 0:
+                self.ptprint(f"Error: No NS records found for domain {domain}", out=Out.ERROR)
+                return None
+            
             ns_name = str(ns_response.rrset[0])
 
             # Use resolveDNS() to get the NS IP address
@@ -598,14 +606,14 @@ class DNS(BaseModule):
                 response = dns.query.udp(request, ns_ip, timeout=10)
 
                 if response.rcode() != 0:
-                    self.ptprint("Error: No DNSKEY record found", out=Out.ERROR)
+                    self.ptprint("Error: No DNSKEY record found", out=Out.VULN)
                     insecure_domains.append(domain)
                     
 
                 # Check if the response contains DNSKEY and RRSIG(DNSKEY)
                 if len(response.answer) < 2:
-                    self.ptprint("DNSSEC is NOT properly set! (Missing DNSSEC signatures RRSIG/DNSKEY)", out=Out.WARNING)
-                    self.ptprint("Status: Insecure", out=Out.ERROR)
+                    self.ptprint("DNSSEC is NOT properly set! (Missing DNSSEC signatures RRSIG/DNSKEY)", out=Out.VULN)
+                    self.ptprint("Status: Insecure", out=Out.VULN)
                     
 
                 # Extract DNSKEY and RRSIG records
@@ -616,8 +624,8 @@ class DNS(BaseModule):
                 name = dns.name.from_text(domain)
                 dns.dnssec.validate(dnskey_rrset, rrsig_rrset, {name: dnskey_rrset})
 
-                self.ptprint("DNSSEC is ENABLED and properly signed!", out=Out.OK)
-                self.ptprint("Status: Secure", out=Out.OK)
+                self.ptprint("DNSSEC is ENABLED and properly signed!", out=Out.NOTVULN)
+                self.ptprint("Status: Secure", out=Out.NOTVULN)
                 self.ptprint("\n")
                 self.ptprint("DNSKEY Details:", out=Out.INFO)
                 self.drawLine()
@@ -632,8 +640,8 @@ class DNS(BaseModule):
                     self.ptprint(f"{'Key Type:':<20} {key_type:<30}\n")
 
             except dns.dnssec.ValidationFailure:
-                self.ptprint("DNSSEC validation failed! Domain is NOT properly signed.", out=Out.WARNING)
-                self.ptprint("Status: Insecure", out=Out.ERROR)
+                self.ptprint("DNSSEC validation failed! Domain is NOT properly signed.", out=Out.VULN)
+                self.ptprint("Status: Insecure", out=Out.VULN)
                 insecure_domains.append(domain)
                 
             except dns.exception.Timeout:

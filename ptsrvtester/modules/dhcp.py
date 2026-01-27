@@ -196,7 +196,7 @@ class DHCP(BaseModule):
 
     def run(self) -> None:
         """Execute the selected DHCP command"""
-        self.ptprint(f"Running DHCP {self.args.command} on interface {self.args.interface}", Out.TITLE, title=True)
+        self.ptprint(f"Running DHCP {self.args.command} on interface {self.args.interface}", Out.INFO)
 
         if self.args.command == "info":
             self._get_server_info()
@@ -219,7 +219,7 @@ class DHCP(BaseModule):
             def is_offer_packet(packet):
                 if packet.haslayer(DHCP):
                     options = packet[DHCP].options
-                    self.ptprint("\n[+] DHCP Server Information:", Out.OK)
+                    self.ptprint("\n[+] DHCP Server Information", Out.OK)
                     for o in range(1, len(options)):
                         if options[o] == "end":
                             break

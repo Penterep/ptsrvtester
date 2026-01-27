@@ -1,4 +1,4 @@
-import argparse, random, re, smtplib, socket, time, dns.resolver
+import argparse, ipaddress, random, re, smtplib, socket, time, dns.resolver
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from enum import Enum
@@ -9,6 +9,7 @@ from ptlibs.ptjsonlib import PtJsonLib
 from ..ptntlmauth.ptntlmauth import NTLMInfo, get_NegotiateMessage_data, decode_ChallengeMessage_blob
 
 from ._base import BaseModule, BaseArgs, Out
+from ptlibs.ptprinthelper import get_colored_text
 from .utils.helpers import (
     Target,
     Creds,
@@ -23,6 +24,18 @@ from .utils.blacklist_parser import BlacklistParser
 
 
 # region helper methods
+
+
+class TestFailedError(Exception):
+    """Raised when a test fails in run-all mode; caught to continue with next test."""
+
+
+def _is_private_ip(ip: str) -> bool:
+    """True if ip is a private (RFC 1918 / ULA) address. Blacklist services only check public IPs."""
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
 
 
 def valid_target_smtp(target: str) -> Target:
@@ -122,15 +135,15 @@ class SMTPArgs(ArgsWithBruteforce):
             {"options": [
                 ["", "--info", "", "Gather basic information"],
                 ["", "--ntlm", "", "Inspect NTLM authentication"],
-                ["-e", "--enumerate", "", "User enumeration (VRFY/EXPN/RCPT/ALL)"],
+                ["-e", "--enumerate", "[VRFY/EXPN/RCPT/ALL]", "User enumeration (default: ALL)"],
                 ["-w", "--wordlist", "", "Wordlist for enumeration"],
-                ["-sd", "--slow-down", "", "Test slow-down protection"],
+                ["-sd", "--slow-down", "", "Test slow-down protection (requires -e)"],
                 ["-mc", "--max-connections", "", "Max connections test"],
-                ["", "--open-relay", "", "Test open relay"],
+                ["-or", "--open-relay", "", "Test open relay"],
                 ["-i", "--interactive", "", "Interactive SMTP CLI"],
                 ["", "", "", ""],
                 ["-b", "--blacklist-test", "", "Test against blacklists"],
-                ["-s", "--spf-test", "", "Test SPF records"],
+                ["-s", "--spf-test", "", "Test SPF records (requires domain name)"],
                 ["", "", "", ""],
                 ["", "--tls", "", "Use implicit SSL/TLS"],
                 ["", "--starttls", "", "Use explicit SSL/TLS"],
@@ -171,7 +184,7 @@ class SMTPArgs(ArgsWithBruteforce):
         indirect.add_argument(
             "-b", "--blacklist-test", action="store_true", help="Test target against blacklists"
         )
-        indirect.add_argument("-s", "--spf-test", action="store_true", help="Test SPF records")
+        indirect.add_argument("-s", "--spf-test", action="store_true", help="Test SPF records (requires domain name)")
 
         direct = parser.add_argument_group(
             "DIRECT SCANNING", "Operations that communicate directly with the target server"
@@ -187,18 +200,20 @@ class SMTPArgs(ArgsWithBruteforce):
             type=str,
             choices=["VRFY", "EXPN", "RCPT", "ALL"],
             nargs="?",
-            help="User enumeration method",
+            const="ALL",
+            default=None,
+            help="User enumeration [VRFY/EXPN/RCPT/ALL] (default: ALL)",
         )
         direct.add_argument(
             "-sd",
             "--slow-down",
             action="store_true",
-            help="Test against slow-down protection during enumeration",
+            help="Test against slow-down protection during enumeration (requires -e)",
         )
         direct.add_argument(
             "-mc", "--max-connections", action="store_true", help="Max connections test"
         )
-        direct.add_argument("--open-relay", action="store_true", help="Test Open relay")
+        direct.add_argument("-or", "--open-relay", action="store_true", help="Test Open relay")
         direct.add_argument("-m", "--mail-from", type=str, help="")
         direct.add_argument("-r", "--rcpt-to", type=str, help="")
         direct.add_argument(
@@ -231,6 +246,7 @@ class SMTP(BaseModule):
             raise argparse.ArgumentError(None, "--interactive cannot be used together with --json")
 
         self.use_json = args.json
+        self.ptjsonlib = ptjsonlib
         self.already_enumerated = None
 
         self.max_connections_is_error = None
@@ -263,22 +279,58 @@ class SMTP(BaseModule):
                     None, "--spf-test requires target specified by a domain name"
                 )
         else:
-            self.target_ip = socket.gethostbyname(self.target)
+            try:
+                self.target_ip = socket.gethostbyname(self.target)
+            except socket.gaierror:
+                raise argparse.ArgumentError(
+                    None, f"Cannot resolve domain name '{self.target}' to IP address"
+                )
 
         self.args = args
-        self.ptjsonlib = ptjsonlib
         self.results: SMTPResults
+
+    def _is_run_all_mode(self) -> bool:
+        """True when only target is given (no test switches). Run all tests in sequence."""
+        return not (
+            self.args.blacklist_test
+            or self.args.spf_test
+            or self.args.info
+            or self.args.interactive
+            or self.args.ntlm
+            or self.args.open_relay
+            or self.args.enumerate is not None
+            or self.args.max_connections
+            or self.do_brute
+        )
+
+    def _fail(self, msg: str) -> None:
+        """In run-all mode: raise TestFailedError. Otherwise: end_error + SystemExit."""
+        if self.run_all_mode:
+            raise TestFailedError(msg)
+        self.ptjsonlib.end_error(msg, self.use_json)
+        raise SystemExit
 
     def run(self):
         self.results = SMTPResults()
         smtp = None
+        self.run_all_mode = self._is_run_all_mode()
+
+        if self.run_all_mode:
+            self._run_all_tests()
+            return
 
         # Indirect scanning
         if self.args.blacklist_test:
             self.results.blacklist = self.test_blacklist(self.target)
 
         if self.args.spf_test:
-            self.results.spf_records = self._get_nameservers(self.target)
+            try:
+                self.results.spf_records = self._get_nameservers(self.target)
+            except SystemExit:
+                raise
+            except Exception as e:
+                self.ptjsonlib.end_error(f"Error during SPF test: {e}", self.use_json)
+                raise SystemExit
 
         # Direct scanning
         # enter only if any of these arguments were explicitly specified
@@ -287,7 +339,7 @@ class SMTP(BaseModule):
             or self.args.interactive
             or self.args.ntlm
             or self.args.open_relay
-            or self.args.enumerate
+            or self.args.enumerate is not None
             or self.args.max_connections
             or self.do_brute
         ):
@@ -324,6 +376,77 @@ class SMTP(BaseModule):
                     self.args.threads,
                 )
 
+    def _run_all_tests(self) -> None:
+        """Run all tests in sequence. On failure: print error, continue with next."""
+        # 1. Blacklist
+        try:
+            bl = self.test_blacklist(self.target)
+            if bl is not None:
+                self.results.blacklist = bl
+        except TestFailedError as e:
+            self.ptprint(f"Blacklist test failed: {e}", Out.ERROR)
+        except Exception as e:
+            self.ptprint(f"Blacklist test failed: {e}", Out.ERROR)
+
+        # 2. SPF (only if domain)
+        if not self.target_is_ip:
+            try:
+                self.results.spf_records = self._get_nameservers(self.target)
+            except TestFailedError as e:
+                self.ptprint(f"SPF test failed: {e}", Out.ERROR)
+            except Exception as e:
+                self.ptprint(f"SPF test failed: {e}", Out.ERROR)
+
+        # 3. Direct tests (need SMTP connection)
+        try:
+            smtp, info = self.initial_info()
+            self.results.info = info
+        except TestFailedError as e:
+            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            return
+        except Exception as e:
+            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            return
+
+        # 4. NTLM
+        try:
+            self.results.ntlm = self.auth_ntlm(smtp)
+        except TestFailedError as e:
+            self.ptprint(f"NTLM test failed: {e}", Out.ERROR)
+        except Exception as e:
+            self.ptprint(f"NTLM test failed: {e}", Out.ERROR)
+
+        # 5. Open relay (only if mail_from/rcpt_to provided)
+        if self.args.mail_from and self.args.rcpt_to:
+            try:
+                self.results.open_relay = self.open_relay_test(
+                    smtp, "TEST", self.args.mail_from, self.args.rcpt_to
+                )
+            except TestFailedError as e:
+                self.ptprint(f"Open relay test failed: {e}", Out.ERROR)
+            except Exception as e:
+                self.ptprint(f"Open relay test failed: {e}", Out.ERROR)
+
+        # 6. Enumerate (ALL)
+        save_enum = self.args.enumerate
+        try:
+            self.args.enumerate = "ALL"
+            self.results.enum_results = self.enumeration(smtp)
+        except TestFailedError as e:
+            self.ptprint(f"Enumeration test failed: {e}", Out.ERROR)
+        except Exception as e:
+            self.ptprint(f"Enumeration test failed: {e}", Out.ERROR)
+        finally:
+            self.args.enumerate = save_enum
+
+        # 7. Max connections
+        try:
+            self.results.max_connections = self.max_connections_test()
+        except TestFailedError as e:
+            self.ptprint(f"Max connections test failed: {e}", Out.ERROR)
+        except Exception as e:
+            self.ptprint(f"Max connections test failed: {e}", Out.ERROR)
+
     def connect(self) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL, int, bytes]:
         try:
             if self.args.tls:
@@ -337,12 +460,11 @@ class SMTP(BaseModule):
 
             return smtp, status, reply
         except Exception as e:
-            self.ptjsonlib.end_error(
+            msg = (
                 f"Could not connect to the target server "
-                + f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}",
-                self.use_json,
+                f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}"
             )
-            raise SystemExit
+            self._fail(msg)
 
     def get_smtp_handler(self) -> smtplib.SMTP:
         smtp_handler, status, reply = self.connect()
@@ -352,6 +474,7 @@ class SMTP(BaseModule):
             self.ptjsonlib.end_error(
                 f"SMTP Info - [{status}] {self.bytes_to_str(reply)}", self.use_json
             )
+            raise SystemExit
 
     def _get_smtp_connection(self):
         smtp, status, reply = self.connect()
@@ -366,18 +489,20 @@ class SMTP(BaseModule):
         else:
             raise Exception("Max connection error")
 
-    def wait_for_unban(self, seconds, ban_duration=0):
+    def wait_for_unban(self, seconds, ban_duration=0, retries_left=12):
+        """Wait for server to unban, then try to reconnect. Returns (ban_minutes, reconnected)."""
         self.noop_smtp_connections()
         ban_duration += seconds
         time.sleep(seconds)
-        # print(ban_duration/60)
         try:
             self.ptdebug(f">", end="")
             self._get_smtp_connection()
             self.ptdebug(f"\r", end="")
-            return ban_duration / 60
+            return (ban_duration / 60, True)
         except Exception as e:
-            return self.wait_for_unban(5, ban_duration)
+            if retries_left <= 0:
+                return (ban_duration / 60, False)
+            return self.wait_for_unban(5, ban_duration, retries_left - 1)
 
     def noop_smtp_connections(self):
         for smtp in self.smtp_list:
@@ -402,6 +527,7 @@ class SMTP(BaseModule):
         allowed_connections = None
         is_disconnect = False
         ban_duration = None
+        ban_reconnected = True
 
         self.ptdebug(f"Max smtp connections test", title=True)
         start_time = time.time()
@@ -421,9 +547,7 @@ class SMTP(BaseModule):
                     Out.INFO,
                 )
                 if index == 0:
-                    self.ptjsonlib.end_error(
-                        f"Could not retrieve initial smtp connection - {e}", self.use_json
-                    )
+                    self._fail(f"Could not retrieve initial smtp connection - {e}")
                 self.smtp_list.pop()
                 try:
                     # self.noop_smtp_connections()
@@ -431,7 +555,12 @@ class SMTP(BaseModule):
                 except Exception as e:
                     self.ptdebug(f"You're banned, reconnecting in 60 seconds ...", Out.INFO)
                     self.ptdebug(f"", Out.INFO, end="")
-                    ban_duration = self.wait_for_unban(60)
+                    ban_duration, ban_reconnected = self.wait_for_unban(60)
+                    if not ban_reconnected:
+                        self.ptdebug(
+                            f"Could not reconnect after ban (max retries exceeded)",
+                            Out.INFO,
+                        )
                 break
 
         # close all smtp connections and delete *self.smtp_list*
@@ -443,7 +572,8 @@ class SMTP(BaseModule):
                 Out.INFO,
             )
         if ban_duration:
-            self.ptdebug(f"Unblocked after {ban_duration} minutes", Out.INFO)
+            if ban_reconnected:
+                self.ptdebug(f"Unblocked after {ban_duration} minutes", Out.INFO)
         else:
             self.ptdebug(f"Not banned", Out.INFO)
 
@@ -677,17 +807,25 @@ class SMTP(BaseModule):
     def bytes_to_str(self, text):
         return text.decode("utf-8")
 
-    def test_blacklist(self, target: str) -> BlacklistResult:
+    def test_blacklist(self, target: str) -> BlacklistResult | None:
         self.ptdebug("Testing target against blacklists:", title=True)
+        if self.target_is_ip and _is_private_ip(target):
+            self.ptdebug("Blacklist test skipped: private IP (blacklists apply only to public IPs)", Out.INFO)
+            return None
+
         blacklist_parser = BlacklistParser(self.ptdebug, self.args.json)
 
         try:
             error_msg = blacklist_parser.lookup(target)
         except Exception as e:
-            self.ptjsonlib.end_error(f"Exception during Blacklist lookup: {e}", self.args.json)
+            self._fail(f"Exception during Blacklist lookup: {e}")
 
         if error_msg:
             self.ptdebug(error_msg, Out.VULN)
+
+        # Check if result is None or doesn't have the expected structure
+        if blacklist_parser.result is None or "table_result" not in blacklist_parser.result:
+            return BlacklistResult(False, None)
 
         listed = [
             BlacklistEntry(r[1], r[2], r[3])
@@ -738,7 +876,25 @@ class SMTP(BaseModule):
             nameserver_list = [str(rdata)[:-1] for rdata in ns_query]
             self.ptdebug("    " + "\n    ".join(nameserver_list))
         except Exception as e:
-            self.ptjsonlib.end_error(f"Error retrieving nameservers - {e}", self.use_json)
+            # Make error message more user-friendly
+            error_msg = str(e)
+            if "does not exist" in error_msg or "NXDOMAIN" in error_msg:
+                user_msg = f"Domain '{domain}' does not exist in DNS"
+            elif "does not contain an answer" in error_msg or "NoAnswer" in str(type(e).__name__):
+                # Check if it's a subdomain
+                parts = domain.split('.')
+                if len(parts) > 2:
+                    main_domain = '.'.join(parts[-2:])
+                    user_msg = f"Could not retrieve nameservers for '{domain}'. SPF records are usually on the main domain. Try using '{main_domain}' instead."
+                else:
+                    user_msg = f"Could not retrieve nameservers for '{domain}'. The domain may not have NS records configured."
+            else:
+                user_msg = f"Error retrieving nameservers for '{domain}': {error_msg}"
+            if self.run_all_mode:
+                self._fail(user_msg)
+            full_msg = f"{user_msg}\n\nUse 'ptsrvtester smtp -h' for help."
+            self.ptjsonlib.end_error(full_msg, self.use_json)
+            raise SystemExit
 
         spf_result = {}
         for ns in nameserver_list:
@@ -784,8 +940,15 @@ class SMTP(BaseModule):
                     self.ptdebug(rdata)
         except dns.resolver.NoAnswer as e:
             pass
+        except dns.resolver.NoNameservers as e:
+            # DNS nameservers failed - return empty result
+            return []
         except dns.resolver.Timeout as e:
             raise Exception("Timeout error")
+        except Exception as e:
+            # Catch any other DNS errors
+            self.ptdebug(f"DNS error: {e}", Out.ERROR)
+            return []
         return result
 
     def auth_ntlm(self, smtp: smtplib.SMTP) -> NTLMResult:
@@ -842,12 +1005,11 @@ class SMTP(BaseModule):
             if "RCPT" in self.args.enumerate:
                 enumeration_vulns.update({"rcpt": self.rcpt_test(smtp)})
         except Exception as e:
-            self.ptjsonlib.end_error(
+            msg = (
                 f"Connection terminated with server "
-                + f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}",
-                self.use_json,
+                f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}"
             )
-            raise SystemExit
+            self._fail(msg)
 
     def test_slowdown_enumeration(
         self, smtp: smtplib.SMTP, enumeration_vulns: dict[str, bool | None]
@@ -936,12 +1098,11 @@ class SMTP(BaseModule):
             self.ptdebug("EHLO response: " + ehlo, Out.INFO)
 
         except Exception as e:
-            self.ptjsonlib.end_error(
+            msg = (
                 f"Could not negotiate initial EHLO with "
-                + f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}",
-                self.use_json,
+                f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}"
             )
-            raise SystemExit
+            self._fail(msg)
 
         return smtp, InfoResult(banner, ehlo)
 
@@ -968,17 +1129,17 @@ class SMTP(BaseModule):
         # Blacklist information
         if blacklist := self.results.blacklist:
             if not blacklist.listed:
-                self.ptprint("Blacklist information: clean", title=True)
+                self.ptprint("Blacklist information: clean", Out.NOTVULN)
             else:
-                self.ptprint("Blacklist information: listed", title=True)
+                self.ptprint("Blacklist information: listed", Out.VULN)
 
                 if (results := blacklist.results) is not None:
-                    self.ptprint("Listed on the following blacklists:", Out.INFO)
+                    self.ptprint("    Listed on the following blacklists", Out.INFO)
 
                     json_lines: list[str] = []
                     for r in results:
                         r_str = f'{r.blacklist.strip()}: "{r.reason}" (TTL={r.ttl})'
-                        self.ptprint(r_str)
+                        self.ptprint(f"        {r_str}")
                         json_lines.append(r_str)
 
                     if len(json_lines) > 0:
@@ -990,13 +1151,13 @@ class SMTP(BaseModule):
 
         # SPF records
         if (spf_records := self.results.spf_records) is not None:
-            self.ptprint(f"SPF records: found {len(spf_records)} records", title=True)
+            self.ptprint(f"SPF records: found {len(spf_records)} records", Out.INFO)
 
             json_lines = []
             for ns, records in spf_records.items():
-                self.ptprint("Nameserver " + ns, Out.INFO)
+                self.ptprint(f"    Nameserver {ns}", Out.INFO)
                 for r in records:
-                    self.ptprint(r)
+                    self.ptprint(f"        {r}")
                     json_lines.append(f"[{ns}] {r}")
 
             if len(json_lines) > 0:
@@ -1004,23 +1165,33 @@ class SMTP(BaseModule):
 
         # Server information
         if info := self.results.info:
-            self.ptprint("Server information", title=True)
+            self.ptprint("Server information", Out.INFO)
 
-            self.ptprint(f"Banner:", Out.INFO)
-            self.ptprint(info.banner)
+            self.ptprint("Banner", Out.INFO)
+            self.ptprint(f"    {info.banner}")
             properties["banner"] = info.banner
 
-            self.ptprint(f"EHLO:", Out.INFO)
-            self.ptprint(info.ehlo)
+            self.ptprint("SMTP commands and extensions", Out.INFO)
+            # Split EHLO response into individual lines
+            if info.ehlo:
+                ehlo_lines = info.ehlo.split('\n') if '\n' in info.ehlo else info.ehlo.split('\r\n')
+                # Display all lines (including first line with hostname)
+                for line in ehlo_lines:
+                    line = line.strip()
+                    if line:  # Skip empty lines
+                        self.ptprint(f"    {line}", Out.TEXT)
             properties["ehloCommand"] = info.ehlo
 
         # NTLM authentication
         if ntlm := self.results.ntlm:
+            self.ptprint("NTLM information", Out.INFO)
             if not ntlm.success:
-                self.ptprint(f"NTLM information failed", title=True)
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} not available", Out.TEXT)
                 properties["ntlmInfoStatus"] = "failed"
             elif ntlm.ntlm is not None:
-                self.ptprint(f"NTLM information", title=True)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} NTLM information", Out.TEXT)
                 properties["ntlmInfoStatus"] = "ok"
 
                 out_lines: list[str] = []
@@ -1033,7 +1204,7 @@ class SMTP(BaseModule):
                 out_lines.append(f"OS version: {ntlm.ntlm.os_version}")
 
                 for line in out_lines:
-                    self.ptprint(line, Out.INFO)
+                    self.ptprint(f"        {line}", Out.TEXT)
 
                 self.ptjsonlib.add_vulnerability(
                     VULNS.NTLM.value, "ntlm authentication", "\n".join(out_lines)
@@ -1041,14 +1212,17 @@ class SMTP(BaseModule):
 
         # Open relay
         if (open_relay := self.results.open_relay) is not None:
-            self.ptprint(f"Open relay: {open_relay}", title=True)
+            if open_relay:
+                self.ptprint("Open relay is allowed", Out.VULN)
+            else:
+                self.ptprint("Open relay is denied", Out.NOTVULN)
 
             if open_relay:
                 self.ptjsonlib.add_vulnerability(VULNS.OpenRelay.value, "Open relay")
 
         # User enumeration
         if (enum_results := self.results.enum_results) is not None:
-            self.ptprint("User enumeration methods", title=True)
+            self.ptprint("User enumeration methods", Out.INFO)
 
             json_lines = []
             for e in enum_results:
@@ -1057,10 +1231,11 @@ class SMTP(BaseModule):
                 else:
                     slowdown = ""
 
-                vuln = "vulnerable" if e.vulnerable else "not vulnerable"
-
-                out_str = f'Method "{e.method}" {vuln}{slowdown}'
-                self.ptprint(out_str, Out.INFO)
+                status = "is enabled" if e.vulnerable else "is deny"
+                icon = get_colored_text("[✗]", color="VULN") if e.vulnerable else get_colored_text("[✓]", color="NOTVULN")
+                method_upper = e.method.upper()
+                out_str = f'{icon} {method_upper} method {status}{slowdown}'
+                self.ptprint(f"    {out_str}", Out.TEXT)
 
                 if not e.vulnerable:
                     continue
@@ -1069,15 +1244,14 @@ class SMTP(BaseModule):
 
                 if (results := e.results) is not None:
                     out_str = f"Enumerated {len(results)} users"
-                    self.ptprint(out_str, Out.INFO)
+                    self.ptprint(f"    {out_str}", Out.INFO)
                     json_lines.append(out_str)
 
                     for r in results:
-                        self.ptprint(r)
+                        self.ptprint(f"    {r}")
                         json_lines.append(r)
 
             if len(json_lines) > 0:
-                self.args.enumerate
                 req = f"enumeration methods: {self.args.enumerate}"
                 if self.args.wordlist is not None:
                     req += f"\nwordlist used: {self.args.wordlist}"
@@ -1087,30 +1261,53 @@ class SMTP(BaseModule):
         # Maximum connections
         if max_con := self.results.max_connections:
             if max_con.max is None:
-                self.ptprint("Maximum connections: no limit found", title=True)
+                self.ptprint("Maximum connections: no limit found", Out.VULN)
                 properties["maxConnections"] = None
             else:
-                self.ptprint("Maximum connections", title=True)
-                self.ptprint(f"Maximum simultaneous connections: {max_con.max}")
+                self.ptprint("Connections", Out.INFO)
+                
+                # Max connections per IP evaluation
+                if max_con.max < 50:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    status_text = ""
+                elif max_con.max < 100:
+                    icon = get_colored_text("[!]", color="WARNING")
+                    status_text = " (high value)"
+                else:  # >= 100
+                    icon = get_colored_text("[✗]", color="VULN")
+                    status_text = " (high value)"
+                
+                self.ptprint(f"    {icon} Max connections per IP: {max_con.max}{status_text}", Out.TEXT)
                 properties["maxConnections"] = max_con.max
 
+                # Timeout evaluation
                 if max_con.ban_minutes is None:
-                    self.ptprint(f"No timeout (ban) detected")
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} Timeout: not detected", Out.TEXT)
                     properties["banDuration"] = None
                 else:
-                    self.ptprint(f"Timeout (ban) duration: {max_con.ban_minutes} minutes")
+                    if max_con.ban_minutes < 10:
+                        icon = get_colored_text("[✓]", color="NOTVULN")
+                        status_text = ""
+                    else:  # >= 10
+                        icon = get_colored_text("[✗]", color="VULN")
+                        status_text = " (high value)"
+                    
+                    # Format timeout: show as "X.X min"
+                    timeout_str = f"{max_con.ban_minutes:.1f} min"
+                    self.ptprint(f"    {icon} Timeout: {timeout_str}{status_text}", Out.TEXT)
                     properties["banDuration"] = max_con.ban_minutes
 
         # Login bruteforce
         if (creds := self.results.creds) is not None:
-            self.ptprint(f"Login bruteforce: {len(creds)} valid credentials", title=True)
+            self.ptprint(f"Login bruteforce: {len(creds)} valid credentials", Out.INFO)
 
             if len(creds) > 0:
                 json_lines: list[str] = []
                 for cred in creds:
                     cred_str = f"user: {cred.user}, password: {cred.passw}"
 
-                    self.ptprint(cred_str)
+                    self.ptprint(f"    {cred_str}")
                     json_lines.append(cred_str)
 
                 if self.args.user is not None:

@@ -297,10 +297,10 @@ class POP3(BaseModule):
 
         # Server information
         if info := self.results.info:
-            self.ptprint("Server information", title=True)
+            self.ptprint("Server information", Out.INFO)
 
-            self.ptprint(f"Banner:", Out.INFO)
-            self.ptprint(f"{info.banner}")
+            self.ptprint("Banner", Out.INFO)
+            self.ptprint(f"    {info.banner}")
             properties["banner"] = info.banner
 
             if capability := info.capability:
@@ -312,14 +312,14 @@ class POP3(BaseModule):
                     else:
                         nested.append((capa, vals))
 
-                self.ptprint("CAPA command:", Out.INFO)
+                self.ptprint("CAPA command", Out.INFO)
                 simple_str = " ".join(simple)
-                self.ptprint(simple_str)
+                self.ptprint(f"    {simple_str}")
 
                 nested_lines: list[str] = []
                 for n in nested:
                     n_str = n[0] + ": " + " ".join(n[1])
-                    self.ptprint(n_str)
+                    self.ptprint(f"    {n_str}")
                     nested_lines.append(n_str)
 
                 if len(nested_lines) > 0:
@@ -329,7 +329,10 @@ class POP3(BaseModule):
 
         # Anonymous authentication
         if (anonymous := self.results.anonymous) is not None:
-            self.ptprint(f"Anonymous authentication: {anonymous}", title=True)
+            if anonymous:
+                self.ptprint("Anonymous authentication is enabled", Out.VULN)
+            else:
+                self.ptprint("Anonymous authentication is disabled", Out.NOTVULN)
 
             if anonymous:
                 self.ptjsonlib.add_vulnerability(VULNS.Anonymous.value, "anonymous authentication")
@@ -337,10 +340,10 @@ class POP3(BaseModule):
         # NTLM authentication
         if ntlm := self.results.ntlm:
             if not ntlm.success:
-                self.ptprint(f"NTLM information failed", title=True)
+                self.ptprint(f"NTLM information failed", Out.NOTVULN)
                 properties["ntlmInfoStatus"] = "failed"
             elif ntlm.ntlm is not None:
-                self.ptprint(f"NTLM information", title=True)
+                self.ptprint(f"NTLM information", Out.VULN)
                 properties["ntlmInfoStatus"] = "ok"
 
                 out_lines: list[str] = []
@@ -353,7 +356,7 @@ class POP3(BaseModule):
                 out_lines.append(f"OS version: {ntlm.ntlm.os_version}")
 
                 for line in out_lines:
-                    self.ptprint(line, Out.INFO)
+                    self.ptprint(f"    {line}", Out.INFO)
 
                 self.ptjsonlib.add_vulnerability(
                     VULNS.NTLM.value, "ntlm authentication", "\n".join(out_lines)
@@ -361,14 +364,14 @@ class POP3(BaseModule):
 
         # Login bruteforce
         if (creds := self.results.creds) is not None:
-            self.ptprint(f"Login bruteforce: {len(creds)} valid credentials", title=True)
+            self.ptprint(f"Login bruteforce: {len(creds)} valid credentials", Out.INFO)
 
             if len(creds) > 0:
                 json_lines: list[str] = []
                 for cred in creds:
                     cred_str = f"user: {cred.user}, password: {cred.passw}"
 
-                    self.ptprint(cred_str)
+                    self.ptprint(f"    {cred_str}")
                     json_lines.append(cred_str)
 
                 if self.args.user is not None:

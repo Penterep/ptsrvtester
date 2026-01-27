@@ -9,6 +9,7 @@ from typing import NamedTuple
 from ptlibs.ptjsonlib import PtJsonLib
 
 from ._base import BaseModule, BaseArgs, Out
+from ptlibs.ptprinthelper import get_colored_text
 from .utils.helpers import (
     Target,
     Creds,
@@ -22,6 +23,11 @@ from .utils.helpers import (
 
 
 # region helper methods
+
+
+class TestFailedError(Exception):
+    """Custom exception for run-all mode: test failed but continue with next test."""
+    pass
 
 
 def valid_target_bounce(target: str) -> Target:
@@ -280,9 +286,35 @@ class FTP(BaseModule):
         self.results: FTPResults
         self.ftp: ftplib.FTP
 
+    def _is_run_all_mode(self) -> bool:
+        """True when only target is given (no test switches). Run all tests in sequence."""
+        return not (
+            self.args.info
+            or self.args.anonymous
+            or self.args.access
+            or self.args.access_list
+            or self.args.bounce
+            or self.do_brute
+        )
+
+    def _fail(self, msg: str) -> None:
+        """In run-all mode: raise TestFailedError. Otherwise: end_error + SystemExit."""
+        if hasattr(self, 'run_all_mode') and self.run_all_mode:
+            raise TestFailedError(msg)
+        else:
+            self.ptjsonlib.end_error(msg, self.args.json)
+            raise SystemExit
+
     def run(self) -> None:
         """Executes FTP methods based on module configuration"""
         self.results = FTPResults()
+        self.run_all_mode = self._is_run_all_mode()
+
+        if self.run_all_mode:
+            self._run_all_tests()
+            return
+
+        # Normal mode: run only specified tests
         self.ftp = self.connect()
 
         if self.args.anonymous:
@@ -309,6 +341,36 @@ class FTP(BaseModule):
             if self.args.bounce:
                 self.results.bounce = self.bounce()
 
+    def _run_all_tests(self) -> None:
+        """Run all tests in sequence. On failure: print error, continue with next."""
+        # 1. Info (banner, SYST, STAT)
+        try:
+            self.ftp = self.connect()
+            self.results.info = self.info()
+        except TestFailedError as e:
+            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            return
+        except Exception as e:
+            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            return
+
+        # 2. Anonymous authentication
+        try:
+            self.results.anonymous = self.anonymous()
+        except TestFailedError as e:
+            self.ptprint(f"Anonymous test failed: {e}", Out.ERROR)
+        except Exception as e:
+            self.ptprint(f"Anonymous test failed: {e}", Out.ERROR)
+
+        # 3. Access check (only if anonymous is enabled)
+        if self.results.anonymous:
+            try:
+                self.results.access = self.access_check()
+            except TestFailedError as e:
+                self.ptprint(f"Access check failed: {e}", Out.ERROR)
+            except Exception as e:
+                self.ptprint(f"Access check failed: {e}", Out.ERROR)
+
     def connect(self) -> ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit:
         """
         Establishes a new FTP connection with the appropriate
@@ -329,12 +391,11 @@ class FTP(BaseModule):
                 ftp = ftplib.FTP()
                 ftp.connect(self.args.target.ip, self.args.target.port)
         except Exception as e:
-            self.ptjsonlib.end_error(
+            msg = (
                 f"Could not connect to the target server "
-                + f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}",
-                self.args.json,
+                + f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}"
             )
-            raise SystemExit
+            self._fail(msg)
 
         # Passive/Active mode
         ftp.set_pasv(not self.args.active)
@@ -526,8 +587,11 @@ class FTP(BaseModule):
             result = creds
         except Exception as e:
             # Valid creds but server-side error?
-            if "cannot change directory" in str(e.args[0]).lower():
-                result = creds
+            if e.args and len(e.args) > 0:
+                if "cannot change directory" in str(e.args[0]).lower():
+                    result = creds
+                else:
+                    result = None
             else:
                 result = None
         finally:
@@ -605,8 +669,9 @@ class FTP(BaseModule):
                         cleaned = True
                     except ftplib.Error as e:
                         # 226 is success, but ftplib does not account for that
-                        if str(e.args[0])[:3] == "226":
-                            cleaned = True
+                        if e.args and len(e.args) > 0 and len(str(e.args[0])) >= 3:
+                            if str(e.args[0])[:3] == "226":
+                                cleaned = True
 
             return BounceResult(
                 self.args.bounce,
@@ -661,23 +726,29 @@ class FTP(BaseModule):
 
         # Basic information
         if info := self.results.info:
-            self.ptprint("Server information", title=True)
+            self.ptprint("Server information", Out.INFO)
 
-            self.ptprint(f"Banner:", Out.INFO)
-            self.ptprint(f"{info.banner}")
+            self.ptprint("Banner", Out.INFO)
+            self.ptprint(f"    {info.banner}")
             properties["banner"] = info.banner
 
-            self.ptprint(f"SYST command:", Out.INFO)
-            self.ptprint(f"{info.syst}")
+            self.ptprint("SYST command", Out.INFO)
+            self.ptprint(f"    {info.syst}")
             properties["systCommand"] = info.syst
 
-            self.ptprint(f"STAT command:", Out.INFO)
-            self.ptprint(f"{info.stat}")
+            self.ptprint("STAT command", Out.INFO)
+            self.ptprint(f"    {info.stat}")
             properties["statCommand"] = info.stat
 
         # Anonymous authentication and access permissions
         if (anon := self.results.anonymous) is not None:
-            self.ptprint(f"Anonymous authentication: {anon}", title=True)
+            self.ptprint("Authentication", Out.INFO)
+            if anon:
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} Anonymous authentication is enabled", Out.TEXT)
+            else:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} Anonymous authentication is disabled", Out.TEXT)
             if anon:
                 if (access := self.results.access) is not None:
                     if access.errors is None and access.results is not None:
@@ -689,7 +760,7 @@ class FTP(BaseModule):
                                 + f"Read: {anon_p.read}, "
                                 + f"Delete: {anon_p.delete})"
                             )
-                            self.ptprint(response_str)
+                            self.ptprint(f"    {response_str}")
                         except StopIteration:
                             response_str = ""
                     else:
@@ -708,7 +779,7 @@ class FTP(BaseModule):
 
         # Bruteforced credentials and their access permissions
         if (creds := self.results.creds) is not None:
-            self.ptprint(f"Login check: {len(creds)} valid credentials", title=True)
+            self.ptprint(f"Login check: {len(creds)} valid credentials", Out.INFO)
 
             if len(creds) > 0:
                 json_lines: list[str] = []
@@ -729,15 +800,15 @@ class FTP(BaseModule):
                                 perm_str = ""
                         else:
                             perm_str = f" Encountered errors during access enumeration:"
-                            self.ptprint(perm_str, Out.ERROR)
+                            self.ptprint(f"    {perm_str}", Out.ERROR)
 
                             for e in access.errors:
-                                self.ptprint(e, Out.ERROR)
+                                self.ptprint(f"        {e}", Out.ERROR)
                                 perm_str += f"\n{e}"
                     else:
                         perm_str = ""
 
-                    self.ptprint(cred_str + perm_str)
+                    self.ptprint(f"    {cred_str + perm_str}")
                     json_lines.append(cred_str + perm_str)
 
                 if self.args.user is not None:
@@ -764,26 +835,30 @@ class FTP(BaseModule):
         ):
             try:
                 p = next(p for p in access.results if p.dirlist is not None and len(p.dirlist) > 0)
-                self.ptprint("Directory listing", title=True)
+                self.ptprint("Directory listing", Out.INFO)
 
                 out_str = "\n".join(p.dirlist)
-                self.ptprint(out_str)
+                self.ptprint(f"    {out_str}")
                 properties["directoryListing"] = out_str
             except StopIteration:
-                self.ptprint("Directory listing failed (no access or empty listing)", title=True)
+                self.ptprint("Directory listing failed (no access or empty listing)", Out.INFO)
                 properties["directoryListing"] = "no access or empty"
 
         # Bounce attack
         if bounce := self.results.bounce:
             if (creds := bounce.used_creds) is None:
-                self.ptprint(f"Bounce attack failed (no valid credentials)", title=True)
+                self.ptprint(f"Bounce attack failed (no valid credentials)", Out.INFO)
                 properties["bounceStatus"] = "no valid credentials"
             else:
-                self.ptprint("Bounce attack", title=True)
-                self.ptprint(f"Creds used: {creds.user}:{creds.passw}", Out.INFO)
+                self.ptprint("Bounce attack", Out.INFO)
+                self.ptprint(f"    Creds used: {creds.user}:{creds.passw}", Out.INFO)
 
-                res = "Yes" if bounce.bounce_accepted else "No"
-                self.ptprint("Bounce allowed: " + res, Out.INFO)
+                if bounce.bounce_accepted:
+                    icon = get_colored_text("[✗]", color="VULN")
+                    self.ptprint(f"    {icon} Bounce is allowed", Out.TEXT)
+                else:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} Bounce is denied", Out.TEXT)
 
                 if not bounce.bounce_accepted:
                     properties["bounceStatus"] = "rejected"
@@ -792,7 +867,7 @@ class FTP(BaseModule):
 
                     if (r := bounce.request) is None:
                         out_str = f"Target port reachable: {bounce.port_accessible}"
-                        self.ptprint(out_str, Out.INFO)
+                        self.ptprint(f"        {out_str}", Out.INFO)
                         self.ptjsonlib.add_vulnerability(
                             VULNS.Bounce.value,
                             f"Bounce port scan target: {bounce.target.ip}:{bounce.target.port}\n"
@@ -802,15 +877,15 @@ class FTP(BaseModule):
                     else:
                         res = f"Yes ({r.ftpserver_filepath})" if r.stored else "No"
                         stored_str = "Stored on FTP server: " + res
-                        self.ptprint(stored_str, Out.INFO)
+                        self.ptprint(f"        {stored_str}", Out.INFO)
 
                         res = "Yes" if r.uploaded else "No"
                         sent_str = "Sent to bounce target: " + res
-                        self.ptprint(sent_str, Out.INFO)
+                        self.ptprint(f"        {sent_str}", Out.INFO)
 
                         res = "Yes" if r.cleaned else "No"
                         clean_str = "Cleaned up: " + res
-                        self.ptprint(clean_str, Out.INFO)
+                        self.ptprint(f"        {clean_str}", Out.INFO)
 
                         self.ptjsonlib.add_vulnerability(
                             VULNS.Bounce.value,

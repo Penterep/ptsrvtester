@@ -451,10 +451,15 @@ class MSRPC(BaseModule):
                 self.drawLine()
                 for tup in dangerous_uuids:
                     handle_discovered_tup(tup)
-                    self.ptprint(f"Named Pipe: {KNOWN_UUIDS[tup[0].lower()]['pipe']}")
-                    self.ptprint(f"Description: {KNOWN_UUIDS[tup[0].lower()]['description']}")
+                    uuid_key = tup[0].lower()
+                    if uuid_key in KNOWN_UUIDS:
+                        self.ptprint(f"Named Pipe: {KNOWN_UUIDS[uuid_key]['pipe']}")
+                        self.ptprint(f"Description: {KNOWN_UUIDS[uuid_key]['description']}")
+                    else:
+                        self.ptprint(f"Named Pipe: Unknown")
+                        self.ptprint(f"Description: Unknown UUID")
                     self.ptprint("\n")
-                    results.append(tup[0].lower())
+                    results.append(uuid_key)
             
             if self.args.output:
                 self.write_to_file(results)
@@ -579,20 +584,20 @@ class MSRPC(BaseModule):
 
             try:
                 shares = smb.listShares()
-                self.ptprint(f"Anonymous login successful. IPC$ accessible.", out=Out.OK)
+                self.ptprint("Anonymous SMB login is allowed", out=Out.VULN)
                 for share in shares:
                     self.ptprint(f"    Share: {share['shi1_netname']}")
                 smb.logoff()
                 result = ["True", "True"]
                 return result
             except Exception as e:
-                self.ptprint(f"Anonymous login successful, but IPC$ access failed: {e}", out=Out.INFO)
+                self.ptprint("Anonymous SMB login is allowed (IPC$ access failed)", out=Out.VULN)
                 smb.logoff()
                 result = ["True", "False"]
                 return result
 
         except Exception as e:
-            self.ptprint(f"Anonymous SMB login failed: {e}", out=Out.ERROR)
+            self.ptprint("Anonymous SMB login is denied", out=Out.NOTVULN)
             return []
         
     # attack just on smb no pipes 

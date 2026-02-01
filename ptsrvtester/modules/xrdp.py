@@ -81,11 +81,17 @@ class XRDPResults:
 def password_iterator(wordlist_path: str) -> Generator:
     """Iterator for passwords from wordlist file"""
     try:
-        with open(wordlist_path, 'r') as f:
+        with open(wordlist_path, "r") as f:
             for line in f:
-                yield line.strip()
-    except Exception as e:
-        raise Exception(f"Error reading wordlist: {str(e)}")
+                password = line.strip()
+                if password:
+                    yield password
+    except FileNotFoundError:
+        raise argparse.ArgumentError(None, f"File not found: '{wordlist_path}'")
+    except PermissionError:
+        raise argparse.ArgumentError(None, f"Cannot read file (permission denied): '{wordlist_path}'")
+    except OSError as e:
+        raise argparse.ArgumentError(None, f"Cannot read file '{wordlist_path}': {e}")
 
 
 def password_generator(alphabet: str, length: int = 1) -> Generator:

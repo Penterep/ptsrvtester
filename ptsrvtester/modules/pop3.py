@@ -5,8 +5,8 @@ from enum import Enum
 from typing import NamedTuple
 
 from ptlibs.ptjsonlib import PtJsonLib
+from ptlibs.ptprinthelper import get_colored_text
 from ..ptntlmauth.ptntlmauth import NTLMInfo, get_NegotiateMessage_data, decode_ChallengeMessage_blob
-
 
 from ._base import BaseModule, BaseArgs, Out
 from .utils.helpers import (
@@ -20,6 +20,70 @@ from .utils.helpers import (
     add_bruteforce_args,
     simple_bruteforce,
 )
+
+
+def valid_target_pop3(target: str) -> Target:
+    """Argparse helper: IP or hostname with optional port (like SMTP)."""
+    return valid_target(target, domain_allowed=True)
+
+
+# POP3 CAPA: known capabilities and security classification (IANA RFC 2449, 2595, 3206, 5034, 6856)
+POP3_KNOWN_CAPABILITIES = frozenset(
+    {
+        "TOP", "UIDL", "USER", "SASL", "RESP-CODES", "LOGIN-DELAY", "PIPELINING",
+        "EXPIRE", "IMPLEMENTATION", "STLS", "AUTH-RESP-CODE", "UTF8", "LANG",
+    }
+)
+# SASL method -> OK / WARNING / ERROR (E=ERROR, W=WARNING, rest OK)
+POP3_SASL_METHOD_LEVEL = {
+    "PLAIN": "ERROR", "LOGIN": "ERROR", "CRAM-MD5": "ERROR", "DIGEST-MD5": "ERROR",
+    "NTLM": "ERROR", "ANONYMOUS": "ERROR", "KERBEROS_V4": "ERROR", "GSSAPI": "ERROR",
+    "EXTERNAL": "WARNING",
+    "XOAUTH2": "OK", "OAUTHBEARER": "OK", "SCRAM-SHA-1": "OK", "SCRAM-SHA-256": "OK",
+}
+POP3_CAPA_WARNING = frozenset({"USER", "IMPLEMENTATION"})  # USER=plaintext, IMPLEMENTATION=info disclosure
+
+
+def _parse_capa_commands(capability: dict[str, list[str]]) -> list[tuple[str, str]]:
+    """
+    Parse POP3 CAPA dict into list of (display_string, level) for output.
+    Level is OK, WARNING, or ERROR. Expands SASL into separate methods.
+    If STLS is not advertised, appends [✗] STLS (is not allowed).
+    """
+    if not capability:
+        return []
+    result: list[tuple[str, str]] = []
+    seen_stls = False
+
+    for capa, vals in sorted(capability.items()):
+        capa_upper = str(capa or "").upper().strip()
+        vals_str = [str(v) for v in (vals or [])]
+
+        if capa_upper == "STLS":
+            seen_stls = True
+
+        if capa_upper == "SASL":
+            methods = vals_str
+            for method in methods:
+                method_upper = method.upper()
+                level = POP3_SASL_METHOD_LEVEL.get(method_upper, "OK")
+                result.append((f"SASL {method_upper}", level))
+            continue
+
+        if capa_upper in POP3_CAPA_WARNING:
+            level = "WARNING"
+        elif capa_upper in POP3_KNOWN_CAPABILITIES:
+            level = "OK"
+        else:
+            level = "OK"  # Unknown capability: show as OK
+
+        display = f"{capa_upper} {' '.join(vals_str)}".strip() if vals_str else capa_upper
+        result.append((display, level))
+
+    if not seen_stls:
+        result.append(("STLS (is not allowed)", "ERROR"))
+
+    return result
 
 
 # region data classes
@@ -38,6 +102,7 @@ class InfoResult(NamedTuple):
 @dataclass
 class POP3Results:
     info: InfoResult | None = None
+    info_error: str | None = None  # When connect/info fails
     anonymous: bool | None = None
     ntlm: NTLMResult | None = None
     creds: set[Creds] | None = None
@@ -79,10 +144,10 @@ class POP3Args(ArgsWithBruteforce):
                 ["", "--tls", "", "Use implicit SSL/TLS"],
                 ["", "--starttls", "", "Use explicit SSL/TLS"],
                 ["", "", "", ""],
-                ["-u", "--user", "", "Single username for bruteforce"],
-                ["-U", "--users-file", "", "File with usernames"],
-                ["-p", "--passw", "", "Single password for bruteforce"],
-                ["-P", "--passw-file", "", "File with passwords"],
+                ["-u", "--user", "<username>", "Single username for bruteforce"],
+                ["-U", "--users", "<wordlist>", "File with usernames"],
+                ["-p", "--password", "<password>", "Single password for bruteforce"],
+                ["-P", "--passwords", "<wordlist>", "File with passwords"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
             ]}
@@ -106,7 +171,9 @@ class POP3Args(ArgsWithBruteforce):
             raise TypeError  # IDE typing
 
         parser.add_argument(
-            "target", type=valid_target, help="IP[:PORT] (e.g. 127.0.0.1 or 127.0.0.1:110)"
+            "target",
+            type=valid_target_pop3,
+            help="IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or mail.example.com:110)",
         )
 
         parser.add_argument("--tls", action="store_true", help="use implicit SSL/TLS")
@@ -159,10 +226,31 @@ class POP3(BaseModule):
         self.results: POP3Results
         self.pop3: poplib.POP3
 
+    def _is_default_mode(self) -> bool:
+        """True when only target is given (no test switches). Run basic info + anonymous."""
+        return not (
+            self.args.info
+            or self.args.ntlm
+            or self.args.anonymous
+            or self.do_brute
+        )
+
     def run(self) -> None:
         """Executes POP3 methods based on module configuration"""
         self.results = POP3Results()
-        self.pop3 = self.connect()
+        try:
+            self.pop3 = self.connect()
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except Exception as e:
+            self.results.info_error = str(e)
+            return
+
+        if self._is_default_mode():
+            # Only target given: run basic tests (info + anonymous), like FTP
+            self.results.info = self.info()
+            self.results.anonymous = self.auth_anonymous()
+            return
 
         if self.args.info:
             self.results.info = self.info()
@@ -177,9 +265,9 @@ class POP3(BaseModule):
             self.results.creds = simple_bruteforce(
                 self._try_login,
                 self.args.user,
-                self.args.users_file,
-                self.args.passw,
-                self.args.passw_file,
+                self.args.users,
+                self.args.password,
+                self.args.passwords,
                 self.args.spray,
                 self.args.threads,
             )
@@ -200,12 +288,11 @@ class POP3(BaseModule):
                 if self.args.starttls:
                     pop3.stls()
         except Exception as e:
-            self.ptjsonlib.end_error(
+            msg = (
                 f"Could not connect to the target server "
-                + f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}",
-                self.args.json,
+                + f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}"
             )
-            raise SystemExit
+            raise OSError(msg) from e
         return pop3
 
     def info(self) -> InfoResult:
@@ -276,7 +363,10 @@ class POP3(BaseModule):
         Returns:
             Creds | None: Creds if success, None if failed
         """
-        pop3 = self.connect()
+        try:
+            pop3 = self.connect()
+        except OSError:
+            return None
         try:
             pop3.user(creds.user)
             pop3.pass_(creds.passw)
@@ -296,7 +386,12 @@ class POP3(BaseModule):
         ]
 
         # Server information
-        if info := self.results.info:
+        if (info_error := self.results.info_error) is not None:
+            self.ptprint("Server information", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Info test failed: {info_error}", Out.TEXT)
+            properties["infoError"] = info_error
+        elif info := self.results.info:
             self.ptprint("Server information", Out.INFO)
 
             self.ptprint("Banner", Out.INFO)
@@ -304,38 +399,30 @@ class POP3(BaseModule):
             properties["banner"] = info.banner
 
             if capability := info.capability:
-                simple: list[str] = []
-                nested: list[tuple[str, list[str]]] = []
-                for capa, vals in capability.items():
-                    if len(vals) == 0:
-                        simple.append(capa)
-                    else:
-                        nested.append((capa, vals))
-
                 self.ptprint("CAPA command", Out.INFO)
-                simple_str = " ".join(simple)
-                self.ptprint(f"    {simple_str}")
-
-                nested_lines: list[str] = []
-                for n in nested:
-                    n_str = n[0] + ": " + " ".join(n[1])
-                    self.ptprint(f"    {n_str}")
-                    nested_lines.append(n_str)
-
-                if len(nested_lines) > 0:
-                    properties["capability"] = simple_str + "\n" + "\n".join(nested_lines)
-                else:
-                    properties["capability"] = simple_str
+                parsed = _parse_capa_commands(capability)
+                json_lines: list[str] = []
+                for display_str, level in parsed:
+                    if level == "ERROR":
+                        icon = get_colored_text("[✗]", color="VULN")
+                    elif level == "WARNING":
+                        icon = get_colored_text("[!]", color="WARNING")
+                    else:
+                        icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} {display_str}", Out.TEXT)
+                    json_lines.append(display_str)
+                properties["capability"] = "\n".join(json_lines)
 
         # Anonymous authentication
         if (anonymous := self.results.anonymous) is not None:
+            self.ptprint("Anonymous authentication", Out.INFO)
             if anonymous:
-                self.ptprint("Anonymous authentication is enabled", Out.VULN)
-            else:
-                self.ptprint("Anonymous authentication is disabled", Out.NOTVULN)
-
-            if anonymous:
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} Enabled", Out.TEXT)
                 self.ptjsonlib.add_vulnerability(VULNS.Anonymous.value, "anonymous authentication")
+            else:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} Disabled", Out.TEXT)
 
         # NTLM authentication
         if ntlm := self.results.ntlm:
@@ -377,12 +464,12 @@ class POP3(BaseModule):
                 if self.args.user is not None:
                     user_str = f"username: {self.args.user}"
                 else:
-                    user_str = f"usernames: {self.args.users_file}"
+                    user_str = f"usernames: {self.args.users}"
 
-                if self.args.passw is not None:
-                    passw_str = f"password: {self.args.passw}"
+                if self.args.password is not None:
+                    passw_str = f"password: {self.args.password}"
                 else:
-                    passw_str = f"passwords: {self.args.passw_file}"
+                    passw_str = f"passwords: {self.args.passwords}"
 
                 self.ptjsonlib.add_vulnerability(
                     VULNS.WeakCreds.value,

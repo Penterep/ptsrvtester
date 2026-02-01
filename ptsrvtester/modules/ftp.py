@@ -30,9 +30,14 @@ class TestFailedError(Exception):
     pass
 
 
+def valid_target_ftp(target: str) -> Target:
+    """Argparse helper: IP or hostname with optional port (like SMTP)."""
+    return valid_target(target, domain_allowed=True)
+
+
 def valid_target_bounce(target: str) -> Target:
-    """Argparse helper function for argument"""
-    return valid_target(target, port_required=True)
+    """Argparse helper: IP:PORT or HOST:PORT for bounce target."""
+    return valid_target(target, port_required=True, domain_allowed=True)
 
 
 def nop_callback(_: str):
@@ -120,8 +125,11 @@ class InfoResult(NamedTuple):
 @dataclass
 class FTPResults:
     info: InfoResult | None = None
+    info_error: str | None = None  # When run-all info/connect fails
     access: AccessCheckResult | None = None
+    access_error: str | None = None  # When run-all access check fails
     anonymous: bool | None = None
+    anonymous_error: str | None = None  # When run-all anonymous test fails
     creds: set[Creds] | None = None
     bounce: BounceResult | None = None
 
@@ -168,10 +176,10 @@ class FTPArgs(ArgsWithBruteforce):
                 ["", "--tls", "", "Use implicit SSL/TLS"],
                 ["", "--starttls", "", "Use explicit SSL/TLS"],
                 ["", "", "", ""],
-                ["-u", "--user", "", "Single username for bruteforce"],
-                ["-U", "--users-file", "", "File with usernames"],
-                ["-p", "--passw", "", "Single password for bruteforce"],
-                ["-P", "--passw-file", "", "File with passwords"],
+                ["-u", "--user", "<username>", "Single username for bruteforce"],
+                ["-U", "--users", "<wordlist>", "File with usernames"],
+                ["-p", "--password", "<password>", "Single password for bruteforce"],
+                ["-P", "--passwords", "<wordlist>", "File with passwords"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
             ]}
@@ -196,7 +204,9 @@ class FTPArgs(ArgsWithBruteforce):
             raise TypeError  # IDE typing
 
         parser.add_argument(
-            "target", type=valid_target, help="IP[:PORT] (e.g. 127.0.0.1 or 127.0.0.1:21)"
+            "target",
+            type=valid_target_ftp,
+            help="IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or ftp.example.com:21)",
         )
 
         parser.add_argument(
@@ -235,7 +245,7 @@ class FTPArgs(ArgsWithBruteforce):
             "-b",
             "--bounce",
             type=valid_target_bounce,
-            help="bounce to the specified IP:PORT service",
+            help="bounce to the specified IP:PORT or HOST:PORT service",
         )
         bounce.add_argument(
             "-B",
@@ -315,7 +325,13 @@ class FTP(BaseModule):
             return
 
         # Normal mode: run only specified tests
-        self.ftp = self.connect()
+        try:
+            self.ftp = self.connect()
+        except (TestFailedError, SystemExit):
+            raise
+        except Exception as e:
+            self.results.info_error = str(e)
+            return  # Cannot continue without connection
 
         if self.args.anonymous:
             self.results.anonymous = self.anonymous()
@@ -324,15 +340,18 @@ class FTP(BaseModule):
             self.results.creds = simple_bruteforce(
                 self._try_login,
                 self.args.user,
-                self.args.users_file,
-                self.args.passw,
-                self.args.passw_file,
+                self.args.users,
+                self.args.password,
+                self.args.passwords,
                 self.args.spray,
                 self.args.threads,
             )
 
         if self.args.info:
-            self.results.info = self.info()
+            try:
+                self.results.info = self.info()
+            except Exception as e:
+                self.results.info_error = str(e)
 
         if self.args.access:
             self.results.access = self.access_check()
@@ -348,28 +367,28 @@ class FTP(BaseModule):
             self.ftp = self.connect()
             self.results.info = self.info()
         except TestFailedError as e:
-            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            self.results.info_error = str(e)
             return
         except Exception as e:
-            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            self.results.info_error = str(e)
             return
 
         # 2. Anonymous authentication
         try:
             self.results.anonymous = self.anonymous()
         except TestFailedError as e:
-            self.ptprint(f"Anonymous test failed: {e}", Out.ERROR)
+            self.results.anonymous_error = str(e)
         except Exception as e:
-            self.ptprint(f"Anonymous test failed: {e}", Out.ERROR)
+            self.results.anonymous_error = str(e)
 
         # 3. Access check (only if anonymous is enabled)
         if self.results.anonymous:
             try:
                 self.results.access = self.access_check()
             except TestFailedError as e:
-                self.ptprint(f"Access check failed: {e}", Out.ERROR)
+                self.results.access_error = str(e)
             except Exception as e:
-                self.ptprint(f"Access check failed: {e}", Out.ERROR)
+                self.results.access_error = str(e)
 
     def connect(self) -> ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit:
         """
@@ -395,7 +414,7 @@ class FTP(BaseModule):
                 f"Could not connect to the target server "
                 + f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}"
             )
-            self._fail(msg)
+            raise OSError(msg) from e
 
         # Passive/Active mode
         ftp.set_pasv(not self.args.active)
@@ -659,6 +678,14 @@ class FTP(BaseModule):
                 # TODO timeout for unreachable ports?
                 ftp.sendcmd("RETR " + filename)
                 uploaded = True
+            except FileNotFoundError:
+                raise argparse.ArgumentError(None, f"File not found: '{self.args.bounce_file}'")
+            except PermissionError:
+                raise argparse.ArgumentError(
+                    None, f"Cannot read file (permission denied): '{self.args.bounce_file}'"
+                )
+            except OSError as e:
+                raise argparse.ArgumentError(None, f"Cannot read file '{self.args.bounce_file}': {e}")
             except ftplib.Error:
                 pass
             finally:
@@ -725,7 +752,12 @@ class FTP(BaseModule):
         ]
 
         # Basic information
-        if info := self.results.info:
+        if (info_error := self.results.info_error) is not None:
+            self.ptprint("Server information", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Info test failed: {info_error}", Out.TEXT)
+            properties["infoError"] = info_error
+        elif info := self.results.info:
             self.ptprint("Server information", Out.INFO)
 
             self.ptprint("Banner", Out.INFO)
@@ -741,7 +773,18 @@ class FTP(BaseModule):
             properties["statCommand"] = info.stat
 
         # Anonymous authentication and access permissions
-        if (anon := self.results.anonymous) is not None:
+        if (anonymous_error := self.results.anonymous_error) is not None:
+            self.ptprint("Authentication", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Anonymous test failed: {anonymous_error}", Out.TEXT)
+            properties["anonymousError"] = anonymous_error
+        elif (access_error := self.results.access_error) is not None:
+            self.ptprint("Authentication", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Anonymous authentication is enabled", Out.TEXT)
+            self.ptprint(f"    {icon} Access check failed: {access_error}", Out.TEXT)
+            properties["accessError"] = access_error
+        elif (anon := self.results.anonymous) is not None:
             self.ptprint("Authentication", Out.INFO)
             if anon:
                 icon = get_colored_text("[✗]", color="VULN")
@@ -814,12 +857,12 @@ class FTP(BaseModule):
                 if self.args.user is not None:
                     user_str = f"username: {self.args.user}"
                 else:
-                    user_str = f"usernames: {self.args.users_file}"
+                    user_str = f"usernames: {self.args.users}"
 
-                if self.args.passw is not None:
-                    passw_str = f"password: {self.args.passw}"
+                if self.args.password is not None:
+                    passw_str = f"password: {self.args.password}"
                 else:
-                    passw_str = f"passwords: {self.args.passw_file}"
+                    passw_str = f"passwords: {self.args.passwords}"
 
                 self.ptjsonlib.add_vulnerability(
                     VULNS.WeakCreds.value,

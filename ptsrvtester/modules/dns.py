@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ptlibs.ptjsonlib import PtJsonLib
 
 from ._base import BaseModule, BaseArgs, Out
+from .utils.helpers import text_or_file
 
 class VULNS(Enum):
     ZoneTransfer = "PTV-DNS-ZONETRANSFER"
@@ -201,31 +202,28 @@ class DNS(BaseModule):
         """
             File Output.
         """
-        with open(self.args.output, 'a') as f:
-            if isinstance(message_or_messages, str):
-                # If it's a single message, write it directly
-                f.write(message_or_messages + '\n')
-            elif isinstance(message_or_messages, list):
-                # If it's a list of messages, iterate and write each one
-                for message in message_or_messages:
-                    f.write(message + '\n')
+        try:
+            with open(self.args.output, "a") as f:
+                if isinstance(message_or_messages, str):
+                    f.write(message_or_messages + "\n")
+                elif isinstance(message_or_messages, list):
+                    for message in message_or_messages:
+                        f.write(message + "\n")
+        except FileNotFoundError:
+            raise argparse.ArgumentError(None, f"File not found: '{self.args.output}'")
+        except PermissionError:
+            raise argparse.ArgumentError(
+                None, f"Cannot write file (permission denied): '{self.args.output}'"
+            )
+        except OSError as e:
+            raise argparse.ArgumentError(None, f"Cannot write file '{self.args.output}': {e}")
 
     def _text_or_file(self, text: str | None, file_path: str | None):
         """
             One domain/address or file.
         """
-        if text:
-            return [text.strip()]
-        elif file_path:
-            try:
-                with open(file_path, 'r') as file:
-                    return [line.strip() for line in file if line.strip()]
-            except Exception as e:
-                self.ptprint(f"Error: reading file {file_path}: {e}", out=Out.WARNING)
-                return []
-        else:
-            self.ptprint("Error: Neither text nor file input provided.", out=Out.WARNING)
-            return []
+        values = text_or_file(text.strip() if text else None, file_path)
+        return [v.strip() for v in values if v.strip()]
 
 
     def get_version_bind(self):
@@ -517,9 +515,8 @@ class DNS(BaseModule):
             output = []
             record_types = ["A", "AAAA", "MX", "TXT", "CNAME", "NS", "SRV", "PTR", "SOA"]
 
-            try: 
-                with open(self.args.subdomains, "r") as f:
-                    subdomains = [line.strip() for line in f]
+            try:
+                subdomains = [s.strip() for s in text_or_file(None, self.args.subdomains) if s.strip()]
 
                 def resolve_subdomain(sub: str):
                     subdomain = f"{sub}.{domain}"
@@ -554,9 +551,8 @@ class DNS(BaseModule):
                 results = [sub[0] for sub in found_subdomains]
                 return results
 
-            except FileNotFoundError:
-                self.ptprint(f"Wordlist file {self.args.subdomains} not found.", out=Out.WARNING)
-                return None
+            except argparse.ArgumentError:
+                raise
         
     def get_nsip(self, domain):
         """

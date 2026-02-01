@@ -228,21 +228,12 @@ def parse_args() -> BaseArgs:
                 if invalid_arg:
                     error_msg = f"Invalid option: {invalid_arg}"
             
-            # Always show error message
+            # Always show error message (no help on error)
             if error_msg:
                 print(f"\n\033[31m[✗]\033[0m Error: {error_msg}")
             else:
                 print(f"\n\033[31m[✗]\033[0m Error: Invalid arguments")
-            
-            # Same behavior as non-existent module: show our help or module help
-            if len(sys.argv) >= 2 and sys.argv[1] in MODULES:
-                # Invalid switch with valid module: show full module help
-                module_name = sys.argv[1]
-                module_help = MODULES[module_name].module_args().get_help()
-                ptprinthelper.help_print(module_help, f"{SCRIPTNAME} {module_name}", __version__)
-            else:
-                # No valid module: show help hint
-                print(f"\nUse 'ptsrvtester -h' for help.\n")
+            print()
         sys.exit(error_code)
 
     ptprinthelper.print_banner(SCRIPTNAME, __version__, args.json)
@@ -258,14 +249,9 @@ def main() -> None:
     try:
         script.run()
     except argparse.ArgumentError as e:
-        # Module raised ArgumentError - show banner, error, and module help (same as parse_args)
-        ptprinthelper.print_banner(SCRIPTNAME, __version__, False)
+        # Module raised ArgumentError - error only (banner already printed after parse_args)
         print(f"\n\033[31m[✗]\033[0m Error: {e.message}")
-        if hasattr(args, 'module') and args.module in MODULES:
-            module_help = MODULES[args.module].module_args().get_help()
-            ptprinthelper.help_print(module_help, f"{SCRIPTNAME} {args.module}", __version__)
-        else:
-            print(f"\nUse 'ptsrvtester -h' for help.\n")
+        print()
         sys.exit(2)
 
 

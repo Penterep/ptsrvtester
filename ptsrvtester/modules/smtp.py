@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import NamedTuple
 
-from ptlibs import ptmisclib
 from ptlibs.ptjsonlib import PtJsonLib
 from ..ptntlmauth.ptntlmauth import NTLMInfo, get_NegotiateMessage_data, decode_ChallengeMessage_blob
 
@@ -19,6 +18,7 @@ from .utils.helpers import (
     valid_target,
     add_bruteforce_args,
     simple_bruteforce,
+    text_or_file,
 )
 from .utils.blacklist_parser import BlacklistParser
 
@@ -40,6 +40,114 @@ def _is_private_ip(ip: str) -> bool:
 
 def valid_target_smtp(target: str) -> Target:
     return valid_target(target, domain_allowed=True)
+
+
+# SMTP EHLO: known extensions and security classification for output
+SMTP_KNOWN_EXTENSIONS = frozenset(
+    {
+        "HELO", "EHLO", "MAIL", "RCPT", "DATA", "RSET", "NOOP", "QUIT",
+        "VRFY", "EXPN", "HELP", "SEND", "SOML", "SAML", "TURN", "ETRN", "ATRN",
+        "8BITMIME", "SIZE", "CHUNKING", "BINARYMIME", "CHECKPOINT", "DELIVERBY",
+        "PIPELINING", "DSN", "AUTH", "BURL", "SMTPUTF8", "STARTTLS", "ENHANCEDSTATUSCODES",
+        "VERB",  # seen in practice
+    }
+)
+# AUTH method -> OK / WARNING / ERROR (E=ERROR, W=WARNING, rest OK)
+SMTP_AUTH_METHOD_LEVEL = {
+    "PLAIN": "ERROR", "LOGIN": "ERROR", "CRAM-MD5": "ERROR", "DIGEST-MD5": "ERROR",
+    "NTLM": "ERROR", "ANONYMOUS": "ERROR", "KERBEROS_V4": "ERROR", "GSSAPI": "ERROR",
+    "EXTERNAL": "WARNING",
+    "XOAUTH2": "OK", "OAUTHBEARER": "OK", "SCRAM-SHA-1": "OK", "SCRAM-SHA-256": "OK",
+}
+SMTP_CMD_ERROR = frozenset({"VRFY", "EXPN"})
+SMTP_CMD_WARNING = frozenset({"RCPT", "ETRN"})
+SIZE_OK_MAX = 26214400       # 25 MB
+SIZE_WARNING_MAX = 52428800  # 50 MB
+
+
+def _parse_ehlo_commands(ehlo_raw: str) -> list[tuple[str, str]]:
+    """
+    Parse EHLO response into list of (display_string, level) for output.
+    Level is OK, WARNING, or ERROR. Hostname line (first line) is skipped.
+    Expands AUTH CRAM-MD5 DIGEST-MD5 into separate AUTH CRAM-MD5, AUTH DIGEST-MD5.
+    Handles both raw SMTP (250-...) and smtplib-style (no prefix) response.
+    """
+    if not ehlo_raw or not ehlo_raw.strip():
+        return []
+    lines = ehlo_raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    result: list[tuple[str, str]] = []
+    seen_starttls = False
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # Strip SMTP code if present: "250-..." or "250 ..."; else use whole line (smtplib often strips code)
+        if line.startswith("250-"):
+            rest = line[4:].strip()
+        elif line.startswith("250 "):
+            rest = line[3:].strip()
+        else:
+            rest = line.strip()
+        if not rest:
+            continue
+        # Normalize \r so key/value match (SMTP uses \r\n; smtplib may leave \r on lines)
+        rest = rest.replace("\r", " ").strip()
+        if not rest:
+            continue
+        # First token is key, rest is value (e.g. "SIZE 29360128", "AUTH CRAM-MD5 DIGEST-MD5")
+        parts = rest.split(None, 1)
+        key = (parts[0] or "").upper().strip()
+        value = (parts[1] or "").strip() if len(parts) > 1 else ""
+
+        # Hostname line (key has dot, not a known extension): skip, not a command
+        if "." in key and key not in SMTP_KNOWN_EXTENSIONS:
+            continue
+        # Unknown extension (no dot): show as OK so we don't drop server-specific lines
+        if key not in SMTP_KNOWN_EXTENSIONS and "." not in key:
+            result.append((rest, "OK"))
+            if key == "STARTTLS":
+                seen_starttls = True
+            continue
+
+        if key == "STARTTLS":
+            seen_starttls = True
+
+        if key == "AUTH":
+            methods = value.split() if value else []
+            for method in methods:
+                method_upper = method.upper()
+                level = SMTP_AUTH_METHOD_LEVEL.get(method_upper, "OK")
+                result.append((f"AUTH {method_upper}", level))
+            continue
+
+        if key == "SIZE":
+            try:
+                size_val = int(value) if value else 0
+                if size_val <= SIZE_OK_MAX:
+                    level = "OK"
+                elif size_val <= SIZE_WARNING_MAX:
+                    level = "WARNING"
+                else:
+                    level = "ERROR"
+            except (ValueError, TypeError):
+                level = "OK"
+            result.append((f"SIZE {value}".strip() or "SIZE", level))
+            continue
+
+        if key in SMTP_CMD_ERROR:
+            level = "ERROR"
+        elif key in SMTP_CMD_WARNING:
+            level = "WARNING"
+        else:
+            level = "OK"
+        display = f"{key} {value}".strip() if value else key
+        result.append((display, level))
+
+    if not seen_starttls:
+        result.append(("STARTTLS (is not allowed)", "ERROR"))
+
+    return result
 
 
 # endregion
@@ -83,13 +191,22 @@ class InfoResult(NamedTuple):
 @dataclass
 class SMTPResults:
     blacklist: BlacklistResult | None = None
+    blacklist_private_ip_skipped: bool = False  # True when target is private IP (not on public blacklists)
     spf_records: dict[str, list[str]] | None = None
+    spf_error: str | None = None  # When run-all SPF test fails
+    spf_requires_domain: bool = False  # True when SPF requested but target is IP
     creds: set[Creds] | None = None
     enum_results: list[EnumResult] | None = None
+    enum_error: str | None = None  # When run-all enumeration fails (e.g. timeout)
     info: InfoResult | None = None
+    info_error: str | None = None  # When run-all info/connect fails
     max_connections: MaxConnectionsResult | None = None
+    max_connections_error: str | None = None  # When run-all max connections test fails
     ntlm: NTLMResult | None = None
+    ntlm_error: str | None = None  # When run-all NTLM test fails
     open_relay: bool | None = None
+    open_relay_error: str | None = None  # When run-all open relay test fails
+    blacklist_error: str | None = None  # When run-all blacklist test fails
 
 
 class VULNS(Enum):
@@ -133,20 +250,25 @@ class SMTPArgs(ArgsWithBruteforce):
                 "ptsrvtester smtp --info --ntlm 127.0.0.1"
             ]},
             {"options": [
-                ["", "--info", "", "Gather basic information"],
+                ["-i", "--info", "", "Gather basic information"],
                 ["", "--ntlm", "", "Inspect NTLM authentication"],
                 ["-e", "--enumerate", "[VRFY/EXPN/RCPT/ALL]", "User enumeration (default: ALL)"],
-                ["-w", "--wordlist", "", "Wordlist for enumeration"],
+                ["-w", "--wordlist", "<wordlist>", "Wordlist for enumeration"],
                 ["-sd", "--slow-down", "", "Test slow-down protection (requires -e)"],
                 ["-mc", "--max-connections", "", "Max connections test"],
                 ["-or", "--open-relay", "", "Test open relay"],
-                ["-i", "--interactive", "", "Interactive SMTP CLI"],
+                ["-I", "--interactive", "", "Interactive SMTP CLI"],
                 ["", "", "", ""],
                 ["-b", "--blacklist-test", "", "Test against blacklists"],
                 ["-s", "--spf-test", "", "Test SPF records (requires domain name)"],
                 ["", "", "", ""],
                 ["", "--tls", "", "Use implicit SSL/TLS"],
                 ["", "--starttls", "", "Use explicit SSL/TLS"],
+                ["", "", "", ""],
+                ["-u", "--user", "<username>", "Single username for bruteforce"],
+                ["-U", "--users", "<wordlist>", "File with usernames"],
+                ["-p", "--password", "<password>", "Single password for bruteforce"],
+                ["-P", "--passwords", "<wordlist>", "File with passwords"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
             ]}
@@ -190,7 +312,10 @@ class SMTPArgs(ArgsWithBruteforce):
             "DIRECT SCANNING", "Operations that communicate directly with the target server"
         )
         direct.add_argument(
-            "--info", action="store_true", help="Gather basic information (bannergrabbing)"
+            "-i",
+            "--info",
+            action="store_true",
+            help="Gather basic information (bannergrabbing)",
         )
         direct.add_argument("--ntlm", action="store_true", help="inspect NTLM authentication")
         direct.add_argument("-w", "--wordlist", type=str, help="Provide wordlist")
@@ -217,7 +342,7 @@ class SMTPArgs(ArgsWithBruteforce):
         direct.add_argument("-m", "--mail-from", type=str, help="")
         direct.add_argument("-r", "--rcpt-to", type=str, help="")
         direct.add_argument(
-            "-i", "--interactive", action="store_true", help="Establish interactive SMTP CLI"
+            "-I", "--interactive", action="store_true", help="Establish interactive SMTP CLI"
         )
 
         add_bruteforce_args(parser)
@@ -253,8 +378,11 @@ class SMTP(BaseModule):
         self.is_slow_down = None
         self.fqdn = "pentereptools.foo" if not args.fqdn else args.fqdn
 
-        self.wordlist = ptmisclib.read_file(args.wordlist) if args.wordlist else None
-        self.wordlist = list(filter(lambda x: x != "", self.wordlist)) if args.wordlist else None
+        # Load enumeration wordlist from file with friendly errors
+        if args.wordlist:
+            self.wordlist = list(filter(lambda x: x != "", text_or_file(None, args.wordlist)))
+        else:
+            self.wordlist = None
 
         # Default port number
         if args.target.port == 0:
@@ -274,10 +402,6 @@ class SMTP(BaseModule):
             self.target_is_ip = False
         if self.target_is_ip:
             self.target_ip = self.target
-            if args.spf_test:
-                raise argparse.ArgumentError(
-                    None, "--spf-test requires target specified by a domain name"
-                )
         else:
             try:
                 self.target_ip = socket.gethostbyname(self.target)
@@ -319,18 +443,25 @@ class SMTP(BaseModule):
             self._run_all_tests()
             return
 
-        # Indirect scanning
+        # Indirect scanning (blacklist: domain + public IP; private IP skipped with message)
         if self.args.blacklist_test:
-            self.results.blacklist = self.test_blacklist(self.target)
+            bl_result, skipped_private = self.test_blacklist(self.target)
+            if skipped_private:
+                self.results.blacklist_private_ip_skipped = True
+            elif bl_result is not None:
+                self.results.blacklist = bl_result
 
         if self.args.spf_test:
-            try:
-                self.results.spf_records = self._get_nameservers(self.target)
-            except SystemExit:
-                raise
-            except Exception as e:
-                self.ptjsonlib.end_error(f"Error during SPF test: {e}", self.use_json)
-                raise SystemExit
+            if self.target_is_ip:
+                self.results.spf_requires_domain = True
+            else:
+                try:
+                    self.results.spf_records = self._get_nameservers(self.target)
+                except SystemExit:
+                    raise
+                except Exception as e:
+                    self.ptjsonlib.end_error(f"Error during SPF test: {e}", self.use_json)
+                    raise SystemExit
 
         # Direct scanning
         # enter only if any of these arguments were explicitly specified
@@ -369,83 +500,86 @@ class SMTP(BaseModule):
                 self.results.creds = simple_bruteforce(
                     self._try_login,
                     self.args.user,
-                    self.args.users_file,
-                    self.args.passw,
-                    self.args.passw_file,
+                    self.args.users,
+                    self.args.password,
+                    self.args.passwords,
                     self.args.spray,
                     self.args.threads,
                 )
 
     def _run_all_tests(self) -> None:
         """Run all tests in sequence. On failure: print error, continue with next."""
-        # 1. Blacklist
-        try:
-            bl = self.test_blacklist(self.target)
-            if bl is not None:
-                self.results.blacklist = bl
-        except TestFailedError as e:
-            self.ptprint(f"Blacklist test failed: {e}", Out.ERROR)
-        except Exception as e:
-            self.ptprint(f"Blacklist test failed: {e}", Out.ERROR)
-
-        # 2. SPF (only if domain)
-        if not self.target_is_ip:
-            try:
-                self.results.spf_records = self._get_nameservers(self.target)
-            except TestFailedError as e:
-                self.ptprint(f"SPF test failed: {e}", Out.ERROR)
-            except Exception as e:
-                self.ptprint(f"SPF test failed: {e}", Out.ERROR)
-
-        # 3. Direct tests (need SMTP connection)
+        # 1. Server information (need SMTP connection first)
         try:
             smtp, info = self.initial_info()
             self.results.info = info
         except TestFailedError as e:
-            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            self.results.info_error = str(e)
             return
         except Exception as e:
-            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            self.results.info_error = str(e)
             return
 
-        # 4. NTLM
+        # 2. Open relay (always in run-all; use defaults if mail_from/rcpt_to not set)
         try:
-            self.results.ntlm = self.auth_ntlm(smtp)
+            mail_from = self.args.mail_from or f"relaytest@{self.fqdn}"
+            rcpt_to = self.args.rcpt_to or "relaytest@external.relaytest.local"
+            self.results.open_relay = self.open_relay_test(smtp, "TEST", mail_from, rcpt_to)
         except TestFailedError as e:
-            self.ptprint(f"NTLM test failed: {e}", Out.ERROR)
+            self.results.open_relay_error = str(e)
         except Exception as e:
-            self.ptprint(f"NTLM test failed: {e}", Out.ERROR)
+            self.results.open_relay_error = str(e)
 
-        # 5. Open relay (only if mail_from/rcpt_to provided)
-        if self.args.mail_from and self.args.rcpt_to:
+        # 3. Blacklist (domain + public IP; private IP skipped)
+        try:
+            bl_result, skipped_private = self.test_blacklist(self.target)
+            if skipped_private:
+                self.results.blacklist_private_ip_skipped = True
+            elif bl_result is not None:
+                self.results.blacklist = bl_result
+        except TestFailedError as e:
+            self.results.blacklist_error = str(e)
+        except Exception as e:
+            self.results.blacklist_error = str(e)
+
+        # 4. SPF (only if domain)
+        if self.target_is_ip:
+            self.results.spf_requires_domain = True
+        else:
             try:
-                self.results.open_relay = self.open_relay_test(
-                    smtp, "TEST", self.args.mail_from, self.args.rcpt_to
-                )
+                self.results.spf_records = self._get_nameservers(self.target)
             except TestFailedError as e:
-                self.ptprint(f"Open relay test failed: {e}", Out.ERROR)
+                self.results.spf_error = str(e)
             except Exception as e:
-                self.ptprint(f"Open relay test failed: {e}", Out.ERROR)
+                self.results.spf_error = str(e)
 
-        # 6. Enumerate (ALL)
+        # 5. User enumeration (ALL)
         save_enum = self.args.enumerate
         try:
             self.args.enumerate = "ALL"
             self.results.enum_results = self.enumeration(smtp)
         except TestFailedError as e:
-            self.ptprint(f"Enumeration test failed: {e}", Out.ERROR)
+            self.results.enum_error = str(e)
         except Exception as e:
-            self.ptprint(f"Enumeration test failed: {e}", Out.ERROR)
+            self.results.enum_error = str(e)
         finally:
             self.args.enumerate = save_enum
 
-        # 7. Max connections
+        # 6. NTLM
+        try:
+            self.results.ntlm = self.auth_ntlm(smtp)
+        except TestFailedError as e:
+            self.results.ntlm_error = str(e)
+        except Exception as e:
+            self.results.ntlm_error = str(e)
+
+        # 7. Connections
         try:
             self.results.max_connections = self.max_connections_test()
         except TestFailedError as e:
-            self.ptprint(f"Max connections test failed: {e}", Out.ERROR)
+            self.results.max_connections_error = str(e)
         except Exception as e:
-            self.ptprint(f"Max connections test failed: {e}", Out.ERROR)
+            self.results.max_connections_error = str(e)
 
     def connect(self) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL, int, bytes]:
         try:
@@ -807,11 +941,12 @@ class SMTP(BaseModule):
     def bytes_to_str(self, text):
         return text.decode("utf-8")
 
-    def test_blacklist(self, target: str) -> BlacklistResult | None:
+    def test_blacklist(self, target: str) -> tuple[BlacklistResult | None, bool]:
+        """Run blacklist check. Returns (result, skipped_private). skipped_private=True for private IP (no API call)."""
         self.ptdebug("Testing target against blacklists:", title=True)
         if self.target_is_ip and _is_private_ip(target):
-            self.ptdebug("Blacklist test skipped: private IP (blacklists apply only to public IPs)", Out.INFO)
-            return None
+            self.ptdebug("Blacklist test skipped: private/internal IP (not on public blacklists)", Out.INFO)
+            return (None, True)
 
         blacklist_parser = BlacklistParser(self.ptdebug, self.args.json)
 
@@ -822,10 +957,15 @@ class SMTP(BaseModule):
 
         if error_msg:
             self.ptdebug(error_msg, Out.VULN)
+            # API returned "Cannot test Private IP Address" or similar
+            if error_msg == "Cannot test Private IP Address":
+                return (None, True)
+            # Other error: no result, not "skipped private"
+            return (BlacklistResult(False, None), False)
 
         # Check if result is None or doesn't have the expected structure
         if blacklist_parser.result is None or "table_result" not in blacklist_parser.result:
-            return BlacklistResult(False, None)
+            return (BlacklistResult(False, None), False)
 
         listed = [
             BlacklistEntry(r[1], r[2], r[3])
@@ -834,11 +974,8 @@ class SMTP(BaseModule):
         ]
 
         if len(listed) > 0:
-            return BlacklistResult(True, listed)
-        else:
-            return BlacklistResult(False, None)
-
-        # parser_result_json = blacklist_parser.result
+            return (BlacklistResult(True, listed), False)
+        return (BlacklistResult(False, None), False)
 
     def _resolver_query(self, resolver, domain, ns, record_type):
         data = resolver.resolve(domain, record_type)
@@ -1126,12 +1263,70 @@ class SMTP(BaseModule):
             "properties"
         ]
 
-        # Blacklist information
-        if blacklist := self.results.blacklist:
-            if not blacklist.listed:
-                self.ptprint("Blacklist information: clean", Out.NOTVULN)
+        # 1. Server information
+        if (info_error := self.results.info_error) is not None:
+            self.ptprint("Server information", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Info test failed: {info_error}", Out.TEXT)
+            properties["infoError"] = info_error
+        elif info := self.results.info:
+            self.ptprint("Server information", Out.INFO)
+
+            self.ptprint("Banner", Out.INFO)
+            self.ptprint(f"    {info.banner}")
+            properties["banner"] = info.banner
+
+            self.ptprint("SMTP commands and extensions", Out.INFO)
+            if info.ehlo:
+                parsed = _parse_ehlo_commands(info.ehlo)
+                for display_str, level in parsed:
+                    if level == "ERROR":
+                        icon = get_colored_text("[✗]", color="VULN")
+                    elif level == "WARNING":
+                        icon = get_colored_text("[!]", color="WARNING")
+                    else:
+                        icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} {display_str}", Out.TEXT)
+            properties["ehloCommand"] = info.ehlo
+
+        # 2. Open relay
+        if (open_relay_error := self.results.open_relay_error) is not None:
+            self.ptprint("Open relay", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Open relay test failed: {open_relay_error}", Out.TEXT)
+            properties["openRelayError"] = open_relay_error
+        elif (open_relay := self.results.open_relay) is not None:
+            self.ptprint("Open relay", Out.INFO)
+            if open_relay:
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} Open relay is allowed", Out.TEXT)
+                self.ptjsonlib.add_vulnerability(VULNS.OpenRelay.value, "Open relay")
             else:
-                self.ptprint("Blacklist information: listed", Out.VULN)
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} Open relay is denied", Out.TEXT)
+
+        # 3. Blacklist information
+        if (blacklist_error := self.results.blacklist_error) is not None:
+            self.ptprint("Blacklist information", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Blacklist test failed: {blacklist_error}", Out.TEXT)
+            properties["blacklistError"] = blacklist_error
+        elif self.results.blacklist_private_ip_skipped:
+            self.ptprint("Blacklist information", Out.INFO)
+            # Print as plain text to control spacing after the [*] icon
+            info_icon = get_colored_text("[*]", color="INFO")
+            self.ptprint(
+                f"    {info_icon}Private/internal IP - blacklist check not applicable (addresses in private ranges are not listed on public blacklists)",
+                Out.TEXT,
+            )
+        elif blacklist := self.results.blacklist:
+            self.ptprint("Blacklist information", Out.INFO)
+            if not blacklist.listed:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} Clean", Out.TEXT)
+            else:
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} Listed", Out.TEXT)
 
                 if (results := blacklist.results) is not None:
                     self.ptprint("    Listed on the following blacklists", Out.INFO)
@@ -1149,13 +1344,26 @@ class SMTP(BaseModule):
                             "\n".join(json_lines),
                         )
 
-        # SPF records
-        if (spf_records := self.results.spf_records) is not None:
-            self.ptprint(f"SPF records: found {len(spf_records)} records", Out.INFO)
+        # 4. SPF records
+        if self.results.spf_requires_domain:
+            self.ptprint("SPF records", Out.INFO)
+            info_icon = get_colored_text("[*]", color="INFO")
+            self.ptprint(
+                f"    {info_icon} Test requires target specified by a domain name",
+                Out.TEXT,
+            )
+        elif (spf_error := self.results.spf_error) is not None:
+            self.ptprint("SPF records", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} SPF test failed: {spf_error}", Out.TEXT)
+            properties["spfError"] = spf_error
+        elif (spf_records := self.results.spf_records) is not None:
+            self.ptprint("SPF records", Out.INFO)
 
             json_lines = []
             for ns, records in spf_records.items():
-                self.ptprint(f"    Nameserver {ns}", Out.INFO)
+                info_icon = get_colored_text("[*]", color="INFO")
+                self.ptprint(f"    {info_icon} Nameserver {ns}", Out.TEXT)
                 for r in records:
                     self.ptprint(f"        {r}")
                     json_lines.append(f"[{ns}] {r}")
@@ -1163,65 +1371,13 @@ class SMTP(BaseModule):
             if len(json_lines) > 0:
                 properties["spfRecords"] = "\n".join(json_lines)
 
-        # Server information
-        if info := self.results.info:
-            self.ptprint("Server information", Out.INFO)
-
-            self.ptprint("Banner", Out.INFO)
-            self.ptprint(f"    {info.banner}")
-            properties["banner"] = info.banner
-
-            self.ptprint("SMTP commands and extensions", Out.INFO)
-            # Split EHLO response into individual lines
-            if info.ehlo:
-                ehlo_lines = info.ehlo.split('\n') if '\n' in info.ehlo else info.ehlo.split('\r\n')
-                # Display all lines (including first line with hostname)
-                for line in ehlo_lines:
-                    line = line.strip()
-                    if line:  # Skip empty lines
-                        self.ptprint(f"    {line}", Out.TEXT)
-            properties["ehloCommand"] = info.ehlo
-
-        # NTLM authentication
-        if ntlm := self.results.ntlm:
-            self.ptprint("NTLM information", Out.INFO)
-            if not ntlm.success:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} not available", Out.TEXT)
-                properties["ntlmInfoStatus"] = "failed"
-            elif ntlm.ntlm is not None:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} NTLM information", Out.TEXT)
-                properties["ntlmInfoStatus"] = "ok"
-
-                out_lines: list[str] = []
-                out_lines.append(f"Target name: {ntlm.ntlm.target_name}")
-                out_lines.append(f"NetBios domain name: {ntlm.ntlm.netbios_domain}")
-                out_lines.append(f"NetBios computer name: {ntlm.ntlm.netbios_computer}")
-                out_lines.append(f"DNS domain name: {ntlm.ntlm.dns_domain}")
-                out_lines.append(f"DNS computer name: {ntlm.ntlm.dns_computer}")
-                out_lines.append(f"DNS tree: {ntlm.ntlm.dns_tree}")
-                out_lines.append(f"OS version: {ntlm.ntlm.os_version}")
-
-                for line in out_lines:
-                    self.ptprint(f"        {line}", Out.TEXT)
-
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.NTLM.value, "ntlm authentication", "\n".join(out_lines)
-                )
-
-        # Open relay
-        if (open_relay := self.results.open_relay) is not None:
-            if open_relay:
-                self.ptprint("Open relay is allowed", Out.VULN)
-            else:
-                self.ptprint("Open relay is denied", Out.NOTVULN)
-
-            if open_relay:
-                self.ptjsonlib.add_vulnerability(VULNS.OpenRelay.value, "Open relay")
-
-        # User enumeration
-        if (enum_results := self.results.enum_results) is not None:
+        # 5. User enumeration
+        if (enum_error := self.results.enum_error) is not None:
+            self.ptprint("User enumeration methods", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Enumeration test failed: {enum_error}", Out.TEXT)
+            properties["enumerationError"] = enum_error
+        elif (enum_results := self.results.enum_results) is not None:
             self.ptprint("User enumeration methods", Out.INFO)
 
             json_lines = []
@@ -1258,8 +1414,46 @@ class SMTP(BaseModule):
 
                 self.ptjsonlib.add_vulnerability(VULNS.UserEnum.value, req, "\n".join(json_lines))
 
-        # Maximum connections
-        if max_con := self.results.max_connections:
+        # 6. NTLM information
+        if (ntlm_error := self.results.ntlm_error) is not None:
+            self.ptprint("NTLM information", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} NTLM test failed: {ntlm_error}", Out.TEXT)
+            properties["ntlmError"] = ntlm_error
+        elif ntlm := self.results.ntlm:
+            self.ptprint("NTLM information", Out.INFO)
+            if not ntlm.success:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} Not available", Out.TEXT)
+                properties["ntlmInfoStatus"] = "failed"
+            elif ntlm.ntlm is not None:
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} NTLM information", Out.TEXT)
+                properties["ntlmInfoStatus"] = "ok"
+
+                out_lines: list[str] = []
+                out_lines.append(f"Target name: {ntlm.ntlm.target_name}")
+                out_lines.append(f"NetBios domain name: {ntlm.ntlm.netbios_domain}")
+                out_lines.append(f"NetBios computer name: {ntlm.ntlm.netbios_computer}")
+                out_lines.append(f"DNS domain name: {ntlm.ntlm.dns_domain}")
+                out_lines.append(f"DNS computer name: {ntlm.ntlm.dns_computer}")
+                out_lines.append(f"DNS tree: {ntlm.ntlm.dns_tree}")
+                out_lines.append(f"OS version: {ntlm.ntlm.os_version}")
+
+                for line in out_lines:
+                    self.ptprint(f"        {line}", Out.TEXT)
+
+                self.ptjsonlib.add_vulnerability(
+                    VULNS.NTLM.value, "ntlm authentication", "\n".join(out_lines)
+                )
+
+        # 7. Connections
+        if (max_connections_error := self.results.max_connections_error) is not None:
+            self.ptprint("Connections", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Max connections test failed: {max_connections_error}", Out.TEXT)
+            properties["maxConnectionsError"] = max_connections_error
+        elif max_con := self.results.max_connections:
             if max_con.max is None:
                 self.ptprint("Maximum connections: no limit found", Out.VULN)
                 properties["maxConnections"] = None
@@ -1313,12 +1507,12 @@ class SMTP(BaseModule):
                 if self.args.user is not None:
                     user_str = f"username: {self.args.user}"
                 else:
-                    user_str = f"usernames: {self.args.users_file}"
+                    user_str = f"usernames: {self.args.users}"
 
-                if self.args.passw is not None:
-                    passw_str = f"password: {self.args.passw}"
+                if self.args.password is not None:
+                    passw_str = f"password: {self.args.password}"
                 else:
-                    passw_str = f"passwords: {self.args.passw_file}"
+                    passw_str = f"passwords: {self.args.passwords}"
 
                 self.ptjsonlib.add_vulnerability(
                     VULNS.WeakCreds.value,

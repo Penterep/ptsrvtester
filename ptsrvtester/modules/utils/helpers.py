@@ -21,9 +21,9 @@ class Target:
 
 class ArgsWithBruteforce(BaseArgs):
     user: str | None
-    users_file: str | None
-    passw: str | None
-    passw_file: str | None
+    users: str | None  # renamed from users_file
+    password: str | None  # renamed from passw
+    passwords: str | None  # renamed from passw_file
     spray: bool
     threads: int
 
@@ -41,20 +41,20 @@ def add_bruteforce_args(parser: argparse.ArgumentParser):
     """
     bruteforce = parser.add_argument_group(
         "LOGIN / BRUTEFORCE",
-        "user/users-file + passw/passw-file",
+        "user/users + password/passwords",
     )
 
     # username / users file
     bruteuser = bruteforce.add_mutually_exclusive_group()
     bruteuser.title = "bruteuser"
     bruteuser.add_argument("-u", "--user", type=str, help="username")
-    bruteuser.add_argument("-U", "--users-file", type=str, help="file containing usernames")
+    bruteuser.add_argument("-U", "--users", type=str, help="file containing usernames")
 
     # password / passwords file
     brutepass = bruteforce.add_mutually_exclusive_group()
     brutepass.title = "brutepass"
-    brutepass.add_argument("-p", "--passw", type=str, help="password")
-    brutepass.add_argument("-P", "--passw-file", type=str, help="file containing passwords")
+    brutepass.add_argument("-p", "--password", type=str, help="password")
+    brutepass.add_argument("-P", "--passwords", type=str, help="file containing passwords")
 
     # other configuration
     bruteforce.add_argument(
@@ -82,7 +82,7 @@ def check_if_brute(args: ArgsWithBruteforce) -> bool:
     Returns:
         bool: whether to perform bruteforce
     """
-    if (args.user or args.users_file) and (args.passw or args.passw_file):
+    if (args.user or args.users) and (args.password or args.passwords):
         return True
     else:
         return False
@@ -213,8 +213,15 @@ def text_or_file(text: str | None, filepath: str | None) -> list[str]:
     if text is not None:
         result = [text]
     elif filepath is not None:
-        with open(filepath, "r") as f:
-            result = f.read().splitlines()
+        try:
+            with open(filepath, "r") as f:
+                result = f.read().splitlines()
+        except FileNotFoundError:
+            raise argparse.ArgumentError(None, f"File not found: '{filepath}'")
+        except PermissionError:
+            raise argparse.ArgumentError(None, f"Cannot read file (permission denied): '{filepath}'")
+        except OSError as e:
+            raise argparse.ArgumentError(None, f"Cannot read file '{filepath}': {e}")
 
     return result
 

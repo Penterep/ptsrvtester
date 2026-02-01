@@ -6,6 +6,7 @@ from string import ascii_letters
 from typing import NamedTuple
 
 from ptlibs.ptjsonlib import PtJsonLib
+from ptlibs.ptprinthelper import get_colored_text
 from ..ptntlmauth.ptntlmauth import NTLMInfo, get_NegotiateMessage_data, decode_ChallengeMessage_blob
 
 from ._base import BaseModule, BaseArgs, Out
@@ -21,6 +22,73 @@ from .utils.helpers import (
 )
 
 
+def valid_target_imap(target: str) -> Target:
+    """Argparse helper: IP or hostname with optional port (like SMTP)."""
+    return valid_target(target, domain_allowed=True)
+
+
+# IMAP CAPABILITY: known capabilities and security classification (IANA RFC 3501, 9051, 4959, etc.)
+IMAP_KNOWN_CAPABILITIES = frozenset(
+    {
+        "IMAP4REV1", "IMAP4REV2", "ACL", "BINARY", "CATENATE", "CHILDREN", "COMPRESS=DEFLATE",
+        "CONDSTORE", "ENABLE", "ESEARCH", "ID", "IDLE", "LITERAL+", "LITERAL-", "LOGIN-REFERRALS",
+        "LOGINDISABLED", "MAILBOX-REFERRALS", "METADATA", "METADATA-SERVER", "MOVE", "MULTIAPPEND",
+        "NAMESPACE", "SASL-IR", "SORT", "STARTTLS", "THREAD", "UIDPLUS", "UNSELECT", "UTF8=ACCEPT",
+        "UTF8=ONLY", "WITHIN", "LIST-EXTENDED", "LIST-STATUS", "QRESYNC", "CONTEXT=SEARCH",
+        "CONTEXT=SORT", "FILTERS", "NOTIFY", "SPECIAL-USE", "CREATE-SPECIAL-USE", "LIST-MYRIGHTS",
+        "RIGHTS=", "QUOTA", "QUOTASET", "APPENDLIMIT", "OBJECTID", "PREVIEW", "SAVEDATE",
+    }
+)
+# AUTH= method -> OK / WARNING / ERROR (same as SMTP/POP3 SASL)
+IMAP_AUTH_METHOD_LEVEL = {
+    "PLAIN": "ERROR", "LOGIN": "ERROR", "CRAM-MD5": "ERROR", "DIGEST-MD5": "ERROR",
+    "NTLM": "ERROR", "ANONYMOUS": "ERROR", "KERBEROS_V4": "ERROR", "GSSAPI": "ERROR",
+    "EXTERNAL": "WARNING",
+    "XOAUTH2": "OK", "OAUTHBEARER": "OK", "SCRAM-SHA-1": "OK", "SCRAM-SHA-256": "OK",
+}
+
+
+def _parse_capability_commands(capability_list: list[str]) -> list[tuple[str, str]]:
+    """
+    Parse IMAP CAPABILITY list into (display_string, level) for output.
+    Level is OK, WARNING, or ERROR. Expands AUTH=X into separate entries.
+    If STARTTLS is not advertised, appends [✗] STARTTLS (is not allowed).
+    """
+    if not capability_list:
+        return []
+    result: list[tuple[str, str]] = []
+    seen_starttls = False
+
+    for capa in capability_list:
+        capa = str(capa or "").strip()
+        if not capa:
+            continue
+        capa_upper = capa.upper()
+
+        if capa_upper == "STARTTLS":
+            seen_starttls = True
+
+        if capa_upper.startswith("AUTH="):
+            method = capa_upper[5:].strip()
+            level = IMAP_AUTH_METHOD_LEVEL.get(method, "OK")
+            result.append((capa, level))
+            continue
+
+        if capa_upper in IMAP_KNOWN_CAPABILITIES or any(
+            capa_upper.startswith(p) for p in ("AUTH=", "THREAD=", "SORT=", "COMPRESS=", "QUOTA=", "RIGHTS=", "I18NLEVEL=", "UTF8=")
+        ):
+            level = "OK"
+        else:
+            level = "OK"  # Unknown: show as OK
+
+        result.append((capa, level))
+
+    if not seen_starttls:
+        result.append(("STARTTLS (is not allowed)", "ERROR"))
+
+    return result
+
+
 # region data classes
 
 
@@ -32,12 +100,13 @@ class NTLMResult(NamedTuple):
 class InfoResult(NamedTuple):
     banner: str
     id: str | None
-    capability: str | None
+    capability: list[str] | None  # Raw list from imap.capabilities
 
 
 @dataclass
 class IMAPResults:
     info: InfoResult | None = None
+    info_error: str | None = None  # When connect/info fails
     anonymous: bool | None = None
     ntlm: NTLMResult | None = None
     creds: set[Creds] | None = None
@@ -79,10 +148,10 @@ class IMAPArgs(ArgsWithBruteforce):
                 ["", "--tls", "", "Use implicit SSL/TLS"],
                 ["", "--starttls", "", "Use explicit SSL/TLS"],
                 ["", "", "", ""],
-                ["-u", "--user", "", "Single username for bruteforce"],
-                ["-U", "--users-file", "", "File with usernames"],
-                ["-p", "--passw", "", "Single password for bruteforce"],
-                ["-P", "--passw-file", "", "File with passwords"],
+                ["-u", "--user", "<username>", "Single username for bruteforce"],
+                ["-U", "--users", "<wordlist>", "File with usernames"],
+                ["-p", "--password", "<password>", "Single password for bruteforce"],
+                ["-P", "--passwords", "<wordlist>", "File with passwords"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
             ]}
@@ -106,7 +175,9 @@ class IMAPArgs(ArgsWithBruteforce):
             raise TypeError  # IDE typing
 
         parser.add_argument(
-            "target", type=valid_target, help="IP[:PORT] (e.g. 127.0.0.1 or 127.0.0.1:143)"
+            "target",
+            type=valid_target_imap,
+            help="IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or mail.example.com:143)",
         )
 
         parser.add_argument("--tls", action="store_true", help="use implicit SSL/TLS")
@@ -160,10 +231,25 @@ class IMAP(BaseModule):
         self.results: IMAPResults
         self.imap: imaplib.IMAP4  # Primary IMAP connection used for most enumeration
 
+    def _is_default_mode(self) -> bool:
+        """True when only target is given (no test switches). Run basic info + anonymous."""
+        return not (
+            self.args.info
+            or self.args.ntlm
+            or self.args.anonymous
+            or self.do_brute
+        )
+
     def run(self) -> None:
         """Executes IMAP methods based on module configuration"""
         self.results = IMAPResults()
         self.imap = self.connect()
+
+        if self._is_default_mode():
+            # Only target given: run basic tests (info + anonymous), like FTP
+            self.results.info = self.info()
+            self.results.anonymous = self.auth_anonymous()
+            return
 
         if self.args.info:
             self.results.info = self.info()
@@ -178,9 +264,9 @@ class IMAP(BaseModule):
             self.results.creds = simple_bruteforce(
                 self._try_login,
                 self.args.user,
-                self.args.users_file,
-                self.args.passw,
-                self.args.passw_file,
+                self.args.users,
+                self.args.password,
+                self.args.passwords,
                 self.args.spray,
                 self.args.threads,
             )
@@ -201,12 +287,11 @@ class IMAP(BaseModule):
                 if self.args.starttls:
                     imap.starttls()
         except Exception as e:
-            self.ptjsonlib.end_error(
+            msg = (
                 f"Could not connect to the target server "
-                + f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}",
-                self.args.json,
+                + f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}"
             )
-            raise SystemExit
+            raise OSError(msg) from e
         return imap
 
     def info(self) -> InfoResult:
@@ -231,7 +316,7 @@ class IMAP(BaseModule):
         except:
             pass
 
-        capability = ", ".join(self.imap.capabilities)
+        capability = [str(c) for c in self.imap.capabilities]
 
         return InfoResult(banner, id, capability)
 
@@ -291,7 +376,10 @@ class IMAP(BaseModule):
             Creds | None: Creds if success, None if failed
         """
 
-        imap = self.connect()
+        try:
+            imap = self.connect()
+        except OSError:
+            return None
         try:
             imap.login(creds.user, creds.passw)
             result = creds
@@ -310,7 +398,12 @@ class IMAP(BaseModule):
         ]
 
         # Server information
-        if info := self.results.info:
+        if (info_error := self.results.info_error) is not None:
+            self.ptprint("Server information", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Info test failed: {info_error}", Out.TEXT)
+            properties["infoError"] = info_error
+        elif info := self.results.info:
             self.ptprint("Server information", Out.INFO)
 
             self.ptprint("Banner", Out.INFO)
@@ -322,18 +415,30 @@ class IMAP(BaseModule):
             properties["idCommand"] = info.id
 
             self.ptprint("CAPABILITY command", Out.INFO)
-            self.ptprint(f"    {info.capability}")
-            properties["capabilityCommand"] = info.capability
+            cap_list = info.capability or []
+            parsed = _parse_capability_commands(cap_list)
+            json_lines: list[str] = []
+            for display_str, level in parsed:
+                if level == "ERROR":
+                    icon = get_colored_text("[✗]", color="VULN")
+                elif level == "WARNING":
+                    icon = get_colored_text("[!]", color="WARNING")
+                else:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} {display_str}", Out.TEXT)
+                json_lines.append(display_str)
+            properties["capabilityCommand"] = "\n".join(json_lines)
 
         # Anonymous authentication
         if (anonymous := self.results.anonymous) is not None:
+            self.ptprint("Anonymous authentication", Out.INFO)
             if anonymous:
-                self.ptprint("Anonymous authentication is enabled", Out.VULN)
-            else:
-                self.ptprint("Anonymous authentication is disabled", Out.NOTVULN)
-
-            if anonymous:
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} Enabled", Out.TEXT)
                 self.ptjsonlib.add_vulnerability(VULNS.Anonymous.value, "anonymous authentication")
+            else:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} Disabled", Out.TEXT)
 
         # NTLM authentication
         if ntlm := self.results.ntlm:
@@ -375,12 +480,12 @@ class IMAP(BaseModule):
                 if self.args.user is not None:
                     user_str = f"username: {self.args.user}"
                 else:
-                    user_str = f"usernames: {self.args.users_file}"
+                    user_str = f"usernames: {self.args.users}"
 
-                if self.args.passw is not None:
-                    passw_str = f"password: {self.args.passw}"
+                if self.args.password is not None:
+                    passw_str = f"password: {self.args.password}"
                 else:
-                    passw_str = f"passwords: {self.args.passw_file}"
+                    passw_str = f"passwords: {self.args.passwords}"
 
                 self.ptjsonlib.add_vulnerability(
                     VULNS.WeakCreds.value,

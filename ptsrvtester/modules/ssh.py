@@ -23,6 +23,11 @@ from .utils.helpers import (
 )
 
 
+def valid_target_ssh(target: str) -> Target:
+    """Argparse helper: IP or hostname with optional port (like SMTP)."""
+    return valid_target(target, domain_allowed=True)
+
+
 # region data classes
 
 
@@ -80,7 +85,9 @@ class InfoResult(NamedTuple):
 @dataclass
 class SSHResults:
     info: InfoResult | None = None
+    info_error: str | None = None  # When run-all info test fails
     ssh_audit: SSHAuditResult | None = None
+    ssh_audit_error: str | None = None  # When run-all ssh-audit test fails (exception)
     bad_pubkey: BadPubkeyResult | None = None
     bad_authkeys: list[str] | None = None
     brute: BruteResult | None = None
@@ -126,11 +133,11 @@ class SSHArgs(ArgsWithBruteforce):
                 ["-A", "--bad-authkeys", "", "Check for static user SSH keys"],
                 ["", "--ssh-audit", "", "Run ssh-audit for CVEs and config"],
                 ["", "", "", ""],
-                ["-u", "--user", "", "Single username for bruteforce"],
-                ["-U", "--users-file", "", "File with usernames"],
-                ["-p", "--passw", "", "Single password for bruteforce"],
-                ["-P", "--passw-file", "", "File with passwords"],
-                ["", "--privkeys", "", "Directory with private keys"],
+                ["-u", "--user", "<username>", "Single username for bruteforce"],
+                ["-U", "--users", "<wordlist>", "File with usernames"],
+                ["-p", "--password", "<password>", "Single password for bruteforce"],
+                ["-P", "--passwords", "<wordlist>", "File with passwords"],
+                ["", "--privkeys", "<directory>", "Directory with private keys"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
             ]}
@@ -154,7 +161,9 @@ class SSHArgs(ArgsWithBruteforce):
             raise TypeError  # IDE typing
 
         parser.add_argument(
-            "target", type=valid_target, help="IP[:PORT] (e.g. 127.0.0.1 or 127.0.0.1:22)"
+            "target",
+            type=valid_target_ssh,
+            help="IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or ssh.example.com:22)",
         )
 
         recon = parser.add_argument_group("RECON")
@@ -285,19 +294,19 @@ class SSH(BaseModule):
         try:
             self.results.info = self.info(True)
         except TestFailedError as e:
-            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            self.results.info_error = str(e)
             return
         except Exception as e:
-            self.ptprint(f"Info test failed: {e}", Out.ERROR)
+            self.results.info_error = str(e)
             return
 
         # 2. ssh-audit (if available)
         try:
             self.results.ssh_audit = self.run_ssh_audit()
         except TestFailedError as e:
-            self.ptprint(f"SSH-audit test failed: {e}", Out.ERROR)
+            self.results.ssh_audit_error = str(e)
         except Exception as e:
-            self.ptprint(f"SSH-audit test failed: {e}", Out.ERROR)
+            self.results.ssh_audit_error = str(e)
 
     def info(self, auth_methods: bool) -> InfoResult:
         """Grab banner and host key, optionally also query the authentication methods"""
@@ -447,8 +456,8 @@ class SSH(BaseModule):
 
     def bruteforce(self) -> BruteResult:
         """Perform login bruteforce using username/password or username/privatekey/(passphrase)"""
-        users = text_or_file(self.args.user, self.args.users_file)
-        passwords = text_or_file(self.args.passw, self.args.passw_file)
+        users = text_or_file(self.args.user, self.args.users)
+        passwords = text_or_file(self.args.password, self.args.passwords)
 
         # Parse private SSH key files
         privkeys: list[PrivKeyDetails] = []
@@ -541,7 +550,12 @@ class SSH(BaseModule):
         ]
 
         # Server information
-        if info := self.results.info:
+        if (info_error := self.results.info_error) is not None:
+            self.ptprint("Server information", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Info test failed: {info_error}", Out.TEXT)
+            properties["infoError"] = info_error
+        elif info := self.results.info:
             self.ptprint("Server information", Out.INFO)
 
             self.ptprint("Banner", Out.INFO)
@@ -563,7 +577,12 @@ class SSH(BaseModule):
                 properties["authMethods"] = info.auth_methods
 
         # ssh-audit results
-        if ssh_audit := self.results.ssh_audit:
+        if (ssh_audit_error := self.results.ssh_audit_error) is not None:
+            self.ptprint("ssh-audit scan results", Out.INFO)
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} SSH-audit test failed: {ssh_audit_error}", Out.TEXT)
+            properties["sshauditError"] = ssh_audit_error
+        elif ssh_audit := self.results.ssh_audit:
 
             if ssh_audit.err is not None:
                 self.ptprint(f"ssh-audit scan failed with error: {ssh_audit.err}", Out.INFO)
@@ -590,19 +609,16 @@ class SSH(BaseModule):
                     Out.TEXT,
                 )
                 for find in ssh_audit.cryptofindings:
-                    # Replace CRITICAL with [✗] Error, WARNING with [!] Warning
+                    # Replace CRITICAL/WARNING with icon only (text stays in JSON output)
                     if find.level.upper() == "CRITICAL":
-                        level_icon = get_colored_text("[✗]", color="VULN")
-                        level_text = "Error"
+                        level_prefix = get_colored_text("[✗]", color="VULN")
                     elif find.level.upper() == "WARNING":
-                        level_icon = get_colored_text("[!]", color="WARNING")
-                        level_text = "Warning"
+                        level_prefix = get_colored_text("[!]", color="WARNING")
                     else:
-                        level_icon = ""
-                        level_text = find.level.upper()
+                        level_prefix = find.level.upper()
                     
                     find_str = (
-                        f"{level_icon} {level_text} {find.category}/{find.action}: {find.name}"
+                        f"{level_prefix} {find.category}/{find.action}: {find.name}"
                         + (f" ({find.notes})" if find.notes else "")
                     )
                     self.ptprint(f"        {find_str}", Out.TEXT)
@@ -683,14 +699,14 @@ class SSH(BaseModule):
                 if self.args.user is not None:
                     user_str = f"username: {self.args.user}"
                 else:
-                    user_str = f"usernames: {self.args.users_file}"
+                    user_str = f"usernames: {self.args.users}"
 
-                if self.args.passw is not None:
-                    passw_str = f"password: {self.args.passw}"
+                if self.args.password is not None:
+                    passw_str = f"password: {self.args.password}"
                 elif self.args.privkeys is not None:
                     passw_str = f"private keys: {self.args.privkeys}"
                 else:
-                    passw_str = f"passwords: {self.args.passw_file}"
+                    passw_str = f"passwords: {self.args.passwords}"
 
                 self.ptjsonlib.add_vulnerability(
                     VULNS.WeakCreds.value,

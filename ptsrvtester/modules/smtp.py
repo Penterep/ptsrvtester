@@ -1,4 +1,4 @@
-import argparse, ipaddress, random, re, smtplib, socket, time, dns.resolver
+import argparse, ipaddress, queue, random, re, smtplib, socket, ssl, threading, time, unicodedata, dns.resolver
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from enum import Enum
@@ -21,6 +21,30 @@ from .utils.helpers import (
     text_or_file,
 )
 from .utils.blacklist_parser import BlacklistParser
+from .utils.service_identification import identify_service
+
+
+def _registrable_domain_psl(host: str) -> str | None:
+    """Get registrable domain from hostname using Public Suffix List (e.g. relay01.prod.amazon.co.jp -> amazon.co.jp).
+    Returns None on failure or if ptlibs.tldparser is unavailable.
+    """
+    host = (host or "").strip()
+    if not host or "." not in host:
+        return None
+    try:
+        from ptlibs.tldparser import parse
+        r = parse(host)
+        if r is None:
+            return None
+        domain = getattr(r, "domain", None)
+        suffix = getattr(r, "suffix", None)
+        if domain and suffix:
+            return f"{domain}.{suffix}"
+        if domain:
+            return domain
+        return None
+    except Exception:
+        return None
 
 
 # region helper methods
@@ -52,31 +76,52 @@ SMTP_KNOWN_EXTENSIONS = frozenset(
         "VERB",  # seen in practice
     }
 )
-# AUTH method -> OK / WARNING / ERROR (E=ERROR, W=WARNING, rest OK)
-SMTP_AUTH_METHOD_LEVEL = {
+# AUTH method -> OK / WARNING / ERROR when on PLAIN (cleartext). Over TLS/STARTTLS all are OK.
+SMTP_AUTH_METHOD_LEVEL_PLAIN = {
     "PLAIN": "ERROR", "LOGIN": "ERROR", "CRAM-MD5": "ERROR", "DIGEST-MD5": "ERROR",
     "NTLM": "ERROR", "ANONYMOUS": "ERROR", "KERBEROS_V4": "ERROR", "GSSAPI": "ERROR",
     "EXTERNAL": "WARNING",
     "XOAUTH2": "OK", "OAUTHBEARER": "OK", "SCRAM-SHA-1": "OK", "SCRAM-SHA-256": "OK",
 }
-SMTP_CMD_ERROR = frozenset({"VRFY", "EXPN"})
+SMTP_CMD_ERROR = frozenset({"VRFY", "EXPN"})   # user enumeration risk (plain or encrypted)
 SMTP_CMD_WARNING = frozenset({"RCPT", "ETRN"})
 SIZE_OK_MAX = 26214400       # 25 MB
 SIZE_WARNING_MAX = 52428800  # 50 MB
+# RCPT TO limit per message: recommended ranges by server role (for evaluation display)
+RCPT_LIMIT_SUBMISSION_RANGE = (50, 200)   # Submission server: max recipients per message
+RCPT_LIMIT_MTA_RANGE = (100, 1000)        # MTA: max recipients per message
 
 
-def _parse_ehlo_commands(ehlo_raw: str) -> list[tuple[str, str]]:
+def _parse_rcptmax_from_ehlo(ehlo_raw: str) -> int | None:
+    """Parse EHLO for LIMITS RCPTMAX=N (RFC 9422). Returns N or None."""
+    if not ehlo_raw or not ehlo_raw.strip():
+        return None
+    for line in ehlo_raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip().upper()
+        if "LIMITS" not in line:
+            continue
+        # e.g. "250-LIMITS MAILMAX=100 RCPTMAX=512" or "250 LIMITS RCPTMAX=20"
+        match = re.search(r"RCPTMAX\s*=\s*(\d+)", line, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _parse_ehlo_commands(ehlo_raw: str, connection_encrypted: bool = False) -> list[tuple[str, str]]:
     """
     Parse EHLO response into list of (display_string, level) for output.
     Level is OK, WARNING, or ERROR. Hostname line (first line) is skipped.
     Expands AUTH CRAM-MD5 DIGEST-MD5 into separate AUTH CRAM-MD5, AUTH DIGEST-MD5.
     Handles both raw SMTP (250-...) and smtplib-style (no prefix) response.
+    When connection_encrypted is True (TLS or STARTTLS), "STARTTLS (is not allowed)" is not
+    added, since it is expected and OK on an already-encrypted connection.
     """
     if not ehlo_raw or not ehlo_raw.strip():
         return []
     lines = ehlo_raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     result: list[tuple[str, str]] = []
     seen_starttls = False
+    first_line = True  # RFC: first EHLO line is always server hostname, not an extension
 
     for line in lines:
         line = line.strip()
@@ -100,11 +145,18 @@ def _parse_ehlo_commands(ehlo_raw: str) -> list[tuple[str, str]]:
         key = (parts[0] or "").upper().strip()
         value = (parts[1] or "").strip() if len(parts) > 1 else ""
 
+        # Skip generic 250 completion (e.g. "250 Ok" / "250 OK") – not an extension
+        if key == "OK":
+            continue
+
         # Hostname line (key has dot, not a known extension): skip, not a command
         if "." in key and key not in SMTP_KNOWN_EXTENSIONS:
             continue
-        # Unknown extension (no dot): show as OK so we don't drop server-specific lines
+        # Unknown extension (no dot): show as OK, except first such line is usually hostname (RFC) – skip once
         if key not in SMTP_KNOWN_EXTENSIONS and "." not in key:
+            if first_line:
+                first_line = False
+                continue
             result.append((rest, "OK"))
             if key == "STARTTLS":
                 seen_starttls = True
@@ -117,7 +169,8 @@ def _parse_ehlo_commands(ehlo_raw: str) -> list[tuple[str, str]]:
             methods = value.split() if value else []
             for method in methods:
                 method_upper = method.upper()
-                level = SMTP_AUTH_METHOD_LEVEL.get(method_upper, "OK")
+                # Over TLS/STARTTLS, AUTH PLAIN/LOGIN etc. are OK (RFC 8314). On plain they are ERROR.
+                level = "OK" if connection_encrypted else SMTP_AUTH_METHOD_LEVEL_PLAIN.get(method_upper, "OK")
                 result.append((f"AUTH {method_upper}", level))
             continue
 
@@ -144,7 +197,7 @@ def _parse_ehlo_commands(ehlo_raw: str) -> list[tuple[str, str]]:
         display = f"{key} {value}".strip() if value else key
         result.append((display, level))
 
-    if not seen_starttls:
+    if not seen_starttls and not connection_encrypted:
         result.append(("STARTTLS (is not allowed)", "ERROR"))
 
     return result
@@ -163,6 +216,15 @@ class NTLMResult(NamedTuple):
 class MaxConnectionsResult(NamedTuple):
     max: int | None
     ban_minutes: float | None
+
+
+class RcptLimitResult(NamedTuple):
+    """Result of RCPT TO limit test: max accepted before server rejected or we stopped."""
+    max_accepted: int
+    limit_triggered: bool  # True if server sent 421/452/5xx or closed connection
+    server_response: str | None  # First error response when limit triggered
+    rejected_addresses: bool = False  # True if server rejected test addresses (450/550) before any accepted
+    domain_used: str | None = None  # Domain used for MAIL FROM/RCPT TO (for hint when test failed)
 
 
 class EnumResult(NamedTuple):
@@ -186,6 +248,22 @@ class BlacklistResult(NamedTuple):
 class InfoResult(NamedTuple):
     banner: str
     ehlo: str
+    ehlo_starttls: str | None = None  # EHLO after STARTTLS upgrade (when PLAIN had STARTTLS)
+
+
+class EncryptionResult(NamedTuple):
+    """
+    Result of encryption test: which connection types are available on the port.
+    Stored in SMTPResults.encryption so that subsequent tests can use it to choose
+    the appropriate connection mode (plaintext, STARTTLS, or TLS).
+    """
+    plaintext_ok: bool
+    starttls_ok: bool
+    tls_ok: bool
+
+
+# Catch-all test result: "configured" | "not_configured" | "indeterminate"
+CatchAllResult = str
 
 
 @dataclass
@@ -200,6 +278,8 @@ class SMTPResults:
     enum_error: str | None = None  # When run-all enumeration fails (e.g. timeout)
     info: InfoResult | None = None
     info_error: str | None = None  # When run-all info/connect fails
+    banner_requested: bool = False
+    commands_requested: bool = False
     max_connections: MaxConnectionsResult | None = None
     max_connections_error: str | None = None  # When run-all max connections test fails
     ntlm: NTLMResult | None = None
@@ -207,6 +287,11 @@ class SMTPResults:
     open_relay: bool | None = None
     open_relay_error: str | None = None  # When run-all open relay test fails
     blacklist_error: str | None = None  # When run-all blacklist test fails
+    encryption: EncryptionResult | None = None
+    encryption_error: str | None = None  # When encryption test fails
+    catch_all: CatchAllResult | None = None  # "configured" | "not_configured" | "indeterminate"
+    rcpt_limit: RcptLimitResult | None = None
+    rcpt_limit_error: str | None = None
 
 
 class VULNS(Enum):
@@ -239,6 +324,7 @@ class SMTPArgs(ArgsWithBruteforce):
     spf_test: bool
     open_relay: bool
     interactive: bool
+    isencrypt: bool
 
     @staticmethod
     def get_help():
@@ -250,16 +336,22 @@ class SMTPArgs(ArgsWithBruteforce):
                 "ptsrvtester smtp --info --ntlm 127.0.0.1"
             ]},
             {"options": [
-                ["-i", "--info", "", "Gather basic information"],
+                ["-i", "--info", "", "Gather basic information (banner and commands)"],
+                ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
+                ["-c", "--commands", "", "Grab EHLO extensions only"],
+                ["-ie", "--isencrypt", "", "Test encryption options (plaintext, STARTTLS, TLS)"],
                 ["", "--ntlm", "", "Inspect NTLM authentication"],
                 ["-e", "--enumerate", "[VRFY/EXPN/RCPT/ALL]", "User enumeration (default: ALL)"],
-                ["-w", "--wordlist", "<wordlist>", "Wordlist for enumeration"],
+                ["-w", "--wordlist", "<wordlist>", "Usernames for enumeration"],
+                ["", "--enum-threads", "<N>", "Parallel threads for enumeration (default: 1)"],
                 ["-sd", "--slow-down", "", "Test slow-down protection (requires -e)"],
                 ["-mc", "--max-connections", "", "Max connections test"],
+                ["-rl", "--recipient-limit", "", "Test RCPT TO recipient limit per message"],
+                ["-d", "--domain", "<domain>", "Recipient domain for RCPT TO limit test"],
                 ["-or", "--open-relay", "", "Test open relay"],
                 ["-I", "--interactive", "", "Interactive SMTP CLI"],
                 ["", "", "", ""],
-                ["-b", "--blacklist-test", "", "Test against blacklists"],
+                ["-bl", "--blacklist-test", "", "Test against blacklists"],
                 ["-s", "--spf-test", "", "Test SPF records (requires domain name)"],
                 ["", "", "", ""],
                 ["", "--tls", "", "Use implicit SSL/TLS"],
@@ -304,7 +396,7 @@ class SMTPArgs(ArgsWithBruteforce):
             "Operations that do NOT communicate directly with the target server",
         )
         indirect.add_argument(
-            "-b", "--blacklist-test", action="store_true", help="Test target against blacklists"
+            "-bl", "--blacklist-test", action="store_true", help="Test target against blacklists"
         )
         indirect.add_argument("-s", "--spf-test", action="store_true", help="Test SPF records (requires domain name)")
 
@@ -315,10 +407,25 @@ class SMTPArgs(ArgsWithBruteforce):
             "-i",
             "--info",
             action="store_true",
-            help="Gather basic information (bannergrabbing)",
+            help="Gather basic information (banner and commands)",
+        )
+        direct.add_argument("-b", "--banner", action="store_true", help="Grab banner + Service Identification (product, version, CPE)")
+        direct.add_argument("-c", "--commands", action="store_true", help="Grab EHLO extensions only")
+        direct.add_argument(
+            "-ie",
+            "--isencrypt",
+            action="store_true",
+            help="Test encryption options on port (plaintext, STARTTLS, TLS)",
         )
         direct.add_argument("--ntlm", action="store_true", help="inspect NTLM authentication")
-        direct.add_argument("-w", "--wordlist", type=str, help="Provide wordlist")
+        direct.add_argument("-w", "--wordlist", type=str, help="Usernames for enumeration")
+        direct.add_argument(
+            "--enum-threads",
+            type=int,
+            default=1,
+            metavar="N",
+            help="Parallel threads for user enumeration (default: 1)",
+        )
         direct.add_argument(
             "-e",
             "--enumerate",
@@ -337,6 +444,19 @@ class SMTPArgs(ArgsWithBruteforce):
         )
         direct.add_argument(
             "-mc", "--max-connections", action="store_true", help="Max connections test"
+        )
+        direct.add_argument(
+            "-rl", "--recipient-limit",
+            action="store_true",
+            dest="rcpt_limit",
+            help="Test RCPT TO recipient limit per message",
+        )
+        direct.add_argument(
+            "-d", "--domain",
+            type=str,
+            metavar="domain",
+            default=None,
+            help="Recipient domain for RCPT TO limit test (default: from server banner/EHLO)",
         )
         direct.add_argument("-or", "--open-relay", action="store_true", help="Test Open relay")
         direct.add_argument("-m", "--mail-from", type=str, help="")
@@ -376,17 +496,22 @@ class SMTP(BaseModule):
 
         self.max_connections_is_error = None
         self.is_slow_down = None
-        self.fqdn = "pentereptools.foo" if not args.fqdn else args.fqdn
+        self.fqdn = "example.com" if not args.fqdn else args.fqdn
 
-        # Load enumeration wordlist from file with friendly errors
+        # Load enumeration wordlist; keep only lines whose local part is valid (RFC 5322/6531)
         if args.wordlist:
-            self.wordlist = list(filter(lambda x: x != "", text_or_file(None, args.wordlist)))
+            raw = list(filter(lambda x: x != "", text_or_file(None, args.wordlist)))
+            self.wordlist = [u for u in raw if self._is_valid_local_part(u.split("@")[0].strip())]
+            self._wordlist_skipped = len(raw) - len(self.wordlist)
         else:
             self.wordlist = None
+            self._wordlist_skipped = 0
 
-        # Default port number
+        # Default port number: 465 for implicit TLS (--tls), 587 for STARTTLS, 25 otherwise
         if args.target.port == 0:
             if args.tls:
+                args.target.port = 465
+            elif getattr(args, "starttls", False):
                 args.target.port = 587
             else:
                 args.target.port = 25
@@ -419,6 +544,9 @@ class SMTP(BaseModule):
             self.args.blacklist_test
             or self.args.spf_test
             or self.args.info
+            or self.args.banner
+            or self.args.commands
+            or self.args.isencrypt
             or self.args.interactive
             or self.args.ntlm
             or self.args.open_relay
@@ -464,20 +592,51 @@ class SMTP(BaseModule):
                     raise SystemExit
 
         # Direct scanning
-        # enter only if any of these arguments were explicitly specified
+        # Only -ie: no need to connect; test_encryption() opens its own connections
         if (
+            self.args.isencrypt
+            and not self.args.info
+            and not self.args.interactive
+            and not self.args.ntlm
+            and not self.args.open_relay
+            and self.args.enumerate is None
+            and not self.args.max_connections
+            and not self.do_brute
+        ):
+            self.results.encryption = self.test_encryption()
+            return
+
+        # enter only if any of these arguments were explicitly specified
+        need_info = (
             self.args.info
+            or self.args.banner
+            or self.args.commands
             or self.args.interactive
+            or self.args.isencrypt
             or self.args.ntlm
             or self.args.open_relay
             or self.args.enumerate is not None
             or self.args.max_connections
+            or getattr(self.args, "rcpt_limit", False)
             or self.do_brute
-        ):
-            smtp, info = self.initial_info()
+        )
+        if need_info:
+            do_banner = self.args.banner or self.args.info
+            do_commands = (
+                self.args.commands or self.args.info or (self.args.enumerate is not None)
+                or (getattr(self.args, "rcpt_limit", False) and not getattr(self.args, "domain", None))
+            )
+            smtp, info = self.initial_info(get_commands=do_commands)
+            self.results.banner_requested = do_banner
+            self.results.commands_requested = self.args.commands or self.args.info
+            self.results.info = InfoResult(
+                info.banner if do_banner else None,
+                info.ehlo if do_commands else None,
+                getattr(info, "ehlo_starttls", None),
+            )
 
-            if self.args.info:
-                self.results.info = info
+            if self.args.isencrypt:
+                self.results.encryption = self.test_encryption()
 
             if self.args.interactive and not self.use_json:
                 self.start_interactive_mode(smtp)
@@ -491,10 +650,26 @@ class SMTP(BaseModule):
                 )
 
             if self.args.enumerate is not None:
-                self.results.enum_results = self.enumeration(smtp)
+                smtp_enum = self.get_smtp_handler()
+                smtp_enum.docmd("EHLO", self.fqdn)
+                self.results.enum_results = self.enumeration(smtp_enum)
+
+            smtp_ca = self.get_smtp_handler()
+            smtp_ca.docmd("EHLO", self.fqdn)
+            self.results.catch_all = self.test_catchall(smtp_ca)
 
             if self.args.max_connections:
                 self.results.max_connections = self.max_connections_test()
+
+            if getattr(self.args, "rcpt_limit", False):
+                try:
+                    smtp_rc = self.get_smtp_handler()
+                    smtp_rc.docmd("EHLO", self.fqdn)
+                    self.results.rcpt_limit = self.test_rcpt_limit(smtp_rc)
+                except TestFailedError as e:
+                    self.results.rcpt_limit_error = str(e)
+                except Exception as e:
+                    self.results.rcpt_limit_error = str(e)
 
             if self.do_brute:
                 self.results.creds = simple_bruteforce(
@@ -508,10 +683,17 @@ class SMTP(BaseModule):
                 )
 
     def _run_all_tests(self) -> None:
-        """Run all tests in sequence. On failure: print error, continue with next."""
-        # 1. Server information (need SMTP connection first)
+        """Run all tests in sequence. On failure: print error, continue with next.
+        
+        Note: max_connections test is NOT included in run-all mode because it opens
+        many connections and triggers rate limits (421) on most servers, causing
+        subsequent tests to fail. Use -mc flag explicitly if needed.
+        """
+        # 1. Banner + commands (plaintext connection, EHLO)
+        self.results.banner_requested = True
+        self.results.commands_requested = True
         try:
-            smtp, info = self.initial_info()
+            smtp, info = self.initial_info(get_commands=True)
             self.results.info = info
         except TestFailedError as e:
             self.results.info_error = str(e)
@@ -519,8 +701,24 @@ class SMTP(BaseModule):
         except Exception as e:
             self.results.info_error = str(e)
             return
+        # 2. Encryption: on port 465 we connected via TLS, so set tls_ok=True.
+        #    With --starttls we already upgraded, so starttls_ok=True (EHLO may omit STARTTLS after upgrade).
+        #    On other ports: STARTTLS from EHLO if present.
+        #    Full test_encryption() (all three modes) only with -ie flag.
+        if self.args.target.port == 465:
+            self.results.encryption = EncryptionResult(
+                plaintext_ok=False, starttls_ok=False, tls_ok=True
+            )
+        elif self.args.starttls or (info.ehlo and "STARTTLS" in info.ehlo.upper()):
+            self.results.encryption = EncryptionResult(
+                plaintext_ok=True, starttls_ok=True, tls_ok=False
+            )
+        else:
+            self.results.encryption = EncryptionResult(
+                plaintext_ok=True, starttls_ok=False, tls_ok=False
+            )
 
-        # 2. Open relay (always in run-all; use defaults if mail_from/rcpt_to not set)
+        # 3. Open relay (always in run-all; use defaults if mail_from/rcpt_to not set)
         try:
             mail_from = self.args.mail_from or f"relaytest@{self.fqdn}"
             rcpt_to = self.args.rcpt_to or "relaytest@external.relaytest.local"
@@ -530,7 +728,7 @@ class SMTP(BaseModule):
         except Exception as e:
             self.results.open_relay_error = str(e)
 
-        # 3. Blacklist (domain + public IP; private IP skipped)
+        # 4. Blacklist (domain + public IP; private IP skipped)
         try:
             bl_result, skipped_private = self.test_blacklist(self.target)
             if skipped_private:
@@ -542,7 +740,7 @@ class SMTP(BaseModule):
         except Exception as e:
             self.results.blacklist_error = str(e)
 
-        # 4. SPF (only if domain)
+        # 5. SPF (only if domain)
         if self.target_is_ip:
             self.results.spf_requires_domain = True
         else:
@@ -553,11 +751,13 @@ class SMTP(BaseModule):
             except Exception as e:
                 self.results.spf_error = str(e)
 
-        # 5. User enumeration (ALL)
+        # 6. User enumeration (ALL) – use fresh connection (open_relay may have closed smtp)
         save_enum = self.args.enumerate
         try:
             self.args.enumerate = "ALL"
-            self.results.enum_results = self.enumeration(smtp)
+            smtp_enum = self.get_smtp_handler()
+            smtp_enum.docmd("EHLO", self.fqdn)
+            self.results.enum_results = self.enumeration(smtp_enum)
         except TestFailedError as e:
             self.results.enum_error = str(e)
         except Exception as e:
@@ -565,7 +765,25 @@ class SMTP(BaseModule):
         finally:
             self.args.enumerate = save_enum
 
-        # 6. NTLM
+        # 6b. Catch-all (after enumeration so we can use enum_results to choose method)
+        try:
+            smtp_ca = self.get_smtp_handler()
+            smtp_ca.docmd("EHLO", self.fqdn)
+            self.results.catch_all = self.test_catchall(smtp_ca)
+        except Exception:
+            self.results.catch_all = "indeterminate"
+
+        # 6c. RCPT TO limit (per message)
+        try:
+            smtp_rc = self.get_smtp_handler()
+            smtp_rc.docmd("EHLO", self.fqdn)
+            self.results.rcpt_limit = self.test_rcpt_limit(smtp_rc)
+        except TestFailedError as e:
+            self.results.rcpt_limit_error = str(e)
+        except Exception as e:
+            self.results.rcpt_limit_error = str(e)
+
+        # 7. NTLM
         try:
             self.results.ntlm = self.auth_ntlm(smtp)
         except TestFailedError as e:
@@ -573,31 +791,53 @@ class SMTP(BaseModule):
         except Exception as e:
             self.results.ntlm_error = str(e)
 
-        # 7. Connections
-        try:
-            self.results.max_connections = self.max_connections_test()
-        except TestFailedError as e:
-            self.results.max_connections_error = str(e)
-        except Exception as e:
-            self.results.max_connections_error = str(e)
-
     def connect(self) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL, int, bytes]:
+        """Port 465 is implicit TLS only (SMTPS), so we use TLS even without --tls.
+        For IP targets we connect manually with server_hostname=None so SNI does not break."""
         try:
-            if self.args.tls:
-                smtp = smtplib.SMTP_SSL(timeout=15.0)
+            if self.args.tls or self.args.target.port == 465:
+                ctx = ssl._create_unverified_context()
+                host, port = self.args.target.ip, self.args.target.port
+                try:
+                    ipaddress.ip_address(host)
+                    server_hostname = None
+                except ValueError:
+                    server_hostname = host
+                sock = socket.create_connection((host, port), timeout=15.0)
+                sock_ssl = ctx.wrap_socket(sock, server_hostname=server_hostname)
+                smtp = smtplib.SMTP(timeout=15.0)
+                smtp.sock = sock_ssl
+                smtp.file = None
+                status, reply = smtp.getreply()
             else:
                 smtp = smtplib.SMTP(timeout=15.0)
-
-            status, reply = smtp.connect(self.args.target.ip, self.args.target.port)
-            if self.args.starttls:
-                smtp.starttls()
+                status, reply = smtp.connect(self.args.target.ip, self.args.target.port)
+                if self.args.starttls and status == 220:
+                    status_stls, _ = smtp.docmd("STARTTLS")
+                    if status_stls == 220:
+                        ctx = ssl._create_unverified_context()
+                        try:
+                            _is_ip = ipaddress.ip_address(self.args.target.ip)
+                            server_hostname = None
+                        except ValueError:
+                            server_hostname = self.args.target.ip
+                        sock_ssl = ctx.wrap_socket(smtp.sock, server_hostname=server_hostname)
+                        smtp.sock = sock_ssl
+                        smtp.file = None
+                        smtp.helo_resp = None
+                        smtp.ehlo_resp = None
+                        smtp.esmtp_features = {}
+                        smtp.does_esmtp = False
 
             return smtp, status, reply
         except Exception as e:
+            mode = "TLS" if (self.args.tls or self.args.target.port == 465) else get_mode(self.args)
             msg = (
                 f"Could not connect to the target server "
-                f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}"
+                f"{self.args.target.ip}:{self.args.target.port} ({mode}): {e}"
             )
+            if self.args.target.port == 587 and not self.args.starttls and "refused" in str(e).lower():
+                msg += " (na portu 587 zkus --starttls)"
             self._fail(msg)
 
     def get_smtp_handler(self) -> smtplib.SMTP:
@@ -621,7 +861,8 @@ class SMTP(BaseModule):
             else:
                 raise Exception("Error when EHLOing")
         else:
-            raise Exception("Max connection error")
+            # Include actual server response (e.g. 421 = too many connections, try later)
+            raise Exception(f"Server responded {status}: {self.bytes_to_str(reply)}")
 
     def wait_for_unban(self, seconds, ban_duration=0, retries_left=12):
         """Wait for server to unban, then try to reconnect. Returns (ban_minutes, reconnected)."""
@@ -722,6 +963,137 @@ class SMTP(BaseModule):
         except:
             self.ptdebug("Server is not vulnerable to Open relay", Out.NOTVULN)
             return False
+
+    @staticmethod
+    def _to_parent_domain(host: str) -> str:
+        """Reduce hostname to parent (second-level) domain: strip leftmost label if 3+ parts."""
+        host = (host or "").strip().lower()
+        if not host or "." not in host:
+            return host
+        parts = host.split(".")
+        if len(parts) >= 3:
+            return ".".join(parts[1:])
+        return host
+
+    def _get_rcpt_limit_domain(self) -> str:
+        """Domain for RCPT TO limit test: -d/--domain, or from server banner/EHLO (via PSL), or fqdn, or test.com.
+        User -d is used as-is. Domain from server: FQDN is resolved to registrable domain via Public Suffix List
+        (e.g. relay01.prod.amazon.co.jp -> amazon.co.jp); fallback to full hostname or _to_parent_domain if PSL fails.
+        """
+        domain = getattr(self.args, "domain", None)
+        if domain and domain.strip():
+            return domain.strip()
+        host: str | None = None
+        info = getattr(self.results, "info", None)
+        if info and getattr(info, "banner", None):
+            line = (info.banner or "").replace("\r", "").split("\n")[0].strip()
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "220":
+                host = parts[1]
+            elif parts:
+                host = parts[0]
+            if host and "." in host:
+                psl_domain = _registrable_domain_psl(host)
+                if psl_domain:
+                    return psl_domain
+                return host
+        if info and getattr(info, "ehlo", None):
+            raw = (info.ehlo or "").replace("\r\n", "\n").replace("\r", "\n")
+            for line in raw.split("\n"):
+                line = line.strip()
+                if line.startswith("250-"):
+                    rest = line[4:].strip()
+                elif line.startswith("250 "):
+                    rest = line[3:].strip()
+                else:
+                    continue
+                if rest and "." in rest.split()[0]:
+                    host = rest.split()[0]
+                    psl_domain = _registrable_domain_psl(host)
+                    if psl_domain:
+                        return psl_domain
+                    return host
+        if self.fqdn and "." in self.fqdn and "pentereptools" not in self.fqdn.lower():
+            psl_domain = _registrable_domain_psl(self.fqdn)
+            if psl_domain:
+                return psl_domain
+            return self._to_parent_domain(self.fqdn)
+        return "test.com"
+
+    def _run_rcpt_limit_for_domain(self, smtp: smtplib.SMTP, domain: str) -> RcptLimitResult:
+        """Run MAIL FROM + RCPT TO loop for a given domain. Used so we can retry with parent domain."""
+        max_try = 2000
+        mail_from = f"a@{domain}"
+
+        try:
+            status, reply = smtp.docmd("MAIL FROM:", f"<{mail_from}>")
+            if status != 250:
+                return RcptLimitResult(0, False, self.bytes_to_str(reply), False)
+        except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
+            return RcptLimitResult(0, True, str(e), False)
+
+        accepted = 0
+        limit_response: str | None = None
+        for i in range(1, max_try + 1):
+            try:
+                status, reply = smtp.docmd("RCPT TO:", f"<{i}@{domain}>")
+                reply_str = self.bytes_to_str(reply)
+                if status == 250:
+                    accepted += 1
+                    continue
+                limit_response = f"[{status}] {reply_str}".strip()
+                # Policy rejection (relay/sender/recipient) when no recipient accepted yet – not a count limit
+                if accepted == 0 and status in (450, 550, 553, 554):
+                    self.ptdebug(f"Server rejects test addresses: {limit_response}", Out.INFO)
+                    return RcptLimitResult(0, False, limit_response, rejected_addresses=True)
+                # Real RCPT count limit: 421 Limit exceeded, 452 Too many recipients, other 5xx
+                if status in (421, 452) or (500 <= status <= 599):
+                    self.ptdebug(f"Server limit after {accepted} recipients: {limit_response}", Out.INFO)
+                    return RcptLimitResult(accepted, True, limit_response, False)
+                return RcptLimitResult(accepted, False, limit_response, False)
+            except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
+                self.ptdebug(f"Server closed connection after {accepted} recipients", Out.INFO)
+                return RcptLimitResult(accepted, True, str(e), False)
+
+        self.ptdebug(f"No limit observed up to {accepted} recipients", Out.VULN)
+        return RcptLimitResult(accepted, False, None, False)
+
+    def test_rcpt_limit(self, smtp: smtplib.SMTP) -> RcptLimitResult:
+        """
+        Test RCPT TO limit per message: send MAIL FROM then many RCPT TO
+        until server rejects (452 Too many recipients, 421, 5xx) or closes.
+        When domain is taken from server (banner/EHLO) and server rejects with 550/553,
+        retry with parent domain (e.g. calm.festiveloft.net -> festiveloft.net).
+        """
+        self.ptdebug("RCPT TO limit test (per message)", title=True)
+        domain = self._get_rcpt_limit_domain()
+        result = self._run_rcpt_limit_for_domain(smtp, domain)
+        domain_used = domain
+
+        # If server rejected (e.g. "User unknown" for full hostname) and user did not set -d,
+        # retry with parent domain so test can succeed (e.g. festiveloft.net accepts 1@, 2@, ...)
+        if (
+            getattr(result, "rejected_addresses", False)
+            and not getattr(self.args, "domain", None)
+            and domain.count(".") >= 2
+        ):
+            parent = self._to_parent_domain(domain)
+            if parent != domain:
+                self.ptdebug(f"Retrying RCPT TO limit with parent domain: {parent}", Out.INFO)
+                try:
+                    smtp.docmd("RSET")
+                except Exception:
+                    pass
+                result = self._run_rcpt_limit_for_domain(smtp, parent)
+                domain_used = parent
+
+        return RcptLimitResult(
+            result.max_accepted,
+            result.limit_triggered,
+            result.server_response,
+            getattr(result, "rejected_addresses", False),
+            domain_used,
+        )
 
     def start_interactive_mode(self, smtp: smtplib.SMTP):
         self.ptprint("\n", end="")
@@ -850,30 +1222,102 @@ class SMTP(BaseModule):
         return {"rcpt": is_slow_down}
 
     def expn_vrfy_enumeration(self, method, smtp) -> list[str]:
-        self.ptdebug(f"Enumerating users:", Out.INFO)
+        enum_threads = getattr(self.args, "enum_threads", 1)
+        ehlo = (self.results.info and self.results.info.ehlo) or ""
+        supports_smtputf8 = "SMTPUTF8" in ehlo.upper()
+        if getattr(self, "_wordlist_skipped", 0) > 0:
+            self.ptdebug(
+                f"Skipped {self._wordlist_skipped} invalid local parts from wordlist",
+                Out.INFO,
+            )
+        self.ptdebug(f"Enumerating users:" + (f" ({enum_threads} threads)" if enum_threads > 1 else ""), Out.INFO)
         enumerated_users: list[str] = []
         total_aliases = 0 if method == "EXPN" else None
-        for user in self.wordlist:
-            start_time = time.time()
-            # print(user)
-            status, reply = smtp.docmd(method, user)
-            # print(status, "\n", time.time() - start_time)
-            if status != 550:
-                user_email = re.findall(r"<(.*?)>", self.bytes_to_str(reply))
-                # Bug fix: findall returns a list, we need to extend not append
-                # to avoid list[list[str]] which causes TypeError in join()
-                if user_email:
-                    enumerated_users.extend(user_email)
+
+        def _skip_non_ascii_no_utf8(s: str) -> bool:
+            return not supports_smtputf8 and any(ord(c) >= 128 for c in s)
+
+        if enum_threads <= 1:
+            if supports_smtputf8:
+                smtp.command_encoding = "utf-8"
+            for user in self.wordlist:
+                if _skip_non_ascii_no_utf8(user):
+                    continue
+                try:
+                    status, reply = smtp.docmd(method, user)
+                except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
                     self.ptdebug(
-                        user_email[0],
+                        f"{method} enumeration interrupted (connection closed/reset): {e}",
+                        Out.INFO,
                     )
-                if method == "EXPN" and len(user_email) > 1:
-                    for alias in user_email[1:]:
-                        total_aliases += len(user_email[1:])
-                        self.ptdebug(f"   {alias}", Out.ADDITIONS)
+                    try:
+                        smtp = self.get_smtp_handler()
+                        smtp.docmd("EHLO", f"{self.fqdn}")
+                        if supports_smtputf8:
+                            smtp.command_encoding = "utf-8"
+                        status, reply = smtp.docmd(method, user)
+                    except Exception:
+                        break
+                if status != 550:
+                    user_email = re.findall(r"<(.*?)>", self.bytes_to_str(reply))
+                    if user_email:
+                        enumerated_users.extend(user_email)
+                        self.ptdebug(user_email[0])
+                    if method == "EXPN" and len(user_email) > 1:
+                        for alias in user_email[1:]:
+                            total_aliases += len(user_email[1:])
+                            self.ptdebug(f"   {alias}", Out.ADDITIONS)
+        else:
+            user_queue: queue.Queue[str | None] = queue.Queue()
+            for u in self.wordlist:
+                if not _skip_non_ascii_no_utf8(u):
+                    user_queue.put(u)
+            for _ in range(enum_threads):
+                user_queue.put(None)
+            result_lock = threading.Lock()
+
+            def worker() -> None:
+                try:
+                    conn = self.get_smtp_handler()
+                    conn.docmd("EHLO", f"{self.fqdn}")
+                    if supports_smtputf8:
+                        conn.command_encoding = "utf-8"
+                except Exception:
+                    return
+                while True:
+                    user = user_queue.get()
+                    if user is None:
+                        user_queue.task_done()
+                        break
+                    try:
+                        status, reply = conn.docmd(method, user)
+                    except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
+                        try:
+                            conn = self.get_smtp_handler()
+                            conn.docmd("EHLO", f"{self.fqdn}")
+                            if supports_smtputf8:
+                                conn.command_encoding = "utf-8"
+                            status, reply = conn.docmd(method, user)
+                        except Exception:
+                            user_queue.task_done()
+                            continue
+                    if status != 550:
+                        user_email = re.findall(r"<(.*?)>", self.bytes_to_str(reply))
+                        if user_email:
+                            with result_lock:
+                                enumerated_users.extend(user_email)
+                                self.ptdebug(user_email[0])
+                    user_queue.task_done()
+
+            threads_list = [threading.Thread(target=worker) for _ in range(enum_threads)]
+            for t in threads_list:
+                t.start()
+            for t in threads_list:
+                t.join()
+            total_aliases = 0
 
         additional_message = (
-            f"(total {len(enumerated_users) + total_aliases} with aliases)"
+            f"(total {len(enumerated_users) + (total_aliases or 0)} with aliases)"
             if method == "EXPN"
             else ""
         )
@@ -921,15 +1365,167 @@ class SMTP(BaseModule):
             self.ptdebug(f"Server is not vulnerable to RCPT enumeration", Out.NOTVULN)
         return is_vulnerable
 
+    def test_catchall(self, smtp: smtplib.SMTP) -> CatchAllResult:
+        """
+        Detect Catch-All mailbox: if server accepts 3 invalid addresses as valid,
+        catch-all is configured (VRFY/EXPN) or indeterminate (RCPT).
+        Uses VRFY or EXPN when available; otherwise RCPT. RCPT cannot distinguish
+        valid address from catch-all, so result is Indeterminate when all accepted.
+        Per RFC 5321: 250/251/252 are success for VRFY/EXPN; 550 = user unknown.
+        """
+        CATCHALL_INVALID = ("catchallnx001", "catchallnx002", "catchallnx003")
+        # RFC 5321: 250 = verified, 251 = forward, 252 = cannot verify (e.g. relay)
+        VRFY_EXPN_ACCEPT = (250, 251, 252)
+
+        def _choose_method() -> str | None:
+            if self.results.enum_results:
+                for e in self.results.enum_results:
+                    if e.vulnerable and e.method in ("expn", "vrfy", "rcpt"):
+                        return e.method
+            try:
+                status, _ = smtp.docmd("VRFY", "catchallprobe")
+                if status in (*VRFY_EXPN_ACCEPT, 550):
+                    return "vrfy"
+            except Exception:
+                pass
+            try:
+                status, _ = smtp.docmd("EXPN", "catchallprobe")
+                if status in (*VRFY_EXPN_ACCEPT, 550):
+                    return "expn"
+            except Exception:
+                pass
+            try:
+                smtp.docmd("MAIL FROM:", "<catchall@probe.test>")
+                status, _ = smtp.docmd("RCPT TO:", "<catchallprobe>")
+                if status in (250, 251, 252, 550):
+                    return "rcpt"
+            except Exception:
+                pass
+            return None
+
+        try:
+            method = _choose_method()
+            if not method:
+                return "indeterminate"
+
+            if method in ("vrfy", "expn"):
+                cmd = "VRFY" if method == "vrfy" else "EXPN"
+                accepted = 0
+                for user in CATCHALL_INVALID:
+                    try:
+                        status, _ = smtp.docmd(cmd, user)
+                        if status in VRFY_EXPN_ACCEPT:
+                            accepted += 1
+                        elif status == 550:
+                            return "not_configured"
+                    except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
+                        return "indeterminate"
+                return "configured" if accepted == 3 else "indeterminate"
+
+            else:
+                try:
+                    smtp.docmd("MAIL FROM:", "<catchall@probe.test>")
+                except Exception:
+                    return "indeterminate"
+                for user in CATCHALL_INVALID:
+                    try:
+                        status, reply = smtp.docmd("RCPT TO:", f"<{user}>")
+                        if status == 550 or "UNKNOWN" in self.bytes_to_str(reply).upper():
+                            return "not_configured"
+                    except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
+                        return "indeterminate"
+                return "indeterminate"
+        except Exception:
+            return "indeterminate"
+
     def rcpt_enumeration(self, smtp) -> list[str]:
-        self.ptdebug(f"Enumerating users:", Out.INFO)
+        enum_threads = getattr(self.args, "enum_threads", 1)
+        ehlo = (self.results.info and self.results.info.ehlo) or ""
+        supports_smtputf8 = "SMTPUTF8" in ehlo.upper()
+        if getattr(self, "_wordlist_skipped", 0) > 0:
+            self.ptdebug(
+                f"Skipped {self._wordlist_skipped} invalid local parts from wordlist",
+                Out.INFO,
+            )
+        self.ptdebug(f"Enumerating users:" + (f" ({enum_threads} threads)" if enum_threads > 1 else ""), Out.INFO)
         enumerated_users: list[str] = []
-        for user in self.wordlist:
-            user = user.split("@")[0]
-            status, reply = smtp.docmd("RCPT TO:", f"<{user}>")
-            if status != 550 and not "UNKNOWN" in self.bytes_to_str(reply).upper():
-                enumerated_users.append(user)
-                self.ptdebug(user)
+
+        def _skip(local: str) -> bool:
+            return not supports_smtputf8 and any(ord(c) >= 128 for c in local)
+
+        if enum_threads <= 1:
+            if supports_smtputf8:
+                smtp.command_encoding = "utf-8"
+            for user in self.wordlist:
+                local = user.split("@")[0].strip()
+                if _skip(local):
+                    continue
+                try:
+                    status, reply = smtp.docmd("RCPT TO:", f"<{local}>")
+                except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
+                    self.ptdebug(
+                        f"RCPT enumeration interrupted (connection closed/reset): {e}",
+                        Out.INFO,
+                    )
+                    try:
+                        smtp = self.get_smtp_handler()
+                        smtp.docmd("EHLO", f"{self.fqdn}")
+                        if supports_smtputf8:
+                            smtp.command_encoding = "utf-8"
+                        smtp.docmd("MAIL FROM:", "<mail@from.me>")
+                        status, reply = smtp.docmd("RCPT TO:", f"<{local}>")
+                    except Exception:
+                        break
+                if status != 550 and not "UNKNOWN" in self.bytes_to_str(reply).upper():
+                    enumerated_users.append(local)
+                    self.ptdebug(local)
+        else:
+            locals_to_try = [u.split("@")[0].strip() for u in self.wordlist if not _skip(u.split("@")[0].strip())]
+            user_queue: queue.Queue[str | None] = queue.Queue()
+            for local in locals_to_try:
+                user_queue.put(local)
+            for _ in range(enum_threads):
+                user_queue.put(None)
+            result_lock = threading.Lock()
+
+            def rcpt_worker() -> None:
+                try:
+                    conn = self.get_smtp_handler()
+                    conn.docmd("EHLO", f"{self.fqdn}")
+                    if supports_smtputf8:
+                        conn.command_encoding = "utf-8"
+                    conn.docmd("MAIL FROM:", "<mail@from.me>")
+                except Exception:
+                    return
+                while True:
+                    local = user_queue.get()
+                    if local is None:
+                        user_queue.task_done()
+                        break
+                    try:
+                        status, reply = conn.docmd("RCPT TO:", f"<{local}>")
+                    except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
+                        try:
+                            conn = self.get_smtp_handler()
+                            conn.docmd("EHLO", f"{self.fqdn}")
+                            if supports_smtputf8:
+                                conn.command_encoding = "utf-8"
+                            conn.docmd("MAIL FROM:", "<mail@from.me>")
+                            status, reply = conn.docmd("RCPT TO:", f"<{local}>")
+                        except Exception:
+                            user_queue.task_done()
+                            continue
+                    if status != 550 and not "UNKNOWN" in self.bytes_to_str(reply).upper():
+                        with result_lock:
+                            enumerated_users.append(local)
+                            self.ptdebug(local)
+                    user_queue.task_done()
+
+            threads_list = [threading.Thread(target=rcpt_worker) for _ in range(enum_threads)]
+            for t in threads_list:
+                t.start()
+            for t in threads_list:
+                t.join()
 
         self.ptdebug(f" ")
         self.ptdebug(f"-- Enumerated {len(enumerated_users)} users --")
@@ -940,6 +1536,26 @@ class SMTP(BaseModule):
 
     def bytes_to_str(self, text):
         return text.decode("utf-8")
+
+    # RFC 5322 atext (atom text) + dot; RFC 6531 allows Unicode letters/digits in local part
+    _ATEXT_ASCII = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-/=?^_`{|}~.")
+
+    @classmethod
+    def _is_valid_local_part(cls, s: str) -> bool:
+        """True if s is a valid email local part (RFC 5322 atext / dot-atom, RFC 6531 Unicode)."""
+        if not s or len(s) > 64:
+            return False
+        if s[0] == "." or s[-1] == "." or ".." in s:
+            return False
+        for c in s:
+            if c in cls._ATEXT_ASCII:
+                continue
+            if ord(c) < 128:
+                return False
+            cat = unicodedata.category(c)
+            if cat not in ("Ll", "Lu", "Lm", "Lo", "Lt", "Nl", "Nd"):
+                return False
+        return True
 
     def test_blacklist(self, target: str) -> tuple[BlacklistResult | None, bool]:
         """Run blacklist check. Returns (result, skipped_private). skipped_private=True for private IP (no API call)."""
@@ -1222,26 +1838,180 @@ class SMTP(BaseModule):
 
         return enum_results
 
-    def initial_info(self) -> tuple[smtplib.SMTP, InfoResult]:
+    def initial_info(self, get_commands: bool = True) -> tuple[smtplib.SMTP, InfoResult]:
+        """Connect and get banner; optionally get EHLO (commands). If PLAIN advertises STARTTLS,
+        open a new connection to get EHLO after STARTTLS (keeps main connection plain for other tests)."""
         self.ptdebug("Initial server information", title=True)
 
-        smtp, _, banner = self.connect()
-        banner = banner.decode()
+        smtp, _, reply = self.connect()
+        banner = reply.decode()
         self.ptdebug("Banner: " + banner, Out.INFO)
 
+        ehlo = None
+        ehlo_starttls = None
+        if get_commands:
+            try:
+                _, ehlo_bytes = smtp.ehlo(self.fqdn)
+                ehlo = ehlo_bytes.decode()
+                self.ptdebug("EHLO response: " + ehlo, Out.INFO)
+            except Exception as e:
+                msg = (
+                    f"Could not negotiate initial EHLO with "
+                    f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}"
+                )
+                self._fail(msg)
+
+            # If on plain connection and server advertises STARTTLS, get EHLO after STARTTLS
+            # via a new connection (same manual STARTTLS as test_encryption: no SNI when IP).
+            if (
+                ehlo
+                and "STARTTLS" in ehlo.upper()
+                and self.args.target.port != 465
+                and not self.args.tls
+            ):
+                smtp_stls = None
+                try:
+                    _ssl_ctx = ssl._create_unverified_context()
+                    smtp_stls = smtplib.SMTP(timeout=15.0)
+                    status, _ = smtp_stls.connect(self.args.target.ip, self.args.target.port)
+                    if status != 220:
+                        raise Exception("connect failed")
+                    status, _ = smtp_stls.docmd("EHLO", self.fqdn)
+                    if status != 250:
+                        raise Exception("EHLO failed")
+                    status, _ = smtp_stls.docmd("STARTTLS")
+                    if status != 220:
+                        raise Exception("STARTTLS refused")
+                    try:
+                        _is_ip = ipaddress.ip_address(self.args.target.ip)
+                        _sni = None
+                    except ValueError:
+                        _sni = self.args.target.ip
+                    sock_ssl = _ssl_ctx.wrap_socket(smtp_stls.sock, server_hostname=_sni)
+                    smtp_stls.sock = sock_ssl
+                    smtp_stls.file = None
+                    smtp_stls.helo_resp = None
+                    smtp_stls.ehlo_resp = None
+                    smtp_stls.esmtp_features = {}
+                    smtp_stls.does_esmtp = False
+                    status, ehlo_st_bytes = smtp_stls.docmd("EHLO", self.fqdn)
+                    if status == 250:
+                        ehlo_starttls = ehlo_st_bytes.decode()
+                        self.ptdebug("EHLO after STARTTLS: " + ehlo_starttls, Out.INFO)
+                except Exception as e:
+                    self.ptdebug(f"STARTTLS EHLO failed: {e}", Out.INFO)
+                finally:
+                    if smtp_stls is not None:
+                        try:
+                            smtp_stls.close()
+                        except Exception:
+                            pass
+
+        return smtp, InfoResult(banner, ehlo, ehlo_starttls)
+
+    def test_encryption(self) -> EncryptionResult:
+        """
+        Test which encryption options are available on the target port:
+        plaintext, STARTTLS, and implicit TLS (SMTP_SSL).
+        Uses fresh connections for each test; does not use self.args.tls/starttls.
+
+        The caller (run() or _run_all_tests()) stores the return value in
+        self.results.encryption so that subsequent tests can use it to select
+        the appropriate connection type (e.g. prefer STARTTLS when available).
+        """
+        host = self.args.target.ip
+        port = self.args.target.port
+        timeout = 10.0
+        plaintext_ok = False
+        starttls_ok = False
+        tls_ok = False
+
+        # Unverified context for availability probe only (server cert may be
+        # self-signed or for different hostname). Use _create_unverified_context
+        # for maximum compatibility with real-world servers.
+        _ssl_ctx = ssl._create_unverified_context()
+        # Port 465 is implicit TLS only (SMTPS): skip plaintext and STARTTLS (they would hang/timeout).
+        tls_only_port = port == 465
+
+        if not tls_only_port:
+            # 1. STARTTLS (plain then upgrade). RFC 3207: EHLO first, then STARTTLS, then EHLO.
+            try:
+                smtp = smtplib.SMTP(timeout=timeout)
+                try:
+                    status, _ = smtp.connect(host, port)
+                    if status == 220:
+                        status, _ = smtp.docmd("EHLO", self.fqdn)
+                        if status == 250:
+                            status, _ = smtp.docmd("STARTTLS")
+                            if status == 220:
+                                try:
+                                    _is_ip = ipaddress.ip_address(host)
+                                    _sni = None
+                                except ValueError:
+                                    _sni = host
+                                sock_ssl = _ssl_ctx.wrap_socket(
+                                    smtp.sock, server_hostname=_sni
+                                )
+                                smtp.sock = sock_ssl
+                                smtp.file = None
+                                smtp.helo_resp = None
+                                smtp.ehlo_resp = None
+                                smtp.esmtp_features = {}
+                                smtp.does_esmtp = False
+                                status, _ = smtp.docmd("EHLO", self.fqdn)
+                                starttls_ok = status == 250
+                finally:
+                    smtp.close()
+            except Exception as e:
+                self.ptdebug(f"STARTTLS test failed: {e}", Out.INFO)
+
+            time.sleep(2)
+
+            # 2. Plaintext (no TLS)
+            try:
+                smtp = smtplib.SMTP(timeout=timeout)
+                try:
+                    status, _ = smtp.connect(host, port)
+                    if status == 220:
+                        status, _ = smtp.docmd("EHLO", self.fqdn)
+                        plaintext_ok = status == 250
+                finally:
+                    smtp.close()
+            except Exception:
+                pass
+
+            time.sleep(2)
+
+        # 3. Implicit TLS (port 465 / SMTPS). Connect manually so we control SNI:
+        # when connecting by IP use server_hostname=None (many servers have hostname-only certs).
         try:
-            _, ehlo = smtp.ehlo(self.fqdn)
-            ehlo = ehlo.decode()
-            self.ptdebug("EHLO response: " + ehlo, Out.INFO)
+            sock = socket.create_connection((host, port), timeout=timeout)
+            try:
+                try:
+                    ipaddress.ip_address(host)
+                    _sni = None
+                except ValueError:
+                    _sni = host
+                sock_ssl = _ssl_ctx.wrap_socket(sock, server_hostname=_sni)
+                smtp = smtplib.SMTP(timeout=timeout)
+                try:
+                    smtp.sock = sock_ssl
+                    smtp.file = None
+                    (status, _) = smtp.getreply()
+                    if status == 220:
+                        status, _ = smtp.docmd("EHLO", self.fqdn)
+                        tls_ok = status == 250
+                finally:
+                    smtp.close()
+            finally:
+                try:
+                    sock_ssl.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-        except Exception as e:
-            msg = (
-                f"Could not negotiate initial EHLO with "
-                f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}"
-            )
-            self._fail(msg)
-
-        return smtp, InfoResult(banner, ehlo)
+        return EncryptionResult(plaintext_ok, starttls_ok, tls_ok)
 
     def _try_login(self, creds: Creds) -> Creds | None:
         smtp, *_ = self.connect()
@@ -1263,33 +2033,126 @@ class SMTP(BaseModule):
             "properties"
         ]
 
-        # 1. Server information
-        if (info_error := self.results.info_error) is not None:
-            self.ptprint("Server information", Out.INFO)
+        # 1. Banner (separate section)
+        if self.results.banner_requested:
+            if (info_error := self.results.info_error) is not None:
+                self.ptprint("Banner", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+                properties["infoError"] = info_error
+            elif (info := self.results.info) and info.banner is not None:
+                self.ptprint("Banner", Out.INFO)
+                sid = identify_service(info.banner)
+                if sid is None:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                elif sid.version is not None:
+                    icon = get_colored_text("[✗]", color="VULN")
+                else:
+                    icon = get_colored_text("[!]", color="WARNING")
+                self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
+                properties["banner"] = info.banner
+                # Service identification from banner (product, version, CPE)
+                if sid is not None:
+                    self.ptprint("Service Identification", Out.INFO)
+                    self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
+                    self.ptprint(
+                        f"    Version:  {sid.version if sid.version else 'unknown'}",
+                        Out.TEXT,
+                    )
+                    self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
+                    properties["serviceIdentification"] = {
+                        "product": sid.product,
+                        "version": sid.version,
+                        "cpe": sid.cpe,
+                    }
+
+        # 2. EHLO extensions (PLAIN and/or STARTTLS when both available)
+        def _print_ehlo_parsed(ehlo_raw: str, connection_encrypted: bool) -> None:
+            parsed = _parse_ehlo_commands(ehlo_raw, connection_encrypted=connection_encrypted)
+            for display_str, level in parsed:
+                if level == "ERROR":
+                    icon = get_colored_text("[✗]", color="VULN")
+                elif level == "WARNING":
+                    icon = get_colored_text("[!]", color="WARNING")
+                else:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} {display_str}", Out.TEXT)
+
+        if self.results.commands_requested:
+            if (info_error := self.results.info_error) is not None:
+                self.ptprint("EHLO extensions", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+                if "infoError" not in properties:
+                    properties["infoError"] = info_error
+            elif (info := self.results.info) and info.ehlo is not None:
+                ehlo_starttls = getattr(info, "ehlo_starttls", None)
+                if ehlo_starttls:
+                    # Two sections: PLAIN then STARTTLS (different risk: AUTH OK over TLS)
+                    self.ptprint("EHLO extensions (PLAIN)", Out.INFO)
+                    if info.ehlo:
+                        _print_ehlo_parsed(info.ehlo, connection_encrypted=False)
+                    self.ptprint("EHLO extensions (STARTTLS)", Out.INFO)
+                    _print_ehlo_parsed(ehlo_starttls, connection_encrypted=True)
+                    properties["ehloCommand"] = info.ehlo
+                    properties["ehloCommandStarttls"] = ehlo_starttls
+                else:
+                    # Single section: label by connection type
+                    connection_encrypted = (
+                        self.args.target.port == 465 or self.args.tls or self.args.starttls
+                    )
+                    section_label = " (TLS)" if connection_encrypted else " (PLAIN)"
+                    self.ptprint(f"EHLO extensions{section_label}", Out.INFO)
+                    if info.ehlo:
+                        _print_ehlo_parsed(info.ehlo, connection_encrypted=connection_encrypted)
+                    # If server advertised STARTTLS but we couldn't get second EHLO, show hint
+                    if (
+                        not connection_encrypted
+                        and "STARTTLS" in (info.ehlo or "").upper()
+                        and not getattr(info, "ehlo_starttls", None)
+                    ):
+                        self.ptprint(
+                            "    [*] STARTTLS EHLO not available (second connection or upgrade failed; try -d for debug)",
+                            Out.TEXT,
+                        )
+                    properties["ehloCommand"] = info.ehlo
+
+        # 2. Encryption
+        if (encryption_error := self.results.encryption_error) is not None:
+            self.ptprint("Encryption", Out.INFO)
             icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Info test failed: {info_error}", Out.TEXT)
-            properties["infoError"] = info_error
-        elif info := self.results.info:
-            self.ptprint("Server information", Out.INFO)
+            self.ptprint(f"    {icon} Encryption test failed: {encryption_error}", Out.TEXT)
+            properties["encryptionError"] = encryption_error
+        elif (enc := self.results.encryption) is not None:
+            self.ptprint("Encryption", Out.INFO)
+            plaintext_only = enc.plaintext_ok and not enc.starttls_ok and not enc.tls_ok
+            any_ok = enc.plaintext_ok or enc.starttls_ok or enc.tls_ok
+            if plaintext_only:
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} Plaintext only", Out.TEXT)
+            elif any_ok:
+                if enc.plaintext_ok:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} Plaintext", Out.TEXT)
+                if enc.starttls_ok:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} STARTTLS", Out.TEXT)
+                if enc.tls_ok:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} TLS", Out.TEXT)
+            else:
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(
+                    f"    {icon} No connection mode available (plaintext, STARTTLS, TLS failed)",
+                    Out.TEXT,
+                )
+            properties["encryption"] = {
+                "plaintext": enc.plaintext_ok,
+                "starttls": enc.starttls_ok,
+                "tls": enc.tls_ok,
+            }
 
-            self.ptprint("Banner", Out.INFO)
-            self.ptprint(f"    {info.banner}")
-            properties["banner"] = info.banner
-
-            self.ptprint("SMTP commands and extensions", Out.INFO)
-            if info.ehlo:
-                parsed = _parse_ehlo_commands(info.ehlo)
-                for display_str, level in parsed:
-                    if level == "ERROR":
-                        icon = get_colored_text("[✗]", color="VULN")
-                    elif level == "WARNING":
-                        icon = get_colored_text("[!]", color="WARNING")
-                    else:
-                        icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} {display_str}", Out.TEXT)
-            properties["ehloCommand"] = info.ehlo
-
-        # 2. Open relay
+        # 3. Open relay
         if (open_relay_error := self.results.open_relay_error) is not None:
             self.ptprint("Open relay", Out.INFO)
             icon = get_colored_text("[✗]", color="VULN")
@@ -1305,7 +2168,86 @@ class SMTP(BaseModule):
                 icon = get_colored_text("[✓]", color="NOTVULN")
                 self.ptprint(f"    {icon} Open relay is denied", Out.TEXT)
 
-        # 3. Blacklist information
+        # 3a. Catch All mailbox
+        if (catch_all := self.results.catch_all) is not None:
+            self.ptprint("Catch All mailbox", Out.INFO)
+            info_icon = get_colored_text("[*]", color="INFO")
+            if catch_all == "configured":
+                self.ptprint(f"    {info_icon} Configured", Out.TEXT)
+            elif catch_all == "not_configured":
+                self.ptprint(f"    {info_icon} Not Configured", Out.TEXT)
+            else:
+                self.ptprint(f"    {info_icon} Indeterminate", Out.TEXT)
+            properties["catchAll"] = catch_all
+
+        # 3b. RCPT TO limit (per message)
+        rcptmax_advertised = None
+        if (info := getattr(self.results, "info", None)) and getattr(info, "ehlo", None):
+            rcptmax_advertised = _parse_rcptmax_from_ehlo(info.ehlo)
+        if (rcpt_limit_err := self.results.rcpt_limit_error) is not None:
+            self.ptprint("RCPT TO limit", Out.INFO)
+            if rcptmax_advertised is not None:
+                info_icon = get_colored_text("[*]", color="INFO")
+                self.ptprint(
+                    f"    {info_icon} Advertised in EHLO (RFC 9422): RCPTMAX={rcptmax_advertised}",
+                    Out.TEXT,
+                )
+                properties["rcptLimitAdvertised"] = rcptmax_advertised
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Test failed: {rcpt_limit_err}", Out.TEXT)
+            properties["rcptLimitError"] = rcpt_limit_err
+        elif (rlim := self.results.rcpt_limit) is not None:
+            self.ptprint("RCPT TO limit", Out.INFO)
+            info_icon = get_colored_text("[*]", color="INFO")
+            if rcptmax_advertised is not None:
+                self.ptprint(
+                    f"    {info_icon} Advertised in EHLO (RFC 9422): RCPTMAX={rcptmax_advertised}",
+                    Out.TEXT,
+                )
+                properties["rcptLimitAdvertised"] = rcptmax_advertised
+            if getattr(rlim, "rejected_addresses", False):
+                self.ptprint(
+                    f"    {info_icon} Could not test: server rejects test addresses (not a count limit)",
+                    Out.TEXT,
+                )
+                if rlim.server_response:
+                    for line in rlim.server_response.replace("\r", "").splitlines():
+                        self.ptprint(f"        {line}", Out.TEXT)
+                self.ptprint(
+                    f"    {info_icon} Try -d/--domain <domain> to use a valid recipient domain.",
+                    Out.TEXT,
+                )
+                properties["rcptLimit"] = {"rejectedAddresses": True, "serverResponse": rlim.server_response}
+            elif rlim.limit_triggered:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} Limit enforced after {rlim.max_accepted} recipients", Out.TEXT)
+                if rlim.server_response:
+                    for line in rlim.server_response.replace("\r", "").splitlines():
+                        self.ptprint(f"        {line}", Out.TEXT)
+                properties["rcptLimit"] = {"maxAccepted": rlim.max_accepted, "limitTriggered": True}
+            else:
+                if rlim.max_accepted == 0:
+                    self.ptprint(
+                        f"    {info_icon} Could not test: no recipients accepted",
+                        Out.TEXT,
+                    )
+                    if rlim.server_response:
+                        for line in rlim.server_response.replace("\r", "").splitlines():
+                            self.ptprint(f"        {line}", Out.TEXT)
+                    self.ptprint(
+                        f"    {info_icon} Try -d/--domain <domain> to use a valid recipient domain.",
+                        Out.TEXT,
+                    )
+                    properties["rcptLimit"] = {"maxAccepted": 0, "limitTriggered": False, "couldNotTest": True}
+                else:
+                    icon = get_colored_text("[✗]", color="VULN")
+                    self.ptprint(
+                        f"    {icon} No limit or too high: {rlim.max_accepted} recipients accepted",
+                        Out.TEXT,
+                    )
+                    properties["rcptLimit"] = {"maxAccepted": rlim.max_accepted, "limitTriggered": False}
+
+        # 4. Blacklist information
         if (blacklist_error := self.results.blacklist_error) is not None:
             self.ptprint("Blacklist information", Out.INFO)
             icon = get_colored_text("[✗]", color="VULN")
@@ -1326,15 +2268,11 @@ class SMTP(BaseModule):
                 self.ptprint(f"    {icon} Clean", Out.TEXT)
             else:
                 icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Listed", Out.TEXT)
-
+                json_lines: list[str] = []
                 if (results := blacklist.results) is not None:
-                    self.ptprint("    Listed on the following blacklists", Out.INFO)
-
-                    json_lines: list[str] = []
                     for r in results:
                         r_str = f'{r.blacklist.strip()}: "{r.reason}" (TTL={r.ttl})'
-                        self.ptprint(f"        {r_str}")
+                        self.ptprint(f"    {icon} {r_str}", Out.TEXT)
                         json_lines.append(r_str)
 
                     if len(json_lines) > 0:
@@ -1344,7 +2282,7 @@ class SMTP(BaseModule):
                             "\n".join(json_lines),
                         )
 
-        # 4. SPF records
+        # 5. SPF records
         if self.results.spf_requires_domain:
             self.ptprint("SPF records", Out.INFO)
             info_icon = get_colored_text("[*]", color="INFO")
@@ -1371,7 +2309,7 @@ class SMTP(BaseModule):
             if len(json_lines) > 0:
                 properties["spfRecords"] = "\n".join(json_lines)
 
-        # 5. User enumeration
+        # 6. User enumeration methods
         if (enum_error := self.results.enum_error) is not None:
             self.ptprint("User enumeration methods", Out.INFO)
             icon = get_colored_text("[✗]", color="VULN")
@@ -1380,30 +2318,38 @@ class SMTP(BaseModule):
         elif (enum_results := self.results.enum_results) is not None:
             self.ptprint("User enumeration methods", Out.INFO)
 
-            json_lines = []
-            for e in enum_results:
+            if self.args.enumerate is None:
+                requested_set = {"EXPN", "VRFY", "RCPT"}
+            elif isinstance(self.args.enumerate, list):
+                requested_set = {m.upper() for m in self.args.enumerate if m}
+            else:
+                requested_set = {self.args.enumerate.upper()} if self.args.enumerate else {"EXPN", "VRFY", "RCPT"}
+
+            filtered = [e for e in enum_results if e.method.upper() in requested_set]
+
+            for e in filtered:
                 if e.slowdown is not None:
                     slowdown = " (rate limited)" if e.slowdown else " (not rate limited)"
                 else:
                     slowdown = ""
-
                 status = "is enabled" if e.vulnerable else "is deny"
                 icon = get_colored_text("[✗]", color="VULN") if e.vulnerable else get_colored_text("[✓]", color="NOTVULN")
                 method_upper = e.method.upper()
                 out_str = f'{icon} {method_upper} method {status}{slowdown}'
                 self.ptprint(f"    {out_str}", Out.TEXT)
 
-                if not e.vulnerable:
-                    continue
-
-                json_lines.append(out_str)
-
-                if (results := e.results) is not None:
-                    out_str = f"Enumerated {len(results)} users"
-                    self.ptprint(f"    {out_str}", Out.INFO)
+            json_lines = []
+            for e in filtered:
+                out_str = f'{get_colored_text("[✗]" if e.vulnerable else "[✓]", color="VULN" if e.vulnerable else "NOTVULN")} {e.method.upper()} method {"is enabled" if e.vulnerable else "is deny"}'
+                if e.vulnerable:
                     json_lines.append(out_str)
-
-                    for r in results:
+                if e.vulnerable and (results := e.results) is not None:
+                    sorted_results = sorted(results, key=str)
+                    email_count = sum(1 for r in sorted_results if "@" in str(r))
+                    out_str = f"Enumerated {email_count} users"
+                    self.ptprint(out_str, Out.INFO)
+                    json_lines.append(out_str)
+                    for r in sorted_results:
                         self.ptprint(f"    {r}")
                         json_lines.append(r)
 
@@ -1441,7 +2387,8 @@ class SMTP(BaseModule):
                 out_lines.append(f"OS version: {ntlm.ntlm.os_version}")
 
                 for line in out_lines:
-                    self.ptprint(f"        {line}", Out.TEXT)
+                    for part in (line or "").replace("\r", "").splitlines():
+                        self.ptprint(f"        {part}", Out.TEXT)
 
                 self.ptjsonlib.add_vulnerability(
                     VULNS.NTLM.value, "ntlm authentication", "\n".join(out_lines)

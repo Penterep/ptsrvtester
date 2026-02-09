@@ -20,6 +20,7 @@ from .utils.helpers import (
     add_bruteforce_args,
     simple_bruteforce,
 )
+from .utils.service_identification import identify_service
 
 
 # region helper methods
@@ -118,6 +119,7 @@ class AccessCheckResult(NamedTuple):
 
 class InfoResult(NamedTuple):
     banner: str | None
+    help_response: str | None  # HELP command output (list of supported commands)
     syst: str | None
     stat: str | None
 
@@ -126,6 +128,8 @@ class InfoResult(NamedTuple):
 class FTPResults:
     info: InfoResult | None = None
     info_error: str | None = None  # When run-all info/connect fails
+    banner_requested: bool = False
+    commands_requested: bool = False
     access: AccessCheckResult | None = None
     access_error: str | None = None  # When run-all access check fails
     anonymous: bool | None = None
@@ -167,11 +171,14 @@ class FTPArgs(ArgsWithBruteforce):
                 "ptsrvtester ftp -u admin -P passwords.txt 127.0.0.1:21"
             ]},
             {"options": [
-                ["-i", "--info", "", "Grab banner and inspect commands"],
+                ["-i", "--info", "", "Grab banner and inspect HELP, SYST, STAT commands"],
+                ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
+                ["-c", "--commands", "", "Grab HELP, SYST and STAT commands only"],
                 ["-A", "--anonymous", "", "Check anonymous authentication"],
                 ["-a", "--access", "", "Check read/write access"],
                 ["-l", "--access-list", "", "Display directory listing"],
-                ["-b", "--bounce", "", "FTP bounce attack"],
+                ["-B", "--bounce", "", "FTP bounce attack"],
+                ["", "--bounce-file", "<file>", "File with request to send (requires --access)"],
                 ["", "--active", "", "Use active mode"],
                 ["", "--tls", "", "Use implicit SSL/TLS"],
                 ["", "--starttls", "", "Use explicit SSL/TLS"],
@@ -221,8 +228,10 @@ class FTPArgs(ArgsWithBruteforce):
             "-i",
             "--info",
             action="store_true",
-            help="grab banner and inspect STAT an SYST commands",
+            help="grab banner and inspect HELP, SYST and STAT commands",
         )
+        recon.add_argument("-b", "--banner", action="store_true", help="grab banner + Service Identification (product, version, CPE)")
+        recon.add_argument("-c", "--commands", action="store_true", help="grab HELP, SYST and STAT commands only")
         recon.add_argument(
             "-A", "--anonymous", action="store_true", help="check anonymous authentication"
         )
@@ -242,13 +251,12 @@ class FTPArgs(ArgsWithBruteforce):
 
         bounce = parser.add_argument_group("BOUNCE", "FTP bounce attack (requires valid login)")
         bounce.add_argument(
-            "-b",
+            "-B",
             "--bounce",
             type=valid_target_bounce,
             help="bounce to the specified IP:PORT or HOST:PORT service",
         )
         bounce.add_argument(
-            "-B",
             "--bounce-file",
             type=str,
             help="file containing a request to be sent to the attacked service"
@@ -300,6 +308,8 @@ class FTP(BaseModule):
         """True when only target is given (no test switches). Run all tests in sequence."""
         return not (
             self.args.info
+            or self.args.banner
+            or self.args.commands
             or self.args.anonymous
             or self.args.access
             or self.args.access_list
@@ -347,9 +357,19 @@ class FTP(BaseModule):
                 self.args.threads,
             )
 
-        if self.args.info:
+        if self.args.info or self.args.banner or self.args.commands:
+            do_banner = self.args.banner or self.args.info
+            do_commands = self.args.commands or self.args.info
+            self.results.banner_requested = do_banner
+            self.results.commands_requested = do_commands
             try:
-                self.results.info = self.info()
+                info = self.info(get_commands=do_commands)
+                self.results.info = InfoResult(
+                    info.banner if do_banner else None,
+                    info.help_response if do_commands else None,
+                    info.syst if do_commands else None,
+                    info.stat if do_commands else None,
+                )
             except Exception as e:
                 self.results.info_error = str(e)
 
@@ -362,10 +382,12 @@ class FTP(BaseModule):
 
     def _run_all_tests(self) -> None:
         """Run all tests in sequence. On failure: print error, continue with next."""
-        # 1. Info (banner, SYST, STAT)
+        # 1. Banner + commands (SYST, STAT)
+        self.results.banner_requested = True
+        self.results.commands_requested = True
         try:
             self.ftp = self.connect()
-            self.results.info = self.info()
+            self.results.info = self.info(get_commands=True)
         except TestFailedError as e:
             self.results.info_error = str(e)
             return
@@ -420,40 +442,44 @@ class FTP(BaseModule):
         ftp.set_pasv(not self.args.active)
         return ftp
 
-    def info(self) -> InfoResult:
-        """Performs bannergrabbing, SYST and STAT commands
+    def info(self, get_commands: bool = True) -> InfoResult:
+        """Performs bannergrabbing; optionally HELP, SYST and STAT commands.
 
         Returns:
-            InfoResult: results
+            InfoResult: (banner, help_response, syst, stat)
         """
-
         banner = self.ftp.welcome
         if banner is None:
             banner = ""
 
-        try:
-            syst = self.ftp.sendcmd("SYST")
+        help_response = None
+        syst = None
+        stat = None
+        if get_commands:
+            try:
+                help_response = self.ftp.sendcmd("HELP")
+                if help_response and help_response.strip():
+                    help_response = help_response.strip()
+                else:
+                    help_response = None
+            except Exception:
+                pass
+            try:
+                syst = self.ftp.sendcmd("SYST")
+                if re.match(r"[0-9]+ UNIX Type: L8", syst):
+                    syst = None
+            except Exception:
+                pass
+            try:
+                if not self.results.anonymous and self.results.creds is not None:
+                    for creds in self.results.creds:
+                        self.ftp.login(creds.user, creds.passw)
+                        break
+                stat = self.ftp.sendcmd("STAT")
+            except Exception:
+                pass
 
-            # Meaningless answer
-            if re.match(r"[0-9]+ UNIX Type: L8", syst):
-                syst = None
-        except:
-            syst = None
-
-        try:
-            # Executing STAT without login usually fails
-            # If there was no anonymous auth, try to login using random valid creds
-            if not self.results.anonymous and self.results.creds is not None:
-                # use creds without removing them from the set
-                for creds in self.results.creds:
-                    self.ftp.login(creds.user, creds.passw)
-                    break
-
-            stat = self.ftp.sendcmd("STAT")
-        except:
-            stat = None
-
-        return InfoResult(banner, syst, stat)
+        return InfoResult(banner, help_response, syst, stat)
 
     def anonymous(self) -> bool:
         """Attempts anonymous authentication
@@ -751,26 +777,60 @@ class FTP(BaseModule):
             "properties"
         ]
 
-        # Basic information
-        if (info_error := self.results.info_error) is not None:
-            self.ptprint("Server information", Out.INFO)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Info test failed: {info_error}", Out.TEXT)
-            properties["infoError"] = info_error
-        elif info := self.results.info:
-            self.ptprint("Server information", Out.INFO)
+        # Banner (separate section)
+        if self.results.banner_requested:
+            if (info_error := self.results.info_error) is not None:
+                self.ptprint("Banner", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+                properties["infoError"] = info_error
+            elif (info := self.results.info) and info.banner is not None:
+                self.ptprint("Banner", Out.INFO)
+                sid = identify_service(info.banner)
+                if sid is None:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                elif sid.version is not None:
+                    icon = get_colored_text("[✗]", color="VULN")
+                else:
+                    icon = get_colored_text("[!]", color="WARNING")
+                self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
+                properties["banner"] = info.banner
+                if sid is not None:
+                    self.ptprint("Service Identification", Out.INFO)
+                    self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
+                    self.ptprint(
+                        f"    Version:  {sid.version if sid.version else 'unknown'}",
+                        Out.TEXT,
+                    )
+                    self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
+                    properties["serviceIdentification"] = {
+                        "product": sid.product,
+                        "version": sid.version,
+                        "cpe": sid.cpe,
+                    }
 
-            self.ptprint("Banner", Out.INFO)
-            self.ptprint(f"    {info.banner}")
-            properties["banner"] = info.banner
-
-            self.ptprint("SYST command", Out.INFO)
-            self.ptprint(f"    {info.syst}")
-            properties["systCommand"] = info.syst
-
-            self.ptprint("STAT command", Out.INFO)
-            self.ptprint(f"    {info.stat}")
-            properties["statCommand"] = info.stat
+        # HELP, SYST and STAT commands (separate section)
+        if self.results.commands_requested:
+            if (info_error := self.results.info_error) is not None:
+                self.ptprint("HELP command", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+                if "infoError" not in properties:
+                    properties["infoError"] = info_error
+            elif (info := self.results.info) and (info.help_response is not None or info.syst is not None or info.stat is not None):
+                if info.help_response is not None:
+                    self.ptprint("HELP command", Out.INFO)
+                    for line in info.help_response.splitlines():
+                        self.ptprint(f"    {line}", Out.TEXT)
+                    properties["helpCommand"] = info.help_response
+                if info.syst is not None:
+                    self.ptprint("SYST command", Out.INFO)
+                    self.ptprint(f"    {info.syst}")
+                    properties["systCommand"] = info.syst
+                if info.stat is not None:
+                    self.ptprint("STAT command", Out.INFO)
+                    self.ptprint(f"    {info.stat}")
+                    properties["statCommand"] = info.stat
 
         # Anonymous authentication and access permissions
         if (anonymous_error := self.results.anonymous_error) is not None:

@@ -20,6 +20,7 @@ from .utils.helpers import (
     add_bruteforce_args,
     simple_bruteforce,
 )
+from .utils.service_identification import identify_service
 
 
 def valid_target_imap(target: str) -> Target:
@@ -98,7 +99,7 @@ class NTLMResult(NamedTuple):
 
 
 class InfoResult(NamedTuple):
-    banner: str
+    banner: str | None
     id: str | None
     capability: list[str] | None  # Raw list from imap.capabilities
 
@@ -107,6 +108,8 @@ class InfoResult(NamedTuple):
 class IMAPResults:
     info: InfoResult | None = None
     info_error: str | None = None  # When connect/info fails
+    banner_requested: bool = False
+    commands_requested: bool = False
     anonymous: bool | None = None
     ntlm: NTLMResult | None = None
     creds: set[Creds] | None = None
@@ -128,6 +131,8 @@ class IMAPArgs(ArgsWithBruteforce):
     tls: bool
     starttls: bool
     info: bool
+    banner: bool
+    commands: bool
     anonymous: bool
     ntlm: bool
 
@@ -142,6 +147,8 @@ class IMAPArgs(ArgsWithBruteforce):
             ]},
             {"options": [
                 ["-i", "--info", "", "Grab banner, ID and CAPABILITY"],
+                ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
+                ["-c", "--commands", "", "Grab ID and CAPABILITY only"],
                 ["-A", "--anonymous", "", "Check anonymous authentication"],
                 ["-N", "--ntlm", "", "Inspect NTLM authentication"],
                 ["", "", "", ""],
@@ -188,8 +195,10 @@ class IMAPArgs(ArgsWithBruteforce):
             "-i",
             "--info",
             action="store_true",
-            help="grab banner and inspect ID an CAPABILITY commands",
+            help="grab banner and inspect ID and CAPABILITY commands",
         )
+        recon.add_argument("-b", "--banner", action="store_true", help="grab banner + Service Identification (product, version, CPE)")
+        recon.add_argument("-c", "--commands", action="store_true", help="grab ID and CAPABILITY only")
         recon.add_argument(
             "-A", "--anonymous", action="store_true", help="check anonymous authentication"
         )
@@ -235,6 +244,8 @@ class IMAP(BaseModule):
         """True when only target is given (no test switches). Run basic info + anonymous."""
         return not (
             self.args.info
+            or self.args.banner
+            or self.args.commands
             or self.args.ntlm
             or self.args.anonymous
             or self.do_brute
@@ -243,16 +254,28 @@ class IMAP(BaseModule):
     def run(self) -> None:
         """Executes IMAP methods based on module configuration"""
         self.results = IMAPResults()
+        if self._is_default_mode():
+            self.results.banner_requested = True
+            self.results.commands_requested = True
         self.imap = self.connect()
 
         if self._is_default_mode():
-            # Only target given: run basic tests (info + anonymous), like FTP
-            self.results.info = self.info()
+            # Only target given: run basic tests (banner + commands + anonymous)
+            self.results.info = self.info(get_commands=True)
             self.results.anonymous = self.auth_anonymous()
             return
 
-        if self.args.info:
-            self.results.info = self.info()
+        if self.args.info or self.args.banner or self.args.commands:
+            do_banner = self.args.banner or self.args.info
+            do_commands = self.args.commands or self.args.info
+            self.results.banner_requested = do_banner
+            self.results.commands_requested = do_commands
+            info = self.info(get_commands=do_commands)
+            self.results.info = InfoResult(
+                info.banner if do_banner else None,
+                info.id if do_commands else None,
+                info.capability if do_commands else None,
+            )
 
         if self.args.ntlm:
             self.results.ntlm = self.auth_ntlm()
@@ -294,31 +317,30 @@ class IMAP(BaseModule):
             raise OSError(msg) from e
         return imap
 
-    def info(self) -> InfoResult:
-        """Performs bannergrabbing, ID and CAPABILITY commands
+    def info(self, get_commands: bool = True) -> InfoResult:
+        """Performs bannergrabbing; optionally ID and CAPABILITY commands.
 
         Returns:
-            InfoResult: results
+            InfoResult: (banner, id or None, capability or None)
         """
         banner = self.imap.welcome.decode()
 
-        id = None
-        try:
-            # According to the built-in commands (e.g. IMAP4.capability())
-            name = "ID"
-            typ, dat = self.imap.xatom(name)
-            typ, res = self.imap._untagged_response(typ, dat, name)
+        id_val = None
+        capability = None
+        if get_commands:
+            try:
+                name = "ID"
+                typ, dat = self.imap.xatom(name)
+                typ, res = self.imap._untagged_response(typ, dat, name)
+                if isinstance(res, list):
+                    id_ = next((d for d in res), None)
+                    if isinstance(id_, bytes):
+                        id_val = id_.decode()
+            except Exception:
+                pass
+            capability = [str(c) for c in self.imap.capabilities]
 
-            if isinstance(res, list):
-                id_ = next((d for d in res), None)
-                if isinstance(id_, bytes):
-                    id = id_.decode()
-        except:
-            pass
-
-        capability = [str(c) for c in self.imap.capabilities]
-
-        return InfoResult(banner, id, capability)
+        return InfoResult(banner, id_val, capability)
 
     def auth_anonymous(self) -> bool:
         """Attempts anonymous authentication
@@ -397,37 +419,66 @@ class IMAP(BaseModule):
             "properties"
         ]
 
-        # Server information
-        if (info_error := self.results.info_error) is not None:
-            self.ptprint("Server information", Out.INFO)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Info test failed: {info_error}", Out.TEXT)
-            properties["infoError"] = info_error
-        elif info := self.results.info:
-            self.ptprint("Server information", Out.INFO)
-
-            self.ptprint("Banner", Out.INFO)
-            self.ptprint(f"    {info.banner}")
-            properties["banner"] = info.banner
-
-            self.ptprint("ID command", Out.INFO)
-            self.ptprint(f"    {info.id}")
-            properties["idCommand"] = info.id
-
-            self.ptprint("CAPABILITY command", Out.INFO)
-            cap_list = info.capability or []
-            parsed = _parse_capability_commands(cap_list)
-            json_lines: list[str] = []
-            for display_str, level in parsed:
-                if level == "ERROR":
-                    icon = get_colored_text("[✗]", color="VULN")
-                elif level == "WARNING":
-                    icon = get_colored_text("[!]", color="WARNING")
-                else:
+        # Banner (separate section)
+        if self.results.banner_requested:
+            if (info_error := self.results.info_error) is not None:
+                self.ptprint("Banner", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+                properties["infoError"] = info_error
+            elif (info := self.results.info) and info.banner is not None:
+                self.ptprint("Banner", Out.INFO)
+                sid = identify_service(info.banner)
+                if sid is None:
                     icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} {display_str}", Out.TEXT)
-                json_lines.append(display_str)
-            properties["capabilityCommand"] = "\n".join(json_lines)
+                elif sid.version is not None:
+                    icon = get_colored_text("[✗]", color="VULN")
+                else:
+                    icon = get_colored_text("[!]", color="WARNING")
+                self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
+                properties["banner"] = info.banner
+                if sid is not None:
+                    self.ptprint("Service Identification", Out.INFO)
+                    self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
+                    self.ptprint(
+                        f"    Version:  {sid.version if sid.version else 'unknown'}",
+                        Out.TEXT,
+                    )
+                    self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
+                    properties["serviceIdentification"] = {
+                        "product": sid.product,
+                        "version": sid.version,
+                        "cpe": sid.cpe,
+                    }
+
+        # ID and CAPABILITY commands (separate section)
+        if self.results.commands_requested:
+            if (info_error := self.results.info_error) is not None:
+                self.ptprint("ID command", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+                if "infoError" not in properties:
+                    properties["infoError"] = info_error
+                self.ptprint("CAPABILITY command", Out.INFO)
+                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+            elif (info := self.results.info) and (info.id is not None or info.capability is not None):
+                self.ptprint("ID command", Out.INFO)
+                self.ptprint(f"    {info.id}")
+                properties["idCommand"] = info.id
+                self.ptprint("CAPABILITY command", Out.INFO)
+                cap_list = info.capability or []
+                parsed = _parse_capability_commands(cap_list)
+                json_lines: list[str] = []
+                for display_str, level in parsed:
+                    if level == "ERROR":
+                        icon = get_colored_text("[✗]", color="VULN")
+                    elif level == "WARNING":
+                        icon = get_colored_text("[!]", color="WARNING")
+                    else:
+                        icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} {display_str}", Out.TEXT)
+                    json_lines.append(display_str)
+                properties["capabilityCommand"] = "\n".join(json_lines)
 
         # Anonymous authentication
         if (anonymous := self.results.anonymous) is not None:

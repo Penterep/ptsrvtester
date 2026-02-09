@@ -164,8 +164,10 @@ def valid_target(target: str, port_required: bool = False, domain_allowed: bool 
         if domain_allowed:
             try:
                 socket.gethostbyname(split[0])
-            except:
-                raise argparse.ArgumentError(None, "Cannot resolve target name into IP address")
+            except Exception:
+                raise argparse.ArgumentError(
+                    None, f"Cannot resolve target name '{split[0]}' into IP address"
+                )
         else:
             raise argparse.ArgumentError(None, "Invalid target IP address")
 
@@ -213,15 +215,24 @@ def text_or_file(text: str | None, filepath: str | None) -> list[str]:
     if text is not None:
         result = [text]
     elif filepath is not None:
+        _encodings = ("utf-8", "cp1250", "iso-8859-2", "cp1252", "latin-1")
         try:
-            with open(filepath, "r") as f:
-                result = f.read().splitlines()
+            with open(filepath, "rb") as f:
+                raw = f.read()
         except FileNotFoundError:
             raise argparse.ArgumentError(None, f"File not found: '{filepath}'")
         except PermissionError:
             raise argparse.ArgumentError(None, f"Cannot read file (permission denied): '{filepath}'")
         except OSError as e:
             raise argparse.ArgumentError(None, f"Cannot read file '{filepath}': {e}")
+        for enc in _encodings:
+            try:
+                result = raw.decode(enc).splitlines()
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            result = raw.decode("utf-8", errors="replace").splitlines()
 
     return result
 

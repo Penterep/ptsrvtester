@@ -93,35 +93,40 @@ ptsrvtester <module> -h     for help for module use
 - Named pipe enumeration
 
 **FTP Module**
-- Banner grabbing
+- Banner and Service Identification
 - Anonymous authentication testing
 - Read/write access testing
 - Credential brute-force
 - FTP bounce attack testing
 
 **SSH Module**
-- Banner and host key retrieval
+- Banner, Service Identification and host key retrieval
 - Authentication method detection
 - Bad public key detection
 - SSH audit (CVE identification)
 - Credential and private key brute-force
 
 **SMTP Module**
+- Banner and Service Identification
 - Server information gathering
+- Encryption testing (plaintext, STARTTLS, TLS); port 465 implicit TLS
 - User enumeration (VRFY, EXPN, RCPT)
 - NTLM information disclosure
 - Open relay testing
+- Catch-all mailbox detection
+- RCPT TO limit test (per-message recipient limit; expects 452/421 or similar)
 - Credential brute-force
 - Blacklist testing
 
 **POP3 Module**
-- Banner and capabilities retrieval
+- Banner, Service Identification and capabilities retrieval
+- Encryption testing (plaintext, STLS, TLS); port 995 implicit TLS
 - Anonymous authentication testing
 - NTLM authentication inspection
 - Credential brute-force
 
 **IMAP Module**
-- Banner and capabilities retrieval
+- Banner, Service Identification and capabilities retrieval
 - Anonymous authentication testing
 - NTLM authentication inspection
 - Credential brute-force

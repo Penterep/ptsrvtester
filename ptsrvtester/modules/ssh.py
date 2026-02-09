@@ -21,6 +21,7 @@ from .utils.helpers import (
     valid_target,
     add_bruteforce_args,
 )
+from .utils.service_identification import identify_service
 
 
 def valid_target_ssh(target: str) -> Target:
@@ -78,7 +79,7 @@ class SSHAuditResult(NamedTuple):
 
 class InfoResult(NamedTuple):
     banner: str | None
-    host_key: str
+    host_key: str | None
     auth_methods: list[str] | None
 
 
@@ -86,6 +87,8 @@ class InfoResult(NamedTuple):
 class SSHResults:
     info: InfoResult | None = None
     info_error: str | None = None  # When run-all info test fails
+    banner_requested: bool = False
+    host_key_requested: bool = False
     ssh_audit: SSHAuditResult | None = None
     ssh_audit_error: str | None = None  # When run-all ssh-audit test fails (exception)
     bad_pubkey: BadPubkeyResult | None = None
@@ -110,6 +113,7 @@ class VULNS(Enum):
 class SSHArgs(ArgsWithBruteforce):
     target: Target
     info: bool
+    banner: bool
     auth_methods: bool
     ssh_audit: bool
     bad_pubkeys: str | None
@@ -128,6 +132,7 @@ class SSHArgs(ArgsWithBruteforce):
             ]},
             {"options": [
                 ["-i", "--info", "", "Get service banner and host key"],
+                ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
                 ["-a", "--auth-methods", "", "Get supported authentication methods"],
                 ["-H", "--bad-pubkeys", "", "Check for static/known host keys"],
                 ["-A", "--bad-authkeys", "", "Check for static user SSH keys"],
@@ -173,6 +178,7 @@ class SSHArgs(ArgsWithBruteforce):
             action="store_true",
             help="get service banner and host key (recommended for connectivity testing)",
         )
+        recon.add_argument("-b", "--banner", action="store_true", help="grab banner + Service Identification (product, version, CPE)")
         recon.add_argument(
             "-a",
             "--auth-methods",
@@ -246,6 +252,7 @@ class SSH(BaseModule):
         """True when only target is given (no test switches). Run all tests in sequence."""
         return not (
             self.args.info
+            or self.args.banner
             or self.args.auth_methods
             or self.args.ssh_audit
             or self.args.bad_pubkeys
@@ -270,11 +277,19 @@ class SSH(BaseModule):
             return
 
         # Normal mode: run only specified tests
-        if self.args.info:
-            self.results.info = self.info(self.args.auth_methods)
+        if self.args.info or self.args.banner:
+            do_banner = self.args.banner or self.args.info
+            do_host_key = self.args.info or bool(self.args.bad_pubkeys)
+            self.results.banner_requested = do_banner
+            self.results.host_key_requested = do_host_key
+            info = self.info(get_commands=do_host_key, auth_methods=self.args.auth_methods)
+            self.results.info = InfoResult(
+                info.banner if do_banner else None,
+                info.host_key if do_host_key else None,
+                info.auth_methods if do_host_key else None,
+            )
 
-            # Pubkey check requires info (that retrieves the key)
-            if self.args.bad_pubkeys:
+            if self.args.bad_pubkeys and self.results.info and self.results.info.host_key:
                 self.results.bad_pubkey = self.bad_pubkey(
                     self.args.bad_pubkeys, self.results.info.host_key
                 )
@@ -290,9 +305,11 @@ class SSH(BaseModule):
 
     def _run_all_tests(self) -> None:
         """Run all tests in sequence. On failure: print error, continue with next."""
-        # 1. Info (with auth_methods=True)
+        # 1. Banner + host key (with auth_methods=True)
+        self.results.banner_requested = True
+        self.results.host_key_requested = True
         try:
-            self.results.info = self.info(True)
+            self.results.info = self.info(get_commands=True, auth_methods=True)
         except TestFailedError as e:
             self.results.info_error = str(e)
             return
@@ -308,14 +325,12 @@ class SSH(BaseModule):
         except Exception as e:
             self.results.ssh_audit_error = str(e)
 
-    def info(self, auth_methods: bool) -> InfoResult:
-        """Grab banner and host key, optionally also query the authentication methods"""
+    def info(self, get_commands: bool = True, auth_methods: bool = False) -> InfoResult:
+        """Grab banner; optionally host key and authentication methods."""
         # Raw banner
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((self.args.target.ip, self.args.target.port))
-
-            # Decode and record the first received line
             banner = sock.recv(4096).strip().splitlines()[0].decode()
             sock.close()
         except Exception as e:
@@ -325,30 +340,28 @@ class SSH(BaseModule):
             )
             self._fail(msg)
 
-        # Host key
-        try:
-            trans = paramiko.Transport((self.args.target.ip, self.args.target.port))
-            trans.start_client()
-            host_key = trans.get_remote_server_key()
-            host_key = host_key.get_name() + " " + host_key.get_base64()
-        except Exception as e:
-            msg = (
-                f"Failed to establish SSH connection with server "
-                + f"{self.args.target.ip}:{self.args.target.port}: {e}"
-            )
-            self._fail(msg)
-
-        # Authentication methods
+        host_key = None
         am = None
-        if auth_methods:
+        if get_commands:
             try:
-                trans.auth_none("")
-            except paramiko.BadAuthenticationType as e:
-                am = e.allowed_types
-            except:
-                pass
-
-        trans.close()
+                trans = paramiko.Transport((self.args.target.ip, self.args.target.port))
+                trans.start_client()
+                hk = trans.get_remote_server_key()
+                host_key = hk.get_name() + " " + hk.get_base64()
+                if auth_methods:
+                    try:
+                        trans.auth_none("")
+                    except paramiko.BadAuthenticationType as e:
+                        am = e.allowed_types
+                    except Exception:
+                        pass
+                trans.close()
+            except Exception as e:
+                msg = (
+                    f"Failed to establish SSH connection with server "
+                    + f"{self.args.target.ip}:{self.args.target.port}: {e}"
+                )
+                self._fail(msg)
 
         return InfoResult(banner, host_key, am)
 
@@ -549,32 +562,60 @@ class SSH(BaseModule):
             "properties"
         ]
 
-        # Server information
-        if (info_error := self.results.info_error) is not None:
-            self.ptprint("Server information", Out.INFO)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Info test failed: {info_error}", Out.TEXT)
-            properties["infoError"] = info_error
-        elif info := self.results.info:
-            self.ptprint("Server information", Out.INFO)
+        # Banner (separate section)
+        if self.results.banner_requested:
+            if (info_error := self.results.info_error) is not None:
+                self.ptprint("Banner", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+                properties["infoError"] = info_error
+            elif (info := self.results.info) and info.banner is not None:
+                self.ptprint("Banner", Out.INFO)
+                sid = identify_service(info.banner)
+                if sid is None:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                elif sid.version is not None:
+                    icon = get_colored_text("[✗]", color="VULN")
+                else:
+                    icon = get_colored_text("[!]", color="WARNING")
+                self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
+                properties["banner"] = info.banner
+                if sid is not None:
+                    self.ptprint("Service Identification", Out.INFO)
+                    self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
+                    self.ptprint(
+                        f"    Version:  {sid.version if sid.version else 'unknown'}",
+                        Out.TEXT,
+                    )
+                    self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
+                    properties["serviceIdentification"] = {
+                        "product": sid.product,
+                        "version": sid.version,
+                        "cpe": sid.cpe,
+                    }
 
-            self.ptprint("Banner", Out.INFO)
-            self.ptprint(f"    {info.banner}")
-            properties["banner"] = info.banner
+        # Host key (separate section)
+        if self.results.host_key_requested:
+            if (info_error := self.results.info_error) is not None:
+                self.ptprint("Host key", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+                if "infoError" not in properties:
+                    properties["infoError"] = info_error
+            elif (info := self.results.info) and info.host_key is not None:
+                self.ptprint("Host key", Out.INFO)
+                self.ptprint(f"    {info.host_key}")
+                properties["hostKey"] = info.host_key
 
-            self.ptprint("Host key", Out.INFO)
-            self.ptprint(f"    {info.host_key}")
-            properties["hostKey"] = info.host_key
-
-            if info.auth_methods is not None:
-                self.ptprint("Authentication methods", Out.INFO)
-                for method in info.auth_methods:
-                    if method.lower() == "password":
-                        icon = get_colored_text("[✗]", color="VULN")
-                    else:
-                        icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} {method}", Out.TEXT)
-                properties["authMethods"] = info.auth_methods
+        if (info := self.results.info) and info.auth_methods is not None:
+            self.ptprint("Authentication methods", Out.INFO)
+            for method in info.auth_methods:
+                if method.lower() == "password":
+                    icon = get_colored_text("[✗]", color="VULN")
+                else:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} {method}", Out.TEXT)
+            properties["authMethods"] = info.auth_methods
 
         # ssh-audit results
         if (ssh_audit_error := self.results.ssh_audit_error) is not None:

@@ -185,6 +185,10 @@ def parse_args() -> BaseArgs:
     subparsers = parser.add_subparsers(required=True, dest="module", parser_class=CustomArgumentParser)
     for name, module in MODULES.items():
         module.module_args().add_subparser(name, subparsers)
+    # Global options must be on each subparser too (subparser parses the remainder of argv)
+    for subp in subparsers.choices.values():
+        subp.add_argument("-j", "--json", action="store_true", help="use Penterep JSON output format")
+        subp.add_argument("--debug", action="store_true", help="enable debug messages")
 
     # First parse to get the module name, second parse to get the module-specific arguments
     try:

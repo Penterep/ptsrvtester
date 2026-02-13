@@ -194,6 +194,40 @@ def parse_args() -> BaseArgs:
     try:
         args = parser.parse_args(namespace=BaseArgs)
         args = parser.parse_args(namespace=MODULES[args.module].module_args())
+
+        # Reject unknown options: argparse can treat -i as prefix of -ie etc., so check explicitly
+        subp = subparsers.choices[args.module]
+        known = set()
+        takes_value = set()
+        for a in subp._actions:
+            for opt in getattr(a, "option_strings", ()):
+                known.add(opt)
+                if getattr(a, "nargs", None) != 0 and (
+                    getattr(a, "nargs", None) is not None or getattr(a, "type", None) is not None
+                ):
+                    takes_value.add(opt)
+        argv = sys.argv[2:]
+        i = 0
+        invalid = []
+        while i < len(argv):
+            tok = argv[i]
+            if tok == "--":
+                i += 1
+                break
+            if not tok.startswith("-") or tok == "-":
+                i += 1
+                continue
+            if tok in known:
+                if tok in takes_value and i + 1 < len(argv) and not argv[i + 1].startswith("-") and argv[i + 1] != "--":
+                    i += 2
+                else:
+                    i += 1
+                continue
+            invalid.append(tok)
+            i += 1
+        if invalid:
+            shared_error["message"] = f"Invalid option(s): {', '.join(invalid)}"
+            raise SystemExit(2)
     except (SystemExit, argparse.ArgumentError) as e:
         # Argparse error occurred
         error_code = e.code if isinstance(e, SystemExit) else 2
@@ -257,6 +291,11 @@ def main() -> None:
         print(f"\n\033[31m[✗]\033[0m Error: {e.message}")
         print()
         sys.exit(2)
+    except OSError as e:
+        # Connection failed (e.g. connection refused, timeout) - show message without traceback
+        print(f"\n\033[31m[✗]\033[0m {e}")
+        print()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from .utils.helpers import (
     get_mode,
     text,
     valid_target,
+    vendor_from_cpe,
     add_bruteforce_args,
     simple_bruteforce,
 )
@@ -181,7 +182,7 @@ class POP3Args(ArgsWithBruteforce):
         examples = """example usage:
   ptsrvtester pop3 -h
   ptsrvtester pop3 --tls -iAN 127.0.0.1
-  ptsrvtester -j pop3 -u admin -P passwords.txt --threads 20 127.0.0.1:110"""
+  ptsrvtester -j pop3 -u admin -P passwords.txt --brute-threads 20 127.0.0.1:110"""
 
         parser = subparsers.add_parser(
             name,
@@ -583,18 +584,32 @@ class POP3(BaseModule):
 
     def output(self) -> None:
         """Formats and outputs module results, both normal and JSON mode"""
-        properties: dict[str, None | str | int | list[str]] = self.ptjsonlib.json_object["results"][
-            "properties"
-        ]
+        properties = {
+            "software_type": None,
+            "name": "pop3",
+            "version": None,
+            "vendor": None,
+            "description": None,
+        }
+        deferred_vulns = []
+
+        # Connection error: show only the error line, no section headers
+        if (info_error := getattr(self.results, "info_error", None)) is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+            properties.update({"infoError": info_error})
+            pop3_node = self.ptjsonlib.create_node_object("software", None, None, properties)
+            self.ptjsonlib.add_node(pop3_node)
+            node_key = pop3_node["key"]
+            for v in deferred_vulns:
+                self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
+            self.ptjsonlib.set_status("finished", "")
+            self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+            return
 
         # Banner (separate section)
         if self.results.banner_requested:
-            if (info_error := self.results.info_error) is not None:
-                self.ptprint("Banner", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                properties["infoError"] = info_error
-            elif (info := self.results.info) and info.banner is not None:
+            if (info := self.results.info) and info.banner is not None:
                 self.ptprint("Banner", Out.INFO)
                 sid = identify_service(info.banner)
                 if sid is None:
@@ -604,8 +619,18 @@ class POP3(BaseModule):
                 else:
                     icon = get_colored_text("[!]", color="WARNING")
                 self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
-                properties["banner"] = info.banner
+                vendor = vendor_from_cpe(sid.cpe) if sid else None
+                version = sid.version if sid else None
+                properties.update(
+                    {
+                        "description": f"Banner: {info.banner}",
+                        "version": version,
+                        "vendor": vendor,
+                    }
+                )
                 if sid is not None:
+                    if sid.version is not None:
+                        deferred_vulns.append({"vuln_code": "PTV-SVC-BANNER"})
                     self.ptprint("Service Identification", Out.INFO)
                     self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
                     self.ptprint(
@@ -613,21 +638,11 @@ class POP3(BaseModule):
                         Out.TEXT,
                     )
                     self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
-                    properties["serviceIdentification"] = {
-                        "product": sid.product,
-                        "version": sid.version,
-                        "cpe": sid.cpe,
-                    }
+                    properties.update({"cpe": sid.cpe})
 
         # CAPA command (PLAIN and/or STLS sections)
         if self.results.commands_requested:
-            if (info_error := self.results.info_error) is not None:
-                self.ptprint("CAPA command", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                if "infoError" not in properties:
-                    properties["infoError"] = info_error
-            elif info := self.results.info:
+            if info := self.results.info:
                 capa_stls = getattr(info, "capability_stls", None)
                 encrypted = self.args.target.port == 995 or self.args.tls
 
@@ -655,14 +670,14 @@ class POP3(BaseModule):
                     title = "CAPA command (TLS)" if encrypted else "CAPA command (PLAIN)"
                     json_lines = _emit_capa_section(title, info.capability, encrypted)
                 if json_lines:
-                    properties["capability"] = "\n".join(json_lines)
+                    properties.update({"capability": "\n".join(json_lines)})
 
         # Encryption options
         if (encryption_error := self.results.encryption_error) is not None:
             self.ptprint("Encryption", Out.INFO)
             icon = get_colored_text("[✗]", color="VULN")
             self.ptprint(f"    {icon} Encryption test failed: {encryption_error}", Out.TEXT)
-            properties["encryptionError"] = encryption_error
+            properties.update({"encryptionError": encryption_error})
         elif (enc := self.results.encryption) is not None:
             self.ptprint("Encryption", Out.INFO)
             plaintext_only = enc.plaintext_ok and not enc.stls_ok and not enc.tls_ok
@@ -672,7 +687,12 @@ class POP3(BaseModule):
                 self.ptprint(f"    {icon} Plaintext only", Out.TEXT)
             elif any_ok:
                 if enc.plaintext_ok:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    # Plaintext available together with STLS/TLS = warning
+                    icon = (
+                        get_colored_text("[!]", color="WARNING")
+                        if (enc.stls_ok or enc.tls_ok)
+                        else get_colored_text("[✓]", color="NOTVULN")
+                    )
                     self.ptprint(f"    {icon} Plaintext", Out.TEXT)
                 if enc.stls_ok:
                     icon = get_colored_text("[✓]", color="NOTVULN")
@@ -686,11 +706,15 @@ class POP3(BaseModule):
                     f"    {icon} No connection mode available (plaintext, STLS, TLS failed)",
                     Out.TEXT,
                 )
-            properties["encryption"] = {
-                "plaintext": enc.plaintext_ok,
-                "stls": enc.stls_ok,
-                "tls": enc.tls_ok,
-            }
+            properties.update(
+                {
+                    "encryption": {
+                        "plaintext": enc.plaintext_ok,
+                        "stls": enc.stls_ok,
+                        "tls": enc.tls_ok,
+                    }
+                }
+            )
 
         # Anonymous authentication
         if (anonymous := self.results.anonymous) is not None:
@@ -698,7 +722,9 @@ class POP3(BaseModule):
             if anonymous:
                 icon = get_colored_text("[✗]", color="VULN")
                 self.ptprint(f"    {icon} Enabled", Out.TEXT)
-                self.ptjsonlib.add_vulnerability(VULNS.Anonymous.value, "anonymous authentication")
+                deferred_vulns.append(
+                    {"vuln_code": VULNS.Anonymous.value, "vuln_request": "anonymous authentication"}
+                )
             else:
                 icon = get_colored_text("[✓]", color="NOTVULN")
                 self.ptprint(f"    {icon} Disabled", Out.TEXT)
@@ -707,10 +733,10 @@ class POP3(BaseModule):
         if ntlm := self.results.ntlm:
             if not ntlm.success:
                 self.ptprint(f"NTLM information failed", Out.NOTVULN)
-                properties["ntlmInfoStatus"] = "failed"
+                properties.update({"ntlmInfoStatus": "failed"})
             elif ntlm.ntlm is not None:
                 self.ptprint(f"NTLM information", Out.VULN)
-                properties["ntlmInfoStatus"] = "ok"
+                properties.update({"ntlmInfoStatus": "ok"})
 
                 out_lines: list[str] = []
                 out_lines.append(f"Target name: {ntlm.ntlm.target_name}")
@@ -724,8 +750,12 @@ class POP3(BaseModule):
                 for line in out_lines:
                     self.ptprint(f"    {line}", Out.INFO)
 
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.NTLM.value, "ntlm authentication", "\n".join(out_lines)
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.NTLM.value,
+                        "vuln_request": "ntlm authentication",
+                        "vuln_response": "\n".join(out_lines),
+                    }
                 )
 
         # Login bruteforce
@@ -750,11 +780,25 @@ class POP3(BaseModule):
                 else:
                     passw_str = f"passwords: {self.args.passwords}"
 
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.WeakCreds.value,
-                    f"{user_str}\n{passw_str}",
-                    "\n".join(json_lines),
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.WeakCreds.value,
+                        "vuln_request": f"{user_str}\n{passw_str}",
+                        "vuln_response": "\n".join(json_lines),
+                    }
                 )
+
+        # Create node at the end with all collected properties and bind vulnerabilities
+        pop3_node = self.ptjsonlib.create_node_object(
+            "software",
+            None,
+            None,
+            properties,
+        )
+        self.ptjsonlib.add_node(pop3_node)
+        node_key = pop3_node["key"]
+        for v in deferred_vulns:
+            self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
 
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)

@@ -16,6 +16,7 @@ from .utils.helpers import (
     ArgsWithBruteforce,
     get_mode,
     valid_target,
+    vendor_from_cpe,
     check_if_brute,
     add_bruteforce_args,
     simple_bruteforce,
@@ -169,7 +170,7 @@ class IMAPArgs(ArgsWithBruteforce):
         examples = """example usage:
   ptsrvtester imap -h
   ptsrvtester imap --tls -iAN 127.0.0.1
-  ptsrvtester -j imap -u admin -P passwords.txt --threads 20 127.0.0.1:143"""
+  ptsrvtester -j imap -u admin -P passwords.txt --brute-threads 20 127.0.0.1:143"""
 
         parser = subparsers.add_parser(
             name,
@@ -257,7 +258,13 @@ class IMAP(BaseModule):
         if self._is_default_mode():
             self.results.banner_requested = True
             self.results.commands_requested = True
-        self.imap = self.connect()
+        try:
+            self.imap = self.connect()
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except Exception as e:
+            self.results.info_error = str(e)
+            return
 
         if self._is_default_mode():
             # Only target given: run basic tests (banner + commands + anonymous)
@@ -415,18 +422,32 @@ class IMAP(BaseModule):
 
     def output(self) -> None:
         """Formats and outputs module results, both normal and JSON mode"""
-        properties: dict[str, None | str | int | list[str]] = self.ptjsonlib.json_object["results"][
-            "properties"
-        ]
+        properties = {
+            "software_type": None,
+            "name": "imap",
+            "version": None,
+            "vendor": None,
+            "description": None,
+        }
+        deferred_vulns = []
+
+        # Connection error: show only the error line, no section headers
+        if (info_error := getattr(self.results, "info_error", None)) is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+            properties.update({"infoError": info_error})
+            imap_node = self.ptjsonlib.create_node_object("software", None, None, properties)
+            self.ptjsonlib.add_node(imap_node)
+            node_key = imap_node["key"]
+            for v in deferred_vulns:
+                self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
+            self.ptjsonlib.set_status("finished", "")
+            self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+            return
 
         # Banner (separate section)
         if self.results.banner_requested:
-            if (info_error := self.results.info_error) is not None:
-                self.ptprint("Banner", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                properties["infoError"] = info_error
-            elif (info := self.results.info) and info.banner is not None:
+            if (info := self.results.info) and info.banner is not None:
                 self.ptprint("Banner", Out.INFO)
                 sid = identify_service(info.banner)
                 if sid is None:
@@ -436,8 +457,18 @@ class IMAP(BaseModule):
                 else:
                     icon = get_colored_text("[!]", color="WARNING")
                 self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
-                properties["banner"] = info.banner
+                vendor = vendor_from_cpe(sid.cpe) if sid else None
+                version = sid.version if sid else None
+                properties.update(
+                    {
+                        "description": f"Banner: {info.banner}",
+                        "version": version,
+                        "vendor": vendor,
+                    }
+                )
                 if sid is not None:
+                    if sid.version is not None:
+                        deferred_vulns.append({"vuln_code": "PTV-SVC-BANNER"})
                     self.ptprint("Service Identification", Out.INFO)
                     self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
                     self.ptprint(
@@ -445,26 +476,14 @@ class IMAP(BaseModule):
                         Out.TEXT,
                     )
                     self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
-                    properties["serviceIdentification"] = {
-                        "product": sid.product,
-                        "version": sid.version,
-                        "cpe": sid.cpe,
-                    }
+                    properties.update({"cpe": sid.cpe})
 
         # ID and CAPABILITY commands (separate section)
         if self.results.commands_requested:
-            if (info_error := self.results.info_error) is not None:
-                self.ptprint("ID command", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                if "infoError" not in properties:
-                    properties["infoError"] = info_error
-                self.ptprint("CAPABILITY command", Out.INFO)
-                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-            elif (info := self.results.info) and (info.id is not None or info.capability is not None):
+            if (info := self.results.info) and (info.id is not None or info.capability is not None):
                 self.ptprint("ID command", Out.INFO)
                 self.ptprint(f"    {info.id}")
-                properties["idCommand"] = info.id
+                properties.update({"idCommand": info.id})
                 self.ptprint("CAPABILITY command", Out.INFO)
                 cap_list = info.capability or []
                 parsed = _parse_capability_commands(cap_list)
@@ -478,7 +497,7 @@ class IMAP(BaseModule):
                         icon = get_colored_text("[✓]", color="NOTVULN")
                     self.ptprint(f"    {icon} {display_str}", Out.TEXT)
                     json_lines.append(display_str)
-                properties["capabilityCommand"] = "\n".join(json_lines)
+                properties.update({"capabilityCommand": "\n".join(json_lines)})
 
         # Anonymous authentication
         if (anonymous := self.results.anonymous) is not None:
@@ -486,7 +505,9 @@ class IMAP(BaseModule):
             if anonymous:
                 icon = get_colored_text("[✗]", color="VULN")
                 self.ptprint(f"    {icon} Enabled", Out.TEXT)
-                self.ptjsonlib.add_vulnerability(VULNS.Anonymous.value, "anonymous authentication")
+                deferred_vulns.append(
+                    {"vuln_code": VULNS.Anonymous.value, "vuln_request": "anonymous authentication"}
+                )
             else:
                 icon = get_colored_text("[✓]", color="NOTVULN")
                 self.ptprint(f"    {icon} Disabled", Out.TEXT)
@@ -495,10 +516,10 @@ class IMAP(BaseModule):
         if ntlm := self.results.ntlm:
             if not ntlm.success:
                 self.ptprint(f"NTLM information failed", Out.NOTVULN)
-                properties["ntlmInfoStatus"] = "failed"
+                properties.update({"ntlmInfoStatus": "failed"})
             elif ntlm.ntlm is not None:
                 self.ptprint(f"NTLM information", Out.VULN)
-                properties["ntlmInfoStatus"] = "ok"
+                properties.update({"ntlmInfoStatus": "ok"})
 
                 out_lines: list[str] = []
                 out_lines.append(f"Target name: {ntlm.ntlm.target_name}")
@@ -512,8 +533,12 @@ class IMAP(BaseModule):
                 for line in out_lines:
                     self.ptprint(f"    {line}", Out.INFO)
 
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.NTLM.value, "ntlm authentication", "\n".join(out_lines)
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.NTLM.value,
+                        "vuln_request": "ntlm authentication",
+                        "vuln_response": "\n".join(out_lines),
+                    }
                 )
 
         # Login bruteforce
@@ -538,11 +563,25 @@ class IMAP(BaseModule):
                 else:
                     passw_str = f"passwords: {self.args.passwords}"
 
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.WeakCreds.value,
-                    f"{user_str}\n{passw_str}",
-                    "\n".join(json_lines),
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.WeakCreds.value,
+                        "vuln_request": f"{user_str}\n{passw_str}",
+                        "vuln_response": "\n".join(json_lines),
+                    }
                 )
+
+        # Create node at the end with all collected properties and bind vulnerabilities
+        imap_node = self.ptjsonlib.create_node_object(
+            "software",
+            None,
+            None,
+            properties,
+        )
+        self.ptjsonlib.add_node(imap_node)
+        node_key = imap_node["key"]
+        for v in deferred_vulns:
+            self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
 
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)

@@ -19,6 +19,7 @@ from .utils.helpers import (
     filepaths,
     text_or_file,
     valid_target,
+    vendor_from_cpe,
     add_bruteforce_args,
 )
 from .utils.service_identification import identify_service
@@ -152,7 +153,7 @@ class SSHArgs(ArgsWithBruteforce):
         examples = """example usage:
   ptsrvtester ssh -h
   ptsrvtester ssh -ia --bad-pubkeys ./hostkeys/ 127.0.0.1
-  ptsrvtester -j ssh -u admin -P passwords.txt --threads 20 127.0.0.1:22
+  ptsrvtester -j ssh -u admin -P passwords.txt --brute-threads 20 127.0.0.1:22
   ptsrvtester ssh --ssh-audit 127.0.0.1"""
 
         parser = subparsers.add_parser(
@@ -558,9 +559,14 @@ class SSH(BaseModule):
     # region output
 
     def output(self) -> None:
-        properties: dict[str, None | str | int | list[str]] = self.ptjsonlib.json_object["results"][
-            "properties"
-        ]
+        properties = {
+            "software_type": None,
+            "name": "ssh",
+            "version": None,
+            "vendor": None,
+            "description": None,
+        }
+        deferred_vulns = []
 
         # Banner (separate section)
         if self.results.banner_requested:
@@ -568,7 +574,7 @@ class SSH(BaseModule):
                 self.ptprint("Banner", Out.INFO)
                 icon = get_colored_text("[✗]", color="VULN")
                 self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                properties["infoError"] = info_error
+                properties.update({"infoError": info_error})
             elif (info := self.results.info) and info.banner is not None:
                 self.ptprint("Banner", Out.INFO)
                 sid = identify_service(info.banner)
@@ -579,8 +585,18 @@ class SSH(BaseModule):
                 else:
                     icon = get_colored_text("[!]", color="WARNING")
                 self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
-                properties["banner"] = info.banner
+                vendor = vendor_from_cpe(sid.cpe) if sid else None
+                version = sid.version if sid else None
+                properties.update(
+                    {
+                        "description": f"Banner: {info.banner}",
+                        "version": version,
+                        "vendor": vendor,
+                    }
+                )
                 if sid is not None:
+                    if sid.version is not None:
+                        deferred_vulns.append({"vuln_code": "PTV-SVC-BANNER"})
                     self.ptprint("Service Identification", Out.INFO)
                     self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
                     self.ptprint(
@@ -588,11 +604,7 @@ class SSH(BaseModule):
                         Out.TEXT,
                     )
                     self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
-                    properties["serviceIdentification"] = {
-                        "product": sid.product,
-                        "version": sid.version,
-                        "cpe": sid.cpe,
-                    }
+                    properties.update({"cpe": sid.cpe})
 
         # Host key (separate section)
         if self.results.host_key_requested:
@@ -600,12 +612,11 @@ class SSH(BaseModule):
                 self.ptprint("Host key", Out.INFO)
                 icon = get_colored_text("[✗]", color="VULN")
                 self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                if "infoError" not in properties:
-                    properties["infoError"] = info_error
+                properties.update({"infoError": info_error})
             elif (info := self.results.info) and info.host_key is not None:
                 self.ptprint("Host key", Out.INFO)
                 self.ptprint(f"    {info.host_key}")
-                properties["hostKey"] = info.host_key
+                properties.update({"hostKey": info.host_key})
 
         if (info := self.results.info) and info.auth_methods is not None:
             self.ptprint("Authentication methods", Out.INFO)
@@ -615,22 +626,22 @@ class SSH(BaseModule):
                 else:
                     icon = get_colored_text("[✓]", color="NOTVULN")
                 self.ptprint(f"    {icon} {method}", Out.TEXT)
-            properties["authMethods"] = info.auth_methods
+            properties.update({"authMethods": info.auth_methods})
 
         # ssh-audit results
         if (ssh_audit_error := self.results.ssh_audit_error) is not None:
             self.ptprint("ssh-audit scan results", Out.INFO)
             icon = get_colored_text("[✗]", color="VULN")
             self.ptprint(f"    {icon} SSH-audit test failed: {ssh_audit_error}", Out.TEXT)
-            properties["sshauditError"] = ssh_audit_error
+            properties.update({"sshauditError": ssh_audit_error})
         elif ssh_audit := self.results.ssh_audit:
 
             if ssh_audit.err is not None:
                 self.ptprint(f"ssh-audit scan failed with error: {ssh_audit.err}", Out.INFO)
-                properties["sshauditStatus"] = ssh_audit.err
+                properties.update({"sshauditStatus": ssh_audit.err})
             else:
                 self.ptprint("ssh-audit scan results", Out.INFO)
-                properties["sshauditStatus"] = "ok"
+                properties.update({"sshauditStatus": "ok"})
 
                 json_lines: list[str] = []
                 self.ptprint(f"    Identified {len(ssh_audit.cves)} CVEs", Out.TEXT)
@@ -640,8 +651,12 @@ class SSH(BaseModule):
                     json_lines.append(cve_str)
 
                 if len(json_lines) > 0:
-                    self.ptjsonlib.add_vulnerability(
-                        VULNS.CVE.value, "ssh-audit scan", "\n".join(json_lines)
+                    deferred_vulns.append(
+                        {
+                            "vuln_code": VULNS.CVE.value,
+                            "vuln_request": "ssh-audit scan",
+                            "vuln_response": "\n".join(json_lines),
+                        }
                     )
 
                 json_lines = []
@@ -657,7 +672,7 @@ class SSH(BaseModule):
                         level_prefix = get_colored_text("[!]", color="WARNING")
                     else:
                         level_prefix = find.level.upper()
-                    
+
                     find_str = (
                         f"{level_prefix} {find.category}/{find.action}: {find.name}"
                         + (f" ({find.notes})" if find.notes else "")
@@ -671,8 +686,12 @@ class SSH(BaseModule):
                     json_lines.append(json_str)
 
                 if len(json_lines) > 0:
-                    self.ptjsonlib.add_vulnerability(
-                        VULNS.InsecureCrypto.value, "ssh-audit scan", "\n".join(json_lines)
+                    deferred_vulns.append(
+                        {
+                            "vuln_code": VULNS.InsecureCrypto.value,
+                            "vuln_request": "ssh-audit scan",
+                            "vuln_response": "\n".join(json_lines),
+                        }
                     )
 
         # Bad host key
@@ -682,10 +701,12 @@ class SSH(BaseModule):
             if badpubkey.bad:
                 self.ptprint("    Matched key path", Out.INFO)
                 self.ptprint(f"        {badpubkey.path}")
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.BadHostKey.value,
-                    f"matched key from: {self.args.bad_pubkeys}",
-                    badpubkey.path,
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.BadHostKey.value,
+                        "vuln_request": f"matched key from: {self.args.bad_pubkeys}",
+                        "vuln_response": badpubkey.path,
+                    }
                 )
 
         # Bad auth keys
@@ -703,10 +724,12 @@ class SSH(BaseModule):
                     self.ptprint(f"        {authkey}")
                     json_lines.append(authkey)
 
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.BadAuthKeys.value,
-                    f"matched keys from: {self.args.bad_authkeys}",
-                    "\n".join(json_lines),
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.BadAuthKeys.value,
+                        "vuln_request": f"matched keys from: {self.args.bad_authkeys}",
+                        "vuln_response": "\n".join(json_lines),
+                    }
                 )
 
         # Login bruteforce
@@ -716,12 +739,12 @@ class SSH(BaseModule):
             if brute.errors:
                 self.ptprint(
                     "WARNING: there were some errors during the bruteforce process."
-                    + " Try reducing the --threads parameter",
+                    + " Try reducing the --brute-threads parameter",
                     Out.WARNING,
                 )
-                properties["bruteStatus"] = "errors"
+                properties.update({"bruteStatus": "errors"})
             else:
-                properties["bruteStatus"] = "ok"
+                properties.update({"bruteStatus": "ok"})
 
             if len(brute.creds) > 0:
                 json_lines = []
@@ -749,11 +772,25 @@ class SSH(BaseModule):
                 else:
                     passw_str = f"passwords: {self.args.passwords}"
 
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.WeakCreds.value,
-                    f"{user_str}\n{passw_str}",
-                    "\n".join(json_lines),
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.WeakCreds.value,
+                        "vuln_request": f"{user_str}\n{passw_str}",
+                        "vuln_response": "\n".join(json_lines),
+                    }
                 )
+
+        # Create node at the end with all collected properties and bind vulnerabilities
+        ssh_node = self.ptjsonlib.create_node_object(
+            "software",
+            None,
+            None,
+            properties,
+        )
+        self.ptjsonlib.add_node(ssh_node)
+        node_key = ssh_node["key"]
+        for v in deferred_vulns:
+            self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
 
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)

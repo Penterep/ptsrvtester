@@ -670,7 +670,6 @@ class LDAP(BaseModule):
         WeakCredentials = "PTV-LDAP-WEAKCREDENTIALS"
         Write = "PTV-LDAP-WRITEACCESS"
         """
-
         def credentials_to_string(creds: List[Credential]) -> str:
             return ", ".join(
                 f"{c.username or 'None'}:{c.password or 'None'}"
@@ -679,19 +678,41 @@ class LDAP(BaseModule):
         def write_results_to_string(result: TestWriteResult) -> str:
             return f"{result.target_dn or 'None'}-{result.atribute or 'None'}-{result.value}-{result.credentials}"
 
-        if (self.results.usernames != None):
-            if len(self.results.usernames) != 0:
-                self.ptjsonlib.add_vulnerability(VULNS.WeakUsername.value, "Searching for usernames", ",".join(self.results.usernames))
-        
+        properties = {
+            "software_type": None,
+            "name": "ldap",
+            "version": None,
+            "vendor": None,
+            "description": None,
+            "usernames": self.results.usernames if self.results.usernames is not None else None,
+            "credentials": credentials_to_string(self.results.credentials) if self.results.credentials is not None else None,
+            "writetest": ", ".join(write_results_to_string(r) for r in self.results.Writetest) if self.results.Writetest is not None and len(self.results.Writetest) != 0 else None,
+        }
+        deferred_vulns = []
 
-        if (self.results.credentials != None):
-            if len(self.results.credentials) != 0:
-                cred_str = credentials_to_string(self.results.credentials)
-                self.ptjsonlib.add_vulnerability(VULNS.WeakCredentials.value, "Bruteforcing LDAP credentials", cred_str) 
+        if self.results.usernames is not None and len(self.results.usernames) != 0:
+            deferred_vulns.append({
+                "vuln_code": VULNS.WeakUsername.value,
+                "vuln_request": "Searching for usernames",
+                "vuln_response": ",".join(self.results.usernames),
+            })
+        if self.results.credentials is not None and len(self.results.credentials) != 0:
+            deferred_vulns.append({
+                "vuln_code": VULNS.WeakCredentials.value,
+                "vuln_request": "Bruteforcing LDAP credentials",
+                "vuln_response": credentials_to_string(self.results.credentials),
+            })
+        if self.results.Writetest is not None and len(self.results.Writetest) != 0:
+            deferred_vulns.append({
+                "vuln_code": VULNS.Write.value,
+                "vuln_request": "Testing write access",
+                "vuln_response": ", ".join(write_results_to_string(r) for r in self.results.Writetest),
+            })
 
-        if (self.results.Writetest != None):
-            if len(self.results.Writetest) != 0:
-                value_str = write_results_to_string(self.results.Writetest)
-                self.ptjsonlib.add_vulnerability(VULNS.Write.value, "Testing write access", value_str)
+        ldap_node = self.ptjsonlib.create_node_object("software", None, None, properties)
+        self.ptjsonlib.add_node(ldap_node)
+        node_key = ldap_node["key"]
+        for v in deferred_vulns:
+            self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
 
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)

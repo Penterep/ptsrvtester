@@ -7,6 +7,16 @@ from ptlibs.threads import ptthreads
 from .._base import BaseArgs
 
 
+def vendor_from_cpe(cpe: str | None) -> str | None:
+    """Extract vendor from CPE 2.3 string (e.g. cpe:2.3:a:microsoft:exchange_server:* -> microsoft)."""
+    if not cpe or ":" not in cpe:
+        return None
+    parts = cpe.split(":")
+    if len(parts) >= 4 and parts[2] in ("a", "o", "h"):
+        return parts[3] or None
+    return None
+
+
 @dataclass(frozen=True)
 class Creds:
     user: str
@@ -63,11 +73,12 @@ def add_bruteforce_args(parser: argparse.ArgumentParser):
         help="try 1 password/key for all users (instead of trying all passwords/keys for 1 user)",
     )
     bruteforce.add_argument(
-        "--threads",
+        "--brute-threads",
         type=int,
         default=10,
         nargs="?",
-        help="numbers of threads (by default 10)",
+        dest="threads",
+        help="number of threads for bruteforce (default: 10)",
     )
 
 

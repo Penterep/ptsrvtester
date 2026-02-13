@@ -17,6 +17,7 @@ from .utils.helpers import (
     check_if_brute,
     get_mode,
     valid_target,
+    vendor_from_cpe,
     add_bruteforce_args,
     simple_bruteforce,
 )
@@ -198,7 +199,7 @@ class FTPArgs(ArgsWithBruteforce):
         examples = """example usage:
   ptsrvtester ftp -h
   ptsrvtester ftp --starttls -iAal 127.0.0.1
-  ptsrvtester -j ftp -u admin -P passwords.txt --threads 20 127.0.0.1:21"""
+  ptsrvtester -j ftp -u admin -P passwords.txt --brute-threads 20 127.0.0.1:21"""
 
         parser = subparsers.add_parser(
             name,
@@ -773,18 +774,32 @@ class FTP(BaseModule):
 
     def output(self) -> None:
         """Formats and outputs module results, both normal and JSON mode"""
-        properties: dict[str, None | str | int | list[str]] = self.ptjsonlib.json_object["results"][
-            "properties"
-        ]
+        properties = {
+            "software_type": None,
+            "name": "ftp",
+            "version": None,
+            "vendor": None,
+            "description": None,
+        }
+        deferred_vulns = []
+
+        # Connection error: show only the error line, no section headers
+        if (info_error := getattr(self.results, "info_error", None)) is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+            properties.update({"infoError": info_error})
+            ftp_node = self.ptjsonlib.create_node_object("software", None, None, properties)
+            self.ptjsonlib.add_node(ftp_node)
+            node_key = ftp_node["key"]
+            for v in deferred_vulns:
+                self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
+            self.ptjsonlib.set_status("finished", "")
+            self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+            return
 
         # Banner (separate section)
         if self.results.banner_requested:
-            if (info_error := self.results.info_error) is not None:
-                self.ptprint("Banner", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                properties["infoError"] = info_error
-            elif (info := self.results.info) and info.banner is not None:
+            if (info := self.results.info) and info.banner is not None:
                 self.ptprint("Banner", Out.INFO)
                 sid = identify_service(info.banner)
                 if sid is None:
@@ -794,8 +809,18 @@ class FTP(BaseModule):
                 else:
                     icon = get_colored_text("[!]", color="WARNING")
                 self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
-                properties["banner"] = info.banner
+                vendor = vendor_from_cpe(sid.cpe) if sid else None
+                version = sid.version if sid else None
+                properties.update(
+                    {
+                        "description": f"Banner: {info.banner}",
+                        "version": version,
+                        "vendor": vendor,
+                    }
+                )
                 if sid is not None:
+                    if sid.version is not None:
+                        deferred_vulns.append({"vuln_code": "PTV-SVC-BANNER"})
                     self.ptprint("Service Identification", Out.INFO)
                     self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
                     self.ptprint(
@@ -803,47 +828,37 @@ class FTP(BaseModule):
                         Out.TEXT,
                     )
                     self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
-                    properties["serviceIdentification"] = {
-                        "product": sid.product,
-                        "version": sid.version,
-                        "cpe": sid.cpe,
-                    }
+                    properties.update({"cpe": sid.cpe})
 
         # HELP, SYST and STAT commands (separate section)
         if self.results.commands_requested:
-            if (info_error := self.results.info_error) is not None:
-                self.ptprint("HELP command", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                if "infoError" not in properties:
-                    properties["infoError"] = info_error
-            elif (info := self.results.info) and (info.help_response is not None or info.syst is not None or info.stat is not None):
+            if (info := self.results.info) and (info.help_response is not None or info.syst is not None or info.stat is not None):
                 if info.help_response is not None:
                     self.ptprint("HELP command", Out.INFO)
                     for line in info.help_response.splitlines():
                         self.ptprint(f"    {line}", Out.TEXT)
-                    properties["helpCommand"] = info.help_response
+                    properties.update({"helpCommand": info.help_response})
                 if info.syst is not None:
                     self.ptprint("SYST command", Out.INFO)
                     self.ptprint(f"    {info.syst}")
-                    properties["systCommand"] = info.syst
+                    properties.update({"systCommand": info.syst})
                 if info.stat is not None:
                     self.ptprint("STAT command", Out.INFO)
                     self.ptprint(f"    {info.stat}")
-                    properties["statCommand"] = info.stat
+                    properties.update({"statCommand": info.stat})
 
         # Anonymous authentication and access permissions
         if (anonymous_error := self.results.anonymous_error) is not None:
             self.ptprint("Authentication", Out.INFO)
             icon = get_colored_text("[✗]", color="VULN")
             self.ptprint(f"    {icon} Anonymous test failed: {anonymous_error}", Out.TEXT)
-            properties["anonymousError"] = anonymous_error
+            properties.update({"anonymousError": anonymous_error})
         elif (access_error := self.results.access_error) is not None:
             self.ptprint("Authentication", Out.INFO)
             icon = get_colored_text("[✗]", color="VULN")
             self.ptprint(f"    {icon} Anonymous authentication is enabled", Out.TEXT)
             self.ptprint(f"    {icon} Access check failed: {access_error}", Out.TEXT)
-            properties["accessError"] = access_error
+            properties.update({"accessError": access_error})
         elif (anon := self.results.anonymous) is not None:
             self.ptprint("Authentication", Out.INFO)
             if anon:
@@ -876,8 +891,12 @@ class FTP(BaseModule):
                 else:
                     response_str = ""
 
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.Anonymous.value, "anonymous login", response_str
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.Anonymous.value,
+                        "vuln_request": "anonymous login",
+                        "vuln_response": response_str,
+                    }
                 )
 
         # Bruteforced credentials and their access permissions
@@ -924,10 +943,12 @@ class FTP(BaseModule):
                 else:
                     passw_str = f"passwords: {self.args.passwords}"
 
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.WeakCreds.value,
-                    f"{user_str}\n{passw_str}",
-                    "\n".join(json_lines),
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.WeakCreds.value,
+                        "vuln_request": f"{user_str}\n{passw_str}",
+                        "vuln_response": "\n".join(json_lines),
+                    }
                 )
 
         # Directory listing
@@ -942,16 +963,16 @@ class FTP(BaseModule):
 
                 out_str = "\n".join(p.dirlist)
                 self.ptprint(f"    {out_str}")
-                properties["directoryListing"] = out_str
+                properties.update({"directoryListing": out_str})
             except StopIteration:
                 self.ptprint("Directory listing failed (no access or empty listing)", Out.INFO)
-                properties["directoryListing"] = "no access or empty"
+                properties.update({"directoryListing": "no access or empty"})
 
         # Bounce attack
         if bounce := self.results.bounce:
             if (creds := bounce.used_creds) is None:
                 self.ptprint(f"Bounce attack failed (no valid credentials)", Out.INFO)
-                properties["bounceStatus"] = "no valid credentials"
+                properties.update({"bounceStatus": "no valid credentials"})
             else:
                 self.ptprint("Bounce attack", Out.INFO)
                 self.ptprint(f"    Creds used: {creds.user}:{creds.passw}", Out.INFO)
@@ -964,18 +985,19 @@ class FTP(BaseModule):
                     self.ptprint(f"    {icon} Bounce is denied", Out.TEXT)
 
                 if not bounce.bounce_accepted:
-                    properties["bounceStatus"] = "rejected"
+                    properties.update({"bounceStatus": "rejected"})
                 else:
-                    properties["bounceStatus"] = "ok"
+                    properties.update({"bounceStatus": "ok"})
 
                     if (r := bounce.request) is None:
                         out_str = f"Target port reachable: {bounce.port_accessible}"
                         self.ptprint(f"        {out_str}", Out.INFO)
-                        self.ptjsonlib.add_vulnerability(
-                            VULNS.Bounce.value,
-                            f"Bounce port scan target: {bounce.target.ip}:{bounce.target.port}\n"
-                            + f"Creds used: {creds.user}:{creds.passw}",
-                            out_str,
+                        deferred_vulns.append(
+                            {
+                                "vuln_code": VULNS.Bounce.value,
+                                "vuln_request": f"Bounce port scan target: {bounce.target.ip}:{bounce.target.port}\nCreds used: {creds.user}:{creds.passw}",
+                                "vuln_response": out_str,
+                            }
                         )
                     else:
                         res = f"Yes ({r.ftpserver_filepath})" if r.stored else "No"
@@ -990,13 +1012,25 @@ class FTP(BaseModule):
                         clean_str = "Cleaned up: " + res
                         self.ptprint(f"        {clean_str}", Out.INFO)
 
-                        self.ptjsonlib.add_vulnerability(
-                            VULNS.Bounce.value,
-                            f"Bounce request target: {bounce.target.ip}:{bounce.target.port}\n"
-                            + f"Creds used: {creds.user}:{creds.passw}"
-                            + f"Request file: {self.args.bounce_file}",
-                            "\n".join([stored_str, sent_str, clean_str]),
+                        deferred_vulns.append(
+                            {
+                                "vuln_code": VULNS.Bounce.value,
+                                "vuln_request": f"Bounce request target: {bounce.target.ip}:{bounce.target.port}\nCreds used: {creds.user}:{creds.passw}\nRequest file: {self.args.bounce_file}",
+                                "vuln_response": "\n".join([stored_str, sent_str, clean_str]),
+                            }
                         )
+
+        # Create node at the end with all collected properties and bind vulnerabilities
+        ftp_node = self.ptjsonlib.create_node_object(
+            "software",
+            None,
+            None,
+            properties,
+        )
+        self.ptjsonlib.add_node(ftp_node)
+        node_key = ftp_node["key"]
+        for v in deferred_vulns:
+            self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
 
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)

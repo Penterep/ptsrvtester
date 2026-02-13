@@ -776,35 +776,41 @@ class MSRPC(BaseModule):
             WeakCreds_TCP = "PTV-MSRPC-WEAKRPCCREDS"
             WeakCreds_HTTP = "PTV-MSRPC-WEAKHTTPCREDS"
         """
-
         def credentials_to_string(creds: List[Credential]) -> str:
             return ", ".join(
                 f"{c.username or 'None'}:{c.password or 'None'}"
                 for c in creds
             )
 
-        if (self.results.Anonymous != None):
-            if len(self.results.Anonymous) != 0:
-                self.ptjsonlib.add_vulnerability(VULNS.NullSession.value, "Testing anonymous SMB access and IPC$ share.", ",".join(self.results.Anonymous))
-        
-        if (self.results.PipesCreds != None):
-            if len(self.results.PipesCreds) != 0:
-                cred_str = credentials_to_string(self.results.PipesCreds)
-                self.ptjsonlib.add_vulnerability(VULNS.WeakCreds_pipes.value, "Bruteforcing credentials for specific pipes", cred_str)
+        properties = {
+            "software_type": None,
+            "name": "msrpc",
+            "version": None,
+            "vendor": None,
+            "description": None,
+            "anonymous": ",".join(self.results.Anonymous) if self.results.Anonymous is not None and len(self.results.Anonymous) != 0 else None,
+            "pipesCreds": credentials_to_string(self.results.PipesCreds) if self.results.PipesCreds is not None and len(self.results.PipesCreds) != 0 else None,
+            "smbBrute": credentials_to_string(self.results.SMB_Brute) if self.results.SMB_Brute is not None and len(self.results.SMB_Brute) != 0 else None,
+            "tcpBrute": credentials_to_string(self.results.TCP_Brute) if self.results.TCP_Brute is not None and len(self.results.TCP_Brute) != 0 else None,
+            "httpBrute": credentials_to_string(self.results.HTTP_Brute) if self.results.HTTP_Brute is not None and len(self.results.HTTP_Brute) != 0 else None,
+        }
+        deferred_vulns = []
 
-        if (self.results.SMB_Brute != None):
-            if len(self.results.SMB_Brute) != 0:
-                cred_str = credentials_to_string(self.results.SMB_Brute)
-                self.ptjsonlib.add_vulnerability(VULNS.WeakCreds_SMB.value, "Bruteforcing SMB credentials", cred_str) 
+        if self.results.Anonymous is not None and len(self.results.Anonymous) != 0:
+            deferred_vulns.append({"vuln_code": VULNS.NullSession.value, "vuln_request": "Testing anonymous SMB access and IPC$ share.", "vuln_response": ",".join(self.results.Anonymous)})
+        if self.results.PipesCreds is not None and len(self.results.PipesCreds) != 0:
+            deferred_vulns.append({"vuln_code": VULNS.WeakCreds_pipes.value, "vuln_request": "Bruteforcing credentials for specific pipes", "vuln_response": credentials_to_string(self.results.PipesCreds)})
+        if self.results.SMB_Brute is not None and len(self.results.SMB_Brute) != 0:
+            deferred_vulns.append({"vuln_code": VULNS.WeakCreds_SMB.value, "vuln_request": "Bruteforcing SMB credentials", "vuln_response": credentials_to_string(self.results.SMB_Brute)})
+        if self.results.TCP_Brute is not None and len(self.results.TCP_Brute) != 0:
+            deferred_vulns.append({"vuln_code": VULNS.WeakCreds_TCP.value, "vuln_request": "Bruteforcing RPC credentials for specific UUID", "vuln_response": credentials_to_string(self.results.TCP_Brute)})
+        if self.results.HTTP_Brute is not None and len(self.results.HTTP_Brute) != 0:
+            deferred_vulns.append({"vuln_code": VULNS.WeakCreds_HTTP.value, "vuln_request": "Bruteforcing HTTP credentials", "vuln_response": credentials_to_string(self.results.HTTP_Brute)})
 
-        if (self.results.TCP_Brute != None):
-            if len(self.results.TCP_Brute) != 0:
-                cred_str = credentials_to_string(self.results.TCP_Brute)
-                self.ptjsonlib.add_vulnerability(VULNS.WeakCreds_TCP.value, "Bruteforcing RPC credentials for specific UUID", cred_str)
-        
-        if (self.results.HTTP_Brute != None):
-            if len(self.results.HTTP_Brute) != 0:
-                cred_str = credentials_to_string(self.results.HTTP_Brute)
-                self.ptjsonlib.add_vulnerability(VULNS.WeakCreds_HTTP.value, "Bruteforcing HTTP credentials", cred_str)
+        msrpc_node = self.ptjsonlib.create_node_object("software", None, None, properties)
+        self.ptjsonlib.add_node(msrpc_node)
+        node_key = msrpc_node["key"]
+        for v in deferred_vulns:
+            self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
 
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)

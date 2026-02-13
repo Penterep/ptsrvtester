@@ -1,4 +1,4 @@
-import argparse, ipaddress, queue, random, re, smtplib, socket, ssl, threading, time, unicodedata, dns.resolver
+import argparse, ipaddress, queue, random, re, smtplib, socket, ssl, struct, threading, time, unicodedata, dns.resolver
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from enum import Enum
@@ -22,6 +22,16 @@ from .utils.helpers import (
 )
 from .utils.blacklist_parser import BlacklistParser
 from .utils.service_identification import identify_service
+
+
+def _vendor_from_cpe(cpe: str | None) -> str | None:
+    """Extract vendor from CPE 2.3 string (e.g. cpe:2.3:a:microsoft:exchange_server:* -> microsoft)."""
+    if not cpe or ":" not in cpe:
+        return None
+    parts = cpe.split(":")
+    if len(parts) >= 4 and parts[2] in ("a", "o", "h"):
+        return parts[3] or None
+    return None
 
 
 def _registrable_domain_psl(host: str) -> str | None:
@@ -87,9 +97,6 @@ SMTP_CMD_ERROR = frozenset({"VRFY", "EXPN"})   # user enumeration risk (plain or
 SMTP_CMD_WARNING = frozenset({"RCPT", "ETRN"})
 SIZE_OK_MAX = 26214400       # 25 MB
 SIZE_WARNING_MAX = 52428800  # 50 MB
-# RCPT TO limit per message: recommended ranges by server role (for evaluation display)
-RCPT_LIMIT_SUBMISSION_RANGE = (50, 200)   # Submission server: max recipients per message
-RCPT_LIMIT_MTA_RANGE = (100, 1000)        # MTA: max recipients per message
 
 
 def _parse_rcptmax_from_ehlo(ehlo_raw: str) -> int | None:
@@ -311,7 +318,6 @@ class SMTPArgs(ArgsWithBruteforce):
     target: Target
     tls: bool
     starttls: bool
-    info: bool
     ntlm: bool
     mail_from: str | None
     rcpt_to: str | None
@@ -323,6 +329,7 @@ class SMTPArgs(ArgsWithBruteforce):
     slow_down: bool
     spf_test: bool
     open_relay: bool
+    catchall: bool
     interactive: bool
     isencrypt: bool
 
@@ -333,22 +340,22 @@ class SMTPArgs(ArgsWithBruteforce):
             {"usage": ["ptsrvtester smtp <options> <target>"]},
             {"usage_example": [
                 "ptsrvtester smtp -e ALL -sd -w wordlist.txt mail.example.com:25",
-                "ptsrvtester smtp --info --ntlm 127.0.0.1"
+                "ptsrvtester smtp -b -c --ntlm 127.0.0.1"
             ]},
             {"options": [
-                ["-i", "--info", "", "Gather basic information (banner and commands)"],
                 ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
                 ["-c", "--commands", "", "Grab EHLO extensions only"],
-                ["-ie", "--isencrypt", "", "Test encryption options (plaintext, STARTTLS, TLS)"],
+                ["-ie", "--isencrypt", "", "Check encryption methods"],
                 ["", "--ntlm", "", "Inspect NTLM authentication"],
                 ["-e", "--enumerate", "[VRFY/EXPN/RCPT/ALL]", "User enumeration (default: ALL)"],
                 ["-w", "--wordlist", "<wordlist>", "Usernames for enumeration"],
-                ["", "--enum-threads", "<N>", "Parallel threads for enumeration (default: 1)"],
+                ["-t", "--threads", "<threads>", "Threads for enumeration (default: 1)"],
                 ["-sd", "--slow-down", "", "Test slow-down protection (requires -e)"],
                 ["-mc", "--max-connections", "", "Max connections test"],
                 ["-rl", "--recipient-limit", "", "Test RCPT TO recipient limit per message"],
                 ["-d", "--domain", "<domain>", "Recipient domain for RCPT TO limit test"],
                 ["-or", "--open-relay", "", "Test open relay"],
+                ["-ca", "--catchall", "", "Test Catch All mailbox"],
                 ["-I", "--interactive", "", "Interactive SMTP CLI"],
                 ["", "", "", ""],
                 ["-bl", "--blacklist-test", "", "Test against blacklists"],
@@ -403,28 +410,24 @@ class SMTPArgs(ArgsWithBruteforce):
         direct = parser.add_argument_group(
             "DIRECT SCANNING", "Operations that communicate directly with the target server"
         )
-        direct.add_argument(
-            "-i",
-            "--info",
-            action="store_true",
-            help="Gather basic information (banner and commands)",
-        )
         direct.add_argument("-b", "--banner", action="store_true", help="Grab banner + Service Identification (product, version, CPE)")
         direct.add_argument("-c", "--commands", action="store_true", help="Grab EHLO extensions only")
         direct.add_argument(
             "-ie",
             "--isencrypt",
             action="store_true",
-            help="Test encryption options on port (plaintext, STARTTLS, TLS)",
+            help="Check encryption methods",
         )
         direct.add_argument("--ntlm", action="store_true", help="inspect NTLM authentication")
         direct.add_argument("-w", "--wordlist", type=str, help="Usernames for enumeration")
         direct.add_argument(
-            "--enum-threads",
+            "-t",
+            "--threads",
             type=int,
             default=1,
-            metavar="N",
-            help="Parallel threads for user enumeration (default: 1)",
+            metavar="threads",
+            dest="enum_threads",
+            help="Threads for enumeration (default: 1)",
         )
         direct.add_argument(
             "-e",
@@ -459,6 +462,7 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Recipient domain for RCPT TO limit test (default: from server banner/EHLO)",
         )
         direct.add_argument("-or", "--open-relay", action="store_true", help="Test Open relay")
+        direct.add_argument("-ca", "--catchall", action="store_true", help="Test Catch All mailbox")
         direct.add_argument("-m", "--mail-from", type=str, help="")
         direct.add_argument("-r", "--rcpt-to", type=str, help="")
         direct.add_argument(
@@ -543,15 +547,16 @@ class SMTP(BaseModule):
         return not (
             self.args.blacklist_test
             or self.args.spf_test
-            or self.args.info
             or self.args.banner
             or self.args.commands
             or self.args.isencrypt
             or self.args.interactive
             or self.args.ntlm
             or self.args.open_relay
+            or self.args.catchall
             or self.args.enumerate is not None
             or self.args.max_connections
+            or getattr(self.args, "rcpt_limit", False)
             or self.do_brute
         )
 
@@ -573,13 +578,16 @@ class SMTP(BaseModule):
 
         # Indirect scanning (blacklist: domain + public IP; private IP skipped with message)
         if self.args.blacklist_test:
+            self.ptprint("Blacklist information", Out.INFO)
             bl_result, skipped_private = self.test_blacklist(self.target)
             if skipped_private:
                 self.results.blacklist_private_ip_skipped = True
             elif bl_result is not None:
                 self.results.blacklist = bl_result
+            self._stream_blacklist_result()
 
         if self.args.spf_test:
+            self.ptprint("SPF records", Out.INFO)
             if self.target_is_ip:
                 self.results.spf_requires_domain = True
             else:
@@ -590,12 +598,12 @@ class SMTP(BaseModule):
                 except Exception as e:
                     self.ptjsonlib.end_error(f"Error during SPF test: {e}", self.use_json)
                     raise SystemExit
+            self._stream_spf_result()
 
         # Direct scanning
         # Only -ie: no need to connect; test_encryption() opens its own connections
         if (
             self.args.isencrypt
-            and not self.args.info
             and not self.args.interactive
             and not self.args.ntlm
             and not self.args.open_relay
@@ -603,65 +611,319 @@ class SMTP(BaseModule):
             and not self.args.max_connections
             and not self.do_brute
         ):
+            if not self.use_json:
+                self.ptprint("Encryption", Out.INFO)
             self.results.encryption = self.test_encryption()
+            self._stream_encryption_result()
+            return
+
+        # Standalone Catch All only: no banner, no initial_info, just this test
+        only_catchall = (
+            self.args.catchall
+            and not self.args.banner
+            and not self.args.commands
+            and not self.args.interactive
+            and not self.args.isencrypt
+            and not self.args.ntlm
+            and not self.args.open_relay
+            and self.args.enumerate is None
+            and not self.args.max_connections
+            and not getattr(self.args, "rcpt_limit", False)
+            and not self.do_brute
+        )
+        if only_catchall:
+            self.ptprint("Catch All mailbox", Out.INFO)
+            try:
+                smtp_ca = self.get_smtp_handler()
+                smtp_ca.docmd("EHLO", self.fqdn)
+                self.results.catch_all = self.test_catchall(smtp_ca)
+                self._stream_catch_all_result()
+            except Exception as e:
+                self.results.info_error = str(e)
+                if not self.use_json:
+                    self.ptprint(f"Error: {e}", Out.ERROR)
+            return
+
+        # Standalone enumeration only: no banner, no initial_info, just this test
+        only_enumerate = (
+            self.args.enumerate is not None
+            and not self.args.banner
+            and not self.args.commands
+            and not self.args.interactive
+            and not self.args.isencrypt
+            and not self.args.ntlm
+            and not self.args.open_relay
+            and not self.args.catchall
+            and not self.args.max_connections
+            and not getattr(self.args, "rcpt_limit", False)
+            and not self.do_brute
+        )
+        if only_enumerate:
+            self.ptprint("User enumeration methods", Out.INFO)
+            try:
+                smtp_enum = self.get_smtp_handler()
+                smtp_enum.docmd("EHLO", self.fqdn)
+                self.results.enum_results = self.enumeration(smtp_enum)
+                self._stream_enumeration_result()
+            except Exception as e:
+                self.results.info_error = str(e)
+                if not self.use_json:
+                    self.ptprint(f"Error: {e}", Out.ERROR)
+            return
+
+        # Standalone commands (EHLO) only: no banner output, just EHLO extensions
+        only_commands = (
+            self.args.commands
+            and not self.args.banner
+            and not self.args.interactive
+            and not self.args.isencrypt
+            and not self.args.ntlm
+            and not self.args.open_relay
+            and not self.args.catchall
+            and self.args.enumerate is None
+            and not self.args.max_connections
+            and not getattr(self.args, "rcpt_limit", False)
+            and not self.do_brute
+        )
+        if only_commands:
+            try:
+                smtp, info = self.initial_info(get_commands=True)
+                self.results.info = InfoResult(
+                    None,
+                    info.ehlo,
+                    getattr(info, "ehlo_starttls", None),
+                )
+                self.results.banner_requested = False
+                self.results.commands_requested = True
+                self._stream_ehlo_result()
+            except Exception as e:
+                self.results.info_error = str(e)
+                if not self.use_json:
+                    self.ptprint(f"Error: {e}", Out.ERROR)
+            return
+
+        # Standalone RCPT TO limit only: no banner, no other tests, just this test
+        only_rcpt_limit = (
+            getattr(self.args, "rcpt_limit", False)
+            and not self.args.banner
+            and not self.args.commands
+            and not self.args.interactive
+            and not self.args.isencrypt
+            and not self.args.ntlm
+            and not self.args.open_relay
+            and not self.args.catchall
+            and self.args.enumerate is None
+            and not self.args.max_connections
+            and not self.do_brute
+        )
+        if only_rcpt_limit:
+            self.ptprint("RCPT TO limit", Out.INFO)
+            try:
+                # Populate results.info (banner + EHLO) so _get_rcpt_limit_domain() uses server hostname
+                # like in run-all; we do not stream banner/ehlo to the user.
+                _, info = self.initial_info(get_commands=True)
+                self.results.info = InfoResult(
+                    info.banner,
+                    info.ehlo,
+                    getattr(info, "ehlo_starttls", None),
+                )
+                self.results.banner_requested = False
+                self.results.commands_requested = False
+                smtp_rc = self.get_smtp_handler()
+                smtp_rc.docmd("EHLO", self.fqdn)
+                self.results.rcpt_limit = self.test_rcpt_limit(smtp_rc)
+                self._stream_rcpt_limit_result()
+            except TestFailedError as e:
+                self.results.rcpt_limit_error = str(e)
+                self._stream_rcpt_limit_result()
+            except Exception as e:
+                self.results.info_error = str(e)
+                if not self.use_json:
+                    self.ptprint(f"Error: {e}", Out.ERROR)
+            return
+
+        # Standalone interactive only: no banner output, just connect and start CLI
+        only_interactive = (
+            self.args.interactive
+            and not self.args.banner
+            and not self.args.commands
+            and not self.args.isencrypt
+            and not self.args.ntlm
+            and not self.args.open_relay
+            and not self.args.catchall
+            and self.args.enumerate is None
+            and not self.args.max_connections
+            and not getattr(self.args, "rcpt_limit", False)
+            and not self.do_brute
+        )
+        if only_interactive and not self.use_json:
+            try:
+                smtp, _ = self.initial_info(get_commands=False)
+                self.start_interactive_mode(smtp)
+            except Exception as e:
+                self.results.info_error = str(e)
+                if not self.use_json:
+                    self.ptprint(f"Error: {e}", Out.ERROR)
+            return
+
+        # Standalone NTLM only: no banner output, just this test
+        only_ntlm = (
+            self.args.ntlm
+            and not self.args.banner
+            and not self.args.commands
+            and not self.args.interactive
+            and not self.args.isencrypt
+            and not self.args.open_relay
+            and not self.args.catchall
+            and self.args.enumerate is None
+            and not self.args.max_connections
+            and not getattr(self.args, "rcpt_limit", False)
+            and not self.do_brute
+        )
+        if only_ntlm:
+            self.ptprint("NTLM information", Out.INFO)
+            try:
+                smtp, _ = self.initial_info(get_commands=False)
+                self.results.ntlm = self.auth_ntlm(smtp)
+                self._stream_ntlm_result()
+            except Exception as e:
+                self.results.info_error = str(e)
+                if not self.use_json:
+                    self.ptprint(f"Error: {e}", Out.ERROR)
+            return
+
+        # Standalone open relay only: no banner output, just this test
+        only_open_relay = (
+            self.args.open_relay
+            and not self.args.banner
+            and not self.args.commands
+            and not self.args.interactive
+            and not self.args.isencrypt
+            and not self.args.ntlm
+            and not self.args.catchall
+            and self.args.enumerate is None
+            and not self.args.max_connections
+            and not getattr(self.args, "rcpt_limit", False)
+            and not self.do_brute
+        )
+        if only_open_relay:
+            self.ptprint("Open relay", Out.INFO)
+            try:
+                smtp, _ = self.initial_info(get_commands=False)
+                mail_from = self.args.mail_from or f"relaytest@{self.fqdn}"
+                rcpt_to = self.args.rcpt_to or "relaytest@external.relaytest.local"
+                self.results.open_relay = self.open_relay_test(smtp, "TEST", mail_from, rcpt_to)
+                self._stream_open_relay_result()
+            except Exception as e:
+                self.results.info_error = str(e)
+                if not self.use_json:
+                    self.ptprint(f"Error: {e}", Out.ERROR)
+            return
+
+        # Standalone max connections only: no banner, no initial_info, just this test
+        only_max_connections = (
+            self.args.max_connections
+            and not self.args.banner
+            and not self.args.commands
+            and not self.args.interactive
+            and not self.args.isencrypt
+            and not self.args.ntlm
+            and not self.args.open_relay
+            and not self.args.catchall
+            and self.args.enumerate is None
+            and not getattr(self.args, "rcpt_limit", False)
+            and not self.do_brute
+        )
+        if only_max_connections:
+            self.ptprint("Connections", Out.INFO)
+            try:
+                self.results.max_connections = self.max_connections_test()
+                self._stream_max_connections_result()
+            except Exception as e:
+                self.results.max_connections_error = str(e)
+                self._stream_max_connections_result()
             return
 
         # enter only if any of these arguments were explicitly specified
         need_info = (
-            self.args.info
-            or self.args.banner
+            self.args.banner
             or self.args.commands
             or self.args.interactive
             or self.args.isencrypt
             or self.args.ntlm
             or self.args.open_relay
+            or self.args.catchall
             or self.args.enumerate is not None
             or self.args.max_connections
             or getattr(self.args, "rcpt_limit", False)
             or self.do_brute
         )
         if need_info:
-            do_banner = self.args.banner or self.args.info
+            do_banner = self.args.banner
             do_commands = (
-                self.args.commands or self.args.info or (self.args.enumerate is not None)
+                self.args.commands
+                or (self.args.enumerate is not None)
                 or (getattr(self.args, "rcpt_limit", False) and not getattr(self.args, "domain", None))
             )
-            smtp, info = self.initial_info(get_commands=do_commands)
             self.results.banner_requested = do_banner
-            self.results.commands_requested = self.args.commands or self.args.info
+            self.results.commands_requested = self.args.commands
+
+            self.ptprint("Banner", Out.INFO)
+            try:
+                smtp, info = self.initial_info(get_commands=do_commands)
+            except Exception as e:
+                self.results.info_error = str(e)
+                return
             self.results.info = InfoResult(
                 info.banner if do_banner else None,
                 info.ehlo if do_commands else None,
                 getattr(info, "ehlo_starttls", None),
             )
+            self._stream_banner_result()
+            if do_commands:
+                self._stream_ehlo_result()
 
             if self.args.isencrypt:
+                self.ptprint("Encryption", Out.INFO)
                 self.results.encryption = self.test_encryption()
+                self._stream_encryption_result()
 
             if self.args.interactive and not self.use_json:
                 self.start_interactive_mode(smtp)
 
             if self.args.ntlm:
+                self.ptprint("NTLM information", Out.INFO)
                 self.results.ntlm = self.auth_ntlm(smtp)
+                self._stream_ntlm_result()
 
             if self.args.open_relay:
+                self.ptprint("Open relay", Out.INFO)
                 self.results.open_relay = self.open_relay_test(
                     smtp, "TEST", self.args.mail_from, self.args.rcpt_to
                 )
+                self._stream_open_relay_result()
+
+            if self.args.catchall:
+                self.ptprint("Catch All mailbox", Out.INFO)
+                smtp_ca = self.get_smtp_handler()
+                smtp_ca.docmd("EHLO", self.fqdn)
+                self.results.catch_all = self.test_catchall(smtp_ca)
+                self._stream_catch_all_result()
 
             if self.args.enumerate is not None:
+                self.ptprint("User enumeration methods", Out.INFO)
                 smtp_enum = self.get_smtp_handler()
                 smtp_enum.docmd("EHLO", self.fqdn)
                 self.results.enum_results = self.enumeration(smtp_enum)
-
-            smtp_ca = self.get_smtp_handler()
-            smtp_ca.docmd("EHLO", self.fqdn)
-            self.results.catch_all = self.test_catchall(smtp_ca)
+                self._stream_enumeration_result()
 
             if self.args.max_connections:
+                self.ptprint("Connections", Out.INFO)
                 self.results.max_connections = self.max_connections_test()
+                self._stream_max_connections_result()
 
             if getattr(self.args, "rcpt_limit", False):
+                self.ptprint("RCPT TO limit", Out.INFO)
                 try:
                     smtp_rc = self.get_smtp_handler()
                     smtp_rc.docmd("EHLO", self.fqdn)
@@ -670,8 +932,10 @@ class SMTP(BaseModule):
                     self.results.rcpt_limit_error = str(e)
                 except Exception as e:
                     self.results.rcpt_limit_error = str(e)
+                self._stream_rcpt_limit_result()
 
             if self.do_brute:
+                self.ptprint("Login bruteforce", Out.INFO)
                 self.results.creds = simple_bruteforce(
                     self._try_login,
                     self.args.user,
@@ -681,6 +945,7 @@ class SMTP(BaseModule):
                     self.args.spray,
                     self.args.threads,
                 )
+                self._stream_brute_result()
 
     def _run_all_tests(self) -> None:
         """Run all tests in sequence. On failure: print error, continue with next.
@@ -692,6 +957,7 @@ class SMTP(BaseModule):
         # 1. Banner + commands (plaintext connection, EHLO)
         self.results.banner_requested = True
         self.results.commands_requested = True
+        self.ptprint("Banner", Out.INFO)
         try:
             smtp, info = self.initial_info(get_commands=True)
             self.results.info = info
@@ -701,6 +967,8 @@ class SMTP(BaseModule):
         except Exception as e:
             self.results.info_error = str(e)
             return
+        self._stream_banner_result()
+        self._stream_ehlo_result()
         # 2. Encryption: on port 465 we connected via TLS, so set tls_ok=True.
         #    With --starttls we already upgraded, so starttls_ok=True (EHLO may omit STARTTLS after upgrade).
         #    On other ports: STARTTLS from EHLO if present.
@@ -717,8 +985,11 @@ class SMTP(BaseModule):
             self.results.encryption = EncryptionResult(
                 plaintext_ok=True, starttls_ok=False, tls_ok=False
             )
+        self.ptprint("Encryption", Out.INFO)
+        self._stream_encryption_result()
 
         # 3. Open relay (always in run-all; use defaults if mail_from/rcpt_to not set)
+        self.ptprint("Open relay", Out.INFO)
         try:
             mail_from = self.args.mail_from or f"relaytest@{self.fqdn}"
             rcpt_to = self.args.rcpt_to or "relaytest@external.relaytest.local"
@@ -727,8 +998,10 @@ class SMTP(BaseModule):
             self.results.open_relay_error = str(e)
         except Exception as e:
             self.results.open_relay_error = str(e)
+        self._stream_open_relay_result()
 
         # 4. Blacklist (domain + public IP; private IP skipped)
+        self.ptprint("Blacklist information", Out.INFO)
         try:
             bl_result, skipped_private = self.test_blacklist(self.target)
             if skipped_private:
@@ -739,8 +1012,10 @@ class SMTP(BaseModule):
             self.results.blacklist_error = str(e)
         except Exception as e:
             self.results.blacklist_error = str(e)
+        self._stream_blacklist_result()
 
         # 5. SPF (only if domain)
+        self.ptprint("SPF records", Out.INFO)
         if self.target_is_ip:
             self.results.spf_requires_domain = True
         else:
@@ -750,8 +1025,20 @@ class SMTP(BaseModule):
                 self.results.spf_error = str(e)
             except Exception as e:
                 self.results.spf_error = str(e)
+        self._stream_spf_result()
 
-        # 6. User enumeration (ALL) – use fresh connection (open_relay may have closed smtp)
+        # 6a. Catch-all (before enumeration – OWASP: result affects enumeration reliability)
+        self.ptprint("Catch All mailbox", Out.INFO)
+        try:
+            smtp_ca = self.get_smtp_handler()
+            smtp_ca.docmd("EHLO", self.fqdn)
+            self.results.catch_all = self.test_catchall(smtp_ca)
+        except Exception:
+            self.results.catch_all = "indeterminate"
+        self._stream_catch_all_result()
+
+        # 6b. User enumeration (ALL) – skip if catch-all would make results unreliable
+        self.ptprint("User enumeration methods", Out.INFO)
         save_enum = self.args.enumerate
         try:
             self.args.enumerate = "ALL"
@@ -764,16 +1051,10 @@ class SMTP(BaseModule):
             self.results.enum_error = str(e)
         finally:
             self.args.enumerate = save_enum
-
-        # 6b. Catch-all (after enumeration so we can use enum_results to choose method)
-        try:
-            smtp_ca = self.get_smtp_handler()
-            smtp_ca.docmd("EHLO", self.fqdn)
-            self.results.catch_all = self.test_catchall(smtp_ca)
-        except Exception:
-            self.results.catch_all = "indeterminate"
+        self._stream_enumeration_result()
 
         # 6c. RCPT TO limit (per message)
+        self.ptprint("RCPT TO limit", Out.INFO)
         try:
             smtp_rc = self.get_smtp_handler()
             smtp_rc.docmd("EHLO", self.fqdn)
@@ -782,14 +1063,17 @@ class SMTP(BaseModule):
             self.results.rcpt_limit_error = str(e)
         except Exception as e:
             self.results.rcpt_limit_error = str(e)
+        self._stream_rcpt_limit_result()
 
         # 7. NTLM
+        self.ptprint("NTLM information", Out.INFO)
         try:
             self.results.ntlm = self.auth_ntlm(smtp)
         except TestFailedError as e:
             self.results.ntlm_error = str(e)
         except Exception as e:
             self.results.ntlm_error = str(e)
+        self._stream_ntlm_result()
 
     def connect(self) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL, int, bytes]:
         """Port 465 is implicit TLS only (SMTPS), so we use TLS even without --tls.
@@ -856,7 +1140,6 @@ class SMTP(BaseModule):
         if status == 220:
             status, reply = smtp.docmd("EHLO", f"{self.fqdn}")
             if status == 250:
-                # print("OK CONNECTION", reply)
                 return smtp
             else:
                 raise Exception("Error when EHLOing")
@@ -892,8 +1175,7 @@ class SMTP(BaseModule):
         for smtp in self.smtp_list:
             try:
                 smtp.quit()
-            except Exception as e:
-                # print("error closing smtp connections:", e)
+            except Exception:
                 continue
         del self.smtp_list
 
@@ -914,7 +1196,6 @@ class SMTP(BaseModule):
                 if self.noop_smtp_connections() and not is_disconnect:
                     is_disconnect = time.time() - start_time
             except Exception as e:
-                # ve chvili kdy uz neni mozne navazat spojeni
                 allowed_connections = len(self.smtp_list)
                 self.ptdebug(f"\r", end="")
                 self.ptdebug(
@@ -925,7 +1206,6 @@ class SMTP(BaseModule):
                     self._fail(f"Could not retrieve initial smtp connection - {e}")
                 self.smtp_list.pop()
                 try:
-                    # self.noop_smtp_connections()
                     self.smtp_list.append(self._get_smtp_connection())
                 except Exception as e:
                     self.ptdebug(f"You're banned, reconnecting in 60 seconds ...", Out.INFO)
@@ -955,14 +1235,43 @@ class SMTP(BaseModule):
         return MaxConnectionsResult(allowed_connections, ban_duration)
 
     def open_relay_test(self, smtp, msg, mail_from, rcpt_to) -> bool:
+        """OWASP/Nmap-style multi-vector open relay test. Tests: empty FROM, internal→external,
+        external→external, literal IP sender. Returns True if any vector succeeds."""
         self.ptdebug(f"Open Relay Test:", title=True)
-        try:
-            smtp.sendmail(mail_from, rcpt_to, msg)
-            self.ptdebug("Server is vulnerable to Open relay", Out.VULN)
-            return True
-        except:
-            self.ptdebug("Server is not vulnerable to Open relay", Out.NOTVULN)
-            return False
+        ext_domain = "external.relaytest.local"
+        host_domain = self.fqdn or "relaytest.local"
+        target_ip = getattr(self.args.target, "ip", None) or "127.0.0.1"
+
+        vectors: list[tuple[str, str, str]] = [
+            ("MAIL FROM:<> (null sender)", "<>", f"relaytest@{ext_domain}"),
+            (f"relaytest@{host_domain} -> external", f"relaytest@{host_domain}", f"relaytest@{ext_domain}"),
+            (f"relaytest@[{target_ip}] -> external", f"relaytest@[{target_ip}]", f"relaytest@{ext_domain}"),
+            ("external -> external", f"relaytest@{ext_domain}", f"relaytest@other.{ext_domain}"),
+        ]
+
+        if mail_from and rcpt_to:
+            vectors.insert(0, (f"user: {mail_from} -> {rcpt_to}", mail_from, rcpt_to))
+
+        for label, from_addr, to_addr in vectors:
+            try:
+                smtp.sendmail(from_addr, [to_addr], msg)
+                self.ptdebug(f"Server is vulnerable to Open relay ({label})", Out.VULN)
+                return True
+            except smtplib.SMTPRecipientsRefused as e:
+                self.ptdebug(f"Relay rejected: {label} - {e}", Out.INFO)
+            except smtplib.SMTPResponseException as e:
+                self.ptdebug(f"Relay rejected: {label} - {e.smtp_code} {e.smtp_error}", Out.INFO)
+            except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
+                self.ptdebug(f"Relay rejected: {label} - {e}", Out.INFO)
+            except Exception as e:
+                self.ptdebug(f"Relay rejected: {label} - {e}", Out.INFO)
+            try:
+                smtp.docmd("RSET")
+            except Exception:
+                pass
+
+        self.ptdebug("Server is not vulnerable to Open relay", Out.NOTVULN)
+        return False
 
     @staticmethod
     def _to_parent_domain(host: str) -> str:
@@ -1123,6 +1432,7 @@ class SMTP(BaseModule):
         ]
         half = int(len(dummy_data) / 2)
         is_slow_down = False
+        is_unstable_response = False  # OWASP: init to avoid NameError
         initial_time = 0
         last_request_time = 0
         first_half_time = 0
@@ -1135,7 +1445,7 @@ class SMTP(BaseModule):
             start_time = time.time()
             try:
                 smtp.docmd(method, user)
-            except:
+            except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
                 return {method.lower(): True}
 
             end_time = time.time() - start_time
@@ -1168,7 +1478,6 @@ class SMTP(BaseModule):
 
     def rcpt_slow_down_test(self, smtp):
         if sum(self.slow_down_results.values()) >= 1:
-            # print("Retrieving new smtp handle ... for rcpt test")
             smtp = self.get_smtp_handler()
             smtp.docmd("EHLO", f"{self.fqdn}")
 
@@ -1198,7 +1507,6 @@ class SMTP(BaseModule):
             last_request_time = end_time
             if index == 0:
                 initial_time += end_time
-            # if index+1 == len(dummy_data):
             if index < half:
                 first_half_time += end_time
             else:
@@ -1207,7 +1515,6 @@ class SMTP(BaseModule):
             if end_time >= 3:
                 is_unstable_response = True
             if end_time >= 3 and is_unstable_response:
-                # print("unstable response, break")
                 is_slow_down = True
                 break
 
@@ -1329,13 +1636,43 @@ class SMTP(BaseModule):
         return enumerated_users
 
     def expn_vrfy_test(self, method, smtp) -> bool:
-        status, reply = smtp.docmd(method, "foofoofoo")
-        self.ptdebug(f"Testing {method} method: [{status}] {self.bytes_to_str(reply)}", Out.INFO)
-        if status in [250, 550] and not "AUTH" in self.bytes_to_str(reply).upper():
-            is_vulnerable = True
+        """Test VRFY/EXPN for user enumeration. RFC 5321: 250/251/252=success, 550/551=user unknown.
+        Vulnerable when server returns 550/551 for invalid user (differentiates valid vs invalid).
+        Not vulnerable when 250/251/252 (accepts all = catch-all, cannot enumerate)."""
+        # OWASP: test multiple invalid addresses to detect uniform "250 OK" (false positive)
+        INVALID_PROBES = ("foofoofoo", "nxuser001", "nxuser002")
+        VRFY_EXPN_ACCEPT = (250, 251, 252)
+        VRFY_EXPN_REJECT = (550, 551, 553, 554)
+
+        replies: list[tuple[int, str]] = []
+        for probe in INVALID_PROBES:
+            try:
+                status, reply = smtp.docmd(method, probe)
+                reply_str = self.bytes_to_str(reply).upper()
+                replies.append((status, reply_str))
+                if "AUTH" in reply_str:
+                    self.ptdebug(f"Testing {method} method: server requires AUTH", Out.INFO)
+                    return False
+            except Exception as e:
+                self.ptdebug(f"Testing {method} method: {e}", Out.INFO)
+                return False
+
+        status, reply_str = replies[0]
+        self.ptdebug(f"Testing {method} method: [{status}] {reply_str}", Out.INFO)
+
+        # Uniform response (all 250) = cannot enumerate (catch-all or misconfigured)
+        if all(s in VRFY_EXPN_ACCEPT for s, _ in replies):
+            self.ptdebug(
+                f"Server returns 250 for all invalid addresses - cannot reliably enumerate ({method})",
+                Out.INFO,
+            )
+            return False
+
+        # Server rejects invalid (550/551) = we can enumerate
+        is_vulnerable = status in VRFY_EXPN_REJECT
+        if is_vulnerable:
             self.ptdebug(f"Server is vulnerable to {method} enumeration", Out.VULN)
         else:
-            is_vulnerable = False
             self.ptdebug(f"Server is not vulnerable to {method} enumeration", Out.INFO)
         return is_vulnerable
 
@@ -1346,22 +1683,53 @@ class SMTP(BaseModule):
         return reply
 
     def rcpt_test(self, smtp) -> bool:
-        """RCPT enum vulnerability"""
-        self.ptdebug(f"Testing RCPT method:", Out.INFO, end=" ")
+        """RCPT enum vulnerability. RFC 5321: 250/251=accepted, 550/551=rejected.
+        Vulnerable when server returns 550/551 for invalid (differentiates)."""
+        RCPT_ACCEPT = (250, 251, 252)
+        RCPT_REJECT = (550, 551, 553, 554)
+        INVALID_PROBES = ("foofoofoo", "nxuser001", "nxuser002")
 
-        status, reply = smtp.docmd("MAIL FROM:", "<mail@from.me>")
-        status, reply = smtp.docmd("RCPT TO:", "<foofoofoo>")
-        reply = self.bytes_to_str(reply)
-        self.ptdebug(f"[{status}] " + reply)
-        if (
-            status in [250, 550]
-            and not "AUTH" in reply.upper()
-            and ("UNKNOWN" in reply.upper() or "OK" in reply.upper())
-        ):
-            is_vulnerable = True
+        try:
+            status, reply = smtp.docmd("MAIL FROM:", "<mail@from.me>")
+            if status not in RCPT_ACCEPT:
+                self.ptdebug(f"Testing RCPT method: MAIL FROM rejected [{status}]", Out.INFO)
+                return False
+        except Exception as e:
+            self.ptdebug(f"Testing RCPT method: {e}", Out.INFO)
+            return False
+
+        replies: list[tuple[int, str]] = []
+        for probe in INVALID_PROBES:
+            try:
+                status, reply = smtp.docmd("RCPT TO:", f"<{probe}>")
+                reply_str = self.bytes_to_str(reply).upper()
+                replies.append((status, reply_str))
+                if "AUTH" in reply_str:
+                    self.ptdebug(f"Testing RCPT method: [{status}] server requires AUTH", Out.INFO)
+                    return False
+            except Exception as e:
+                self.ptdebug(f"Testing RCPT method: {e}", Out.INFO)
+                return False
+
+        status, reply_str = replies[0]
+        self.ptdebug(f"Testing RCPT method: [{status}] {reply_str}")
+
+        # Uniform 250 for all invalid = cannot enumerate
+        if all(s in RCPT_ACCEPT for s, _ in replies):
+            self.ptdebug(
+                "Server returns 250 for all invalid addresses - cannot reliably enumerate (RCPT)",
+                Out.INFO,
+            )
+            return False
+
+        # 550/551 with UNKNOWN/user not found = we can enumerate
+        is_vulnerable = (
+            status in RCPT_REJECT
+            and ("UNKNOWN" in reply_str or "OK" in reply_str or "USER" in reply_str or "MAILBOX" in reply_str)
+        )
+        if is_vulnerable:
             self.ptdebug(f"Server is vulnerable to RCPT enumeration", Out.VULN)
         else:
-            is_vulnerable = False
             self.ptdebug(f"Server is not vulnerable to RCPT enumeration", Out.NOTVULN)
         return is_vulnerable
 
@@ -1372,10 +1740,11 @@ class SMTP(BaseModule):
         Uses VRFY or EXPN when available; otherwise RCPT. RCPT cannot distinguish
         valid address from catch-all, so result is Indeterminate when all accepted.
         Per RFC 5321: 250/251/252 are success for VRFY/EXPN; 550 = user unknown.
+        OWASP: RCPT uses full addresses (local@domain) for robustness.
         """
         CATCHALL_INVALID = ("catchallnx001", "catchallnx002", "catchallnx003")
-        # RFC 5321: 250 = verified, 251 = forward, 252 = cannot verify (e.g. relay)
         VRFY_EXPN_ACCEPT = (250, 251, 252)
+        domain = self._get_rcpt_limit_domain()
 
         def _choose_method() -> str | None:
             if self.results.enum_results:
@@ -1396,7 +1765,7 @@ class SMTP(BaseModule):
                 pass
             try:
                 smtp.docmd("MAIL FROM:", "<catchall@probe.test>")
-                status, _ = smtp.docmd("RCPT TO:", "<catchallprobe>")
+                status, _ = smtp.docmd("RCPT TO:", f"<catchallprobe@{domain}>")
                 if status in (250, 251, 252, 550):
                     return "rcpt"
             except Exception:
@@ -1416,7 +1785,7 @@ class SMTP(BaseModule):
                         status, _ = smtp.docmd(cmd, user)
                         if status in VRFY_EXPN_ACCEPT:
                             accepted += 1
-                        elif status == 550:
+                        elif status in (550, 551, 553, 554):
                             return "not_configured"
                     except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
                         return "indeterminate"
@@ -1429,8 +1798,8 @@ class SMTP(BaseModule):
                     return "indeterminate"
                 for user in CATCHALL_INVALID:
                     try:
-                        status, reply = smtp.docmd("RCPT TO:", f"<{user}>")
-                        if status == 550 or "UNKNOWN" in self.bytes_to_str(reply).upper():
+                        status, reply = smtp.docmd("RCPT TO:", f"<{user}@{domain}>")
+                        if status in (550, 551, 553, 554) or "UNKNOWN" in self.bytes_to_str(reply).upper():
                             return "not_configured"
                     except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
                         return "indeterminate"
@@ -1598,7 +1967,6 @@ class SMTP(BaseModule):
         return [self._rdata_to_str(rdata) for rdata in data]
 
     def _get_spf_records(self, resolver, domain, ns):
-        # self.ptprint(f"SPF Records for {ns}:", "INFO", self.use_json))
         spf_result = {ns: []}
         try:
             for record in ["SPF", "TXT"]:
@@ -1708,9 +2076,7 @@ class SMTP(BaseModule):
         """
         Performs NTLM authentication to extract internal server
         information from server's challenge response.
-
-        Returns:
-            NTLMInfo | None: disclosed information, or None in case of failure
+        OWASP: Common finding on MS Exchange - exposes domain/hostname.
         """
         ntlm = None
         try:
@@ -1718,9 +2084,15 @@ class SMTP(BaseModule):
             if code == 334:
                 smtp.send(b64encode(get_NegotiateMessage_data()) + smtplib.bCRLF)
                 code, resp = smtp.getreply()
-
                 ntlm = decode_ChallengeMessage_blob(b64decode(resp))
-        except:
+        except (
+            smtplib.SMTPException,
+            ValueError,
+            TypeError,
+            KeyError,
+            struct.error,
+            UnicodeDecodeError,
+        ):
             ntlm = None
 
         if ntlm is None:
@@ -1729,19 +2101,24 @@ class SMTP(BaseModule):
                 Out.NOTVULN,
             )
             return NTLMResult(False, None)
-        else:
-            self.ptdebug(
-                f"Server is vulnerable to information disclosure via NTLM authentication", Out.VULN
-            )
-            self.ptdebug(f"  Target name: {ntlm.target_name}")
-            self.ptdebug(f"  NetBios domain name: {ntlm.netbios_domain}")
-            self.ptdebug(f"  NetBios computer name: {ntlm.netbios_computer}")
-            self.ptdebug(f"  DNS domain name: {ntlm.dns_domain}")
-            self.ptdebug(f"  DNS computer name: {ntlm.dns_computer}")
-            self.ptdebug(f"  DNS tree: {ntlm.dns_tree}")
-            self.ptdebug(f"  OS version: {ntlm.os_version}")
 
-            return NTLMResult(True, ntlm)
+        self.ptdebug(
+            f"Server is vulnerable to information disclosure via NTLM authentication", Out.VULN
+        )
+        # OWASP: flag internal domain/hostname (common on MS Exchange)
+        internal_hints = (".local", ".internal", ".corp", ".lan", ".localdomain")
+        domain_str = (ntlm.netbios_domain or "") + (ntlm.dns_domain or "")
+        if any(h in (domain_str or "").lower() for h in internal_hints):
+            self.ptdebug("  [*] Internal domain/hostname disclosed (common MS Exchange finding)", Out.VULN)
+        self.ptdebug(f"  Target name: {ntlm.target_name}")
+        self.ptdebug(f"  NetBios domain name: {ntlm.netbios_domain}")
+        self.ptdebug(f"  NetBios computer name: {ntlm.netbios_computer}")
+        self.ptdebug(f"  DNS domain name: {ntlm.dns_domain}")
+        self.ptdebug(f"  DNS computer name: {ntlm.dns_computer}")
+        self.ptdebug(f"  DNS tree: {ntlm.dns_tree}")
+        self.ptdebug(f"  OS version: {ntlm.os_version}")
+
+        return NTLMResult(True, ntlm)
 
     def test_enumeration(self, smtp: smtplib.SMTP, enumeration_vulns: dict[str, bool | None]):
         if self.args.enumerate is None:
@@ -1770,17 +2147,12 @@ class SMTP(BaseModule):
         if self.args.enumerate is None:
             return None
 
-        # self.prefered_enum_method = None
         self.slow_down_results = {"expn": False, "vrfy": False, "rcpt": False}
         if "EXPN" in self.args.enumerate and enumeration_vulns["expn"]:
             self.slow_down_results.update(self.expn_vrfy_slow_down_test("EXPN", smtp))
-        if (
-            "VRFY" in self.args.enumerate and enumeration_vulns["vrfy"]
-        ):  # and not self.is_slow_down:
+        if "VRFY" in self.args.enumerate and enumeration_vulns["vrfy"]:
             self.slow_down_results.update(self.expn_vrfy_slow_down_test("VRFY", smtp))
-        if (
-            "RCPT" in self.args.enumerate and enumeration_vulns["rcpt"]
-        ):  # and not self.is_slow_down:
+        if "RCPT" in self.args.enumerate and enumeration_vulns["rcpt"]:
             self.slow_down_results.update(self.rcpt_slow_down_test(smtp))
 
         self.ptdebug("Slow-Down results:", Out.INFO)
@@ -1790,17 +2162,32 @@ class SMTP(BaseModule):
     def do_enumeration(
         self, smtp: smtplib.SMTP, enumeration_vulns: dict[str, bool]
     ) -> dict[str, list[str] | None]:
+        """OWASP: skip enumeration when catch-all would make results unreliable."""
         enumeration_results: dict[str, list[str] | None] = {
             "expn": None,
             "vrfy": None,
             "rcpt": None,
         }
+        catch_all = getattr(self.results, "catch_all", None)
+
         if enumeration_vulns["expn"]:
-            enumeration_results["expn"] = self.expn_vrfy_enumeration("EXPN", smtp)
+            if catch_all == "configured":
+                self.ptdebug("Skipping EXPN enumeration: catch-all configured (results would be false positives)", Out.INFO)
+            else:
+                enumeration_results["expn"] = self.expn_vrfy_enumeration("EXPN", smtp)
         elif enumeration_vulns["vrfy"]:
-            enumeration_results["vrfy"] = self.expn_vrfy_enumeration("VRFY", smtp)
+            if catch_all == "configured":
+                self.ptdebug("Skipping VRFY enumeration: catch-all configured (results would be false positives)", Out.INFO)
+            else:
+                enumeration_results["vrfy"] = self.expn_vrfy_enumeration("VRFY", smtp)
         elif enumeration_vulns["rcpt"]:
-            enumeration_results["rcpt"] = self.rcpt_enumeration(smtp)
+            if catch_all in ("indeterminate", "configured"):
+                self.ptdebug(
+                    f"Skipping RCPT enumeration: catch-all {catch_all} (results would be false positives)",
+                    Out.INFO,
+                )
+            else:
+                enumeration_results["rcpt"] = self.rcpt_enumeration(smtp)
 
         return enumeration_results
 
@@ -2027,46 +2414,31 @@ class SMTP(BaseModule):
 
     # endregion
 
-    # region output
-    def output(self) -> None:
-        properties: dict[str, None | str | int | list[str]] = self.ptjsonlib.json_object["results"][
-            "properties"
-        ]
+    # region streaming (real-time terminal output during run)
+    def _stream_banner_result(self) -> None:
+        """Print banner result to terminal (header already printed before initial_info())."""
+        if not self.results.banner_requested or not (info := self.results.info) or info.banner is None:
+            return
+        sid = identify_service(info.banner)
+        if sid is None:
+            icon = get_colored_text("[✓]", color="NOTVULN")
+        elif sid.version is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+        else:
+            icon = get_colored_text("[!]", color="WARNING")
+        self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
+        if sid is not None:
+            self.ptprint("Service Identification", Out.INFO)
+            self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
+            self.ptprint(f"    Version:  {sid.version if sid.version else 'unknown'}", Out.TEXT)
+            self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
 
-        # 1. Banner (separate section)
-        if self.results.banner_requested:
-            if (info_error := self.results.info_error) is not None:
-                self.ptprint("Banner", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                properties["infoError"] = info_error
-            elif (info := self.results.info) and info.banner is not None:
-                self.ptprint("Banner", Out.INFO)
-                sid = identify_service(info.banner)
-                if sid is None:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                elif sid.version is not None:
-                    icon = get_colored_text("[✗]", color="VULN")
-                else:
-                    icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
-                properties["banner"] = info.banner
-                # Service identification from banner (product, version, CPE)
-                if sid is not None:
-                    self.ptprint("Service Identification", Out.INFO)
-                    self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
-                    self.ptprint(
-                        f"    Version:  {sid.version if sid.version else 'unknown'}",
-                        Out.TEXT,
-                    )
-                    self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
-                    properties["serviceIdentification"] = {
-                        "product": sid.product,
-                        "version": sid.version,
-                        "cpe": sid.cpe,
-                    }
+    def _stream_ehlo_result(self) -> None:
+        """Print EHLO section header(s) and result."""
+        if not self.results.commands_requested or not (info := self.results.info) or info.ehlo is None:
+            return
+        ehlo_starttls = getattr(info, "ehlo_starttls", None)
 
-        # 2. EHLO extensions (PLAIN and/or STARTTLS when both available)
         def _print_ehlo_parsed(ehlo_raw: str, connection_encrypted: bool) -> None:
             parsed = _parse_ehlo_commands(ehlo_raw, connection_encrypted=connection_encrypted)
             for display_str, level in parsed:
@@ -2078,378 +2450,513 @@ class SMTP(BaseModule):
                     icon = get_colored_text("[✓]", color="NOTVULN")
                 self.ptprint(f"    {icon} {display_str}", Out.TEXT)
 
-        if self.results.commands_requested:
-            if (info_error := self.results.info_error) is not None:
-                self.ptprint("EHLO extensions", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                if "infoError" not in properties:
-                    properties["infoError"] = info_error
-            elif (info := self.results.info) and info.ehlo is not None:
-                ehlo_starttls = getattr(info, "ehlo_starttls", None)
-                if ehlo_starttls:
-                    # Two sections: PLAIN then STARTTLS (different risk: AUTH OK over TLS)
-                    self.ptprint("EHLO extensions (PLAIN)", Out.INFO)
-                    if info.ehlo:
-                        _print_ehlo_parsed(info.ehlo, connection_encrypted=False)
-                    self.ptprint("EHLO extensions (STARTTLS)", Out.INFO)
-                    _print_ehlo_parsed(ehlo_starttls, connection_encrypted=True)
-                    properties["ehloCommand"] = info.ehlo
-                    properties["ehloCommandStarttls"] = ehlo_starttls
-                else:
-                    # Single section: label by connection type
-                    connection_encrypted = (
-                        self.args.target.port == 465 or self.args.tls or self.args.starttls
-                    )
-                    section_label = " (TLS)" if connection_encrypted else " (PLAIN)"
-                    self.ptprint(f"EHLO extensions{section_label}", Out.INFO)
-                    if info.ehlo:
-                        _print_ehlo_parsed(info.ehlo, connection_encrypted=connection_encrypted)
-                    # If server advertised STARTTLS but we couldn't get second EHLO, show hint
-                    if (
-                        not connection_encrypted
-                        and "STARTTLS" in (info.ehlo or "").upper()
-                        and not getattr(info, "ehlo_starttls", None)
-                    ):
-                        self.ptprint(
-                            "    [*] STARTTLS EHLO not available (second connection or upgrade failed; try -d for debug)",
-                            Out.TEXT,
-                        )
-                    properties["ehloCommand"] = info.ehlo
-
-        # 2. Encryption
-        if (encryption_error := self.results.encryption_error) is not None:
-            self.ptprint("Encryption", Out.INFO)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Encryption test failed: {encryption_error}", Out.TEXT)
-            properties["encryptionError"] = encryption_error
-        elif (enc := self.results.encryption) is not None:
-            self.ptprint("Encryption", Out.INFO)
-            plaintext_only = enc.plaintext_ok and not enc.starttls_ok and not enc.tls_ok
-            any_ok = enc.plaintext_ok or enc.starttls_ok or enc.tls_ok
-            if plaintext_only:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Plaintext only", Out.TEXT)
-            elif any_ok:
-                if enc.plaintext_ok:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} Plaintext", Out.TEXT)
-                if enc.starttls_ok:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} STARTTLS", Out.TEXT)
-                if enc.tls_ok:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} TLS", Out.TEXT)
-            else:
-                icon = get_colored_text("[✗]", color="VULN")
+        if ehlo_starttls:
+            self.ptprint("EHLO extensions (PLAIN)", Out.INFO)
+            if info.ehlo:
+                _print_ehlo_parsed(info.ehlo, connection_encrypted=False)
+            self.ptprint("EHLO extensions (STARTTLS)", Out.INFO)
+            _print_ehlo_parsed(ehlo_starttls, connection_encrypted=True)
+        else:
+            connection_encrypted = (
+                self.args.target.port == 465 or self.args.tls or self.args.starttls
+            )
+            section_label = " (TLS)" if connection_encrypted else " (PLAIN)"
+            self.ptprint(f"EHLO extensions{section_label}", Out.INFO)
+            if info.ehlo:
+                _print_ehlo_parsed(info.ehlo, connection_encrypted=connection_encrypted)
+            if (
+                not connection_encrypted
+                and "STARTTLS" in (info.ehlo or "").upper()
+                and not getattr(info, "ehlo_starttls", None)
+            ):
+                self.ptprint("EHLO extensions (STARTTLS)", Out.INFO)
+                icon = get_colored_text("[*]", color="INFO")
                 self.ptprint(
-                    f"    {icon} No connection mode available (plaintext, STARTTLS, TLS failed)",
+                    f"    {icon} STARTTLS EHLO not available (second connection or upgrade failed; try -d for debug)",
                     Out.TEXT,
                 )
-            properties["encryption"] = {
-                "plaintext": enc.plaintext_ok,
-                "starttls": enc.starttls_ok,
-                "tls": enc.tls_ok,
-            }
 
-        # 3. Open relay
+    def _stream_encryption_result(self) -> None:
+        if (encryption_error := self.results.encryption_error) is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Encryption test failed: {encryption_error}", Out.TEXT)
+            return
+        enc = self.results.encryption
+        if enc is None:
+            return
+        plaintext_only = enc.plaintext_ok and not enc.starttls_ok and not enc.tls_ok
+        any_ok = enc.plaintext_ok or enc.starttls_ok or enc.tls_ok
+        if plaintext_only:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Plaintext only", Out.TEXT)
+        elif any_ok:
+            if enc.plaintext_ok:
+                # Plaintext available together with STARTTLS/TLS = warning
+                icon = (
+                    get_colored_text("[!]", color="WARNING")
+                    if (enc.starttls_ok or enc.tls_ok)
+                    else get_colored_text("[✓]", color="NOTVULN")
+                )
+                self.ptprint(f"    {icon} Plaintext", Out.TEXT)
+            if enc.starttls_ok:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} STARTTLS", Out.TEXT)
+            if enc.tls_ok:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} TLS", Out.TEXT)
+        else:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(
+                f"    {icon} No connection mode available (plaintext, STARTTLS, TLS failed)",
+                Out.TEXT,
+            )
+
+    def _stream_open_relay_result(self) -> None:
         if (open_relay_error := self.results.open_relay_error) is not None:
-            self.ptprint("Open relay", Out.INFO)
             icon = get_colored_text("[✗]", color="VULN")
             self.ptprint(f"    {icon} Open relay test failed: {open_relay_error}", Out.TEXT)
-            properties["openRelayError"] = open_relay_error
-        elif (open_relay := self.results.open_relay) is not None:
-            self.ptprint("Open relay", Out.INFO)
-            if open_relay:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Open relay is allowed", Out.TEXT)
-                self.ptjsonlib.add_vulnerability(VULNS.OpenRelay.value, "Open relay")
-            else:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} Open relay is denied", Out.TEXT)
+            return
+        if (open_relay := self.results.open_relay) is None:
+            return
+        if open_relay:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Open relay is allowed", Out.TEXT)
+        else:
+            icon = get_colored_text("[✓]", color="NOTVULN")
+            self.ptprint(f"    {icon} Open relay is denied", Out.TEXT)
 
-        # 3a. Catch All mailbox
-        if (catch_all := self.results.catch_all) is not None:
-            self.ptprint("Catch All mailbox", Out.INFO)
-            info_icon = get_colored_text("[*]", color="INFO")
-            if catch_all == "configured":
-                self.ptprint(f"    {info_icon} Configured", Out.TEXT)
-            elif catch_all == "not_configured":
-                self.ptprint(f"    {info_icon} Not Configured", Out.TEXT)
-            else:
-                self.ptprint(f"    {info_icon} Indeterminate", Out.TEXT)
-            properties["catchAll"] = catch_all
+    def _stream_catch_all_result(self) -> None:
+        if (catch_all := self.results.catch_all) is None:
+            return
+        info_icon = get_colored_text("[*]", color="INFO")
+        if catch_all == "configured":
+            self.ptprint(f"    {info_icon} Configured", Out.TEXT)
+        elif catch_all == "not_configured":
+            self.ptprint(f"    {info_icon} Not Configured", Out.TEXT)
+        else:
+            self.ptprint(f"    {info_icon} Indeterminate", Out.TEXT)
 
-        # 3b. RCPT TO limit (per message)
+    def _stream_rcpt_limit_result(self) -> None:
         rcptmax_advertised = None
         if (info := getattr(self.results, "info", None)) and getattr(info, "ehlo", None):
             rcptmax_advertised = _parse_rcptmax_from_ehlo(info.ehlo)
         if (rcpt_limit_err := self.results.rcpt_limit_error) is not None:
-            self.ptprint("RCPT TO limit", Out.INFO)
             if rcptmax_advertised is not None:
                 info_icon = get_colored_text("[*]", color="INFO")
                 self.ptprint(
                     f"    {info_icon} Advertised in EHLO (RFC 9422): RCPTMAX={rcptmax_advertised}",
                     Out.TEXT,
                 )
-                properties["rcptLimitAdvertised"] = rcptmax_advertised
             icon = get_colored_text("[✗]", color="VULN")
             self.ptprint(f"    {icon} Test failed: {rcpt_limit_err}", Out.TEXT)
-            properties["rcptLimitError"] = rcpt_limit_err
-        elif (rlim := self.results.rcpt_limit) is not None:
-            self.ptprint("RCPT TO limit", Out.INFO)
-            info_icon = get_colored_text("[*]", color="INFO")
-            if rcptmax_advertised is not None:
+            return
+        rlim = self.results.rcpt_limit
+        if rlim is None:
+            return
+        info_icon = get_colored_text("[*]", color="INFO")
+        if rcptmax_advertised is not None:
+            self.ptprint(
+                f"    {info_icon} Advertised in EHLO (RFC 9422): RCPTMAX={rcptmax_advertised}",
+                Out.TEXT,
+            )
+        if getattr(rlim, "rejected_addresses", False):
+            self.ptprint(
+                f"    {info_icon} Could not test: server rejects test addresses (not a count limit)",
+                Out.TEXT,
+            )
+            if rlim.server_response:
+                for line in (rlim.server_response or "").replace("\r", "").splitlines():
+                    self.ptprint(f"        {line}", Out.TEXT)
+            if not getattr(self.args, "domain", None):
                 self.ptprint(
-                    f"    {info_icon} Advertised in EHLO (RFC 9422): RCPTMAX={rcptmax_advertised}",
+                    f"    {info_icon} Try -d/--domain <domain> to set recipient domain for this test",
                     Out.TEXT,
                 )
-                properties["rcptLimitAdvertised"] = rcptmax_advertised
-            if getattr(rlim, "rejected_addresses", False):
-                self.ptprint(
-                    f"    {info_icon} Could not test: server rejects test addresses (not a count limit)",
-                    Out.TEXT,
-                )
+        elif rlim.limit_triggered:
+            icon = get_colored_text("[✓]", color="NOTVULN")
+            self.ptprint(f"    {icon} Limit enforced after {rlim.max_accepted} recipients", Out.TEXT)
+            if rlim.server_response:
+                for line in (rlim.server_response or "").replace("\r", "").splitlines():
+                    self.ptprint(f"        {line}", Out.TEXT)
+        else:
+            if rlim.max_accepted == 0:
+                self.ptprint(f"    {info_icon} Could not test: no recipients accepted", Out.TEXT)
                 if rlim.server_response:
-                    for line in rlim.server_response.replace("\r", "").splitlines():
+                    for line in (rlim.server_response or "").replace("\r", "").splitlines():
                         self.ptprint(f"        {line}", Out.TEXT)
-                self.ptprint(
-                    f"    {info_icon} Try -d/--domain <domain> to use a valid recipient domain.",
-                    Out.TEXT,
-                )
-                properties["rcptLimit"] = {"rejectedAddresses": True, "serverResponse": rlim.server_response}
-            elif rlim.limit_triggered:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} Limit enforced after {rlim.max_accepted} recipients", Out.TEXT)
-                if rlim.server_response:
-                    for line in rlim.server_response.replace("\r", "").splitlines():
-                        self.ptprint(f"        {line}", Out.TEXT)
-                properties["rcptLimit"] = {"maxAccepted": rlim.max_accepted, "limitTriggered": True}
             else:
-                if rlim.max_accepted == 0:
-                    self.ptprint(
-                        f"    {info_icon} Could not test: no recipients accepted",
-                        Out.TEXT,
-                    )
-                    if rlim.server_response:
-                        for line in rlim.server_response.replace("\r", "").splitlines():
-                            self.ptprint(f"        {line}", Out.TEXT)
-                    self.ptprint(
-                        f"    {info_icon} Try -d/--domain <domain> to use a valid recipient domain.",
-                        Out.TEXT,
-                    )
-                    properties["rcptLimit"] = {"maxAccepted": 0, "limitTriggered": False, "couldNotTest": True}
-                else:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(
-                        f"    {icon} No limit or too high: {rlim.max_accepted} recipients accepted",
-                        Out.TEXT,
-                    )
-                    properties["rcptLimit"] = {"maxAccepted": rlim.max_accepted, "limitTriggered": False}
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(
+                    f"    {icon} No limit or too high: {rlim.max_accepted} recipients accepted",
+                    Out.TEXT,
+                )
 
-        # 4. Blacklist information
+    def _stream_blacklist_result(self) -> None:
         if (blacklist_error := self.results.blacklist_error) is not None:
-            self.ptprint("Blacklist information", Out.INFO)
             icon = get_colored_text("[✗]", color="VULN")
             self.ptprint(f"    {icon} Blacklist test failed: {blacklist_error}", Out.TEXT)
-            properties["blacklistError"] = blacklist_error
-        elif self.results.blacklist_private_ip_skipped:
-            self.ptprint("Blacklist information", Out.INFO)
-            # Print as plain text to control spacing after the [*] icon
+            return
+        if self.results.blacklist_private_ip_skipped:
             info_icon = get_colored_text("[*]", color="INFO")
             self.ptprint(
                 f"    {info_icon}Private/internal IP - blacklist check not applicable (addresses in private ranges are not listed on public blacklists)",
                 Out.TEXT,
             )
-        elif blacklist := self.results.blacklist:
-            self.ptprint("Blacklist information", Out.INFO)
-            if not blacklist.listed:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} Clean", Out.TEXT)
-            else:
-                icon = get_colored_text("[✗]", color="VULN")
-                json_lines: list[str] = []
-                if (results := blacklist.results) is not None:
-                    for r in results:
-                        r_str = f'{r.blacklist.strip()}: "{r.reason}" (TTL={r.ttl})'
-                        self.ptprint(f"    {icon} {r_str}", Out.TEXT)
-                        json_lines.append(r_str)
+            return
+        blacklist = self.results.blacklist
+        if blacklist is None:
+            return
+        if not blacklist.listed:
+            icon = get_colored_text("[✓]", color="NOTVULN")
+            self.ptprint(f"    {icon} Clean", Out.TEXT)
+        else:
+            icon = get_colored_text("[✗]", color="VULN")
+            if (results := blacklist.results) is not None:
+                for r in results:
+                    r_str = f'{r.blacklist.strip()}: "{r.reason}" (TTL={r.ttl})'
+                    self.ptprint(f"    {icon} {r_str}", Out.TEXT)
 
-                    if len(json_lines) > 0:
-                        self.ptjsonlib.add_vulnerability(
-                            VULNS.Blacklist.value,
-                            f"blacklists containing target {self.target}",
-                            "\n".join(json_lines),
-                        )
-
-        # 5. SPF records
+    def _stream_spf_result(self) -> None:
         if self.results.spf_requires_domain:
-            self.ptprint("SPF records", Out.INFO)
             info_icon = get_colored_text("[*]", color="INFO")
             self.ptprint(
                 f"    {info_icon} Test requires target specified by a domain name",
                 Out.TEXT,
             )
-        elif (spf_error := self.results.spf_error) is not None:
-            self.ptprint("SPF records", Out.INFO)
+            return
+        if (spf_error := self.results.spf_error) is not None:
             icon = get_colored_text("[✗]", color="VULN")
             self.ptprint(f"    {icon} SPF test failed: {spf_error}", Out.TEXT)
-            properties["spfError"] = spf_error
-        elif (spf_records := self.results.spf_records) is not None:
-            self.ptprint("SPF records", Out.INFO)
+            return
+        spf_records = self.results.spf_records
+        if spf_records is None:
+            return
+        for ns, records in spf_records.items():
+            info_icon = get_colored_text("[*]", color="INFO")
+            self.ptprint(f"    {info_icon} Nameserver {ns}", Out.TEXT)
+            for r in records:
+                self.ptprint(f"        {r}", Out.TEXT)
 
-            json_lines = []
-            for ns, records in spf_records.items():
-                info_icon = get_colored_text("[*]", color="INFO")
-                self.ptprint(f"    {info_icon} Nameserver {ns}", Out.TEXT)
-                for r in records:
-                    self.ptprint(f"        {r}")
-                    json_lines.append(f"[{ns}] {r}")
-
-            if len(json_lines) > 0:
-                properties["spfRecords"] = "\n".join(json_lines)
-
-        # 6. User enumeration methods
+    def _stream_enumeration_result(self) -> None:
         if (enum_error := self.results.enum_error) is not None:
-            self.ptprint("User enumeration methods", Out.INFO)
             icon = get_colored_text("[✗]", color="VULN")
             self.ptprint(f"    {icon} Enumeration test failed: {enum_error}", Out.TEXT)
-            properties["enumerationError"] = enum_error
-        elif (enum_results := self.results.enum_results) is not None:
-            self.ptprint("User enumeration methods", Out.INFO)
+            return
+        enum_results = self.results.enum_results
+        if enum_results is None:
+            return
+        if self.args.enumerate is None:
+            requested_set = {"EXPN", "VRFY", "RCPT"}
+        elif isinstance(self.args.enumerate, list):
+            requested_set = {m.upper() for m in self.args.enumerate if m}
+        else:
+            requested_set = {self.args.enumerate.upper()} if self.args.enumerate else {"EXPN", "VRFY", "RCPT"}
+        filtered = [e for e in enum_results if e.method.upper() in requested_set]
+        for e in filtered:
+            slowdown = ""
+            if e.slowdown is not None:
+                slowdown = " (rate limited)" if e.slowdown else " (not rate limited)"
+            status = "is enabled" if e.vulnerable else "is deny"
+            icon = get_colored_text("[✗]", color="VULN") if e.vulnerable else get_colored_text("[✓]", color="NOTVULN")
+            self.ptprint(f"    {icon} {e.method.upper()} method {status}{slowdown}", Out.TEXT)
+        for e in filtered:
+            if e.vulnerable and (results := e.results) is not None:
+                sorted_results = sorted(results, key=str)
+                email_count = sum(1 for r in sorted_results if "@" in str(r))
+                self.ptprint(f"Enumerated {email_count} users", Out.INFO)
+                for r in sorted_results:
+                    self.ptprint(f"    {r}")
 
+    def _stream_ntlm_result(self) -> None:
+        if (ntlm_error := self.results.ntlm_error) is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} NTLM test failed: {ntlm_error}", Out.TEXT)
+            return
+        ntlm = self.results.ntlm
+        if ntlm is None:
+            return
+        if not ntlm.success:
+            icon = get_colored_text("[✓]", color="NOTVULN")
+            self.ptprint(f"    {icon} Not available", Out.TEXT)
+        elif ntlm.ntlm is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} NTLM information", Out.TEXT)
+            for line in (
+                f"Target name: {ntlm.ntlm.target_name}",
+                f"NetBios domain name: {ntlm.ntlm.netbios_domain}",
+                f"NetBios computer name: {ntlm.ntlm.netbios_computer}",
+                f"DNS domain name: {ntlm.ntlm.dns_domain}",
+                f"DNS computer name: {ntlm.ntlm.dns_computer}",
+                f"DNS tree: {ntlm.ntlm.dns_tree}",
+                f"OS version: {ntlm.ntlm.os_version}",
+            ):
+                for part in (line or "").replace("\r", "").splitlines():
+                    self.ptprint(f"        {part}", Out.TEXT)
+
+    def _stream_max_connections_result(self) -> None:
+        if (max_connections_error := self.results.max_connections_error) is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Max connections test failed: {max_connections_error}", Out.TEXT)
+            return
+        max_con = self.results.max_connections
+        if max_con is None:
+            return
+        if max_con.max is None:
+            self.ptprint("Maximum connections: no limit found", Out.VULN)
+            return
+        if max_con.max < 50:
+            icon = get_colored_text("[✓]", color="NOTVULN")
+            status_text = ""
+        elif max_con.max < 100:
+            icon = get_colored_text("[!]", color="WARNING")
+            status_text = " (high value)"
+        else:
+            icon = get_colored_text("[✗]", color="VULN")
+            status_text = " (high value)"
+        self.ptprint(f"    {icon} Max connections per IP: {max_con.max}{status_text}", Out.TEXT)
+        if max_con.ban_minutes is None:
+            icon = get_colored_text("[✓]", color="NOTVULN")
+            self.ptprint(f"    {icon} Timeout: not detected", Out.TEXT)
+        else:
+            if max_con.ban_minutes < 10:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                status_text = ""
+            else:
+                icon = get_colored_text("[✗]", color="VULN")
+                status_text = " (high value)"
+            self.ptprint(f"    {icon} Timeout: {max_con.ban_minutes:.1f} min{status_text}", Out.TEXT)
+
+    def _stream_brute_result(self) -> None:
+        creds = self.results.creds
+        if creds is None:
+            return
+        for cred in creds:
+            self.ptprint(f"    user: {cred.user}, password: {cred.passw}")
+
+    # endregion
+
+    # region output
+    def output(self) -> None:
+        properties = {
+            "software_type": None,
+            "name": "smtp",
+            "version": None,
+            "vendor": None,
+            "description": None,
+        }
+        deferred_vulns = []
+
+        # Connection error: show only the error line, no section headers
+        if (info_error := getattr(self.results, "info_error", None)) is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+            properties.update({"infoError": info_error})
+            smtp_node = self.ptjsonlib.create_node_object("software", None, None, properties)
+            self.ptjsonlib.add_node(smtp_node)
+            for v in deferred_vulns:
+                self.ptjsonlib.add_vulnerability(**v)
+            self.ptjsonlib.set_status("finished", "")
+            self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+            return
+
+        # 1. Banner (streaming: already printed in run())
+        if self.results.banner_requested:
+            if (info := self.results.info) and info.banner is not None:
+                sid = identify_service(info.banner)
+                vendor = _vendor_from_cpe(sid.cpe) if sid else None
+                version = sid.version if sid else None
+                properties.update(
+                    {
+                        "description": f"Banner: {info.banner}",
+                        "version": version,
+                        "vendor": vendor,
+                    }
+                )
+                if sid is not None:
+                    if sid.version is not None:
+                        deferred_vulns.append({"vuln_code": "PTV-SVC-BANNER"})
+                    properties.update({"cpe": sid.cpe})
+
+        # 2. EHLO extensions (streaming: already printed in run())
+        if self.results.commands_requested:
+            if (info := self.results.info) and info.ehlo is not None:
+                ehlo_starttls = getattr(info, "ehlo_starttls", None)
+                if ehlo_starttls:
+                    properties.update(
+                        {"ehloCommand": info.ehlo, "ehloCommandStarttls": ehlo_starttls}
+                    )
+                else:
+                    properties.update({"ehloCommand": info.ehlo})
+
+        # 2. Encryption (streaming: already printed in run())
+        if (encryption_error := self.results.encryption_error) is not None:
+            properties.update({"encryptionError": encryption_error})
+        elif (enc := self.results.encryption) is not None:
+            properties.update(
+                {
+                    "encryption": {
+                        "plaintext": enc.plaintext_ok,
+                        "starttls": enc.starttls_ok,
+                        "tls": enc.tls_ok,
+                    }
+                }
+            )
+
+        # 3. Open relay (streaming: already printed in run())
+        if (open_relay_error := self.results.open_relay_error) is not None:
+            properties.update({"openRelayError": open_relay_error})
+        elif (open_relay := self.results.open_relay) is not None:
+            if open_relay:
+                deferred_vulns.append(
+                    {"vuln_code": VULNS.OpenRelay.value, "vuln_request": "Open relay"}
+                )
+
+        # 3a. Catch All mailbox (streaming: already printed in run())
+        if (catch_all := self.results.catch_all) is not None:
+            properties.update({"catchAll": catch_all})
+
+        # 3b. RCPT TO limit (streaming: already printed in run())
+        rcptmax_advertised = None
+        if (info := getattr(self.results, "info", None)) and getattr(info, "ehlo", None):
+            rcptmax_advertised = _parse_rcptmax_from_ehlo(info.ehlo)
+        if (rcpt_limit_err := self.results.rcpt_limit_error) is not None:
+            if rcptmax_advertised is not None:
+                properties.update({"rcptLimitAdvertised": rcptmax_advertised})
+            properties.update({"rcptLimitError": rcpt_limit_err})
+        elif (rlim := self.results.rcpt_limit) is not None:
+            if rcptmax_advertised is not None:
+                properties.update({"rcptLimitAdvertised": rcptmax_advertised})
+            if getattr(rlim, "rejected_addresses", False):
+                properties.update(
+                    {"rcptLimit": {"rejectedAddresses": True, "serverResponse": rlim.server_response}}
+                )
+            elif rlim.limit_triggered:
+                properties.update(
+                    {"rcptLimit": {"maxAccepted": rlim.max_accepted, "limitTriggered": True}}
+                )
+            else:
+                if rlim.max_accepted == 0:
+                    properties.update(
+                        {"rcptLimit": {"maxAccepted": 0, "limitTriggered": False, "couldNotTest": True}}
+                    )
+                else:
+                    properties.update(
+                        {"rcptLimit": {"maxAccepted": rlim.max_accepted, "limitTriggered": False}}
+                    )
+
+        # 4. Blacklist information (streaming: already printed in run())
+        if (blacklist_error := self.results.blacklist_error) is not None:
+            properties.update({"blacklistError": blacklist_error})
+        elif self.results.blacklist_private_ip_skipped:
+            properties.update({"blacklistSkipped": "private_ip"})
+        elif blacklist := self.results.blacklist:
+            if not blacklist.listed:
+                pass
+            else:
+                json_lines: list[str] = []
+                if (results := blacklist.results) is not None:
+                    for r in results:
+                        json_lines.append(f'{r.blacklist.strip()}: "{r.reason}" (TTL={r.ttl})')
+                    if len(json_lines) > 0:
+                        deferred_vulns.append(
+                            {
+                                "vuln_code": VULNS.Blacklist.value,
+                                "vuln_request": f"blacklists containing target {self.target}",
+                                "vuln_response": "\n".join(json_lines),
+                            }
+                        )
+
+        # 5. SPF records (streaming: already printed in run())
+        if (spf_error := self.results.spf_error) is not None:
+            properties.update({"spfError": spf_error})
+        elif self.results.spf_requires_domain:
+            properties.update({"spfSkipped": "requires_domain"})
+        elif (spf_records := self.results.spf_records) is not None:
+            json_lines = []
+            for ns, records in spf_records.items():
+                for r in records:
+                    json_lines.append(f"[{ns}] {r}")
+            if len(json_lines) > 0:
+                properties.update({"spfRecords": "\n".join(json_lines)})
+
+        # 6. User enumeration methods (streaming: already printed in run())
+        if (enum_error := self.results.enum_error) is not None:
+            properties.update({"enumerationError": enum_error})
+        elif (enum_results := self.results.enum_results) is not None:
             if self.args.enumerate is None:
                 requested_set = {"EXPN", "VRFY", "RCPT"}
             elif isinstance(self.args.enumerate, list):
                 requested_set = {m.upper() for m in self.args.enumerate if m}
             else:
                 requested_set = {self.args.enumerate.upper()} if self.args.enumerate else {"EXPN", "VRFY", "RCPT"}
-
             filtered = [e for e in enum_results if e.method.upper() in requested_set]
-
-            for e in filtered:
-                if e.slowdown is not None:
-                    slowdown = " (rate limited)" if e.slowdown else " (not rate limited)"
-                else:
-                    slowdown = ""
-                status = "is enabled" if e.vulnerable else "is deny"
-                icon = get_colored_text("[✗]", color="VULN") if e.vulnerable else get_colored_text("[✓]", color="NOTVULN")
-                method_upper = e.method.upper()
-                out_str = f'{icon} {method_upper} method {status}{slowdown}'
-                self.ptprint(f"    {out_str}", Out.TEXT)
-
             json_lines = []
             for e in filtered:
-                out_str = f'{get_colored_text("[✗]" if e.vulnerable else "[✓]", color="VULN" if e.vulnerable else "NOTVULN")} {e.method.upper()} method {"is enabled" if e.vulnerable else "is deny"}'
+                out_str = f'{e.method.upper()} method {"is enabled" if e.vulnerable else "is deny"}'
                 if e.vulnerable:
                     json_lines.append(out_str)
                 if e.vulnerable and (results := e.results) is not None:
                     sorted_results = sorted(results, key=str)
                     email_count = sum(1 for r in sorted_results if "@" in str(r))
-                    out_str = f"Enumerated {email_count} users"
-                    self.ptprint(out_str, Out.INFO)
-                    json_lines.append(out_str)
+                    json_lines.append(f"Enumerated {email_count} users")
                     for r in sorted_results:
-                        self.ptprint(f"    {r}")
-                        json_lines.append(r)
-
+                        json_lines.append(str(r))
             if len(json_lines) > 0:
                 req = f"enumeration methods: {self.args.enumerate}"
                 if self.args.wordlist is not None:
                     req += f"\nwordlist used: {self.args.wordlist}"
-
-                self.ptjsonlib.add_vulnerability(VULNS.UserEnum.value, req, "\n".join(json_lines))
-
-        # 6. NTLM information
-        if (ntlm_error := self.results.ntlm_error) is not None:
-            self.ptprint("NTLM information", Out.INFO)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} NTLM test failed: {ntlm_error}", Out.TEXT)
-            properties["ntlmError"] = ntlm_error
-        elif ntlm := self.results.ntlm:
-            self.ptprint("NTLM information", Out.INFO)
-            if not ntlm.success:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} Not available", Out.TEXT)
-                properties["ntlmInfoStatus"] = "failed"
-            elif ntlm.ntlm is not None:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} NTLM information", Out.TEXT)
-                properties["ntlmInfoStatus"] = "ok"
-
-                out_lines: list[str] = []
-                out_lines.append(f"Target name: {ntlm.ntlm.target_name}")
-                out_lines.append(f"NetBios domain name: {ntlm.ntlm.netbios_domain}")
-                out_lines.append(f"NetBios computer name: {ntlm.ntlm.netbios_computer}")
-                out_lines.append(f"DNS domain name: {ntlm.ntlm.dns_domain}")
-                out_lines.append(f"DNS computer name: {ntlm.ntlm.dns_computer}")
-                out_lines.append(f"DNS tree: {ntlm.ntlm.dns_tree}")
-                out_lines.append(f"OS version: {ntlm.ntlm.os_version}")
-
-                for line in out_lines:
-                    for part in (line or "").replace("\r", "").splitlines():
-                        self.ptprint(f"        {part}", Out.TEXT)
-
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.NTLM.value, "ntlm authentication", "\n".join(out_lines)
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.UserEnum.value,
+                        "vuln_request": req,
+                        "vuln_response": "\n".join(json_lines),
+                    }
                 )
 
-        # 7. Connections
+        # 6. NTLM information (streaming: already printed in run())
+        if (ntlm_error := self.results.ntlm_error) is not None:
+            properties.update({"ntlmError": ntlm_error})
+        elif ntlm := self.results.ntlm:
+            if not ntlm.success:
+                properties.update({"ntlmInfoStatus": "failed"})
+            elif ntlm.ntlm is not None:
+                properties.update({"ntlmInfoStatus": "ok"})
+                out_lines = [
+                    f"Target name: {ntlm.ntlm.target_name}",
+                    f"NetBios domain name: {ntlm.ntlm.netbios_domain}",
+                    f"NetBios computer name: {ntlm.ntlm.netbios_computer}",
+                    f"DNS domain name: {ntlm.ntlm.dns_domain}",
+                    f"DNS computer name: {ntlm.ntlm.dns_computer}",
+                    f"DNS tree: {ntlm.ntlm.dns_tree}",
+                    f"OS version: {ntlm.ntlm.os_version}",
+                ]
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.NTLM.value,
+                        "vuln_request": "ntlm authentication",
+                        "vuln_response": "\n".join(out_lines),
+                    }
+                )
+
+        # 7. Connections (streaming: already printed in run())
         if (max_connections_error := self.results.max_connections_error) is not None:
-            self.ptprint("Connections", Out.INFO)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Max connections test failed: {max_connections_error}", Out.TEXT)
-            properties["maxConnectionsError"] = max_connections_error
+            properties.update({"maxConnectionsError": max_connections_error})
         elif max_con := self.results.max_connections:
             if max_con.max is None:
-                self.ptprint("Maximum connections: no limit found", Out.VULN)
-                properties["maxConnections"] = None
+                properties.update({"maxConnections": None})
             else:
-                self.ptprint("Connections", Out.INFO)
-                
-                # Max connections per IP evaluation
-                if max_con.max < 50:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    status_text = ""
-                elif max_con.max < 100:
-                    icon = get_colored_text("[!]", color="WARNING")
-                    status_text = " (high value)"
-                else:  # >= 100
-                    icon = get_colored_text("[✗]", color="VULN")
-                    status_text = " (high value)"
-                
-                self.ptprint(f"    {icon} Max connections per IP: {max_con.max}{status_text}", Out.TEXT)
-                properties["maxConnections"] = max_con.max
-
-                # Timeout evaluation
+                properties.update({"maxConnections": max_con.max})
                 if max_con.ban_minutes is None:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} Timeout: not detected", Out.TEXT)
-                    properties["banDuration"] = None
+                    properties.update({"banDuration": None})
                 else:
-                    if max_con.ban_minutes < 10:
-                        icon = get_colored_text("[✓]", color="NOTVULN")
-                        status_text = ""
-                    else:  # >= 10
-                        icon = get_colored_text("[✗]", color="VULN")
-                        status_text = " (high value)"
-                    
-                    # Format timeout: show as "X.X min"
-                    timeout_str = f"{max_con.ban_minutes:.1f} min"
-                    self.ptprint(f"    {icon} Timeout: {timeout_str}{status_text}", Out.TEXT)
-                    properties["banDuration"] = max_con.ban_minutes
+                    properties.update({"banDuration": max_con.ban_minutes})
 
-        # Login bruteforce
+        # Login bruteforce (streaming: already printed in run())
         if (creds := self.results.creds) is not None:
-            self.ptprint(f"Login bruteforce: {len(creds)} valid credentials", Out.INFO)
-
             if len(creds) > 0:
                 json_lines: list[str] = []
                 for cred in creds:
-                    cred_str = f"user: {cred.user}, password: {cred.passw}"
-
-                    self.ptprint(f"    {cred_str}")
-                    json_lines.append(cred_str)
+                    json_lines.append(f"user: {cred.user}, password: {cred.passw}")
 
                 if self.args.user is not None:
                     user_str = f"username: {self.args.user}"
@@ -2461,11 +2968,24 @@ class SMTP(BaseModule):
                 else:
                     passw_str = f"passwords: {self.args.passwords}"
 
-                self.ptjsonlib.add_vulnerability(
-                    VULNS.WeakCreds.value,
-                    f"{user_str}\n{passw_str}",
-                    "\n".join(json_lines),
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.WeakCreds.value,
+                        "vuln_request": f"{user_str}\n{passw_str}",
+                        "vuln_response": "\n".join(json_lines),
+                    }
                 )
+
+        # Create node at the end with all collected properties and bind vulnerabilities
+        smtp_node = self.ptjsonlib.create_node_object(
+            "software",
+            None,
+            None,
+            properties,
+        )
+        self.ptjsonlib.add_node(smtp_node)
+        for v in deferred_vulns:
+            self.ptjsonlib.add_vulnerability(**v)
 
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)

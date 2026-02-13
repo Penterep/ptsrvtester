@@ -444,7 +444,27 @@ class XRDP(BaseModule):
             result_data = {
                 "tested_passwords": self.results.tested_passwords,
                 "valid_credentials": self.results.valid_creds,
-                "error": self.results.error
+                "error": self.results.error,
             }
-            self.ptjsonlib.add_vulnerability("XRDP_TESTED", result_data)
+            properties = {
+                "software_type": None,
+                "name": "xrdp",
+                "version": None,
+                "vendor": None,
+                "description": str(self.results.error) if self.results.error else None,
+                **result_data,
+            }
+            xrdp_node = self.ptjsonlib.create_node_object(
+                "software",
+                None,
+                None,
+                properties,
+            )
+            self.ptjsonlib.add_node(xrdp_node)
+            node_key = xrdp_node["key"]
+            self.ptjsonlib.add_vulnerability(
+                "XRDP_TESTED",
+                result_data,
+                node_key=node_key,
+            )
             self.ptprint(self.ptjsonlib.get_result_json(), Out.TEXT, json=True)

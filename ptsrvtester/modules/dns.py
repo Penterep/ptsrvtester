@@ -831,23 +831,48 @@ class DNS(BaseModule):
         DNSSEC = "PTV-SNMPv2-DNSSEC"
         ZoneWalk = "PTV-SNMPv3-ZONEWALK"
         """
+        properties = {
+            "software_type": None,
+            "name": "dns",
+            "version": None,
+            "vendor": None,
+            "description": None,
+            "zoneTransfer": self.results.ZoneTransfer if self.results.ZoneTransfer is not None else None,
+            "subdomains": self.results.Subdomains if self.results.Subdomains is not None else None,
+            "dnssec": self.results.DNSSEC if self.results.DNSSEC is not None else None,
+            "zonewalk": self.results.Zonewalk if self.results.Zonewalk is not None else None,
+        }
+        deferred_vulns = []
 
-        if (self.results.ZoneTransfer != None):
-            if len(self.results.ZoneTransfer) != 0:
-                #domains of nameservers which allows Zone Transfer
-                self.ptjsonlib.add_vulnerability(VULNS.ZoneTransfer.value, "Testing for Zone transfer", ",".join(self.results.ZoneTransfer))
-        
-        if (self.results.Subdomains != None):
-            if len(self.results.Subdomains) != 0:
-                self.ptjsonlib.add_vulnerability(VULNS.Subdomains.value, "Subdomains discovered via brute-force enumeration", ",".join(self.results.Subdomains))
+        if self.results.ZoneTransfer is not None and len(self.results.ZoneTransfer) != 0:
+            deferred_vulns.append({
+                "vuln_code": VULNS.ZoneTransfer.value,
+                "vuln_request": "Testing for Zone transfer",
+                "vuln_response": ",".join(self.results.ZoneTransfer),
+            })
+        if self.results.Subdomains is not None and len(self.results.Subdomains) != 0:
+            deferred_vulns.append({
+                "vuln_code": VULNS.Subdomains.value,
+                "vuln_request": "Subdomains discovered via brute-force enumeration",
+                "vuln_response": ",".join(self.results.Subdomains),
+            })
+        if self.results.DNSSEC is not None and len(self.results.DNSSEC) != 0:
+            deferred_vulns.append({
+                "vuln_code": VULNS.DNSSEC.value,
+                "vuln_request": "Domains without DNSSEC or with invalid DNSSEC configuration",
+                "vuln_response": ",".join(self.results.DNSSEC),
+            })
+        if self.results.Zonewalk is not None and len(self.results.Zonewalk) != 0:
+            deferred_vulns.append({
+                "vuln_code": VULNS.ZoneWalk.value,
+                "vuln_request": "Subdomains discovered via DNS zone walking (NSEC/NSEC3)",
+                "vuln_response": ",".join(self.results.Zonewalk),
+            })
 
-        if (self.results.DNSSEC != None):
-            if len(self.results.DNSSEC) != 0:
-                self.ptjsonlib.add_vulnerability(VULNS.DNSSEC.value, "Domains without DNSSEC or with invalid DNSSEC configuration", ",".join(self.results.DNSSEC)) 
-
-        if (self.results.Zonewalk != None):
-            if len(self.results.Zonewalk) != 0:
-                self.ptjsonlib.add_vulnerability(VULNS.ZoneWalk.value, "Subdomains discovered via DNS zone walking (NSEC/NSEC3)", ",".join(self.results.Zonewalk))
-        
+        dns_node = self.ptjsonlib.create_node_object("software", None, None, properties)
+        self.ptjsonlib.add_node(dns_node)
+        node_key = dns_node["key"]
+        for v in deferred_vulns:
+            self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
 
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)

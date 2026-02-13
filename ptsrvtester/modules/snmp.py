@@ -1036,7 +1036,6 @@ class SNMP(BaseModule):
             Bulk2: Optional[List[str]] = None
             Bulk3: Optional[List[str]] = None
         """
-
         def credentials_to_string(creds: List[Credential]) -> str:
             return ", ".join(
                 f"{c.username or 'None'}:{c.password or 'None'}"
@@ -1048,39 +1047,48 @@ class SNMP(BaseModule):
                 for r in results
             )
 
-        if (self.results.communities != None):
-            if len(self.results.communities) != 0:
-                self.ptjsonlib.add_vulnerability(VULNS.WeakCommunityName.value, "Bruteforcing SNMPv1-2 community strings", ",".join(self.results.communities))
-        
-        if (self.results.usernames != None):
-            if len(self.results.usernames) != 0:
-                self.ptjsonlib.add_vulnerability(VULNS.WeakUsername.value, "Bruteforcing SNMPv3 usernames", ",".join(self.results.usernames))
+        bulk3_str = None
+        if self.results.Bulk3 is not None and len(self.results.Bulk3) != 0:
+            bulk3_str = self.results.Bulk3 if isinstance(self.results.Bulk3, str) else "\n".join(self.results.Bulk3)
+        bulk2_str = None
+        if self.results.Bulk2 is not None and len(self.results.Bulk2) != 0:
+            bulk2_str = self.results.Bulk2 if isinstance(self.results.Bulk2, str) else "\n".join(self.results.Bulk2)
 
-        if (self.results.credentials != None):
-            if len(self.results.credentials) != 0:
-                cred_str = credentials_to_string(self.results.credentials)
-                self.ptjsonlib.add_vulnerability(VULNS.WeakCredentials.value, "Bruteforcing SNMPv3 credentials", cred_str) 
+        properties = {
+            "software_type": None,
+            "name": "snmp",
+            "version": None,
+            "vendor": None,
+            "description": None,
+            "communities": ",".join(self.results.communities) if self.results.communities is not None and len(self.results.communities) != 0 else None,
+            "usernames": ",".join(self.results.usernames) if self.results.usernames is not None and len(self.results.usernames) != 0 else None,
+            "credentials": credentials_to_string(self.results.credentials) if self.results.credentials is not None and len(self.results.credentials) != 0 else None,
+            "writetest3": write_results_to_string(self.results.Writetest3) if self.results.Writetest3 is not None and len(self.results.Writetest3) != 0 else None,
+            "writetest2": write_results_to_string(self.results.Writetest2) if self.results.Writetest2 is not None and len(self.results.Writetest2) != 0 else None,
+            "bulk3": bulk3_str,
+            "bulk2": bulk2_str,
+        }
+        deferred_vulns = []
 
-        if (self.results.Writetest3 != None):
-            if len(self.results.Writetest3) != 0:
-                value_str = write_results_to_string(self.results.Writetest3)
-                self.ptjsonlib.add_vulnerability(VULNS.Write_3.value, "Testing write access trough SNMPv3", value_str)
-        
-        if (self.results.Writetest2 != None):
-            if len(self.results.Writetest2) != 0:
-                value_str = write_results_to_string(self.results.Writetest2)
-                self.ptjsonlib.add_vulnerability(VULNS.Write_2.value, "Testing write access trough SNMPv2", value_str)
-        
-        if (self.results.Bulk3 != None):
-            if len(self.results.Bulk3) != 0:
-                self.ptjsonlib.add_vulnerability(VULNS.Readmib_3.value, "Testing reading MIB database trough SNMPv3", self.results.Bulk3)
+        if self.results.communities is not None and len(self.results.communities) != 0:
+            deferred_vulns.append({"vuln_code": VULNS.WeakCommunityName.value, "vuln_request": "Bruteforcing SNMPv1-2 community strings", "vuln_response": ",".join(self.results.communities)})
+        if self.results.usernames is not None and len(self.results.usernames) != 0:
+            deferred_vulns.append({"vuln_code": VULNS.WeakUsername.value, "vuln_request": "Bruteforcing SNMPv3 usernames", "vuln_response": ",".join(self.results.usernames)})
+        if self.results.credentials is not None and len(self.results.credentials) != 0:
+            deferred_vulns.append({"vuln_code": VULNS.WeakCredentials.value, "vuln_request": "Bruteforcing SNMPv3 credentials", "vuln_response": credentials_to_string(self.results.credentials)})
+        if self.results.Writetest3 is not None and len(self.results.Writetest3) != 0:
+            deferred_vulns.append({"vuln_code": VULNS.Write_3.value, "vuln_request": "Testing write access trough SNMPv3", "vuln_response": write_results_to_string(self.results.Writetest3)})
+        if self.results.Writetest2 is not None and len(self.results.Writetest2) != 0:
+            deferred_vulns.append({"vuln_code": VULNS.Write_2.value, "vuln_request": "Testing write access trough SNMPv2", "vuln_response": write_results_to_string(self.results.Writetest2)})
+        if bulk3_str is not None:
+            deferred_vulns.append({"vuln_code": VULNS.Readmib_3.value, "vuln_request": "Testing reading MIB database trough SNMPv3", "vuln_response": bulk3_str})
+        if bulk2_str is not None:
+            deferred_vulns.append({"vuln_code": VULNS.Readmib_2.value, "vuln_request": "Testing reading MIB database trough SNMPv3", "vuln_response": bulk2_str})
 
-        if (self.results.Bulk2 != None):
-            if len(self.results.Bulk2) != 0:
-                self.ptjsonlib.add_vulnerability(VULNS.Readmib_2.value, "Testing reading MIB database trough SNMPv3", self.results.Bulk2)
-
-    
-
-        
+        snmp_node = self.ptjsonlib.create_node_object("software", None, None, properties)
+        self.ptjsonlib.add_node(snmp_node)
+        node_key = snmp_node["key"]
+        for v in deferred_vulns:
+            self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
 
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)

@@ -3,6 +3,10 @@ Service identification from server banner.
 Maps banner content to product name, version (if numeric), OS/distribution, and CPE 2.3 (NVD-style).
 Only numeric app versions (e.g. 7.1.1, 4.96) are used as version and in CPE; distribution
 names (e.g. Ubuntu, Debian/GNU Linux) from banner go to os, not version.
+
+CPE 2.3 (NIST/NVD) has exactly 11 components after the "cpe:2.3:" prefix:
+  part, vendor, product, version, update, edition, language, sw_edition, target_sw, target_hw, other.
+Unknown/NA components are represented as *.
 """
 import re
 from dataclasses import dataclass
@@ -10,6 +14,23 @@ from typing import Final
 
 # Version string acceptable for CPE (NVD uses numeric versions). Reject distro names.
 _CPE_VERSION_RE = re.compile(r"^\d+[.\d]*(?:p\d+)?[\w.-]*$", re.I)
+
+# CPE 2.3: exactly 11 components after "cpe:2.3:"
+_CPE_23_NUM_COMPONENTS = 11
+
+
+def _cpe_23_normalize(cpe: str) -> str:
+    """Return CPE 2.3 string with all 11 components; pad with * if shorter."""
+    if not cpe or not cpe.startswith("cpe:2.3:"):
+        return cpe
+    parts = cpe.split(":")
+    if len(parts) < 3:
+        return cpe
+    # parts[0]=cpe, parts[1]=2.3, parts[2:]=component list
+    components = parts[2:]
+    while len(components) < _CPE_23_NUM_COMPONENTS:
+        components.append("*")
+    return ":".join([parts[0], parts[1]] + components[: _CPE_23_NUM_COMPONENTS])
 
 # (pattern re, product display name, CPE base cpe:2.3:a:vendor:product:*)
 # Order: more specific first. Version is first capture group if present.
@@ -159,5 +180,6 @@ def identify_service(banner: str | None) -> ServiceIdentification | None:
                 version, os_str = None, None
             use_in_cpe = version and cpe_base.endswith("*")
             cpe = (cpe_base[:-1] + version) if use_in_cpe else cpe_base
+            cpe = _cpe_23_normalize(cpe)
             return ServiceIdentification(product=product, version=version, cpe=cpe, os=os_str)
     return None

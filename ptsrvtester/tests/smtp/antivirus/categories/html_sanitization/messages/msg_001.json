@@ -1,0 +1,5 @@
+{
+  "subject": "HTML sanitization test - XSS (PTL-SVC-SMTP-ANTIVIRUS)",
+  "body": "This message contains HTML with JavaScript and iframe. Webmail should sanitize.",
+  "bodyHtml": "<html><body><p>Test</p><script>alert('XSS')</script><iframe src=\"javascript:alert(1)\"></iframe><img src=x onerror=alert(1)><a href=\"javascript:alert('phishing')\">Click here</a></body></html>"
+}

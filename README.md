@@ -31,6 +31,11 @@ ptsrvtester dns whois -d example.com
 ptsrvtester ldap banner -ip 192.168.1.1
 ptsrvtester dhcp info --interface eth0
 ptsrvtester xrdp bruteforce --target 192.168.1.1 --username admin --wordlist passwords.txt
+ptsrvtester smtp --spoof-headers -r victim@example.com -u user -p pass smtp.example.com:587
+ptsrvtester smtp --bcc-test -r to@example.com --cc cc@example.com --bcc bcc@example.com smtp.example.com:25
+ptsrvtester smtp -al -r admin@example.com smtp.example.com:25
+ptsrvtester smtp -id mail.example.com:25
+ptsrvtester smtp -id --id-aggressive smtp.example.com:25
 ptsrvtester <module> -h     for help for module use
 ```
 
@@ -97,6 +102,8 @@ ptsrvtester <module> -h     for help for module use
 - Anonymous authentication testing
 - Read/write access testing
 - Credential brute-force
+- Path enumeration (dictionary attack)
+- Data mode test (passive/active, PASV IP leakage)
 - FTP bounce attack testing
 
 **SSH Module**
@@ -108,18 +115,35 @@ ptsrvtester <module> -h     for help for module use
 
 **SMTP Module**
 - Banner and Service Identification
+- Server identification
 - Server information gathering
 - Encryption testing (plaintext, STARTTLS, TLS); port 465 implicit TLS
 - User enumeration (VRFY, EXPN, RCPT)
+- AUTH user enumeration (LOGIN/NTLM)
+- HELO/EHLO hostname validation
+- AUTH downgrade test
+- Invalid/non-standard SMTP commands
+- HELO-only test
+- HELO/EHLO bypass test
+- Bounce replay / backscatter test
+- Mail bomb / rate limiting test
+- Antivirus/antispam protection test
+- SSRF test
+- Queue flood, SIZE extension test
+- Zip Bomb, Billion Laughs, XXE in attachments test
+- Spoof headers test
+- BCC disclosure test
+- Alias & addressing bypass test
 - NTLM information disclosure
 - Open relay testing
 - Catch-all mailbox detection
-- RCPT TO limit test (per-message recipient limit; expects 452/421 or similar)
+- RCPT TO limit test
 - Credential brute-force
 - Blacklist testing
 
 **POP3 Module**
 - Banner, Service Identification and capabilities retrieval
+- Help/Implementation info disclosure test (HELP command, IMPLEMENTATION from CAPA)
 - Encryption testing (plaintext, STLS, TLS); port 995 implicit TLS
 - Anonymous authentication testing
 - NTLM authentication inspection

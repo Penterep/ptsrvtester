@@ -1,11 +1,10 @@
-import argparse, paramiko, paramiko.ssh_exception, socket, sys, json
+import argparse, ipaddress, json, paramiko, paramiko.ssh_exception, socket, sys, threading
 from dataclasses import dataclass
 from enum import Enum
 from io import StringIO
 from typing import NamedTuple
 
 from ptlibs.ptjsonlib import PtJsonLib
-from ptlibs.threads import ptthreads
 
 from ssh_audit import ssh_audit
 
@@ -18,6 +17,7 @@ from .utils.helpers import (
     check_if_brute,
     filepaths,
     text_or_file,
+    threaded_bruteforce,
     valid_target,
     vendor_from_cpe,
     add_bruteforce_args,
@@ -132,9 +132,9 @@ class SSHArgs(ArgsWithBruteforce):
                 "ptsrvtester ssh --ssh-audit 127.0.0.1"
             ]},
             {"options": [
-                ["-i", "--info", "", "Get service banner and host key"],
+                ["-i", "--info", "", "Get service banner, host key and auth methods"],
                 ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
-                ["-a", "--auth-methods", "", "Get supported authentication methods"],
+                ["-a", "--auth-methods", "", "Get supported auth methods (warns if keyboard-interactive may affect password bruteforce)"],
                 ["-H", "--bad-pubkeys", "", "Check for static/known host keys"],
                 ["-A", "--bad-authkeys", "", "Check for static user SSH keys"],
                 ["", "--ssh-audit", "", "Run ssh-audit for CVEs and config"],
@@ -243,11 +243,22 @@ class SSH(BaseModule):
         if args.target.port == 0:
             args.target.port = 22
 
-        self.do_brute = check_if_brute(args)
+        self.do_brute = check_if_brute(args) or bool(
+            (args.user or args.users) and getattr(args, "privkeys", None)
+        )
+        self.use_json = getattr(args, "json", False)
 
         self.args = args
         self.ptjsonlib = ptjsonlib
         self.results: SSHResults
+        self._output_lock = threading.Lock()
+        self._streamed_banner = False
+        self._streamed_auth_methods = False
+        self._streamed_kex = False
+        self._streamed_ssh_audit = False
+        self._streamed_bad_pubkey = False
+        self._streamed_bad_authkeys = False
+        self._streamed_brute = False
 
     def _is_run_all_mode(self) -> bool:
         """True when only target is given (no test switches). Run all tests in sequence."""
@@ -266,10 +277,11 @@ class SSH(BaseModule):
         if hasattr(self, 'run_all_mode') and self.run_all_mode:
             raise TestFailedError(msg)
         else:
-            self.ptjsonlib.end_error(msg, self.args.json)
+            self.ptjsonlib.end_error(msg, self.use_json)
             raise SystemExit
 
     def run(self) -> None:
+        """Linear flow: Connect/Info -> Stream Banner -> Stream Auth Methods -> KEX/Audit -> Bad Pubkeys -> Bruteforce."""
         self.results = SSHResults()
         self.run_all_mode = self._is_run_all_mode()
 
@@ -277,40 +289,73 @@ class SSH(BaseModule):
             self._run_all_tests()
             return
 
-        # Normal mode: run only specified tests
+        # 1. Info (banner, host_key, auth_methods)
         if self.args.info or self.args.banner:
             do_banner = self.args.banner or self.args.info
             do_host_key = self.args.info or bool(self.args.bad_pubkeys)
             self.results.banner_requested = do_banner
             self.results.host_key_requested = do_host_key
-            info = self.info(get_commands=do_host_key, auth_methods=self.args.auth_methods)
-            self.results.info = InfoResult(
-                info.banner if do_banner else None,
-                info.host_key if do_host_key else None,
-                info.auth_methods if do_host_key else None,
-            )
-
-            if self.args.bad_pubkeys and self.results.info and self.results.info.host_key:
-                self.results.bad_pubkey = self.bad_pubkey(
-                    self.args.bad_pubkeys, self.results.info.host_key
+            try:
+                info = self.info(get_commands=do_host_key, auth_methods=self.args.auth_methods or self.args.info)
+                self.results.info = InfoResult(
+                    info.banner if do_banner else None,
+                    info.host_key if do_host_key else None,
+                    info.auth_methods if (do_host_key and (self.args.auth_methods or self.args.info)) else None,
                 )
+                self._stream_banner_result()
+                self._stream_auth_methods_result()
+            except (TestFailedError, SystemExit):
+                raise
+            except Exception as e:
+                self.results.info_error = str(e)
 
+        # 2. ssh-audit (KEX, CVEs, weak algorithms)
         if self.args.ssh_audit:
-            self.results.ssh_audit = self.run_ssh_audit()
+            try:
+                self.results.ssh_audit = self.run_ssh_audit()
+                self._stream_ssh_audit_result()
+            except Exception as e:
+                self.results.ssh_audit_error = str(e)
+                self._stream_ssh_audit_result()
 
+        # 3. Bad pubkeys (requires info + host_key)
+        if self.args.bad_pubkeys and self.results.info and self.results.info.host_key:
+            self.results.bad_pubkey = self.bad_pubkey(
+                self.args.bad_pubkeys, self.results.info.host_key
+            )
+            self._stream_bad_pubkey_result()
+
+        # 4. Bad auth keys
         if self.args.bad_authkeys:
             self.results.bad_authkeys = self.bad_authkeys(self.args.bad_authkeys)
+            self._stream_bad_authkeys_result()
 
+        # 5. Bruteforce (silent info when brute-only, to stream banner/auth_methods and keyboard-interactive warning)
         if self.do_brute:
+            if not (self.args.info or self.args.banner) and self.results.info is None:
+                try:
+                    silent = self.info(get_commands=True, auth_methods=True)
+                    self.results.info = silent
+                    self.results.banner_requested = True
+                    self.results.host_key_requested = True
+                    self._stream_banner_result()
+                    self._stream_auth_methods_result()
+                except (TestFailedError, SystemExit):
+                    raise
+                except Exception:
+                    pass
             self.results.brute = self.bruteforce()
+            self._stream_brute_result()
 
     def _run_all_tests(self) -> None:
-        """Run all tests in sequence. On failure: print error, continue with next."""
+        """Run all tests in sequence. On failure: print error, continue with next. Stream immediately."""
         # 1. Banner + host key (with auth_methods=True)
         self.results.banner_requested = True
         self.results.host_key_requested = True
         try:
             self.results.info = self.info(get_commands=True, auth_methods=True)
+            self._stream_banner_result()
+            self._stream_auth_methods_result()
         except TestFailedError as e:
             self.results.info_error = str(e)
             return
@@ -321,10 +366,13 @@ class SSH(BaseModule):
         # 2. ssh-audit (if available)
         try:
             self.results.ssh_audit = self.run_ssh_audit()
+            self._stream_ssh_audit_result()
         except TestFailedError as e:
             self.results.ssh_audit_error = str(e)
+            self._stream_ssh_audit_result()
         except Exception as e:
             self.results.ssh_audit_error = str(e)
+            self._stream_ssh_audit_result()
 
     def info(self, get_commands: bool = True, auth_methods: bool = False) -> InfoResult:
         """Grab banner; optionally host key and authentication methods."""
@@ -504,26 +552,27 @@ class SSH(BaseModule):
                 for s in secrets
             ]
 
-        # Redirect stderr to prevent printing unwanted output
+        # Redirect stderr to prevent paramiko from printing unwanted output
         err = StringIO("")
         old_write = sys.stderr.write
         sys.stderr.write = err.write
 
-        # TODO maybe custom without ptthreads because of missing stop-on-success functionality
-        threads = ptthreads.PtThreads(True)
-        result = threads.threads(creds, self._try_login, self.args.threads)
-        found_creds: set[SSHCreds] = set(result)
+        if not self.use_json:
+            self.ptprint("Login bruteforce", Out.INFO)
+        on_success = self._on_brute_success if not self.use_json else None
+        found_creds = threaded_bruteforce(
+            creds, self._try_login, self.args.threads, on_success=on_success
+        )
 
         sys.stderr.write = old_write
         errors = len(err.getvalue()) > 0
         err.close()
 
-        found_creds.discard(None)
-
         return BruteResult(found_creds, errors)
 
     def _try_login(self, creds: SSHCreds) -> SSHCreds | None:
-        """Attempt login with username/password or username/privatekey/passphrase"""
+        """Attempt login with username/password or username/privatekey/passphrase.
+        Returns creds on success even if server requires password change (interactive)."""
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.MissingHostKeyPolicy)
 
@@ -547,18 +596,181 @@ class SSH(BaseModule):
                 key_filename=keypath,
                 passphrase=passphrase,
             )
-            result = creds
-        except:
-            result = None
+            return creds
+        except paramiko.SSHException as e:
+            # Password change required - server accepted creds but enforces change
+            if "change" in str(e).lower() and "password" in str(e).lower():
+                return creds
+            return None
+        except Exception:
+            return None
         finally:
-            ssh.close()
-            return result
+            try:
+                ssh.close()
+            except Exception:
+                pass
+
+    def _on_brute_success(self, cred: SSHCreds) -> None:
+        """Callback for real-time streaming of found credentials (thread-safe)."""
+        with self._output_lock:
+            if cred.privkey:
+                if cred.privkey.passphrase is not None:
+                    cred_str = f"user: {cred.user}, keypath: {cred.privkey.keypath}, passphrase: {cred.privkey.passphrase}"
+                else:
+                    cred_str = f"user: {cred.user}, keypath: {cred.privkey.keypath}"
+            else:
+                cred_str = f"user: {cred.user}, password: {cred.passw}"
+            self.ptprint(f"    {cred_str}", Out.TEXT)
+
+    def _stream_banner_result(self) -> None:
+        if self.use_json or not (info := self.results.info) or info.banner is None:
+            return
+        with self._output_lock:
+            self.ptprint("Banner", Out.INFO)
+            sid = identify_service(info.banner)
+            if sid is None:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+            elif sid.version is not None:
+                icon = get_colored_text("[✗]", color="VULN")
+            else:
+                icon = get_colored_text("[!]", color="WARNING")
+            self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
+            if sid is not None:
+                self.ptprint("Service Identification", Out.INFO)
+                self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
+                self.ptprint(
+                    f"    Version:  {sid.version if sid.version else 'unknown'}",
+                    Out.TEXT,
+                )
+                self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
+        self._streamed_banner = True
+
+    def _stream_auth_methods_result(self) -> None:
+        if self.use_json or not (info := self.results.info) or info.auth_methods is None:
+            return
+        with self._output_lock:
+            self.ptprint("Authentication methods", Out.INFO)
+            has_kb_interactive = False
+            for method in info.auth_methods:
+                if method.lower() == "keyboard-interactive":
+                    has_kb_interactive = True
+                if method.lower() == "password":
+                    icon = get_colored_text("[✗]", color="VULN")
+                else:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} {method}", Out.TEXT)
+            if has_kb_interactive:
+                icon = get_colored_text("[!]", color="WARNING")
+                self.ptprint(
+                    f"    {icon} Server supports keyboard-interactive; password bruteforce may fail.",
+                    Out.TEXT,
+                )
+        self._streamed_auth_methods = True
+
+    def _stream_kex_result(self) -> None:
+        """Stream KEX/crypto findings from ssh-audit. KEX data comes from ssh_audit."""
+        if self.use_json:
+            return
+        audit = self.results.ssh_audit
+        if audit is None or audit.err is not None:
+            return
+        with self._output_lock:
+            if audit.cryptofindings or audit.cves:
+                self.ptprint("KEX / Crypto (ssh-audit)", Out.INFO)
+                for find in audit.cryptofindings:
+                    if find.level.upper() == "CRITICAL":
+                        icon = get_colored_text("[✗]", color="VULN")
+                    elif find.level.upper() == "WARNING":
+                        icon = get_colored_text("[!]", color="WARNING")
+                    else:
+                        icon = find.level.upper()
+                    s = f"{icon} {find.category}/{find.action}: {find.name}"
+                    if find.notes:
+                        s += f" ({find.notes})"
+                    self.ptprint(f"    {s}", Out.TEXT)
+                for cve in audit.cves:
+                    icon = get_colored_text("[✗]", color="VULN")
+                    self.ptprint(f"    {icon} {cve.name} ({cve.severity}): {cve.description}", Out.TEXT)
+        self._streamed_kex = True
+
+    def _stream_ssh_audit_result(self) -> None:
+        if self.use_json:
+            return
+        if (err := self.results.ssh_audit_error) is not None:
+            with self._output_lock:
+                self.ptprint("ssh-audit scan results", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} SSH-audit test failed: {err}", Out.TEXT)
+            self._streamed_ssh_audit = True
+            return
+        audit = self.results.ssh_audit
+        if audit is None:
+            return
+        with self._output_lock:
+            self.ptprint("ssh-audit scan results", Out.INFO)
+            if audit.err is not None:
+                self.ptprint(f"    ssh-audit failed with error: {audit.err}", Out.TEXT)
+            else:
+                self.ptprint(f"    Identified {len(audit.cves)} CVEs", Out.TEXT)
+                for cve in audit.cves:
+                    self.ptprint(f"        {cve.name} ({cve.severity}): {cve.description}", Out.TEXT)
+                self.ptprint(f"    Identified {len(audit.cryptofindings)} insecure SSH configurations", Out.TEXT)
+                for find in audit.cryptofindings:
+                    if find.level.upper() == "CRITICAL":
+                        icon = get_colored_text("[✗]", color="VULN")
+                    elif find.level.upper() == "WARNING":
+                        icon = get_colored_text("[!]", color="WARNING")
+                    else:
+                        icon = find.level.upper()
+                    s = f"{icon} {find.category}/{find.action}: {find.name}"
+                    if find.notes:
+                        s += f" ({find.notes})"
+                    self.ptprint(f"        {s}", Out.TEXT)
+        self._streamed_ssh_audit = True
+
+    def _stream_bad_pubkey_result(self) -> None:
+        if self.use_json or (bp := self.results.bad_pubkey) is None:
+            return
+        with self._output_lock:
+            self.ptprint("Known static (bad) host key", Out.INFO)
+            if bp.bad:
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} Matched key path: {bp.path}", Out.TEXT)
+            else:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} No match", Out.TEXT)
+        self._streamed_bad_pubkey = True
+
+    def _stream_bad_authkeys_result(self) -> None:
+        if self.use_json or (keys := self.results.bad_authkeys) is None:
+            return
+        with self._output_lock:
+            self.ptprint("Known static (bad) auth keys", Out.INFO)
+            if len(keys) > 0:
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} Matched {len(keys)} key(s)", Out.TEXT)
+                for k in keys:
+                    self.ptprint(f"        {k}", Out.TEXT)
+            else:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} No match", Out.TEXT)
+        self._streamed_bad_authkeys = True
+
+    def _stream_brute_result(self) -> None:
+        brute = self.results.brute
+        if brute is None:
+            return
+        if not self.use_json and len(brute.creds) > 0:
+            with self._output_lock:
+                self.ptprint(f"    Found {len(brute.creds)} valid credentials", Out.INFO)
+        self._streamed_brute = True
 
     # endregion
 
     # region output
 
     def output(self) -> None:
+        """Formats and outputs module results. Skips streamed sections in text mode; JSON always complete."""
         properties = {
             "software_type": None,
             "name": "ssh",
@@ -568,16 +780,42 @@ class SSH(BaseModule):
         }
         deferred_vulns = []
 
-        # Banner (separate section)
-        if self.results.banner_requested:
-            if (info_error := self.results.info_error) is not None:
+        # Connection/info error - use unified error format (status=error, empty nodes)
+        if (info_error := self.results.info_error) is not None:
+            if self.use_json:
+                self.ptjsonlib.end_error(info_error, self.use_json)
+            if not self.use_json:
                 self.ptprint("Banner", Out.INFO)
                 icon = get_colored_text("[✗]", color="VULN")
                 self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                properties.update({"infoError": info_error})
-            elif (info := self.results.info) and info.banner is not None:
+            properties.update({"infoError": info_error})
+            ssh_node = self.ptjsonlib.create_node_object("software", None, None, properties)
+            self.ptjsonlib.add_node(ssh_node)
+            node_key = ssh_node["key"]
+            for v in deferred_vulns:
+                self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
+            self.ptjsonlib.set_status("finished", "")
+            self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+            return
+
+        # Banner (skip if streamed; always add to properties for JSON)
+        if (info := self.results.info) and info.banner is not None:
+            sid = identify_service(info.banner)
+            vendor = vendor_from_cpe(sid.cpe) if sid else None
+            version = sid.version if sid else None
+            properties.update(
+                {
+                    "description": f"Banner: {info.banner}",
+                    "version": version,
+                    "vendor": vendor,
+                }
+            )
+            if sid is not None:
+                if sid.version is not None:
+                    deferred_vulns.append({"vuln_code": "PTV-SVC-BANNER"})
+                properties.update({"cpe": sid.cpe})
+            if not self.use_json and not self._streamed_banner:
                 self.ptprint("Banner", Out.INFO)
-                sid = identify_service(info.banner)
                 if sid is None:
                     icon = get_colored_text("[✓]", color="NOTVULN")
                 elif sid.version is not None:
@@ -585,18 +823,7 @@ class SSH(BaseModule):
                 else:
                     icon = get_colored_text("[!]", color="WARNING")
                 self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
-                vendor = vendor_from_cpe(sid.cpe) if sid else None
-                version = sid.version if sid else None
-                properties.update(
-                    {
-                        "description": f"Banner: {info.banner}",
-                        "version": version,
-                        "vendor": vendor,
-                    }
-                )
                 if sid is not None:
-                    if sid.version is not None:
-                        deferred_vulns.append({"vuln_code": "PTV-SVC-BANNER"})
                     self.ptprint("Service Identification", Out.INFO)
                     self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
                     self.ptprint(
@@ -604,53 +831,42 @@ class SSH(BaseModule):
                         Out.TEXT,
                     )
                     self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
-                    properties.update({"cpe": sid.cpe})
 
         # Host key (separate section)
-        if self.results.host_key_requested:
-            if (info_error := self.results.info_error) is not None:
+        if self.results.host_key_requested and (info := self.results.info) and info.host_key is not None:
+            properties.update({"hostKey": info.host_key})
+            if not self.use_json:
                 self.ptprint("Host key", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-                properties.update({"infoError": info_error})
-            elif (info := self.results.info) and info.host_key is not None:
-                self.ptprint("Host key", Out.INFO)
-                self.ptprint(f"    {info.host_key}")
-                properties.update({"hostKey": info.host_key})
+                self.ptprint(f"    {info.host_key}", Out.TEXT)
 
+        # Auth methods (skip if streamed; always add to properties for JSON)
         if (info := self.results.info) and info.auth_methods is not None:
-            self.ptprint("Authentication methods", Out.INFO)
-            for method in info.auth_methods:
-                if method.lower() == "password":
-                    icon = get_colored_text("[✗]", color="VULN")
-                else:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} {method}", Out.TEXT)
             properties.update({"authMethods": info.auth_methods})
+            if not self.use_json and not self._streamed_auth_methods:
+                self.ptprint("Authentication methods", Out.INFO)
+                for method in info.auth_methods:
+                    if method.lower() == "password":
+                        icon = get_colored_text("[✗]", color="VULN")
+                    else:
+                        icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} {method}", Out.TEXT)
 
-        # ssh-audit results
+        # ssh-audit results (skip if streamed; always add to properties for JSON)
         if (ssh_audit_error := self.results.ssh_audit_error) is not None:
-            self.ptprint("ssh-audit scan results", Out.INFO)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} SSH-audit test failed: {ssh_audit_error}", Out.TEXT)
             properties.update({"sshauditError": ssh_audit_error})
-        elif ssh_audit := self.results.ssh_audit:
-
+            if not self.use_json and not self._streamed_ssh_audit:
+                self.ptprint("ssh-audit scan results", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} SSH-audit test failed: {ssh_audit_error}", Out.TEXT)
+        elif (ssh_audit := self.results.ssh_audit) is not None:
             if ssh_audit.err is not None:
-                self.ptprint(f"ssh-audit scan failed with error: {ssh_audit.err}", Out.INFO)
                 properties.update({"sshauditStatus": ssh_audit.err})
             else:
-                self.ptprint("ssh-audit scan results", Out.INFO)
                 properties.update({"sshauditStatus": "ok"})
-
                 json_lines: list[str] = []
-                self.ptprint(f"    Identified {len(ssh_audit.cves)} CVEs", Out.TEXT)
                 for cve in ssh_audit.cves:
-                    cve_str = f"{cve.name} ({cve.severity}): {cve.description}"
-                    self.ptprint(f"        {cve_str}")
-                    json_lines.append(cve_str)
-
-                if len(json_lines) > 0:
+                    json_lines.append(f"{cve.name} ({cve.severity}): {cve.description}")
+                if json_lines:
                     deferred_vulns.append(
                         {
                             "vuln_code": VULNS.CVE.value,
@@ -658,34 +874,13 @@ class SSH(BaseModule):
                             "vuln_response": "\n".join(json_lines),
                         }
                     )
-
                 json_lines = []
-                self.ptprint(
-                    f"    Identified {len(ssh_audit.cryptofindings)} insecure SSH configurations",
-                    Out.TEXT,
-                )
                 for find in ssh_audit.cryptofindings:
-                    # Replace CRITICAL/WARNING with icon only (text stays in JSON output)
-                    if find.level.upper() == "CRITICAL":
-                        level_prefix = get_colored_text("[✗]", color="VULN")
-                    elif find.level.upper() == "WARNING":
-                        level_prefix = get_colored_text("[!]", color="WARNING")
-                    else:
-                        level_prefix = find.level.upper()
-
-                    find_str = (
-                        f"{level_prefix} {find.category}/{find.action}: {find.name}"
-                        + (f" ({find.notes})" if find.notes else "")
-                    )
-                    self.ptprint(f"        {find_str}", Out.TEXT)
-                    # For JSON, keep original format
-                    json_str = (
+                    json_lines.append(
                         f"{find.level.upper()} {find.category}/{find.action}: {find.name}"
                         + (f" ({find.notes})" if find.notes else "")
                     )
-                    json_lines.append(json_str)
-
-                if len(json_lines) > 0:
+                if json_lines:
                     deferred_vulns.append(
                         {
                             "vuln_code": VULNS.InsecureCrypto.value,
@@ -693,14 +888,30 @@ class SSH(BaseModule):
                             "vuln_response": "\n".join(json_lines),
                         }
                     )
+            if not self.use_json and not self._streamed_ssh_audit:
+                self.ptprint("ssh-audit scan results", Out.INFO)
+                if ssh_audit.err is not None:
+                    self.ptprint(f"    ssh-audit failed with error: {ssh_audit.err}", Out.TEXT)
+                else:
+                    self.ptprint(f"    Identified {len(ssh_audit.cves)} CVEs", Out.TEXT)
+                    for cve in ssh_audit.cves:
+                        self.ptprint(f"        {cve.name} ({cve.severity}): {cve.description}", Out.TEXT)
+                    self.ptprint(f"    Identified {len(ssh_audit.cryptofindings)} insecure SSH configurations", Out.TEXT)
+                    for find in ssh_audit.cryptofindings:
+                        if find.level.upper() == "CRITICAL":
+                            icon = get_colored_text("[✗]", color="VULN")
+                        elif find.level.upper() == "WARNING":
+                            icon = get_colored_text("[!]", color="WARNING")
+                        else:
+                            icon = find.level.upper()
+                        s = f"{icon} {find.category}/{find.action}: {find.name}"
+                        if find.notes:
+                            s += f" ({find.notes})"
+                        self.ptprint(f"        {s}", Out.TEXT)
 
-        # Bad host key
-        if badpubkey := self.results.bad_pubkey:
-            self.ptprint(f"Known static (bad) host key: {badpubkey.bad}", Out.INFO)
-
+        # Bad host key (skip if streamed)
+        if (badpubkey := self.results.bad_pubkey) is not None:
             if badpubkey.bad:
-                self.ptprint("    Matched key path", Out.INFO)
-                self.ptprint(f"        {badpubkey.path}")
                 deferred_vulns.append(
                     {
                         "vuln_code": VULNS.BadHostKey.value,
@@ -708,43 +919,62 @@ class SSH(BaseModule):
                         "vuln_response": badpubkey.path,
                     }
                 )
+            if not self.use_json and not self._streamed_bad_pubkey:
+                self.ptprint("Known static (bad) host key", Out.INFO)
+                if badpubkey.bad:
+                    icon = get_colored_text("[✗]", color="VULN")
+                    self.ptprint(f"    {icon} Matched key path: {badpubkey.path}", Out.TEXT)
+                else:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} No match", Out.TEXT)
 
-        # Bad auth keys
+        # Bad auth keys (skip if streamed)
         if (badauthkeys := self.results.bad_authkeys) is not None:
-            self.ptprint(
-                f"Known static (bad) auth keys: {len(badauthkeys) > 0}",
-                Out.INFO,
-            )
-
             if len(badauthkeys) > 0:
-                self.ptprint("    Matched keys", Out.INFO)
-
-                json_lines = []
-                for authkey in badauthkeys:
-                    self.ptprint(f"        {authkey}")
-                    json_lines.append(authkey)
-
                 deferred_vulns.append(
                     {
                         "vuln_code": VULNS.BadAuthKeys.value,
                         "vuln_request": f"matched keys from: {self.args.bad_authkeys}",
-                        "vuln_response": "\n".join(json_lines),
+                        "vuln_response": "\n".join(badauthkeys),
                     }
                 )
+            if not self.use_json and not self._streamed_bad_authkeys:
+                self.ptprint("Known static (bad) auth keys", Out.INFO)
+                if len(badauthkeys) > 0:
+                    icon = get_colored_text("[✗]", color="VULN")
+                    self.ptprint(f"    {icon} Matched {len(badauthkeys)} key(s)", Out.TEXT)
+                    for k in badauthkeys:
+                        self.ptprint(f"        {k}", Out.TEXT)
+                else:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} No match", Out.TEXT)
 
-        # Login bruteforce
-        if brute := self.results.brute:
-            self.ptprint(f"Login bruteforce: {len(brute.creds)} valid credentials", title=True)
-
+        # Login bruteforce (skip if streamed; always add to deferred for JSON)
+        if (brute := self.results.brute) is not None:
             if brute.errors:
-                self.ptprint(
-                    "WARNING: there were some errors during the bruteforce process."
-                    + " Try reducing the --brute-threads parameter",
-                    Out.WARNING,
-                )
                 properties.update({"bruteStatus": "errors"})
             else:
                 properties.update({"bruteStatus": "ok"})
+
+            if not self.use_json and not self._streamed_brute:
+                if brute.errors:
+                    self.ptprint(
+                        "WARNING: there were some errors during the bruteforce process."
+                        + " Try reducing the --brute-threads parameter",
+                        Out.WARNING,
+                    )
+                self.ptprint("Login bruteforce", Out.INFO)
+                if len(brute.creds) > 0:
+                    self.ptprint(f"    {len(brute.creds)} valid credentials", Out.INFO)
+                for cred in brute.creds:
+                    if privkey := cred.privkey:
+                        if privkey.passphrase is not None:
+                            cred_str = f"user: {cred.user}, keypath: {privkey.keypath}, passphrase: {privkey.passphrase}"
+                        else:
+                            cred_str = f"user: {cred.user}, keypath: {privkey.keypath}"
+                    else:
+                        cred_str = f"user: {cred.user}, password: {cred.passw}"
+                    self.ptprint(f"    {cred_str}", Out.TEXT)
 
             if len(brute.creds) > 0:
                 json_lines = []
@@ -755,9 +985,7 @@ class SSH(BaseModule):
                         else:
                             cred_str = f"user: {cred.user}, keypath: {privkey.keypath}"
                     else:
-                        cred_str = f"user: {cred.user}, password: {cred.password}"
-
-                    self.ptprint(f"    {cred_str}")
+                        cred_str = f"user: {cred.user}, password: {cred.passw}"
                     json_lines.append(cred_str)
 
                 if self.args.user is not None:

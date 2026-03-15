@@ -1,0 +1,19 @@
+From: {FROM}
+To: {TO}
+Subject: {SUBJECT}
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BND1"
+
+--BND1
+Content-Type: text/plain
+
+Malformed MIME - nested part uses wrong boundary to confuse parser.
+--BND1
+Content-Type: multipart/alternative; boundary="BND2"
+
+--BND_WRONG
+Content-Type: application/octet-stream; name="eicar.com"
+Content-Transfer-Encoding: base64
+
+WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo=
+--BND1--

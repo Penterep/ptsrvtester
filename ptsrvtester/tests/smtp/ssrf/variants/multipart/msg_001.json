@@ -1,0 +1,5 @@
+{
+  "subject": "SSRF test - multipart (PTL-SVC-SMTP-SSRF)",
+  "body": "Test SSRF – odkaz v plain části: {{CANARY_URL}}",
+  "bodyHtml": "<html><body><p>Odkaz v HTML:</p><a href=\"{{CANARY_URL}}\">link</a></body></html>"
+}

@@ -19,13 +19,36 @@
 """
 
 import argparse
+import os
 import re
 import sys
 
 from ptlibs import ptprinthelper, ptjsonlib
+from ptlibs.ptprinthelper import out_if, out_ifnot, ptprint
 
 
 from ._version import __version__
+
+
+class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
+    """PtJsonLib subclass with unified error output format for customer reports.
+    On end_error: status=error, message='Error: ...', empty nodes/properties/vulnerabilities."""
+
+    def end_error(self, message, condition, details=None):
+        full_msg = f"Error: {message}"
+        ptprint(out_ifnot(full_msg, "ERROR", condition))
+        if details:
+            from ptlibs.ptprinthelper import get_colored_text
+            ptprint("    " + out_ifnot(f"{get_colored_text(details, 'ADDITIONS')}", "TEXT", condition))
+        self.json_object["status"] = "error"
+        self.json_object["message"] = full_msg
+        self.json_object["results"]["nodes"] = []
+        self.json_object["results"]["properties"] = {}
+        self.json_object["results"]["vulnerabilities"] = []
+        ptprint(out_if(self.get_result_json(), None, condition))
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+        os._exit(1)
 from .modules.snmp import SNMP
 from .modules._base import BaseArgs
 from .modules.dns import DNS
@@ -62,8 +85,8 @@ class Ptsrvtester:
 
     def run(self) -> None:
         """Runs selected module with its configured arguments"""
-        # Initialize JSON data
-        ptjson = ptjsonlib.PtJsonLib()
+        # Initialize JSON data (PtsrvtesterJsonLib for unified error format)
+        ptjson = PtsrvtesterJsonLib()
 
         # Run the selected module
         module = MODULES[self.args.module](self.args, ptjson)

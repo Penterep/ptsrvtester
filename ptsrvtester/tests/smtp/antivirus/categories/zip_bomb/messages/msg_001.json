@@ -1,0 +1,5 @@
+{
+  "subject": "Zip bomb test - resource exhaustion (PTL-SVC-SMTP-ANTIVIRUS)",
+  "body": "This message contains a zip bomb (~100KB compressed, ~100MB expanded). Use with caution. Monitor server performance.",
+  "attachments": ["zipbomb.zip"]
+}

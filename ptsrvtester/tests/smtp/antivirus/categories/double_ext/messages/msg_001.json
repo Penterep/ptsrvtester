@@ -1,0 +1,5 @@
+{
+  "subject": "Invoice document - double extension test",
+  "body": "Please find the invoice attached.",
+  "attachments": ["invoice.pdf.exe"]
+}

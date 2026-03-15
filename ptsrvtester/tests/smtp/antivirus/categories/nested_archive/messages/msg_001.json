@@ -1,0 +1,5 @@
+{
+  "subject": "Nested archive test - PTL-SVC-SMTP-ANTIVIRUS (recursive decompression)",
+  "body": "This message contains a ZIP archive with 5 nesting levels. EICAR test file is in the innermost layer. Modern AV engines often limit decompression depth (e.g. 3-4 levels); if server accepts (250 OK), inspection may stop before detecting the payload.",
+  "attachments": ["nested.zip"]
+}

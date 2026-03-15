@@ -1,0 +1,5 @@
+{
+  "subject": "Executable attachment test - PTL-SVC-SMTP-ANTIVIRUS",
+  "body": "Test message with executable attachment.",
+  "attachments": ["test.exe", "test.bat"]
+}

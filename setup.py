@@ -11,7 +11,7 @@ setuptools.setup(
     description="Application server penetration testing tool (Penterep tool)",
     version=__version__,
     author="Penterep",
-    author_email="xvlkov03@vutbr.cz",
+    author_email="martsuchwork@gmail.com",
     url="https://www.penterep.com/",
     license="GPLv3+",
     packages=setuptools.find_packages(),

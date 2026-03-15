@@ -1,0 +1,5 @@
+{
+  "subject": "Encoded content test - Base64 (PTL-SVC-SMTP-ANTIVIRUS)",
+  "body": "This message contains EICAR in base64-encoded body. Server should decode before AV scan.",
+  "bodyBase64": "WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo="
+}

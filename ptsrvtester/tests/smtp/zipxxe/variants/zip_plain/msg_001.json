@@ -1,0 +1,4 @@
+{
+  "subject": "ZIPXXE test - ZIP with XXE (PTL-SVC-SMTP-ZIPXXE)",
+  "body": "This email contains a ZIP archive with an XML file. Please process normally. Server should not resolve XML external entities."
+}

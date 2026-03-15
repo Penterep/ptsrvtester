@@ -1,0 +1,5 @@
+{
+  "subject": "SSRF test - HTML link (PTL-SVC-SMTP-SSRF)",
+  "body": "Odkaz v těle.",
+  "bodyHtml": "<html><body><p>Klikněte zde:</p><a href=\"{{CANARY_URL}}\">{{CANARY_URL}}</a></body></html>"
+}

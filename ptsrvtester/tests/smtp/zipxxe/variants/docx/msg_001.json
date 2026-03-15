@@ -1,0 +1,4 @@
+{
+  "subject": "ZIPXXE test - OOXML DOCX with XXE (PTL-SVC-SMTP-ZIPXXE)",
+  "body": "Please find the attached Word document. Server should not resolve XML external entities when parsing OOXML."
+}

@@ -99,6 +99,38 @@ def check_if_brute(args: ArgsWithBruteforce) -> bool:
         return False
 
 
+def threaded_bruteforce(
+    creds: list,
+    try_login: Callable,
+    threads: int,
+    on_success: Callable | None = None,
+) -> set:
+    """
+    Generic bruteforce with custom creds list and on_success callback.
+    Used by modules (e.g. SSH) that need custom credential types (SSHCreds).
+
+    Args:
+        creds: list of credentials to try
+        try_login: function(cred) -> cred or None
+        threads: number of threads
+        on_success: optional callback(cred) when login succeeds
+
+    Returns:
+        set of successfully logged-in credentials
+    """
+    def _wrapped(c):
+        r = try_login(c)
+        if r is not None and on_success is not None:
+            on_success(r)
+        return r
+
+    pt = ptthreads.PtThreads(True)
+    result = pt.threads(creds, _wrapped, threads)
+    found = set(result)
+    found.discard(None)
+    return found
+
+
 def simple_bruteforce(
     try_login: Callable[[Creds], Creds | None],
     user: str | None,
@@ -107,6 +139,7 @@ def simple_bruteforce(
     passwf: str | None,
     spray: bool,
     threads: int,
+    on_success: Callable[[Creds], None] | None = None,
 ) -> set[Creds]:
     """
     Performs a login bruteforce attack using an arbitrary login functino.
@@ -120,6 +153,8 @@ def simple_bruteforce(
         passwf (str | None): passwords file argument
         spray (bool): spray argument
         threads (int): threads argument
+        on_success (Callable[[Creds], None] | None): optional callback for real-time
+            streaming when a credential is found (called from worker thread)
 
     Returns:
         set[Creds]: a set of valid login credentials
@@ -132,9 +167,15 @@ def simple_bruteforce(
     else:
         creds = [Creds(u, p) for u in users for p in passwords]
 
+    def _wrapped_try(cred: Creds) -> Creds | None:
+        result = try_login(cred)
+        if result is not None and on_success is not None:
+            on_success(result)
+        return result
+
     # TODO maybe custom without ptthreads because of missing stop-on-success functionality
     pt_threads = ptthreads.PtThreads(True)
-    result = pt_threads.threads(creds, try_login, threads)
+    result = pt_threads.threads(creds, _wrapped_try, threads)
     found_creds: set[Creds] = set(result)
 
     found_creds.discard(None)

@@ -1,0 +1,4 @@
+{
+  "subject": "SSRF test - plain URL (PTL-SVC-SMTP-SSRF)",
+  "body": "Test SSRF – prosím zkontrolujte odkaz: {{CANARY_URL}}"
+}

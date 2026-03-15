@@ -13,16 +13,29 @@ class BlacklistParser:
         self.result = None
 
     BLACKLIST_TIMEOUT = 15.0
+    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
     def _get_auth_keys(self):
         try:
-            auth_key = httpx.get(
+            response = httpx.get(
                 "https://mxtoolbox.com/api/v1/user",
-                headers={"Accept": "application/json, text/javascript, */*; q=0.01"},
+                headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "User-Agent": self.USER_AGENT,
+                    "Referer": "https://mxtoolbox.com/",
+                },
                 timeout=self.BLACKLIST_TIMEOUT,
-            ).json()
+            )
+            if response.status_code != 200:
+                raise ValueError(
+                    f"mxtoolbox.com returned HTTP {response.status_code} "
+                    f"(API may block automated access - try again later or check network)"
+                )
+            auth_key = response.json()
+        except ValueError:
+            raise
         except Exception as e:
-            raise ValueError("BlacklistParser: Could not retrieve json")
+            raise ValueError(f"Could not retrieve blacklist data: {type(e).__name__}: {e}") from e
         return auth_key["MxVisitorUid"], auth_key["TempAuthKey"]
 
     def _parse_response(self, response):
@@ -62,6 +75,8 @@ class BlacklistParser:
         headers = {
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Tempauthorization": auth_key,
+            "User-Agent": self.USER_AGENT,
+            "Referer": "https://mxtoolbox.com/",
         }
         cookie = {"MxVisitorUID": auth_visitor_id}
         client = httpx.Client(http2=True, timeout=self.BLACKLIST_TIMEOUT)

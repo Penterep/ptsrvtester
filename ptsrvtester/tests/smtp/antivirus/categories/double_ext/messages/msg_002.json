@@ -1,0 +1,5 @@
+{
+  "subject": "Image scan - double extension test",
+  "body": "Please review the scan.",
+  "attachments": ["scan.jpg.js"]
+}

@@ -1,0 +1,5 @@
+{
+  "subject": "EICAR antivirus test - PTL-SVC-SMTP-ANTIVIRUS",
+  "body": "This message contains the EICAR standard antivirus test file as attachment. It is harmless but should be detected by antivirus.",
+  "attachments": ["eicar.com"]
+}

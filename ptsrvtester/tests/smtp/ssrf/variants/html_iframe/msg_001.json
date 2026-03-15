@@ -1,0 +1,5 @@
+{
+  "subject": "SSRF test - HTML iframe (PTL-SVC-SMTP-SSRF)",
+  "body": "Iframe v těle.",
+  "bodyHtml": "<html><body><iframe src=\"{{CANARY_URL}}\" width=\"1\" height=\"1\"></iframe></body></html>"
+}

@@ -1,0 +1,5 @@
+{
+  "subject": "XXE test - XML Entity Expansion (PTL-SVC-SMTP-ANTIVIRUS)",
+  "body": "This message contains XML attachment with external entity declaration. Server should block XXE.",
+  "attachments": ["xxe_simple.xml"]
+}

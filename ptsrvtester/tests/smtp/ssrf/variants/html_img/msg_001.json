@@ -1,0 +1,5 @@
+{
+  "subject": "SSRF test - HTML image (PTL-SVC-SMTP-SSRF)",
+  "body": "Obrázek v těle.",
+  "bodyHtml": "<html><body><img src=\"{{CANARY_URL}}\" alt=\"tracking\" /></body></html>"
+}

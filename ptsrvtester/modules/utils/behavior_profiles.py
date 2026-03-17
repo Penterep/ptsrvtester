@@ -337,7 +337,7 @@ def match_ehlo_profile(
             missing = tuple(sorted(profile_keys_upper - all_keys))
             sample = ", ".join(sorted(keys_list)[:6])
             lacks_str = f"; lacks {', '.join(missing[:3])}" if missing else ""
-            best_detail = f"{sample}{lacks_str}"[:60]
+            best_detail = f"{sample}{lacks_str}"
             best_matched = matched
             best_missing = missing
 

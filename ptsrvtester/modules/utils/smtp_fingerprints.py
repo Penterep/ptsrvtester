@@ -588,14 +588,14 @@ def identify_smtp_server(
         scoring.append(ScoringEntry("banner", banner_weight, f"Banner match: {product}"))
     else:
         if banner:
-            first_line = (banner.split("\n")[0] if "\n" in banner else banner).strip()[:80]
+            first_line = (banner.split("\n")[0] if "\n" in banner else banner).strip()
             banner_claims = first_line if first_line else "Generic"
 
     # 2. EHLO
     ehlo_ext, ehlo_prop, ehlo_order = _parse_ehlo_extensions(ehlo_raw)
     ehlo_product, ehlo_cpe, ehlo_pts = _identify_from_ehlo(ehlo_ext, ehlo_prop, ehlo_order)
     if ehlo_product and ehlo_pts:
-        scoring.append(ScoringEntry("ehlo_keywords", ehlo_pts, f"Found: {', '.join(ehlo_prop[:5]) or ehlo_order[:3]}"[:60]))
+        scoring.append(ScoringEntry("ehlo_keywords", ehlo_pts, f"Found: {', '.join(ehlo_prop[:5]) or ehlo_order[:3]}"))
         if not product:
             product = ehlo_product
             cpe = ehlo_cpe
@@ -639,7 +639,7 @@ def identify_smtp_server(
                 ScoringEntry(
                     "behavioral_unknown_cmd",
                     unk_pts,
-                    f"Response: {unknown_cmd_response[:50]}",
+                    f"Response: {unknown_cmd_response}",
                 )
             )
             if not product:
@@ -655,7 +655,7 @@ def identify_smtp_server(
     if tls_product and tls_pts:
         san_preview = ", ".join((tls_cert_san or [])[:3]) if tls_cert_san else ""
         prefix = "Self-signed; " if tls_cert_self_signed else ""
-        tls_detail = f"{prefix}Issuer: {tls_cert_issuer or '—'}; SAN: {san_preview}"[:60]
+        tls_detail = f"{prefix}Issuer: {tls_cert_issuer or '—'}; SAN: {san_preview}"
         scoring.append(ScoringEntry("tls_cert", tls_pts, tls_detail))
         if not product:
             product = tls_product
@@ -810,7 +810,7 @@ def identify_smtp_server(
             beh_missing = cloud_result[2]
             sample = ", ".join(sorted(beh_matched)[:6]) if beh_matched else ""
             lacks_str = f"; lacks {', '.join(beh_missing[:3])}" if beh_missing else ""
-            beh_detail = f"{sample}{lacks_str}"[:60]
+            beh_detail = f"{sample}{lacks_str}"
     # Plesk/HestiaCP/cPanel/VestaCP context: NTT Docomo/Enterprise Cloud Gateway are Western hosting.
     if (
         beh_product in ("Enterprise Cloud Gateway", "NTT Docomo")
@@ -834,7 +834,7 @@ def identify_smtp_server(
                 beh_missing = fallback_result[2]
                 sample = ", ".join(sorted(beh_matched)[:6]) if beh_matched else ""
                 lacks_str = f"; lacks {', '.join(beh_missing[:3])}" if beh_missing else ""
-                beh_detail = f"{sample}{lacks_str}"[:60]
+                beh_detail = f"{sample}{lacks_str}"
                 break
         # If no suitable fallback (shoda < 35 %), ponechat původní beh_product – uživatel vždy vidí EHLO analýzu
     # Variant B: when os_hint suggests Cisco/network appliance (TTL 255) and Enterprise Cloud Gateway match is weak,
@@ -855,7 +855,7 @@ def identify_smtp_server(
             beh_missing = app_result[2]
             sample = ", ".join(sorted(beh_matched)[:6]) if beh_matched else ""
             lacks_str = f"; lacks {', '.join(beh_missing[:3])}" if beh_missing else ""
-            beh_detail = f"{sample}{lacks_str}"[:60]
+            beh_detail = f"{sample}{lacks_str}"
     total_before_beh = sum(s.points for s in scoring)
     # Variant B follow-up: when we overrode to Network-Appliance via os_hint, prefer it over weak EHLO
     if (

@@ -951,7 +951,7 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["", "--cc", "<emails>", "CC recipients, comma-separated (no validation)"],
                 ["-m", "--mail-from", "<email>", "Sender address (MAIL FROM); used by -bomb, -av, -br, -sh, -al"],
                 ["-r", "--rcpt-to", "<email>", "Recipient (To); required for -bomb, -av, -ssrf, -zipxxe, -sh, -bcc, -al; recommended for -flood"],
-                ["-ssrf", "--ssrf", "", "Test SSRF – server fetches links (PTL-SVC-SMTP-SSRF); requires -r and --ssrf-canary-url"],
+                ["-ssrf", "--ssrf", "", "Test SSRF – server fetches links; requires -r and --ssrf-canary-url"],
                 ["", "--ssrf-canary-url", "<URL>", "Canary URL for SSRF test (Interactsh, ngrok, etc.)"],
                 ["", "--ssrf-variants", "<v1,v2,...>", "SSRF variants (default: all)"],
                 ["", "--ssrf-internal-urls", "", "Also test internal URLs (127.0.0.1, localhost)"],
@@ -1227,7 +1227,7 @@ class SMTPArgs(ArgsWithBruteforce):
             "--ssrf",
             action="store_true",
             dest="ssrf",
-            help="Test SSRF – server fetches links in messages (PTL-SVC-SMTP-SSRF); requires -r and --ssrf-canary-url",
+            help="Test SSRF – server fetches links; requires -r and --ssrf-canary-url",
         )
         direct.add_argument(
             "--ssrf-canary-url",
@@ -9483,8 +9483,6 @@ class SMTP(BaseModule):
                     time_str = f" ({t.response_time_sec:.2f}s)" if getattr(t, "response_time_sec", None) is not None else ""
                     if vt == "acceptance":
                         reply_part = (t.reply or "2xx").split("\n")[0].strip()
-                        if len(reply_part) > 50:
-                            reply_part = reply_part[:47] + "…"
                         msg = f"VULNERABLE (ACCEPTANCE): Server accepted invalid input '{t.command_display}' ({reply_part}){time_str}"
                     elif vt == "timeout":
                         msg = f"VULNERABLE (TIMEOUT): No response (timeout) for '{t.command_display}'{time_str}"
@@ -9495,7 +9493,7 @@ class SMTP(BaseModule):
                     icon = get_colored_text("[✓]", color="NOTVULN") if t.status in (500, 501, 502, 503, 421, 422) else get_colored_text("[*]", color="INFO")
                     status_str = str(t.status) if t.status is not None else "connection lost"
                     display_reply = self._inv_comm_reply_for_display(t.status, t.reply)
-                    short_reply = (display_reply[:60] + "…") if display_reply and len(display_reply) > 60 else (display_reply or "")
+                    short_reply = display_reply or ""
                     time_str = f" ({t.response_time_sec:.2f}s)" if getattr(t, "response_time_sec", None) is not None else ""
                     self.ptprint(f"    {icon} {t.command_display}: {status_str} {short_reply}{time_str}", Out.TEXT)
                 if t.info_leak:
@@ -9599,7 +9597,7 @@ class SMTP(BaseModule):
         ok_icon = get_colored_text("[✓]", color="NOTVULN")
         warn_icon = get_colored_text("[!]", color="WARNING")
         if not self.use_json:
-            banner_display = (r.banner or "").replace("\r", "").strip()[:80]
+            banner_display = (r.banner or "").replace("\r", "").strip()
             if r.hidden_banner and banner_display:
                 self.ptprint(f"    {get_colored_text('[*] Banner:', color='INFO')} {banner_display} (Hidden)", Out.TEXT)
             elif r.banner:
@@ -9610,7 +9608,7 @@ class SMTP(BaseModule):
             if getattr(r, "behavioral_profile_product", None) or getattr(r, "behavioral_profile_detail", None) or getattr(r, "behavioral_discrepancies", None) or getattr(r, "latency_avg_ms", None) is not None or getattr(r, "cert_software_context", None):
                 self.ptprint(f"    {get_colored_text('[Behavioral Analysis]', color='INFO')}", Out.TEXT)
                 if getattr(r, "behavioral_profile_product", None) and getattr(r, "behavioral_profile_sim", 0) > 0:
-                    self.ptprint(f"        - EHLO profile: {r.behavioral_profile_sim}% match '{r.behavioral_profile_product}' {f'({r.behavioral_profile_detail})' if getattr(r, 'behavioral_profile_detail', None) else ''}", Out.TEXT)
+                    self.ptprint(f"    EHLO profile: {r.behavioral_profile_sim}% match '{r.behavioral_profile_product}' {f'({r.behavioral_profile_detail})' if getattr(r, 'behavioral_profile_detail', None) else ''}", Out.TEXT)
                     # Evidence-based: matched and missing verbs
                     matched = getattr(r, "behavioral_matched_verbs", None) or ()
                     missing = getattr(r, "behavioral_missing_verbs", None) or ()
@@ -9618,52 +9616,52 @@ class SMTP(BaseModule):
                     sim = getattr(r, "behavioral_profile_sim", 0) or 0
                     signature_label = f" ({product_name} signature)" if sim >= 75 else " (EHLO profile match)"
                     if matched:
-                        self.ptprint(f"        - {ok_icon} Matched verbs: {', '.join(matched)}{signature_label}", Out.TEXT)
+                        self.ptprint(f"    {ok_icon} Matched verbs: {', '.join(matched)}{signature_label}", Out.TEXT)
                     if missing:
                         parts = []
                         for v in missing:
                             # Case-insensitive lookup: verbs normalized to uppercase (server may return "auth" vs "AUTH")
                             hint = PROFILE_MISSING_HINTS.get((product_name, (v or "").upper()))
                             parts.append(f"{v} ({hint})" if hint else v)
-                        self.ptprint(f"        - {warn_icon} Missing verbs: {', '.join(parts)}", Out.TEXT)
+                        self.ptprint(f"    {warn_icon} Missing verbs: {', '.join(parts)}", Out.TEXT)
                 if getattr(r, "unknown_cmd_response", None) and getattr(self.args, "id_aggressive", False):
-                    self.ptprint(f"        - Unknown command: {r.unknown_cmd_response.strip()[:60]}{'...' if len((r.unknown_cmd_response or '').strip()) > 60 else ''}", Out.TEXT)
+                    self.ptprint(f"    Unknown command: {r.unknown_cmd_response.strip()}", Out.TEXT)
                 if getattr(r, "latency_avg_ms", None) is not None:
                     jitter = getattr(r, "latency_jitter_ms", None)
                     jitter_str = f", jitter {jitter:.0f} ms" if jitter is not None and jitter > 0 else ""
                     proxy_hint = " (possible proxy/filter)" if jitter and jitter > 50 else " (direct MTA)"
-                    self.ptprint(f"        - Latency: avg {r.latency_avg_ms:.0f} ms{jitter_str}{proxy_hint}", Out.TEXT)
+                    self.ptprint(f"    Latency: avg {r.latency_avg_ms:.0f} ms{jitter_str}{proxy_hint}", Out.TEXT)
                 if getattr(r, "cert_software_context", None):
-                    self.ptprint(f"        - TLS cert context: {r.cert_software_context}", Out.TEXT)
+                    self.ptprint(f"    TLS cert context: {r.cert_software_context}", Out.TEXT)
                 for d in getattr(r, "behavioral_discrepancies", None) or []:
-                    self.ptprint(f"        - {warn_icon} {d}", Out.TEXT)
+                    self.ptprint(f"    {warn_icon} {d}", Out.TEXT)
             if r.tls_cert_subject or r.tls_cert_issuer or (r.tls_cert_san and r.tls_cert_san):
                 self.ptprint(f"    {get_colored_text('[*] TLS Certificate Info:', color='INFO')}", Out.TEXT)
                 if r.tls_cert_subject:
-                    self.ptprint(f"        - Subject: {r.tls_cert_subject}", Out.TEXT)
+                    self.ptprint(f"    Subject: {r.tls_cert_subject}", Out.TEXT)
                 if r.tls_cert_san:
-                    self.ptprint(f"        - SAN: {', '.join(r.tls_cert_san)}", Out.TEXT)
+                    self.ptprint(f"    SAN: {', '.join(r.tls_cert_san)}", Out.TEXT)
                 if r.tls_cert_issuer:
-                    self.ptprint(f"        - Issuer: {r.tls_cert_issuer}", Out.TEXT)
+                    self.ptprint(f"    Issuer: {r.tls_cert_issuer}", Out.TEXT)
                 if r.tls_cert_self_signed:
-                    self.ptprint(f"        - Self-signed: yes", Out.TEXT)
+                    self.ptprint(f"    Self-signed: yes", Out.TEXT)
                 if getattr(r, "tls_policy", None) and r.tls_policy != "n/a":
-                    self.ptprint(f"        - TLS policy: {r.tls_policy}", Out.TEXT)
+                    self.ptprint(f"    TLS policy: {r.tls_policy}", Out.TEXT)
                 if getattr(r, "tls_downgrade_probed", False):
                     downgrade = getattr(r, "tls_downgrade_findings", None) or []
                     if downgrade:
                         for w in downgrade:
-                            self.ptprint(f"        - {warn_icon} TLS downgrade: {w}", Out.TEXT)
+                            self.ptprint(f"    {warn_icon} TLS downgrade: {w}", Out.TEXT)
                     else:
-                        self.ptprint(f"        - {ok_icon} TLS downgrade: TLS 1.0/1.1 rejected (Good)", Out.TEXT)
+                        self.ptprint(f"    {ok_icon} TLS downgrade: TLS 1.0/1.1 rejected (Good)", Out.TEXT)
                 if getattr(r, "os_hint", None):
-                    self.ptprint(f"        - OS hint: {r.os_hint}", Out.TEXT)
+                    self.ptprint(f"    OS hint: {r.os_hint}", Out.TEXT)
                 if getattr(r, "cert_domain_match", False):
-                    self.ptprint(f"        - {ok_icon} Cert domain match: SAN aligns with target", Out.TEXT)
+                    self.ptprint(f"    {ok_icon} Cert domain match: SAN aligns with target", Out.TEXT)
                 for w in getattr(r, "tls_cert_warnings", None) or []:
-                    self.ptprint(f"        - {warn_icon} {w}", Out.TEXT)
+                    self.ptprint(f"    {warn_icon} {w}", Out.TEXT)
                 for w in getattr(r, "tls_cipher_warnings", None) or []:
-                    self.ptprint(f"        - {warn_icon} {w}", Out.TEXT)
+                    self.ptprint(f"    {warn_icon} {w}", Out.TEXT)
             elif getattr(r, "tls_upgrade_failed", False):
                 msg = "TLS certificate could not be extracted (STARTTLS upgrade or cert parse failed"
                 if self.args.debug and getattr(r, "tls_upgrade_error", None):
@@ -9940,7 +9938,7 @@ class SMTP(BaseModule):
             self.ptprint("", Out.TEXT)
             for v in al.variants:
                 status_str = f"[{v.smtp_status}]" if v.smtp_status is not None else "[?]"
-                reply_snippet = (v.smtp_reply or "").strip()[:50]
+                reply_snippet = (v.smtp_reply or "").strip()
                 line = f"    {info_icon} Variant '{v.variant}' ({v.address}): {status_str}"
                 if v.accepted:
                     line += " OK"

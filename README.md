@@ -100,11 +100,15 @@ ptsrvtester <module> -h     for help for module use
 **FTP Module**
 - Banner and Service Identification
 - Anonymous authentication testing
+- Known-account login or credential brute-force
 - Read/write access testing
-- Credential brute-force
-- Path enumeration (dictionary attack)
-- Data mode test (passive/active, PASV IP leakage)
-- FTP bounce attack testing
+- Path enumeration
+- Data mode test
+- Active mode policy audit
+- Command surface audit
+- Invalid-command resilience
+- Username enumeration
+- Bounce attack testing
 
 **SSH Module**
 - Banner, Service Identification and host key retrieval

@@ -2,10 +2,12 @@
 SMTP server fingerprinting (PTL-SVC-SMTP-IDENTIFY).
 Identifies server software from banner, EHLO, HELP, error syntax, and unknown command responses.
 v1.0.5: Behavioral analysis, cert software context, cert domain match.
+v1.0.5+: Data leakage scan (e-mail addresses in banner, TLS DN, EHLO, HELP, errors).
 """
+import ipaddress
 import re
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Literal
 
 from .behavior_profiles import (
     BANNER_EXPECTED_EXTENSIONS,
@@ -17,7 +19,7 @@ from .behavior_profiles import (
     match_ehlo_profile,
     match_ehlo_profile_for_product,
 )
-from .service_identification import ServiceIdentification, identify_service
+from .service_identification import ServiceIdentification, identify_service, is_generic_esmtp_banner
 
 # Scoring weights (percent)
 WEIGHT_BANNER = 60
@@ -35,29 +37,36 @@ WEIGHT_BEHAVIORAL_EHLO_PROFILE = 15  # Weighted Jaccard EHLO match (50–79%)
 WEIGHT_BEHAVIORAL_EHLO_STRONG = 25  # Strong weighted match (≥80%) – e.g. J-Cloud ETRN+CRAM-MD5
 WEIGHT_CERT_DOMAIN_MATCH = 5  # SAN/Subject domain aligns with target domain
 WEIGHT_CERT_SOFTWARE_CONTEXT = 10  # Plesk/HestiaCP/cPanel in cert → inferred MTA
+# Penalty when banner product ≠ best behavioral EHLO profile (discrepancy_detected): up to this many points at 100% profile sim
+WEIGHT_BEHAVIORAL_CONFLICT_MAX = 15
+# Generic ESMTP fallback: generic banner + minimal EHLO + low confidence — penalize spurious product attribution
+WEIGHT_IDENTITY_BLUR = -15
+
+_GENERIC_ESMTP_SERVICE_PRODUCT = "Generic ESMTP Service"
+_GENERIC_ESMTP_SERVICE_CPE = "cpe:2.3:a:generic:esmtp_service:*:*:*:*:*:*:*:*"
 
 # EHLO fingerprint: (keywords set, order_prefix first 2-3 extensions, product, cpe)
 _SMTP_EHLO_FINGERPRINTS: Final[list[tuple[set[str], tuple[str, ...], str, str]]] = [
     # Exchange: X-EXPS, XEXCH50, X-RCPTLIMIT are unique
-    ({"X-EXPS", "XEXCH50", "X-LINK2STATE", "XRDST", "X-ANONYMOUSTLS"}, (), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*"),
-    ({"X-EXPS", "XEXCH50", "X-LINK2STATE"}, (), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*"),
-    ({"X-EXPS", "XEXCH50"}, (), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*"),
-    ({"X-RCPTLIMIT"}, (), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*"),
+    ({"X-EXPS", "XEXCH50", "X-LINK2STATE", "XRDST", "X-ANONYMOUSTLS"}, (), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*"),
+    ({"X-EXPS", "XEXCH50", "X-LINK2STATE"}, (), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*"),
+    ({"X-EXPS", "XEXCH50"}, (), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*"),
+    ({"X-RCPTLIMIT"}, (), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*"),
     # Barracuda: X-BARRACUDA-* (check before Postfix – unique signature)
-    ({"X-BARRACUDA-GW"}, (), "Barracuda Email Security", "cpe:2.3:h:barracuda:email_security_gateway:*"),
-    ({"X-BARRACUDA-BRTS"}, (), "Barracuda Email Security", "cpe:2.3:h:barracuda:email_security_gateway:*"),
-    ({"X-BARRACUDA-CPANEL"}, (), "Barracuda Email Security", "cpe:2.3:h:barracuda:email_security_gateway:*"),
+    ({"X-BARRACUDA-GW"}, (), "Barracuda Email Security", "cpe:2.3:h:barracuda:email_security_gateway:*:*:*:*:*:*:*:*"),
+    ({"X-BARRACUDA-BRTS"}, (), "Barracuda Email Security", "cpe:2.3:h:barracuda:email_security_gateway:*:*:*:*:*:*:*:*"),
+    ({"X-BARRACUDA-CPANEL"}, (), "Barracuda Email Security", "cpe:2.3:h:barracuda:email_security_gateway:*:*:*:*:*:*:*:*"),
     # Postfix: XCLIENT, XFORWARD (CHUNKING removed – used by Exchange/MailStore too)
-    ({"Postcow", "XCLIENT"}, (), "Mailcow", "cpe:2.3:a:mailcow:mailcow:*"),
-    ({"XCLIENT", "XFORWARD", "CHUNKING"}, ("PIPELINING", "SIZE"), "Postfix", "cpe:2.3:a:postfix:postfix:*"),
-    ({"XCLIENT", "CHUNKING"}, (), "Postfix", "cpe:2.3:a:postfix:postfix:*"),
+    ({"Postcow", "XCLIENT"}, (), "Mailcow", "cpe:2.3:a:mailcow:mailcow:*:*:*:*:*:*:*:*"),
+    ({"XCLIENT", "XFORWARD", "CHUNKING"}, ("PIPELINING", "SIZE"), "Postfix", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
+    ({"XCLIENT", "CHUNKING"}, (), "Postfix", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
     # Exim: X_E_N_D_O_F_M_E_S_S_A_G_E_
-    ({"X_E_N_D_O_F_M_E_S_S_A_G_E_"}, (), "Exim", "cpe:2.3:a:exim:exim:*"),
+    ({"X_E_N_D_O_F_M_E_S_S_A_G_E_"}, (), "Exim", "cpe:2.3:a:exim:exim:*:*:*:*:*:*:*:*"),
     # Sendmail: ETRN, DSN, DELIVERBY
-    ({"ETRN", "DSN", "DELIVERBY"}, ("ETRN", "DSN"), "Sendmail", "cpe:2.3:a:sendmail:sendmail:*"),
-    ({"ETRN", "DELIVERBY"}, ("ETRN",), "Sendmail", "cpe:2.3:a:sendmail:sendmail:*"),
+    ({"ETRN", "DSN", "DELIVERBY"}, ("ETRN", "DSN"), "Sendmail", "cpe:2.3:a:sendmail:sendmail:*:*:*:*:*:*:*:*"),
+    ({"ETRN", "DELIVERBY"}, ("ETRN",), "Sendmail", "cpe:2.3:a:sendmail:sendmail:*:*:*:*:*:*:*:*"),
     # Cisco
-    ({"AsyncOS", "IronPort"}, (), "Cisco Secure Email (IronPort)", "cpe:2.3:h:cisco:secure_email_gateway:*"),
+    ({"AsyncOS", "IronPort"}, (), "Cisco Secure Email (IronPort)", "cpe:2.3:h:cisco:secure_email_gateway:*:*:*:*:*:*:*:*"),
 ]
 
 # Help regex: (pattern, product, version capture group or None)
@@ -95,21 +104,21 @@ _SMTP_UNKNOWN_CMD: Final[list[tuple[re.Pattern[str], str]]] = [
 # TLS cert fingerprint: (issuer_pattern, subject_san_pattern) -> product, cpe
 # Check SAN/Subject first (product-specific hostnames), then issuer (e.g. Let's Encrypt -> Postfix)
 _SMTP_TLS_CERT_FINGERPRINTS: Final[list[tuple[re.Pattern[str], re.Pattern[str], str, str]]] = [
-    (re.compile(r".*"), re.compile(r"exchange|outlook|microsoft|exch[0-9]+", re.I), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*"),
-    (re.compile(r".*"), re.compile(r"barracuda", re.I), "Barracuda Email Security Gateway", "cpe:2.3:h:barracuda:email_security_gateway:*"),
-    (re.compile(r".*"), re.compile(r"ironport|cisco\.com", re.I), "Cisco Secure Email (IronPort)", "cpe:2.3:h:cisco:secure_email_gateway:*"),
-    (re.compile(r".*"), re.compile(r"postfix|mailcow|postfix-vm", re.I), "Postfix", "cpe:2.3:a:postfix:postfix:*"),
-    (re.compile(r".*"), re.compile(r"exim|exim[0-9]", re.I), "Exim", "cpe:2.3:a:exim:exim:*"),
-    (re.compile(r".*"), re.compile(r"sendmail", re.I), "Sendmail", "cpe:2.3:a:sendmail:sendmail:*"),
-    (re.compile(r"Let's Encrypt", re.I), re.compile(r".*"), "Postfix", "cpe:2.3:a:postfix:postfix:*"),  # LE often used with Postfix
+    (re.compile(r".*"), re.compile(r"exchange|outlook|microsoft|exch[0-9]+", re.I), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*"),
+    (re.compile(r".*"), re.compile(r"barracuda", re.I), "Barracuda Email Security Gateway", "cpe:2.3:h:barracuda:email_security_gateway:*:*:*:*:*:*:*:*"),
+    (re.compile(r".*"), re.compile(r"ironport|cisco\.com", re.I), "Cisco Secure Email (IronPort)", "cpe:2.3:h:cisco:secure_email_gateway:*:*:*:*:*:*:*:*"),
+    (re.compile(r".*"), re.compile(r"postfix|mailcow|postfix-vm", re.I), "Postfix", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
+    (re.compile(r".*"), re.compile(r"exim|exim[0-9]", re.I), "Exim", "cpe:2.3:a:exim:exim:*:*:*:*:*:*:*:*"),
+    (re.compile(r".*"), re.compile(r"sendmail", re.I), "Sendmail", "cpe:2.3:a:sendmail:sendmail:*:*:*:*:*:*:*:*"),
+    (re.compile(r"Let's Encrypt", re.I), re.compile(r".*"), "Postfix", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),  # LE often used with Postfix
 ]
 
 # Self-signed cert fingerprints: (subject_san_pattern, product, cpe, weight) - only when Subject == Issuer
 # Ubuntu/Postfix default: CN=ubuntu. Exchange: CN = internal NetBIOS server name (exch01, mailbox02, etc.)
 # Corporate/Internal: OU= or O= in subject = air-gapped or internal company mail server
 _SMTP_TLS_SELF_SIGNED_FINGERPRINTS: Final[list[tuple[re.Pattern[str], str, str, int]]] = [
-    (re.compile(r"CN=ubuntu\b|ubuntumachine|ubuntu\.local", re.I), "Postfix", "cpe:2.3:a:postfix:postfix:*", WEIGHT_TLS_CERT),
-    (re.compile(r"exchange|exch[0-9]+|mailbox[0-9]+|cas[0-9]*|edge[0-9]*", re.I), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*", WEIGHT_TLS_CERT),
+    (re.compile(r"CN=ubuntu\b|ubuntumachine|ubuntu\.local", re.I), "Postfix", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*", WEIGHT_TLS_CERT),
+    (re.compile(r"exchange|exch[0-9]+|mailbox[0-9]+|cas[0-9]*|edge[0-9]*", re.I), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*", WEIGHT_TLS_CERT),
     (re.compile(r",OU=|\bOU=[^,\s]|,O=|\bO=[^,\s]", re.I), "Private/Internal Mail Server", None, WEIGHT_TLS_CERT_CORPORATE),  # No CPE: generic internal/corporate
 ]
 
@@ -196,14 +205,22 @@ _PRODUCT_EXPECTED_OS: Final[dict[str, str]] = {
     "Oracle Communications Messaging Server": "linux",
     "Cisco Secure Email (IronPort)": "cisco",
     "MailStore Gateway": "cisco",
-    "NTT Docomo": "linux",
     "Enterprise Cloud Gateway": "linux",
 }
+
+# OS hint matrix text: generic gateway/appliance profiles use neutral wording (OS not identity-proof).
+_GENERIC_OS_HINT_PRODUCTS: Final[frozenset[str]] = frozenset(
+    {
+        "Network Appliance / Security Gateway",
+        "Enterprise Cloud Gateway",
+        "Sophos Email Appliance",
+    }
+)
 
 # TTL Override: when os_hint indicates network appliance (TTL 255) and raw banner contains
 # gateway/appliance keywords but banner_sid is None, veto weak Postfix/Exim from EHLO
 _GATEWAY_BANNER_KEYWORDS = re.compile(
-    r"\b(gateway|appliance|proxy|firewall|cisco|barracuda|mailstore|fortimail|fortinet)\b",
+    r"\b(gateway|appliance|proxy|firewall|cisco|barracuda|mailstore|fortimail|fortinet|sophos)\b",
     re.I,
 )
 _GATEWAY_KEYWORD_TO_PRODUCT: Final[dict[str, str]] = {
@@ -212,6 +229,7 @@ _GATEWAY_KEYWORD_TO_PRODUCT: Final[dict[str, str]] = {
     "cisco": "Cisco Secure Email (IronPort)",
     "fortimail": "FortiMail",
     "fortinet": "FortiMail",
+    "sophos": "Sophos Email Appliance",
 }
 
 # Cloud providers: banner authoritative (>80 %), EHLO similar across providers – do not let behavioral override
@@ -239,10 +257,26 @@ _APPLIANCE_PROXY_PRODUCTS: Final[frozenset[str]] = frozenset({
     "Cisco Secure Email (IronPort)",
     "FortiMail",
     "Network Appliance / Security Gateway",
+    "Sophos Email Appliance",
     "PowerMTA (Port25)",  # Often presents Postfix-like EHLO when masquerading
     "Plesk",
-    "Exim",  # EHLO often overlaps with NTT Docomo; suppress false discrepancy
+    "Exim",  # EHLO often overlaps with Enterprise Cloud Gateway; suppress false discrepancy
 })
+
+# Appliance banner + Postfix/Exim-like EHLO: vendor-specific integrity text (full sentence).
+_APPLIANCE_SPECIFIC_INTEGRITY_NOTES: Final[dict[str, str]] = {
+    "Sophos Email Appliance": (
+        "Sophos secure email / UTM often exposes Exim- or Postfix-like EHLO; "
+        "consistent with Sophos gateway stack."
+    ),
+}
+# Human-readable stack label when a generic “appliance → MTA” explanation fits (not same-MTA case).
+_APPLIANCE_INTEGRITY_LABELS: Final[dict[str, str]] = {
+    "FortiMail": "FortiMail gateway",
+    "Barracuda Email Security": "Barracuda ESG stack",
+    "Barracuda Email Security Gateway": "Barracuda ESG stack",
+    "Cisco Secure Email (IronPort)": "Cisco AsyncOS environment",
+}
 
 
 @dataclass
@@ -251,6 +285,420 @@ class ScoringEntry:
     method: str
     points: int
     detail: str | None
+
+
+@dataclass(frozen=True)
+class DataLeakFinding:
+    """E-mail or TLS-exposed identifier in SMTP/TLS surface (-id data leakage section)."""
+
+    email: str  # E-mail address, or comma-separated internal hostnames when kind is internal_hostname
+    risk: Literal["low", "medium", "high"]
+    sources: tuple[str, ...]
+    target_domain_match: bool = False  # True when risk is high (address domain aligns with scan target)
+    kind: Literal["email", "internal_hostname"] = "email"
+
+
+# E-mail-shaped tokens in banner, EHLO, HELP, error text, TLS Subject/Issuer/SAN.
+_DATA_LEAK_EMAIL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z0-9._%+-])"
+    r"([A-Za-z0-9](?:[A-Za-z0-9._%+-]*[A-Za-z0-9])?@"
+    r"(?:localhost|127\.0\.0\.1|(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}))"
+    r"(?![A-Za-z0-9._%+-])",
+    re.I,
+)
+
+_LOW_LEAK_DOMAINS: Final[frozenset[str]] = frozenset(
+    {
+        "localhost",
+        "127.0.0.1",
+        "localdomain",
+        "invalid",
+        "example",
+        "test",
+    }
+)
+_LOW_LEAK_PLACEHOLDER_DOMAINS: Final[frozenset[str]] = frozenset(
+    {
+        "nameserver.tld",
+        "domain.tld",
+        "hostname.tld",
+        "server.tld",
+        "yourdomain.tld",
+        "mail.local",
+    }
+)
+_LOW_LEAK_DOMAIN_SUFFIXES: Final[tuple[str, ...]] = (
+    ".local",
+    ".localdomain",
+    ".lan",
+    ".corp",
+    ".internal",
+    ".intranet",
+    ".private",
+    ".priv",
+    ".ads",
+    ".test",
+    ".invalid",
+    ".example",
+)
+
+# TLS CN/SAN: non-routable / internal naming that should not appear on internet-facing SMTP
+_INTERNAL_INFRA_DNS_SUFFIXES: Final[tuple[str, ...]] = (
+    ".local",
+    ".localdomain",
+    ".lan",
+    ".internal",
+    ".intranet",
+    ".private",
+    ".priv",
+    ".ads",
+    ".home",
+    ".node",
+    ".corp",
+)
+_INTERNAL_INFRA_HIGH_SUFFIXES: Final[frozenset[str]] = frozenset(
+    {".internal", ".intranet", ".corp", ".private", ".priv", ".ads"}
+)
+
+
+def _email_domain_low_risk(domain: str) -> bool:
+    d = domain.lower().rstrip(".")
+    if d in _LOW_LEAK_DOMAINS:
+        return True
+    if d in _LOW_LEAK_PLACEHOLDER_DOMAINS:
+        return True
+    for suf in _LOW_LEAK_DOMAIN_SUFFIXES:
+        if d.endswith(suf):
+            return True
+    if d.endswith(".example.com") or d.endswith(".example.org") or d.endswith(".example.net"):
+        return True
+    try:
+        addr = ipaddress.ip_address(d)
+        return bool(addr.is_loopback or addr.is_private or addr.is_link_local)
+    except ValueError:
+        pass
+    return False
+
+
+def _noreply_local_base(local: str) -> str:
+    """Strip plus-addressing for noreply heuristics (noreply+tag@x → noreply)."""
+    return (local.split("+", 1)[0]).lower().strip()
+
+
+def _is_noreply_local_part(local: str) -> bool:
+    """Automated / unmonitored mailbox locals — low value for phishing or credential attacks."""
+    b = _noreply_local_base(local)
+    return b.startswith(
+        (
+            "noreply",
+            "no-reply",
+            "no_reply",
+            "donotreply",
+            "do-not-reply",
+            "do_not_reply",
+        )
+    )
+
+
+def _normalize_scan_target_host(host: str | None) -> str | None:
+    """Hostname for domain-alignment checks; None if IP-only or unusable."""
+    if not host or not str(host).strip():
+        return None
+    h = str(host).strip().lower().rstrip(".")
+    if h.startswith("["):
+        end = h.find("]")
+        if end > 1:
+            inner = h[1:end]
+            try:
+                ipaddress.ip_address(inner)
+                return None
+            except ValueError:
+                return inner.lower().rstrip(".") or None
+        return None
+    if ":" in h:
+        host_part, _, maybe_port = h.rpartition(":")
+        if maybe_port.isdigit():
+            h = host_part
+    try:
+        ipaddress.ip_address(h)
+        return None
+    except ValueError:
+        pass
+    if "." not in h:
+        return None
+    return h
+
+
+def _shared_dns_label_suffix_len(a: str, b: str) -> int:
+    """Count matching labels from the right (e.g. mail.firma.cz vs firma.cz → 2)."""
+    pa = [x for x in a.lower().split(".") if x]
+    pb = [x for x in b.lower().split(".") if x]
+    if not pa or not pb:
+        return 0
+    n = 0
+    while n < len(pa) and n < len(pb) and pa[-1 - n] == pb[-1 - n]:
+        n += 1
+    return n
+
+
+def _email_domain_matches_target(email_domain: str, target_host: str) -> bool:
+    """True if e-mail domain is the same org/DNS zone as the scanned target host."""
+    e = email_domain.lower().strip(".")
+    t = target_host.lower().strip(".")
+    if not e or not t:
+        return False
+    if e == t:
+        return True
+    if t.endswith("." + e) or e.endswith("." + t):
+        return True
+    return _shared_dns_label_suffix_len(e, t) >= 2
+
+
+def _classify_email_leak_risk(addr: str, target_host: str | None) -> Literal["low", "medium", "high"]:
+    if "@" not in addr:
+        return "low"
+    local, dom = addr.rsplit("@", 1)
+    if _is_noreply_local_part(local):
+        return "low"
+    if _email_domain_low_risk(dom):
+        return "low"
+    tnorm = _normalize_scan_target_host(target_host)
+    if tnorm and _email_domain_matches_target(dom, tnorm):
+        return "high"
+    return "medium"
+
+
+_RISK_RANK: Final[dict[str, int]] = {"low": 0, "medium": 1, "high": 2}
+
+
+def _merge_risk(
+    a: Literal["low", "medium", "high"], b: Literal["low", "medium", "high"]
+) -> Literal["low", "medium", "high"]:
+    return a if _RISK_RANK[a] >= _RISK_RANK[b] else b
+
+
+def _extract_emails_from_text(text: str | None) -> set[str]:
+    if not text or not text.strip():
+        return set()
+    return {m.group(1) for m in _DATA_LEAK_EMAIL_RE.finditer(text)}
+
+
+def _extract_cn_values_from_dn(dn: str | None) -> list[str]:
+    """RFC4514-style DN: collect CN= values (server cert Subject/Issuer)."""
+    if not dn or not dn.strip():
+        return []
+    return [m.group(1).strip() for m in re.finditer(r"\bCN=([^,+\"\\]+)", dn, re.I) if m.group(1).strip()]
+
+
+def _normalize_tls_san_dns_name(entry: str | None) -> str | None:
+    if not entry or not str(entry).strip():
+        return None
+    e = str(entry).strip()
+    up = e.upper()
+    # rfc822Name / email SAN — handled by _tls_san_rfc822_email, not as dNSName
+    if up.startswith(("EMAIL:", "RFC822:", "RFC822NAME:", "E-MAIL:")):
+        return None
+    if up.startswith("DNS:"):
+        e = e[4:].strip()
+        up = e.upper()
+    elif up.startswith("IP:") or up.startswith("URI:"):
+        return None
+    if "@" in e:
+        return None
+    if not e or "*" in e:
+        return None
+    return e
+
+
+def _tls_san_rfc822_email(entry: str | None) -> str | None:
+    """RFC822 / email SAN: prefixed (email:, rfc822:) or raw user@domain (cryptography rfc822Name).
+
+    Local-part-only rfc822Name (no @, e.g. postmaster) is valid in PKIX but not a mailbox — ignored for leakage."""
+    if not entry or not str(entry).strip():
+        return None
+    raw = str(entry).strip()
+    up = raw.upper()
+    for pref in ("EMAIL:", "RFC822:", "RFC822NAME:", "E-MAIL:"):
+        if up.startswith(pref):
+            body = raw[len(pref) :].strip()
+            return body if body and "@" in body else None
+    if "*" in raw:
+        return None
+    if "@" not in raw:
+        return None
+    if up.startswith("DNS:") or up.startswith("IP:") or up.startswith("URI:"):
+        return None
+    return raw
+
+
+def _is_internal_infrastructure_hostname(name: str) -> bool:
+    """True for reserved / non-Internet suffixes or single-label host-style tokens (e.g. MAILSERVER)."""
+    n = name.strip()
+    if not n or "*" in n:
+        return False
+    low = n.lower().rstrip(".")
+    if low in ("localhost", "invalid"):
+        return False
+    try:
+        ipaddress.ip_address(low.strip("[]"))
+        return False
+    except ValueError:
+        pass
+    for suf in _INTERNAL_INFRA_DNS_SUFFIXES:
+        if low.endswith(suf):
+            return True
+    if "." not in low:
+        if len(low) < 3:
+            return False
+        return bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9-]{0,61}[A-Za-z0-9]$", n, re.I))
+    return False
+
+
+def _internal_hostname_finding_risk(display_name: str) -> Literal["medium", "high"]:
+    low = display_name.lower().rstrip(".")
+    for suf in _INTERNAL_INFRA_HIGH_SUFFIXES:
+        if low.endswith(suf):
+            return "high"
+    return "medium"
+
+
+def _collect_tls_internal_hostname_leaks(
+    tls_cert_subject: str | None,
+    tls_cert_issuer: str | None,
+    tls_cert_san: list[str] | None,
+) -> DataLeakFinding | None:
+    """One aggregated finding for internal / non-routable names in TLS CN and SAN."""
+    # key lower -> [display, risk, sources set]
+    acc: dict[str, list] = {}
+
+    def _add(disp: str, source: str) -> None:
+        if not _is_internal_infrastructure_hostname(disp):
+            return
+        d = disp.strip()
+        lk = d.lower()
+        r: Literal["medium", "high"] = _internal_hostname_finding_risk(d)
+        if lk not in acc:
+            acc[lk] = [d, r, {source}]
+        else:
+            row = acc[lk]
+            row[2].add(source)
+            if r == "high":
+                row[1] = "high"
+
+    for cn in _extract_cn_values_from_dn(tls_cert_subject):
+        _add(cn, "TLS Certificate Subject")
+    for cn in _extract_cn_values_from_dn(tls_cert_issuer):
+        _add(cn, "TLS Certificate Issuer")
+    for san in tls_cert_san or []:
+        nm = _normalize_tls_san_dns_name(san)
+        if nm:
+            _add(nm, "TLS SAN")
+        rfc = _tls_san_rfc822_email(san)
+        if rfc:
+            _add(rfc, "TLS SAN (RFC822)")
+    if not acc:
+        return None
+    items = sorted(acc.values(), key=lambda x: str(x[0]).lower())
+    names_display = ", ".join(str(x[0]) for x in items)
+    merged_srcs: set[str] = set()
+    max_risk: Literal["medium", "high"] = "medium"
+    for x in items:
+        merged_srcs |= x[2]
+        if x[1] == "high":
+            max_risk = "high"
+    return DataLeakFinding(
+        email=names_display,
+        risk=max_risk,
+        sources=tuple(sorted(merged_srcs)),
+        target_domain_match=False,
+        kind="internal_hostname",
+    )
+
+
+def _collect_data_leakage_findings(
+    banner: str | None,
+    ehlo_raw: str | None,
+    help_response: str | None,
+    error_samples: list[str],
+    unknown_cmd_response: str | None,
+    tls_cert_subject: str | None,
+    tls_cert_issuer: str | None,
+    tls_cert_san: list[str] | None,
+    target_host: str | None = None,
+) -> tuple[DataLeakFinding, ...]:
+    """Collect unique e-mails from all passive -id sources; classify low / medium / high exposure."""
+    by_key: dict[str, tuple[str, Literal["low", "medium", "high"], set[str]]] = {}
+    sources_map: list[tuple[str, str | None]] = [
+        ("TLS Certificate Subject", tls_cert_subject),
+        ("TLS Certificate Issuer", tls_cert_issuer),
+        ("Banner", banner),
+        ("EHLO response", ehlo_raw),
+        ("HELP response", help_response),
+        ("Unknown command response", unknown_cmd_response),
+    ]
+    for label, blob in sources_map:
+        if not blob:
+            continue
+        for em in _extract_emails_from_text(blob):
+            key = em.lower()
+            risk = _classify_email_leak_risk(em, target_host)
+            if key not in by_key:
+                by_key[key] = (em, risk, {label})
+            else:
+                prev_em, prev_risk, srcs = by_key[key]
+                by_key[key] = (prev_em, _merge_risk(prev_risk, risk), srcs | {label})
+    for sample in error_samples or []:
+        for em in _extract_emails_from_text(sample):
+            key = em.lower()
+            risk = _classify_email_leak_risk(em, target_host)
+            if key not in by_key:
+                by_key[key] = (em, risk, {"SMTP error response"})
+            else:
+                prev_em, prev_risk, srcs = by_key[key]
+                by_key[key] = (prev_em, _merge_risk(prev_risk, risk), srcs | {"SMTP error response"})
+    for san in tls_cert_san or []:
+        san_src = "TLS SAN"
+        rfc822 = _tls_san_rfc822_email(san)
+        if rfc822:
+            key = rfc822.lower()
+            risk = _classify_email_leak_risk(rfc822, target_host)
+            src = "TLS SAN (RFC822)"
+            if key not in by_key:
+                by_key[key] = (rfc822, risk, {src})
+            else:
+                prev_em, prev_risk, srcs = by_key[key]
+                by_key[key] = (prev_em, _merge_risk(prev_risk, risk), srcs | {src})
+        for em in _extract_emails_from_text(san):
+            key = em.lower()
+            risk = _classify_email_leak_risk(em, target_host)
+            if key not in by_key:
+                by_key[key] = (em, risk, {san_src})
+            else:
+                prev_em, prev_risk, srcs = by_key[key]
+                by_key[key] = (prev_em, _merge_risk(prev_risk, risk), srcs | {san_src})
+    internal_finding = _collect_tls_internal_hostname_leaks(
+        tls_cert_subject, tls_cert_issuer, tls_cert_san
+    )
+    rank_order = {"high": 0, "medium": 1, "low": 2}
+    out: list[DataLeakFinding] = []
+    if by_key:
+        rows = sorted(by_key.values(), key=lambda t: (rank_order[t[1]], t[0].lower()))
+        out.extend(
+            DataLeakFinding(
+                email=em,
+                risk=risk,
+                sources=tuple(sorted(srcs)),
+                target_domain_match=(risk == "high"),
+                kind="email",
+            )
+            for em, risk, srcs in rows
+        )
+    if internal_finding is not None:
+        out.append(internal_finding)
+    if not out:
+        return ()
+    out.sort(key=lambda f: (rank_order[f.risk], f.email.lower(), 0 if f.kind == "email" else 1))
+    return tuple(out)
 
 
 @dataclass
@@ -281,6 +729,8 @@ class ServerIdentifyResult:
     tls_cert_self_signed: bool = False
     tls_upgrade_failed: bool = False  # True if STARTTLS was attempted but cert not extracted
     tls_upgrade_error: str | None = None  # Exception message when STARTTLS failed (for --debug)
+    transport_tls: bool = False  # True if SMTP socket was TLS at end of identify probe (465/--tls/STARTTLS)
+    starttls_advertised: bool = False  # STARTTLS appeared in EHLO (plaintext policy / UI)
     tls_policy: str | None = None  # "mandatory" | "opportunistic" | "n/a"
     tls_cert_warnings: list[str] | None = None  # SHA-1, weak key, self-signed deliverability risk
     tls_cipher_warnings: list[str] | None = None  # RC4, 3DES, CBC, deprecated protocol
@@ -299,6 +749,11 @@ class ServerIdentifyResult:
     behavioral_matched_verbs: tuple[str, ...] = ()  # EHLO verbs that matched profile (evidence-based)
     behavioral_missing_verbs: tuple[str, ...] = ()  # EHLO verbs expected but missing (evidence-based)
     integrity_note: str | None = None  # Positive note when appliance proxy EHLO is consistent (suppresses false discrepancy)
+    data_leakage_findings: tuple[DataLeakFinding, ...] = ()  # E-mails in banner/TLS/EHLO/HELP/errors (-id privacy)
+    discrepancy_detected: bool = False  # Banner product vs behavioral EHLO profile (universal identity mismatch)
+    discrepancy_banner_product: str | None = None
+    discrepancy_behavior_product: str | None = None
+    behavioral_hint: str | None = None  # Raw best EHLO profile hint when generic fallback applies (e.g. "Exim (67%)")
 
 
 def _parse_ehlo_extensions(ehlo_raw: str | None) -> tuple[list[str], list[str], list[str]]:
@@ -384,10 +839,10 @@ def _identify_from_help(help_text: str | None) -> tuple[str | None, str | None, 
         if m:
             version = m.group(1) if has_version and m.lastindex and m.lastindex >= 1 else None
             cpe_map = {
-                "Sendmail": "cpe:2.3:a:sendmail:sendmail:*",
-                "Postfix": "cpe:2.3:a:postfix:postfix:*",
-                "Exim": "cpe:2.3:a:exim:exim:*",
-                "Microsoft Exchange Server": "cpe:2.3:a:microsoft:exchange_server:*",
+                "Sendmail": "cpe:2.3:a:sendmail:sendmail:*:*:*:*:*:*:*:*",
+                "Postfix": "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*",
+                "Exim": "cpe:2.3:a:exim:exim:*:*:*:*:*:*:*:*",
+                "Microsoft Exchange Server": "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*",
             }
             cpe = cpe_map.get(product, "*")
             points = WEIGHT_HELP if "version" in help_text.lower() or version else WEIGHT_HELP // 2
@@ -449,12 +904,28 @@ def _confidence_label(pct: int) -> str:
     return "indeterminate"
 
 
+def _product_identity_key(name: str) -> str:
+    """Normalize product name for discrepancy: same family before '(' (e.g. Postfix vs Postfix (VPS))."""
+    if not name or not str(name).strip():
+        return ""
+    return str(name).split("(", 1)[0].strip().lower()
+
+
 def _build_recommendation(
     hidden_banner: bool,
     confidence_pct: int,
     confidence_label: str,
     anomalous_identity: bool,
+    identity_mismatch_banner: str | None = None,
+    identity_mismatch_behavior: str | None = None,
 ) -> str | None:
+    if identity_mismatch_banner and identity_mismatch_behavior:
+        return (
+            f"Identity mismatch detected. The server identifies as '{identity_mismatch_banner}', but its behavioral "
+            f"fingerprint matches '{identity_mismatch_behavior}'. This typically suggests an MTA relay / Security "
+            f"Gateway (e.g. Proofpoint, FortiMail, Cisco Secure Email), a forwarding proxy, or a Honeypot setup. "
+            f"Verify the delivery chain via 'Received' headers or hop-specific latency analysis."
+        )
     if anomalous_identity:
         return (
             "The server appears to be misconfigured or intentionally spoofing its "
@@ -491,22 +962,25 @@ def _normalize_cpe(cpe: str | None) -> str | None:
 def _product_cpe_fallback(product: str) -> str:
     """CPE for products not in EHLO_PROFILES."""
     m = {
-        "Postfix (Default/Stripped)": "cpe:2.3:a:postfix:postfix:*",
-        "Zimbra Collaboration": "cpe:2.3:a:zimbra:collaboration:*",
-        "FortiMail": "cpe:2.3:h:fortinet:fortimail:*",
-        "Cisco Secure Email (IronPort)": "cpe:2.3:h:cisco:secure_email_gateway:*",
-        "NTT Docomo": "cpe:2.3:a:ntt:docomo:*",
-        "Network Appliance / Security Gateway": "cpe:2.3:a:network:appliance_mta:*",
-        "Enterprise Cloud Gateway": "cpe:2.3:a:enterprise:cloud_gateway:*",
-        "MailStore Gateway": "cpe:2.3:a:mailstore:mailstore_gateway:*",
-        "Barracuda Email Security": "cpe:2.3:h:barracuda:email_security_gateway:*",
-        "Zoho Mail": "cpe:2.3:a:zoho:mail:*",
-        "Microsoft 365": "cpe:2.3:a:microsoft:exchange_online:*",
-        "Proton Mail": "cpe:2.3:a:protonmail:protonmail:*",
-        "Fastmail": "cpe:2.3:a:fastmail:fastmail:*",
-        "Yandex Mail": "cpe:2.3:a:yandex:yandex_mail:*",
+        "Postfix (Default/Stripped)": "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*",
+        "Zimbra Collaboration": "cpe:2.3:a:zimbra:collaboration:*:*:*:*:*:*:*:*",
+        "FortiMail": "cpe:2.3:h:fortinet:fortimail:*:*:*:*:*:*:*:*",
+        "Cisco Secure Email (IronPort)": "cpe:2.3:h:cisco:secure_email_gateway:*:*:*:*:*:*:*:*",
+        "Network Appliance / Security Gateway": "cpe:2.3:a:network:appliance_mta:*:*:*:*:*:*:*:*",
+        "Enterprise Cloud Gateway": "cpe:2.3:a:enterprise:cloud_gateway:*:*:*:*:*:*:*:*",
+        "MailStore Gateway": "cpe:2.3:a:mailstore:mailstore_gateway:*:*:*:*:*:*:*:*",
+        "Barracuda Email Security": "cpe:2.3:h:barracuda:email_security_gateway:*:*:*:*:*:*:*:*",
+        "Sophos Email Appliance": "cpe:2.3:a:sophos:email_appliance:*:*:*:*:*:*:*:*",
+        "Zoho Mail": "cpe:2.3:a:zoho:mail:*:*:*:*:*:*:*:*",
+        "Microsoft 365": "cpe:2.3:a:microsoft:exchange_online:*:*:*:*:*:*:*:*",
+        "Proton Mail": "cpe:2.3:a:protonmail:protonmail:*:*:*:*:*:*:*:*",
+        "Fastmail": "cpe:2.3:a:fastmail:fastmail:*:*:*:*:*:*:*:*",
+        "Yandex Mail": "cpe:2.3:a:yandex:yandex_mail:*:*:*:*:*:*:*:*",
     }
-    return m.get(product, f"cpe:2.3:a:{product.lower().replace(' ', '_').replace('(', '').replace(')', '')}:*")
+    return m.get(
+        product,
+        f"cpe:2.3:a:{product.lower().replace(' ', '_').replace('(', '').replace(')', '')}:*:*:*:*:*:*:*:*",
+    )
 
 
 def _cert_domain_matches_target(cert_text: str, target_host: str | None) -> bool:
@@ -553,6 +1027,8 @@ def identify_smtp_server(
     tls_cert_self_signed: bool = False,
     tls_upgrade_failed: bool = False,
     tls_upgrade_error: str | None = None,
+    transport_tls: bool = False,
+    starttls_advertised: bool = False,
     tls_policy: str | None = None,
     tls_cert_warnings: list[str] | None = None,
     tls_cipher_warnings: list[str] | None = None,
@@ -685,31 +1161,6 @@ def identify_smtp_server(
                 )
                 break
 
-    # 8. OS hint (TTL) consistency: os_hint matches expected platform for product → +5%
-    # Skip for cloud providers: TTL at anycast networks is unreliable for OS inference.
-    if (
-        product
-        and product not in _CLOUD_PROVIDER_PRODUCTS
-        and os_hint
-        and "Unknown" not in os_hint
-    ):
-        hint_os: str | None = None
-        if "Linux" in os_hint or "Unix" in os_hint:
-            hint_os = "linux"
-        elif "Windows" in os_hint:
-            hint_os = "windows"
-        elif "Cisco" in os_hint:
-            hint_os = "cisco"
-        expected_os = _PRODUCT_EXPECTED_OS.get(product) if product else None
-        if hint_os and expected_os and hint_os == expected_os:
-            scoring.append(
-                ScoringEntry(
-                    "os_hint_match",
-                    WEIGHT_OS_HINT_CONSISTENCY,
-                    f"OS hint ({hint_os}) matches {product}",
-                )
-            )
-
     # 8b. TTL Override: os_hint=appliance + banner keywords → veto weak Postfix/Exim
     if (
         banner_sid is None
@@ -793,7 +1244,9 @@ def identify_smtp_server(
     beh_product, beh_sim, beh_detail, beh_matched, beh_missing = match_ehlo_profile(
         ehlo_order, ehlo_ext, ehlo_prop
     )
-    # Cloud-first: when banner matched a cloud provider, use only that product's EHLO profile – discard NTT Docomo etc.
+    raw_beh_product: str | None = beh_product
+    raw_beh_sim: int = beh_sim
+    # Cloud-first: when banner matched a cloud provider, use only that product's EHLO profile – discard spurious EHLO winners.
     if (
         product
         and product in _CLOUD_PROVIDER_PRODUCTS
@@ -811,9 +1264,9 @@ def identify_smtp_server(
             sample = ", ".join(sorted(beh_matched)[:6]) if beh_matched else ""
             lacks_str = f"; lacks {', '.join(beh_missing[:3])}" if beh_missing else ""
             beh_detail = f"{sample}{lacks_str}"
-    # Plesk/HestiaCP/cPanel/VestaCP context: NTT Docomo/Enterprise Cloud Gateway are Western hosting.
+    # Plesk/HestiaCP/cPanel/VestaCP context: Enterprise Cloud Gateway EHLO overlap on panel-managed hosts.
     if (
-        beh_product in ("Enterprise Cloud Gateway", "NTT Docomo")
+        beh_product == "Enterprise Cloud Gateway"
         and cert_software_context_str
         and any(
             x in (cert_software_context_str or "").lower()
@@ -929,13 +1382,20 @@ def identify_smtp_server(
 
     # 11b. Kill-switch (Forbidden): X-EXPS/XEXCH50 are Exchange-exclusive (MS-OXSMTP, unixwiz.net).
     # If present, Postfix and Exim are impossible – override immediately.
+    _exchange_integrity_note: str | None = None
+    exchange_verb_override_applied = False
     _EXCHANGE_FORBIDDEN_VERBS: frozenset[str] = frozenset({"X-EXPS", "XEXCH50"})
     _postfix_or_exim = product and (
         product == "Exim" or product.startswith("Postfix")
     )
     if _EXCHANGE_FORBIDDEN_VERBS & ehlo_keys_set and _postfix_or_exim:
+        exchange_verb_override_applied = True
         product = "Microsoft Exchange Server"
-        cpe = "cpe:2.3:a:microsoft:exchange_server:*"
+        cpe = "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*"
+        _exchange_integrity_note = (
+            "Banner claims Postfix/Exim, but EHLO contains Exchange-exclusive verbs "
+            "(X-EXPS/XEXCH50). Identity overridden to Microsoft Exchange."
+        )
         scoring.append(
             ScoringEntry(
                 "exchange_forbidden_override",
@@ -952,7 +1412,7 @@ def identify_smtp_server(
     ):
         if not product or product in ("Postfix", "Postfix (Default/Stripped)"):
             product = "Postfix (Default/Stripped)"
-            cpe = "cpe:2.3:a:postfix:postfix:*"
+            cpe = "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"
             total_before = sum(s.points for s in scoring)
             pts = max(0, 70 - total_before)
             if pts > 0:
@@ -975,10 +1435,22 @@ def identify_smtp_server(
         discrepancies.extend(
             check_banner_unknown_cmd_discrepancy(banner_claims, unk_product)
         )
-    # Internal domain disclosure: .local, .lan, .internal in banner = internal topology leak
+    # Internal domain disclosure: non-Internet suffixes in banner = internal topology leak
     if banner:
         first_line = (banner.split("\n")[0] if "\n" in banner else banner).strip().lower()
-        for suffix in (".local", ".lan", ".internal", ".localdomain"):
+        for suffix in (
+            ".local",
+            ".lan",
+            ".internal",
+            ".intranet",
+            ".private",
+            ".priv",
+            ".ads",
+            ".localdomain",
+            ".home",
+            ".node",
+            ".corp",
+        ):
             if suffix in first_line:
                 discrepancies.append(
                     f"Internal domain disclosure detected in banner ({suffix})"
@@ -988,7 +1460,7 @@ def identify_smtp_server(
         anomalous_identity = True
         behavior_matches = behavior_matches or "EHLO mismatch"
 
-    integrity_note: str | None = None
+    integrity_note: str | None = _exchange_integrity_note
 
     # VestaCP/HestiaCP + Exim: EHLO may match Postfix (clean config), but it's panel-managed Exim - suppress false discrepancy
     if (
@@ -1011,23 +1483,40 @@ def identify_smtp_server(
         behavior_matches = None
         integrity_note = "Plesk default Postfix often has ETRN/VRFY; behavioral profile consistent."
 
-    # Exim + NTT Docomo: standard Exim EHLO often overlaps with NTT Docomo signature
+    # Exim + Enterprise Cloud Gateway: standard Exim EHLO often overlaps that gateway profile
     elif (
         product == "Exim"
-        and behavior_matches == "NTT Docomo"
+        and behavior_matches == "Enterprise Cloud Gateway"
     ):
         anomalous_identity = False
         behavior_matches = None
-        integrity_note = "Standard Exim EHLO profile often overlaps with NTT Docomo signature; integrity verified."
-    # Appliance/Gateway proxy: MailStore, Barracuda, Cisco, FortiMail often pass Postfix/Exim-like EHLO – expected, not discrepancy
+        integrity_note = "Standard Exim EHLO profile often overlaps Enterprise Cloud Gateway signature; integrity verified."
+    # Appliance/Gateway: banner product vs Postfix/Exim-like EHLO — expected stack overlap, not honeypot
     elif (
         product
         and product in _APPLIANCE_PROXY_PRODUCTS
         and behavior_matches in ("Postfix", "Exim")
     ):
+        # behavior_matches can be Postfix from EHLO keyword fingerprint while best behavioral profile is still Exim
+        _proxy_integrity_same_mta = product == behavior_matches or (
+            beh_product is not None
+            and _product_identity_key(product or "") == _product_identity_key(beh_product)
+        )
         anomalous_identity = False
         behavior_matches = None
-        integrity_note = f"Behavioral profile is consistent with {product} proxy."
+        _specific_note = _APPLIANCE_SPECIFIC_INTEGRITY_NOTES.get(product)
+        if _specific_note:
+            integrity_note = _specific_note
+        elif _proxy_integrity_same_mta:
+            integrity_note = f"Behavioral profile is consistent with {product}."
+        else:
+            _label = _APPLIANCE_INTEGRITY_LABELS.get(product)
+            if _label is None:
+                if product.endswith("Gateway") or product in ("Exim", "Plesk"):
+                    _label = product
+                else:
+                    _label = f"{product} gateway"
+            integrity_note = f"Behavioral profile is consistent with {_label}."
     # Postfix (DreamHost VPS): DreamHost runs Postfix; EHLO often matches Postfix or Network Appliance profile
     elif (
         product == "Postfix (DreamHost VPS)"
@@ -1052,6 +1541,29 @@ def identify_smtp_server(
         anomalous_identity = False
         behavior_matches = None
         integrity_note = "Behavioral profile is consistent with Postfix on Etius.jp (WebArena)."
+    # Plain Postfix: weighted EHLO profile "Network Appliance / Security Gateway" matches common RFC extensions
+    # (PIPELINING, SIZE, ETRN, DSN, 8BITMIME, …); same overlap as Plesk/DreamHost/LWS cases above.
+    elif (
+        product
+        and (product == "Postfix" or product.startswith("Postfix ("))
+        and behavior_matches == "Network Appliance / Security Gateway"
+    ):
+        anomalous_identity = False
+        behavior_matches = None
+        integrity_note = (
+            "The generic 'Network Appliance / Security Gateway' EHLO profile often overlaps Postfix "
+            "(PIPELINING, SIZE, ETRN, DSN, …); this is not by itself evidence of spoofing or a honeypot."
+        )
+    # Exim: self-signed cert with generic corporate-style DN (OU/O) scores as "Private/Internal Mail Server"
+    # while banner and EHLO still identify Exim — same idea as Postfix vs appliance overlap, not honeypot.
+    elif (
+        product == "Exim"
+        and behavior_matches == "Private/Internal Mail Server"
+        and tls_cert_self_signed
+    ):
+        anomalous_identity = False
+        behavior_matches = None
+        integrity_note = "Banner and EHLO both support Exim; internal-mail identity label is consistent with normal self-managed Exim."
 
     # Postfix-based cloud providers: Proton Mail etc. openly show Postfix in banner – EHLO match expected
     elif (
@@ -1063,14 +1575,135 @@ def identify_smtp_server(
         behavior_matches = None
         integrity_note = "Banner and behavior consistent; provider openly uses Postfix."
 
+    # OS hint (TTL): after final product — generic appliance wording vs product-specific match (+5%).
+    if (
+        product
+        and product not in _CLOUD_PROVIDER_PRODUCTS
+        and os_hint
+        and "Unknown" not in os_hint
+    ):
+        hint_os: str | None = None
+        if "Linux" in os_hint or "Unix" in os_hint:
+            hint_os = "linux"
+        elif "Windows" in os_hint:
+            hint_os = "windows"
+        elif "Cisco" in os_hint:
+            hint_os = "cisco"
+        if hint_os:
+            if product in _GENERIC_OS_HINT_PRODUCTS and hint_os in ("linux", "cisco"):
+                scoring.append(
+                    ScoringEntry(
+                        "os_hint_match",
+                        WEIGHT_OS_HINT_CONSISTENCY,
+                        f"OS hint ({hint_os}) matches typical appliance environment",
+                    )
+                )
+            else:
+                expected_os = _PRODUCT_EXPECTED_OS.get(product)
+                if expected_os and hint_os == expected_os:
+                    scoring.append(
+                        ScoringEntry(
+                            "os_hint_match",
+                            WEIGHT_OS_HINT_CONSISTENCY,
+                            f"OS hint ({hint_os}) matches {product}",
+                        )
+                    )
+
+    # Universal banner vs behavioral EHLO profile mismatch (any product pair), after integrity suppressions.
+    banner_pts_for_discrepancy = sum(s.points for s in scoring if s.method == "banner")
+    discrepancy_detected = False
+    discrepancy_banner_product: str | None = None
+    discrepancy_behavior_product: str | None = None
+    if (
+        banner_sid is not None
+        and beh_product
+        and beh_sim >= 50
+        and banner_pts_for_discrepancy > 30
+        and _product_identity_key(banner_sid.product) != _product_identity_key(beh_product)
+        and anomalous_identity
+        and not exchange_verb_override_applied
+    ):
+        discrepancy_detected = True
+        discrepancy_banner_product = banner_sid.product
+        discrepancy_behavior_product = beh_product
+        conflict_penalty = round((beh_sim / 100.0) * WEIGHT_BEHAVIORAL_CONFLICT_MAX)
+        if conflict_penalty > 0:
+            scoring.append(
+                ScoringEntry(
+                    "behavioral_conflict",
+                    -conflict_penalty,
+                    (
+                        f"EHLO behavioral profile '{discrepancy_behavior_product}' matches at {beh_sim}% "
+                        f"while banner identifies '{discrepancy_banner_product}'"
+                    ),
+                )
+            )
+
     total_pts = sum(s.points for s in scoring)
-    confidence_pct = min(100, total_pts)
+    confidence_pct = max(0, min(100, total_pts))
     confidence_label = _confidence_label(confidence_pct)
-    recommendation = _build_recommendation(hidden_banner, confidence_pct, confidence_label, anomalous_identity)
+    recommendation = _build_recommendation(
+        hidden_banner,
+        confidence_pct,
+        confidence_label,
+        anomalous_identity,
+        identity_mismatch_banner=discrepancy_banner_product if discrepancy_detected else None,
+        identity_mismatch_behavior=discrepancy_behavior_product if discrepancy_detected else None,
+    )
+
+    behavioral_hint: str | None = None
+    if (
+        confidence_pct < 40
+        and is_generic_esmtp_banner(banner)
+        and len(ehlo_keys_set) < 5
+        and product not in _CLOUD_PROVIDER_PRODUCTS
+        and product != "Postfix (Default/Stripped)"
+        and ehlo_keys_set != POSTFIX_STRIPPED_KEYS
+        and not exchange_verb_override_applied
+    ):
+        scoring.append(
+            ScoringEntry(
+                "identity_blur",
+                WEIGHT_IDENTITY_BLUR,
+                "Generic banner & minimalist EHLO configuration",
+            )
+        )
+        confidence_pct = max(0, min(100, sum(s.points for s in scoring)))
+        confidence_label = "low"
+        product = _GENERIC_ESMTP_SERVICE_PRODUCT
+        cpe = _normalize_cpe(_GENERIC_ESMTP_SERVICE_CPE)
+        version = None
+        if raw_beh_product and raw_beh_sim > 0:
+            behavioral_hint = f"{raw_beh_product} ({raw_beh_sim}%)"
+        discrepancy_detected = False
+        discrepancy_banner_product = None
+        discrepancy_behavior_product = None
+        anomalous_identity = False
+        behavior_matches = None
+        integrity_note = None
+        _beh_like = raw_beh_product or "an indeterminate MTA"
+        recommendation = (
+            f"Identity is ambiguous. EHLO patterns suggest {_beh_like}-like behavior, "
+            "but generic banner and minimal EHLO configuration are typical for hardened "
+            "relays or security appliances. Cross-reference with other services "
+            "(e.g., ports 445, 3389) to narrow down the host identity."
+        )
 
     # Cloud providers: TTL at anycast networks is unreliable for OS inference – label as "Cloud Infrastructure"
     os_hint_display: str | None = (
         "Cloud Infrastructure" if (product and product in _CLOUD_PROVIDER_PRODUCTS and os_hint) else os_hint
+    )
+
+    data_leakage_findings = _collect_data_leakage_findings(
+        banner=banner,
+        ehlo_raw=ehlo_raw,
+        help_response=help_response,
+        error_samples=error_samples,
+        unknown_cmd_response=unknown_cmd_response,
+        tls_cert_subject=tls_cert_subject,
+        tls_cert_issuer=tls_cert_issuer,
+        tls_cert_san=tls_cert_san,
+        target_host=target_host,
     )
 
     return ServerIdentifyResult(
@@ -1099,6 +1732,8 @@ def identify_smtp_server(
         tls_cert_self_signed=tls_cert_self_signed,
         tls_upgrade_failed=tls_upgrade_failed,
         tls_upgrade_error=tls_upgrade_error,
+        transport_tls=transport_tls,
+        starttls_advertised=starttls_advertised,
         tls_policy=tls_policy,
         tls_cert_warnings=tls_cert_warnings,
         tls_cipher_warnings=tls_cipher_warnings,
@@ -1116,4 +1751,9 @@ def identify_smtp_server(
         behavioral_matched_verbs=beh_matched,
         behavioral_missing_verbs=beh_missing,
         integrity_note=integrity_note,
+        data_leakage_findings=data_leakage_findings,
+        discrepancy_detected=discrepancy_detected,
+        discrepancy_banner_product=discrepancy_banner_product,
+        discrepancy_behavior_product=discrepancy_behavior_product,
+        behavioral_hint=behavioral_hint,
     )

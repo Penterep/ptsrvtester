@@ -8,7 +8,7 @@ from .._base import BaseArgs
 
 
 def vendor_from_cpe(cpe: str | None) -> str | None:
-    """Extract vendor from CPE 2.3 string (e.g. cpe:2.3:a:microsoft:exchange_server:* -> microsoft)."""
+    """Extract vendor from CPE 2.3 string (e.g. cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:* -> microsoft)."""
     if not cpe or ":" not in cpe:
         return None
     parts = cpe.split(":")

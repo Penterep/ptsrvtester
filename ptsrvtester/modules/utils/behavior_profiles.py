@@ -27,8 +27,8 @@ VERB_WEIGHTS: Final[dict[str, float]] = {
     "X-BARRACUDA-BRTS": 10.0,  # Barracuda signature (even with masked banner)
     "X-BARRACUDA-CPANEL": 10.0,
     "X-BARRACUDA-GW": 10.0,
-    "PIPE_CONNECT": 10.0,  # NTT Docomo / early pipelining (draft-harris-early-pipe)
-    "HELP": 8.0,  # NTT Docomo / unusual EHLO verb
+    "PIPE_CONNECT": 10.0,  # Enterprise gateways / early pipelining (draft-harris-early-pipe)
+    "HELP": 8.0,  # Common on enterprise relays and some Exim builds
 }
 
 # EHLO profile: (product, set of typical extension keys for Jaccard, required_keys for Postfix/Exchange)
@@ -51,36 +51,38 @@ EHLO_PROFILES: Final[list[EHLOProfile]] = [
         ("SIZE", "PIPELINING", "8BITMIME"),
         ("PIPELINING",),
         ("X-EXPS", "XEXCH50"),
-        "cpe:2.3:a:postfix:postfix:*",
+        "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*",
     ),
     EHLOProfile(
         "Microsoft Exchange Server",
         ("X-EXPS", "X-LINK2STATE", "XEXCH50", "X-RCPTLIMIT", "PIPELINING", "SIZE", "STARTTLS", "AUTH"),
         ("X-EXPS",),
         (),
-        "cpe:2.3:a:microsoft:exchange_server:*",
+        "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*",
     ),
     EHLOProfile(
         "Postfix",
         ("PIPELINING", "SIZE", "VRFY", "CHUNKING", "XCLIENT", "XFORWARD", "STARTTLS"),
         ("PIPELINING",),
         ("X-EXPS", "XEXCH50"),  # Exchange-specific, disproves Postfix
-        "cpe:2.3:a:postfix:postfix:*",
+        "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*",
     ),
-    # Exim: LIMITS since 4.98 (rate limiting), 8BITMIME common. X_E_N_D_O_F_M_E_S_S_A_G_E_ when CHUNKING enabled.
+    # Exim: common advertised verbs only (weighted Jaccard). LIMITS (4.98+) and X_E_N_D_O_F_M_E_S_S_A_G_E_
+    # (CHUNKING) are strong when present but shrink similarity for typical 4.9x installs — handled via
+    # other fingerprints / missing-verb hints, not this set (avoids false weak match on generic Exim).
     EHLOProfile(
         "Exim",
-        ("SIZE", "PIPELINING", "STARTTLS", "AUTH", "LIMITS", "8BITMIME", "X_E_N_D_O_F_M_E_S_S_A_G_E_"),
+        ("SIZE", "PIPELINING", "STARTTLS", "AUTH", "8BITMIME", "HELP"),
         (),
         (),
-        "cpe:2.3:a:exim:exim:*",
+        "cpe:2.3:a:exim:exim:*:*:*:*:*:*:*:*",
     ),
     EHLOProfile(
         "Sendmail",
         ("ETRN", "DSN", "DELIVERBY", "PIPELINING", "SIZE", "STARTTLS"),
         ("ETRN",),
         (),
-        "cpe:2.3:a:sendmail:sendmail:*",
+        "cpe:2.3:a:sendmail:sendmail:*:*:*:*:*:*:*:*",
     ),
     # Fastmail: standard profile (SIZE, STARTTLS, PIPELINING, CHUNKING) – banner authoritative
     EHLOProfile(
@@ -88,7 +90,7 @@ EHLO_PROFILES: Final[list[EHLOProfile]] = [
         ("SIZE", "STARTTLS", "PIPELINING", "CHUNKING"),
         (),
         ("X-EXPS", "XEXCH50"),
-        "cpe:2.3:a:fastmail:fastmail:*",
+        "cpe:2.3:a:fastmail:fastmail:*:*:*:*:*:*:*:*",
     ),
     # Yandex Mail: similar to Google (SIZE, STARTTLS, ENHANCEDSTATUSCODES, CHUNKING)
     EHLOProfile(
@@ -96,7 +98,7 @@ EHLO_PROFILES: Final[list[EHLOProfile]] = [
         ("SIZE", "STARTTLS", "ENHANCEDSTATUSCODES", "CHUNKING"),
         (),
         ("X-EXPS", "XEXCH50"),
-        "cpe:2.3:a:yandex:yandex_mail:*",
+        "cpe:2.3:a:yandex:yandex_mail:*:*:*:*:*:*:*:*",
     ),
     # Zoho Mail: minimal EHLO (SIZE, STARTTLS, SMTPUTF8, 8BITMIME), similar to Amazon SES – banner authoritative
     EHLOProfile(
@@ -104,21 +106,21 @@ EHLO_PROFILES: Final[list[EHLOProfile]] = [
         ("SIZE", "STARTTLS", "SMTPUTF8", "8BITMIME", "PIPELINING"),
         (),
         ("X-EXPS", "XEXCH50"),
-        "cpe:2.3:a:zoho:mail:*",
+        "cpe:2.3:a:zoho:mail:*:*:*:*:*:*:*:*",
     ),
     EHLOProfile(
         "Amazon SES",
         ("PIPELINING", "SIZE", "STARTTLS", "AUTH"),  # Short list, no ETRN/DSN
         (),
         (),  # Could also match Postfix; use lack of ETRN/DSN as hint
-        "cpe:2.3:a:amazon:ses:*",
+        "cpe:2.3:a:amazon:ses:*:*:*:*:*:*:*:*",
     ),
     EHLOProfile(
         "Cisco Secure Email (IronPort)",
         ("AsyncOS", "IronPort", "PIPELINING", "SIZE", "STARTTLS"),
         ("AsyncOS", "IronPort"),
         (),
-        "cpe:2.3:h:cisco:secure_email_gateway:*",
+        "cpe:2.3:h:cisco:secure_email_gateway:*:*:*:*:*:*:*:*",
     ),
     # Barracuda Email Security: X-BARRACUDA-* verbs identify even when banner masked
     EHLOProfile(
@@ -126,7 +128,7 @@ EHLO_PROFILES: Final[list[EHLOProfile]] = [
         ("PIPELINING", "SIZE", "STARTTLS", "X-BARRACUDA-GW", "X-BARRACUDA-BRTS", "X-BARRACUDA-CPANEL"),
         ("X-BARRACUDA-GW",),  # when banner claims Barracuda, expect at least GW
         ("X-EXPS", "XEXCH50"),
-        "cpe:2.3:h:barracuda:email_security_gateway:*",
+        "cpe:2.3:h:barracuda:email_security_gateway:*:*:*:*:*:*:*:*",
     ),
     # MailStore Gateway: archive/proxy often has BINARYMIME, CHUNKING
     EHLOProfile(
@@ -134,15 +136,7 @@ EHLO_PROFILES: Final[list[EHLOProfile]] = [
         ("PIPELINING", "SIZE", "STARTTLS", "CHUNKING", "BINARYMIME"),
         ("CHUNKING", "BINARYMIME"),
         ("X-EXPS", "XEXCH50"),
-        "cpe:2.3:a:mailstore:mailstore_gateway:*",
-    ),
-    # NTT Docomo: Japanese telco SMTP; PIPE_CONNECT, HELP more common than in standard Exim
-    EHLOProfile(
-        "NTT Docomo",
-        ("PIPELINING", "SIZE", "STARTTLS", "AUTH", "8BITMIME", "PIPE_CONNECT", "HELP"),
-        (),
-        (),
-        "cpe:2.3:a:ntt:docomo:*",
+        "cpe:2.3:a:mailstore:mailstore_gateway:*:*:*:*:*:*:*:*",
     ),
     # Network-Appliance-MTA: Cisco/FortiMail/IronPort. TTL 255, ETRN+VRFY typical.
     # No CRAM-MD5, no AsyncOS in EHLO. Self-signed cert common.
@@ -151,16 +145,28 @@ EHLO_PROFILES: Final[list[EHLOProfile]] = [
         ("PIPELINING", "SIZE", "VRFY", "ETRN", "STARTTLS", "DSN", "ENHANCEDSTATUSCODES", "8BITMIME"),
         (),
         ("X-EXPS", "XEXCH50"),
-        "cpe:2.3:a:network:appliance_mta:*",
+        "cpe:2.3:a:network:appliance_mta:*:*:*:*:*:*:*:*",
     ),
-    # Enterprise Cloud Gateway: ETRN + CRAM-MD5 = on-prem/legacy (often modified Postfix/Sendmail).
-    # Forbidden: X-EXPS, XEXCH50 (not Exchange).
+    # Enterprise Cloud Gateway: hosted / on-prem relays — ETRN+CRAM-MD5 legacy stack and/or PIPE_CONNECT+HELP
+    # (early-pipeline style EHLO). Forbidden: X-EXPS, XEXCH50 (not Exchange).
     EHLOProfile(
         "Enterprise Cloud Gateway",
-        ("PIPELINING", "SIZE", "ETRN", "AUTH", "CRAM-MD5", "ENHANCEDSTATUSCODES", "DSN", "8BITMIME", "STARTTLS"),
-        ("ETRN",),
+        (
+            "PIPELINING",
+            "SIZE",
+            "STARTTLS",
+            "AUTH",
+            "8BITMIME",
+            "PIPE_CONNECT",
+            "HELP",
+            "ETRN",
+            "CRAM-MD5",
+            "ENHANCEDSTATUSCODES",
+            "DSN",
+        ),
+        (),
         ("X-EXPS", "XEXCH50"),
-        "cpe:2.3:a:enterprise:cloud_gateway:*",
+        "cpe:2.3:a:enterprise:cloud_gateway:*:*:*:*:*:*:*:*",
     ),
 ]
 
@@ -226,7 +232,7 @@ def get_ehlo_keys_from_extensions(extensions: list[str]) -> set[str]:
 # Optional verb hints: when a typical key is missing, human-readable hint (product, verb) -> hint.
 # Keys: product (exact match from EHLO_PROFILES), verb (UPPERCASE – lookup is case-insensitive).
 # Sources: Postfix XCLIENT_README/XFORWARD_README; unixwiz.net (XEXCH50); Sendmail O'Reilly (noetrn);
-# Exim CVE-2017-16943 / chunking_advertise_hosts; Cisco ESA docs; AWS SES docs; NTT Docomo (bizmw.com).
+# Exim CVE-2017-16943 / chunking_advertise_hosts; Cisco ESA docs; AWS SES docs; enterprise relay docs.
 PROFILE_MISSING_HINTS: Final[dict[tuple[str, str], str]] = {
     # Postfix
     ("Postfix", "XFORWARD"): "optional; often disabled in Plesk",
@@ -246,13 +252,13 @@ PROFILE_MISSING_HINTS: Final[dict[tuple[str, str], str]] = {
     ("Amazon SES", "AUTH"): "optional on some relay endpoints",
     # Cisco Secure Email – Cisco TAC doc 217162
     ("Cisco Secure Email (IronPort)", "PIPELINING"): "optional; may be absent in some AsyncOS configs",
-    # NTT Docomo – bizmw.com and similar; proprietary or heavily customized Postfix
-    ("NTT Docomo", "STARTTLS"): "standard for Docomo Business Relay; absence suggests legacy configuration",
-    ("NTT Docomo", "AUTH"): "often missing on inbound MX relays; required on outbound submission",
-    ("NTT Docomo", "8BITMIME"): "optional; might be filtered by NTT security middleware",
-    # Enterprise Cloud Gateway – ETRN + CRAM-MD5, modified Postfix/Sendmail
+    # Enterprise Cloud Gateway – ETRN + CRAM-MD5, PIPE_CONNECT, HELP (hosted / legacy relays)
     ("Enterprise Cloud Gateway", "CRAM-MD5"): "strong identifier; older/enterprise gateways",
     ("Enterprise Cloud Gateway", "ETRN"): "strong identifier; rare in modern cloud",
+    ("Enterprise Cloud Gateway", "PIPE_CONNECT"): "early-pipelining; some enterprise gateways and Exim builds",
+    ("Enterprise Cloud Gateway", "STARTTLS"): "expected on internet-facing relays; absence may indicate legacy path",
+    ("Enterprise Cloud Gateway", "AUTH"): "often restricted on inbound MX; full AUTH on submission",
+    ("Enterprise Cloud Gateway", "8BITMIME"): "optional; may be filtered by policy middleware",
     # Network Appliance – Cisco/FortiMail/IronPort
     ("Network Appliance / Security Gateway", "VRFY"): "optional; often disabled on mail relays",
     ("Network Appliance / Security Gateway", "ETRN"): "optional; may be disabled for security",
@@ -316,7 +322,6 @@ def match_ehlo_profile(
     Returns (product, similarity_pct, detail, matched_verbs, missing_verbs) or (None, 0.0, "", (), ()).
     """
     all_keys = _build_ehlo_all_keys(ehlo_order, ehlo_extensions, ehlo_proprietary)
-    keys_list = list(all_keys)
     best_product: str | None = None
     best_sim = 0.0
     best_detail = ""
@@ -335,7 +340,7 @@ def match_ehlo_profile(
             profile_keys_upper = {k.upper() for k in profile.typical_keys}
             matched = tuple(sorted(all_keys & profile_keys_upper))
             missing = tuple(sorted(profile_keys_upper - all_keys))
-            sample = ", ".join(sorted(keys_list)[:6])
+            sample = ", ".join(matched[:6]) if matched else ""
             lacks_str = f"; lacks {', '.join(missing[:3])}" if missing else ""
             best_detail = f"{sample}{lacks_str}"
             best_matched = matched

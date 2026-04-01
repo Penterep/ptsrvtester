@@ -72,26 +72,22 @@ class BaseModule(ABC):
         raise NotImplementedError
 
     def ptdebug(self, string: str, out: Out = Out.TEXT, title: bool = False, end: str = "\n"):
-        """Prints only in debug mode.
+        """Prints only in verbose mode (-vv/--verbose).
 
-        Args:
-            string (str): text to print
-            out (Out, optional): output category. Defaults to Out.TEXT.
-            title (bool, optional): whether to print a title. Defaults to False.
-            end (str, optional): line ending. Defaults to "\n".
+        Uses gray (ADDITIONS in ptdefs) like ptprint(..., \"ADDITIONS\", ..., colortext=True).
+        Suppressed when --json is set. ``out`` and ``title`` are kept for call-site compatibility.
         """
         if not self.args.debug:
             return
 
-        if title:
-            colortext = True
-            category = Out.TITLE.value
-        else:
-            # Out.INFO should have colored text (yellow) for headings
-            colortext = (out == Out.INFO)
-            category = out.value
-
-        ptprinthelper.ptprint(string, category, True, flush=True, colortext=colortext, end=end)
+        ptprinthelper.ptprint(
+            string,
+            "ADDITIONS",
+            not self.args.json,
+            end=end,
+            flush=True,
+            colortext=True,
+        )
 
     def ptprint(
         self,

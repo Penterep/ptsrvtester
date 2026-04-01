@@ -113,6 +113,7 @@ class MSRPCArgs(BaseArgs):
                 ["enumerate-pipes", "<options>", "", "Enumerate accessible named pipes"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
+                ["-vv", "--verbose", "", "Enable verbose mode"],
             ]}
         ]
 

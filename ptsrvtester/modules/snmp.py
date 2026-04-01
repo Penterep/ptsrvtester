@@ -93,6 +93,7 @@ class SNMPArgs(BaseArgs):
                 ["snmpv3-write", "<options>", "", "Test SNMPv3 write permissions"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
+                ["-vv", "--verbose", "", "Enable verbose mode"],
             ]}
         ]
 

@@ -178,7 +178,7 @@ class POP3Args(ArgsWithBruteforce):
                 ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
                 ["-c", "--commands", "", "Grab CAPA (capabilities) only"],
                 ["-hi", "--help-info", "", "Test HELP and IMPLEMENTATION – show info disclosed by server"],
-                ["-ie", "--isencrypt", "", "Test encryption options (plaintext, STLS, TLS)"],
+                ["-ie", "--is-encrypt", "", "Test encryption options (plaintext, STLS, TLS)"],
                 ["-A", "--anonymous", "", "Check anonymous authentication"],
                 ["-N", "--ntlm", "", "Inspect NTLM authentication"],
                 ["", "", "", ""],
@@ -191,6 +191,7 @@ class POP3Args(ArgsWithBruteforce):
                 ["-P", "--passwords", "<wordlist>", "File with passwords"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
+                ["-vv", "--verbose", "", "Enable verbose mode"],
             ]}
         ]
 
@@ -233,8 +234,9 @@ class POP3Args(ArgsWithBruteforce):
         recon.add_argument("-c", "--commands", action="store_true", help="grab CAPA (capabilities) only")
         recon.add_argument(
             "-ie",
-            "--isencrypt",
+            "--is-encrypt",
             action="store_true",
+            dest="isencrypt",
             help="test encryption options on port (plaintext, STLS, TLS)",
         )
         recon.add_argument(

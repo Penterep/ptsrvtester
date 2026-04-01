@@ -140,6 +140,7 @@ class DHCPArgs(BaseArgs):
                 ["denial", "<options>", "", "Run DHCP DoS attack"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
+                ["-vv", "--verbose", "", "Enable verbose mode"],
             ]}
         ]
 

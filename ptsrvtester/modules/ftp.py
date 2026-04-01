@@ -393,7 +393,7 @@ class FTPArgs(ArgsWithBruteforce):
                 ["-i", "--info", "", "Grab banner and inspect HELP, SYST, STAT commands"],
                 ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
                 ["-c", "--commands", "", "Grab HELP, SYST and STAT commands only"],
-                ["-ie", "--isencrypt", "", "Test encryption options (plaintext, AUTH TLS, implicit TLS)"],
+                ["-ie", "--is-encrypt", "", "Test encryption options (plaintext, AUTH TLS, implicit TLS)"],
                 ["-A", "--anonymous", "", "Check anonymous authentication"],
                 ["-a", "--access", "", "Read/write check (use with -A and/or -u/-p)"],
                 ["-l", "--access-list", "", "Display directory listing"],
@@ -405,8 +405,8 @@ class FTPArgs(ArgsWithBruteforce):
                 ["", "--active-audit-low-ports", "<list>", "Comma-separated data ports <1000 for full audit (default 80,443,21)"],
                 ["-C", "--cmd-audit", "", "HELP/FEAT/SITE command surface audit"],
                 ["", "--cmd-audit-active", "", "After -C: safe SITE probes (needs login); timeouts + DELE cleanup"],
-                ["-iv", "--invalid-cmd-audit", "", "Invalid command resilience (same idea as SMTP -iv); raw bytes, resilienceRating"],
-                ["-eu", "--user-enum", "", "Username enumeration: USER then wrong PASS (PTL-SVC-FTP-USRENUM); needs --user-enum-wordlist"],
+                ["-iv", "--invalid-cmd-audit", "", "Invalid command resilience; raw bytes, resilienceRating"],
+                ["-eu", "--user-enum", "", "Username enumeration: USER then wrong PASS; needs --user-enum-wordlist"],
                 ["", "--user-enum-wordlist", "<file>", "Usernames for -eu, one per line"],
                 ["", "--user-enum-password", "<str>", "Fixed wrong password after 331/332 (default built-in)"],
                 ["", "--user-enum-keep-alive", "", "One TCP session for all -eu probes (no --user-enum-threads > 1)"],
@@ -416,18 +416,16 @@ class FTPArgs(ArgsWithBruteforce):
                 ["", "--active", "", "Use active mode"],
                 ["", "--tls", "", "Use implicit SSL/TLS"],
                 ["", "--starttls", "", "Use explicit SSL/TLS"],
-                ["", "", "", ""],
                 ["-u", "--user", "<username>", "FTP username (known account with -p, or bruteforce with -P)"],
                 ["-U", "--users", "<wordlist>", "File with usernames"],
                 ["-p", "--password", "<password>", "FTP password (known account with -u, or bruteforce with -U)"],
                 ["-P", "--passwords", "<wordlist>", "File with passwords"],
-                ["", "", "", ""],
                 ["-e", "--enum-paths", "", "Dictionary attack for path discovery (requires creds)"],
                 ["-w", "--paths-wordlist", "<file>", "Paths to test, one per line (required with -e)"],
                 ["", "--enum-threads", "<n>", "Threads for path enumeration (default: 5)"],
                 ["", "--base-path", "<path>", "Start directory for enumeration"],
-                ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
+                ["-vv", "--verbose", "", "Enable verbose mode"],
             ]}
         ]
 
@@ -483,7 +481,7 @@ Credentials:
         recon.add_argument("-b", "--banner", action="store_true", help="grab banner + Service Identification (product, version, CPE)")
         recon.add_argument("-c", "--commands", action="store_true", help="grab HELP, SYST and STAT commands only")
         recon.add_argument(
-            "-ie", "--isencrypt", action="store_true", dest="isencrypt",
+            "-ie", "--is-encrypt", action="store_true", dest="isencrypt",
             help="test encryption options (plaintext, AUTH TLS, implicit TLS)"
         )
         recon.add_argument(
@@ -614,7 +612,7 @@ Credentials:
             "--invalid-cmd-audit",
             action="store_true",
             dest="invalid_cmd_audit",
-            help="invalid command resilience (like SMTP -iv): raw/malformed control lines incl. USER…\\x00…; JSON resilienceRating",
+            help="invalid command resilience: raw/malformed control lines incl. USER…\\x00…; JSON resilienceRating",
         )
 
         ue_grp = parser.add_argument_group(
@@ -1909,6 +1907,229 @@ class FTP(BaseModule):
             return "Not logged in or command refused."
         return None
 
+    def _active_audit_step_verdict(
+        self, s: ActiveAuditStep, aa: ActiveAuditResult
+    ) -> tuple[str | None, str | None]:
+        """Terminal verdict (NOTVULN / VULN / WARNING) for one active-audit step; (None, None) = omit."""
+        c = s.code
+        name = s.name
+        phase = s.phase
+        reply_l = (s.reply or "").lower()
+        cmd_s = s.command or ""
+
+        if cmd_s == "(skipped)" or name in ("port_skipped", "port_sessions"):
+            note_l = (s.note or "").lower()
+            if "non-ipv4" in note_l or "ipv4" in note_l:
+                return "WARNING", "IPv4 required for PORT tests; audit incomplete"
+            return None, None
+
+        if phase == "preAuth":
+            if name == "pasv":
+                if c == 530:
+                    return "NOTVULN", "Login required before PASV (strict policy)"
+                if c == 227:
+                    return "WARNING", "PASV allowed before login (informational attack surface)"
+                if c == 502:
+                    return "NOTVULN", "PASV not implemented or disabled on server"
+                if c in (501, 504):
+                    return "NOTVULN", "PASV not available or parameter rejected"
+            if name in ("port_own_high", "port_own_1930", "port_own"):
+                if c == 530:
+                    return "NOTVULN", "Login required before PORT (expected for hardened servers)"
+                if c == 200:
+                    return "VULN", "PORT accepted before login (unusual — review policy)"
+            if name == "port_foreign":
+                if c == 200:
+                    return "VULN", "Third-party PORT accepted before login (FTP bounce risk)"
+                if c in (530, 500, 501, 502, 504):
+                    return "NOTVULN", "Third-party PORT rejected before login (bounce mitigation)"
+
+        if phase == "postAuth":
+            if name == "d0_list_raw":
+                if c in (425, 503, 501):
+                    return "NOTVULN", "Strict RFC-style state (PASV/PORT required first)"
+                if c == 530:
+                    return "NOTVULN", "Login or sequence required before data channel"
+            if name == "pasv_list":
+                if s.reply == "ok" or c == 226:
+                    return "NOTVULN", "Passive data transfer OK"
+                if s.reply == "failed":
+                    return "WARNING", "Passive LIST failed (see reply)"
+            if name == "pasv":
+                if c == 227:
+                    return "NOTVULN", "Passive mode available after login"
+            if name == "list_active":
+                if "ok" in reply_l:
+                    return "NOTVULN", "Active-mode LIST completed (data path OK)"
+                return "WARNING", "Active-mode LIST failed (NAT/firewall on tester side possible)"
+
+            if name == "port_foreign_list":
+                if c == 200:
+                    return "VULN", "PORT 200 to foreign IP — bounce risk (verify with capture)"
+                if c in (500, 501, 502, 504, 530):
+                    return "NOTVULN", "Third-party PORT rejected (bounce risk mitigated)"
+
+            if name.startswith("port_own_low_"):
+                if c in (500, 501, 502, 504, 530):
+                    return "NOTVULN", "Low data port (<1024) rejected"
+
+            if name in ("port_own_high_list", "port_own_1930_list"):
+                if c == 200:
+                    return "WARNING", "PORT accepted — verify data path and policy"
+                if c in (500, 501, 502, 504) and "illegal" in reply_l:
+                    return "NOTVULN", "PORT rejected (active mode disabled or restricted)"
+                if c == 530:
+                    return "NOTVULN", "PORT refused (policy)"
+                if c == 500 and "illegal" not in reply_l:
+                    return "NOTVULN", "PORT rejected by server"
+
+            if name in ("port_own_high", "port_foreign", "port_low") and c is not None:
+                if c == 200 and name == "port_foreign":
+                    return "VULN", "Third-party PORT accepted after login (bounce risk)"
+                if c == 200:
+                    return "WARNING", "PORT command accepted (check follow-up behaviour)"
+                if c in (500, 501, 502, 504) and "illegal" in reply_l:
+                    return "NOTVULN", "PORT rejected (active mode disabled or restricted)"
+                if c == 530:
+                    return "NOTVULN", "PORT refused or login required"
+
+        return None, None
+
+    def _print_active_audit_terminal(self, aa: ActiveAuditResult) -> None:
+        """Structured terminal output for PTL-SVC-FTP-ACTIVE (aligned with other FTP sections)."""
+        fk = get_colored_text
+        star_h = fk("[*]", color="INFO")
+        bounce_header = False
+        printed_pre = False
+        post_header = False
+
+        self.ptprint("Active mode policy", Out.INFO)
+
+        for s in aa.steps:
+            if s.phase == "preAuth" and not printed_pre:
+                self.ptprint("Pre-authentication checks", Out.INFO)
+                printed_pre = True
+            if s.phase == "postAuth" and not post_header:
+                self.ptprint("Post-authentication checks", Out.INFO)
+                post_header = True
+            if (
+                s.phase == "postAuth"
+                and s.name in ("port_foreign_list", "port_foreign")
+                and not bounce_header
+            ):
+                self.ptprint("FTP bounce (foreign IP)", Out.INFO)
+                bounce_header = True
+
+            c = s.code
+            code_s = f" [{c}]" if c is not None else ""
+            cmd_s = s.command if s.command else "(no command)"
+            self.ptprint(f"    [{s.phase}/{s.name}] {cmd_s}{code_s}", Out.TEXT)
+            if s.reply:
+                r = s.reply[:500] + ("…" if len(s.reply) > 500 else "")
+                self.ptprint(f"        {r}", Out.TEXT)
+            if s.list_reply:
+                lc = s.list_code
+                lc_s = f" [list {lc}]" if lc is not None else ""
+                lr = s.list_reply[:400] + ("…" if len(s.list_reply or "") > 400 else "")
+                self.ptprint(f"        list:{lc_s} {lr}", Out.TEXT)
+
+            v_col, v_msg = self._active_audit_step_verdict(s, aa)
+            if v_msg and v_col:
+                icon = fk(
+                    "[✓]" if v_col == "NOTVULN" else ("[✗]" if v_col == "VULN" else "[!]"),
+                    color=v_col,
+                )
+                self.ptprint(f"        {icon} {v_msg}", Out.TEXT)
+            elif s.interpretation:
+                self.ptprint(f"        hint: {s.interpretation}", Out.TEXT)
+            if s.note and not (cmd_s == "(skipped)" and v_msg):
+                self.ptprint(f"        note: {s.note}", Out.TEXT)
+
+        if not aa.post_auth_ran:
+            warn = fk("[!]", color="WARNING")
+            self.ptprint(
+                f"    {warn} Post-login steps skipped (no credentials); use --anonymous or -u USER -p PASS (or wordlists)",
+                Out.TEXT,
+            )
+
+        doc_net_ip = "192.0.2.1"
+        if aa.foreign_ip_accepted:
+            icon = fk("[✗]", color="VULN")
+            self.ptprint(
+                f"    {icon} PORT accepted for non-client IP (bounce risk; tested {doc_net_ip})",
+                Out.TEXT,
+            )
+            self.ptprint(
+                "    Verify with a packet capture whether the server opens TCP to the stated IP:port.",
+                Out.TEXT,
+            )
+        if aa.low_port_accepted:
+            icon = fk("[✗]", color="VULN")
+            lp = ", ".join(str(p) for p in aa.low_ports_accepted) if aa.low_ports_accepted else "<1000"
+            self.ptprint(
+                f"    {icon} PORT accepted for low data port(s): {lp} (RFC 2577: suggest reject < 1024)",
+                Out.TEXT,
+            )
+        if aa.list_after_own_port_ok is False:
+            warn = fk("[!]", color="WARNING")
+            self.ptprint(
+                f"    {warn} Active-mode LIST failed; may be NAT/firewall on tester side",
+                Out.TEXT,
+            )
+
+        self.ptprint("Summary", Out.INFO)
+        passive_ok = any(
+            (x.name == "pasv_list" and x.reply == "ok")
+            or (x.name == "pasv" and x.code == 227)
+            for x in aa.steps
+        )
+        passive_txt = (
+            "Available / data transfer OK" if passive_ok else "Not verified or failed in this run"
+        )
+        self.ptprint(f"    {star_h} Passive mode:    {passive_txt}", Out.TEXT)
+
+        if not aa.post_auth_ran:
+            self.ptprint(
+                f"    {star_h} Active mode:     {fk('[!]', color='WARNING')} Not assessed (no post-login audit)",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"    {star_h} Overall status:  {fk('[!]', color='WARNING')} Incomplete audit",
+                Out.TEXT,
+            )
+            return
+
+        active_vuln = aa.foreign_ip_accepted or aa.low_port_accepted
+        port_rejected = any(
+            x.name.endswith("_list")
+            and x.code in (500, 501, 502, 504)
+            and "illegal" in (x.reply or "").lower()
+            for x in aa.steps
+        )
+        ipv4_skip = any(
+            "non-ipv4" in (x.note or "").lower() for x in aa.steps if x.command == "(skipped)"
+        )
+
+        if active_vuln:
+            active_txt = f"{fk('[✗]', color='VULN')} PORT policy risk (foreign or low port accepted)"
+        elif ipv4_skip:
+            active_txt = f"{fk('[!]', color='WARNING')} Not fully assessed (IPv4 required for PORT probes)"
+        elif port_rejected and not aa.foreign_ip_accepted:
+            active_txt = f"{fk('[✓]', color='NOTVULN')} Disabled / rejected (no 200 on bounce/low-port probes in this run)"
+        else:
+            active_txt = f"{fk('[✓]', color='NOTVULN')} No bounce/low-port PORT acceptance (200) observed"
+
+        self.ptprint(f"    {star_h} Active mode:     {active_txt}", Out.TEXT)
+
+        if active_vuln:
+            overall = f"{fk('[✗]', color='VULN')} PTL-SVC-FTP-ACTIVE: review PORT policy (bounce / low port)"
+        elif ipv4_skip:
+            overall = f"{fk('[!]', color='WARNING')} Inconclusive (partial audit)"
+        else:
+            overall = f"{fk('[✓]', color='NOTVULN')} No bounce/low-port finding from this run"
+
+        self.ptprint(f"    {star_h} Overall status:  {overall}", Out.TEXT)
+
     def _raw_list_without_pasv_port(self, ftp: ftplib.FTP) -> tuple[str, int | None]:
         """Send LIST on control channel without ftplib issuing PASV/PORT first (D0)."""
         try:
@@ -2588,6 +2809,353 @@ class FTP(BaseModule):
                 by_k[k] = r
         order = {"critical": 0, "high": 1, "medium": 2}
         return tuple(sorted(by_k.values(), key=lambda x: (order.get(x.tier, 9), x.token, x.source)))
+
+    _CMD_AUDIT_SOURCE_LABEL: dict[str, str] = {
+        "helpPreAuth": "HELP (pre-auth)",
+        "featResponse": "FEAT response",
+        "siteHelpPreAuth": "SITE HELP (pre-auth)",
+        "siteHelpAllPreAuth": "SITE HELP ALL (pre-auth)",
+        "siteHelpPostAuth": "SITE HELP (post-auth)",
+        "siteHelpAllPostAuth": "SITE HELP ALL (post-auth)",
+    }
+
+    def _cmd_audit_blob_for_source(self, ca: CommandAuditResult, source: str) -> str:
+        m = {
+            "helpPreAuth": ca.help_pre_auth,
+            "featResponse": ca.feat_response,
+            "siteHelpPreAuth": ca.site_help_pre or "",
+            "siteHelpAllPreAuth": ca.site_help_all_pre or "",
+            "siteHelpPostAuth": ca.site_help_post or "",
+            "siteHelpAllPostAuth": ca.site_help_all_post or "",
+        }
+        return m.get(source, "") or ""
+
+    def _cmd_audit_snippet_for_risk(self, ca: CommandAuditResult, risk: CmdAuditRisk) -> str:
+        blob = self._cmd_audit_blob_for_source(ca, risk.source)
+        if not blob.strip():
+            return "(empty response for this source)"
+        parts = risk.token.split()
+        needle = None
+        for kw in reversed(parts):
+            ku = kw.upper()
+            if ku in ("FEAT", "SITE"):
+                continue
+            needle = kw
+            break
+        if not needle and parts:
+            needle = parts[-1]
+        if not needle:
+            needle = risk.token
+        for line in blob.splitlines():
+            if re.search(rf"\b{re.escape(needle)}\b", line, re.I):
+                s = line.strip()
+                return s[:400] + ("…" if len(s) > 400 else "")
+        for line in blob.splitlines():
+            if line.strip():
+                s = line.strip()
+                return s[:400] + ("…" if len(s) > 400 else "")
+        s = blob.strip()
+        return s[:400] + ("…" if len(s) > 400 else "")
+
+    @staticmethod
+    def _cmd_audit_risk_explain(risk: CmdAuditRisk) -> tuple[str | None, str, str | None]:
+        tok = risk.token.upper()
+        tier = risk.tier
+
+        def t(vuln: str | None, risk_t: str, info: str | None = None) -> tuple[str | None, str, str | None]:
+            return (vuln, risk_t, info)
+
+        if tier == "critical":
+            return t(
+                "Server advertises SITE EXEC / EXECUTE / RUN (implementation-dependent).",
+                "If callable by unprivileged users, may lead to remote command execution or full host compromise.",
+                None,
+            )
+
+        if "SYMLINK" in tok or tok.endswith(" LINK") or tok.endswith(" LN"):
+            return t(
+                "Advertised capability to create symbolic links on the server side.",
+                "High potential for path traversal or access to files outside the intended FTP root.",
+                None,
+            )
+        if "CHOWN" in tok:
+            return t(
+                "Advertised SITE CHOWN (change file ownership).",
+                "May allow privilege escalation or unauthorized ownership changes if not strictly restricted.",
+                None,
+            )
+        if "CHMOD" in tok:
+            return t(
+                "Advertised SITE CHMOD (change file permissions).",
+                "May allow weakening permissions or making sensitive files world-readable if abused.",
+                None,
+            )
+        if "UMASK" in tok:
+            return t(
+                "Advertised SITE UMASK (default permission mask).",
+                "May affect security of newly created files if misconfigured or abused.",
+                None,
+            )
+        if "CPFR" in tok or "CPTO" in tok:
+            return t(
+                "Advertised SITE CPFR/CPTO (FTP “copy” / server-side file copy).",
+                "Associated with historical FTP bounce / abuse scenarios; verify server policy and access control.",
+                None,
+            )
+        if "WHO" in tok:
+            return t(
+                None,
+                "SITE WHO can expose logged-in users or session metadata.",
+                "Useful for reconnaissance; impact depends on daemon implementation.",
+            )
+        if "IDLE" in tok:
+            return t(
+                None,
+                "SITE IDLE may allow tuning or probing idle timeouts.",
+                "Minor information or DoS relevance depending on server.",
+            )
+        if "MDTM" in tok:
+            return t(
+                None,
+                "Allows remote determination of exact file modification times.",
+                "Useful for fingerprinting files or coordinating time-based attacks.",
+            )
+        if "SIZE" in tok:
+            return t(
+                None,
+                "Allows remote determination of exact file sizes.",
+                "Can confirm existence of sensitive files or support side-channel style analysis before exfiltration.",
+            )
+        if "MLST" in tok or "MLSD" in tok:
+            return t(
+                None,
+                "Provides detailed filesystem metadata in a unified, machine-readable format (RFC 3659 style).",
+                "Simplifies automated target enumeration and data gathering.",
+            )
+
+        return t(
+            None,
+            f"Capability matched in captured text ({risk.token}). Review whether it is required and properly restricted.",
+            None,
+        )
+
+    def _print_cmd_audit_terminal(self, ca: CommandAuditResult) -> None:
+        """Structured command-surface audit output (HELP/FEAT/SITE), aligned with other FTP sections."""
+        fk = get_colored_text
+        warn_b = fk("[!]", color="WARNING")
+        # Same yellow as section headings (Out.INFO); detail lines are informational [i].
+        head_style = fk("[*]", color="INFO")
+        info_icon = fk("[i]", color="INFO")
+
+        self.ptprint("Command surface audit", Out.INFO)
+        if ca.response_truncated:
+            self.ptprint(f"    {warn_b} At least one response was truncated (64 KiB cap)", Out.TEXT)
+        if ca.site_help_all_pre_error:
+            self.ptprint(
+                f"    {warn_b} SITE HELP ALL (pre-auth): {ca.site_help_all_pre_error}",
+                Out.TEXT,
+            )
+        if ca.site_help_all_post_error:
+            self.ptprint(
+                f"    {warn_b} SITE HELP ALL (post-auth): {ca.site_help_all_post_error}",
+                Out.TEXT,
+            )
+
+        if not ca.matched_risks:
+            self.ptprint(
+                f"    {fk('[✓]', color='NOTVULN')} No high-risk SITE / EXEC patterns in captured HELP/FEAT/SITE output",
+                Out.TEXT,
+            )
+            return
+
+        for r in ca.matched_risks:
+            col = "VULN" if r.tier in ("critical", "high") else "WARNING"
+            head_icon = fk("[✗]" if r.tier in ("critical", "high") else "[!]", color=col)
+            src_label = self._CMD_AUDIT_SOURCE_LABEL.get(r.source, r.source)
+            self.ptprint(f"    {head_icon} [{r.tier}] {r.token} — {src_label}", Out.TEXT)
+
+            snippet = self._cmd_audit_snippet_for_risk(ca, r)
+            self.ptprint(f"        {head_style} Response: {snippet}", Out.TEXT)
+
+            vuln_t, risk_t, info_t = self._cmd_audit_risk_explain(r)
+
+            if vuln_t and r.tier in ("critical", "high"):
+                self.ptprint(f"        {info_icon} VULNERABLE: {vuln_t}", Out.TEXT)
+            self.ptprint(f"        {info_icon} RISK: {risk_t}", Out.TEXT)
+            if info_t:
+                self.ptprint(f"        {info_icon} INFO: {info_t}", Out.TEXT)
+
+    def _inv_payload_terminal(self, p: InvalidCmdProbeResult) -> str:
+        prev = p.line_sent_preview
+        if p.probe_id in ("long_buffer_cwd", "long_buffer_user"):
+            return f"{prev} ({self._INV_AUDIT_LONG_LEN}+ byte line)"
+        return prev
+
+    @staticmethod
+    def _inv_verdict_label(classification: str) -> str:
+        return {
+            "no_reply_code": "NO_REPLY_CODE",
+            "connection_lost": "CONNECTION_LOST",
+            "reply_timeout": "REPLY_TIMEOUT",
+            "positive_2xx_unexpected": "UNEXPECTED_2XX",
+            "null_byte_possible_login_230": "NULL_BYTE_POSSIBLE_LOGIN",
+        }.get(classification, classification.upper())
+
+    def _inv_probe_detail_lines(self, p: InvalidCmdProbeResult, post_auth: bool) -> None:
+        """Print one probe block for invalid-command audit (aligned with cmd/active terminal style)."""
+        fk = get_colored_text
+        star_h = fk("[*]", color="INFO")
+        info_i = fk("[i]", color="INFO")
+        ok_i = fk("[✓]", color="NOTVULN")
+        bad_i = fk("[✗]", color="VULN")
+        warn_i = fk("[!]", color="WARNING")
+
+        self.ptprint(f"    [{p.probe_id}] {p.intent_label}", Out.TEXT)
+        self.ptprint(f"        {star_h} Payload: {self._inv_payload_terminal(p)}", Out.TEXT)
+
+        code_s = str(p.reply_code) if p.reply_code is not None else "—"
+        resp_summary = f"{code_s} | {p.classification}"
+        auth_note = "after login" if post_auth else "before login"
+
+        cls = p.classification
+        if cls in ("no_reply_code", "connection_lost", "reply_timeout"):
+            self.ptprint(f"        {bad_i} Verdict: {self._inv_verdict_label(cls)}", Out.TEXT)
+            if cls == "no_reply_code":
+                self.ptprint(
+                    f"        {info_i} RISK: No standard numeric FTP reply; server may have stalled or dropped the line.",
+                    Out.TEXT,
+                )
+            elif cls == "connection_lost":
+                self.ptprint(
+                    f"        {info_i} RISK: Connection closed or reset after probe (service instability).",
+                    Out.TEXT,
+                )
+                self.ptprint(
+                    f"        {info_i} INFO: Possible Denial of Service (DoS) via malformed or oversized input.",
+                    Out.TEXT,
+                )
+            else:
+                self.ptprint(
+                    f"        {info_i} RISK: Reply timed out; control channel may be slow or stuck.",
+                    Out.TEXT,
+                )
+        elif cls == "positive_2xx_unexpected":
+            self.ptprint(f"        {bad_i} Verdict: UNEXPECTED_2XX", Out.TEXT)
+            self.ptprint(
+                f"        {info_i} RISK: Server accepted garbage or probe with a success class reply (review manually).",
+                Out.TEXT,
+            )
+        elif cls == "null_byte_possible_login_230":
+            self.ptprint(f"        {bad_i} Verdict: NULL_BYTE_POSSIBLE_LOGIN", Out.TEXT)
+            self.ptprint(
+                f"        {info_i} RISK: USER with null byte may have produced login success (230); verify PWD/session.",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(f"        {ok_i} Response: {resp_summary}", Out.TEXT)
+            # Informational "Result" for common benign cases
+            if cls == "server_error_5xx":
+                if p.probe_id == "unknown_hello":
+                    msg = f"Unknown verb rejected with 5xx ({auth_note})."
+                elif p.probe_id == "user_typo":
+                    msg = f"Typo command rejected; no obvious syntax bypass ({auth_note})."
+                elif p.probe_id == "user_null_byte":
+                    msg = "Null-byte USER handled without accepting a full login in this reply."
+                elif p.probe_id in ("long_buffer_cwd", "long_buffer_user"):
+                    msg = f"Large buffer on {p.probe_id.split('_')[-1].upper()} rejected with an error response."
+                elif p.probe_id == "format_string_stat":
+                    msg = "Format-string STAT probe answered without unexpected 2xx success."
+                else:
+                    msg = f"Server returned 5xx for malformed input ({auth_note})."
+            elif cls in ("null_byte_user_truncation_331",):
+                msg = "331 after null-byte USER suggests truncation parsing (review for auth bypass)."
+            elif cls == "double_crlf_probe_reply":
+                msg = "Server replied to double-CRLF smuggle probe; check for response splitting."
+            else:
+                msg = f"Classification: {cls} ({auth_note})."
+            self.ptprint(f"        {info_i} Result: {msg}", Out.TEXT)
+
+        if p.null_byte_outcome:
+            self.ptprint(f"        {warn_i} nullByteOutcome: {p.null_byte_outcome}", Out.TEXT)
+        if p.error:
+            self.ptprint(f"        {warn_i} error: {p.error}", Out.TEXT)
+        if p.follow_up_command:
+            fc = str(p.follow_up_reply_code) if p.follow_up_reply_code is not None else "—"
+            sn = (p.follow_up_reply_snippet or "")[:180]
+            if p.follow_up_reply_snippet and len(p.follow_up_reply_snippet) > 180:
+                sn += "…"
+            self.ptprint(
+                f"        {info_i} follow-up {p.follow_up_command} → {fc}: {sn}",
+                Out.TEXT,
+            )
+
+    def _print_invalid_cmd_audit_terminal(self, inv: InvalidCmdAuditResult) -> None:
+        """Structured invalid-command (INVCOMM) terminal output."""
+        fk = get_colored_text
+        warn_b = fk("[!]", color="WARNING")
+        vuln_b = fk("[!]", color="VULN")
+
+        self.ptprint("Invalid command resilience (raw socket)", Out.INFO)
+
+        if inv.setup_error:
+            self.ptprint(f"    {fk('[✗]', color='VULN')} {inv.setup_error}", Out.TEXT)
+            if inv.tls_handshake_hint:
+                self.ptprint(f"    {warn_b} tlsHandshakeHint: {inv.tls_handshake_hint}", Out.TEXT)
+            if inv.obsolete_tls_suspected:
+                self.ptprint(
+                    f"    {fk('[✗]', color='VULN')} {VULNS.FtpObsoleteTls.value}: server likely requires obsolete TLS (<1.2); "
+                    "see JSON tlsHandshakeHint / setupError.",
+                    Out.TEXT,
+                )
+            return
+
+        rating = inv.overall_resilience_rating
+        ru = rating.upper()
+        if rating == "Vulnerable":
+            rb = "Unexpected 2xx, null-byte login suspicion, or no recovery after probe (see JSON)."
+            ricon = vuln_b
+        elif rating == "Degraded":
+            rb = "Server stability issues during fuzzing (timeouts, drops, or suspicious replies)."
+            ricon = warn_b
+        else:
+            rb = "Replies largely within expected error handling for this run."
+            ricon = fk("[✓]", color="NOTVULN")
+
+        self.ptprint(f"    {ricon} Rating: {ru} — {rb}", Out.TEXT)
+        if inv.null_byte_truncation_suspected:
+            self.ptprint(f"    {warn_b} nullByteTruncationSuspected=true", Out.TEXT)
+        if inv.post_auth_login_error:
+            self.ptprint(f"    {warn_b} post-auth login: {inv.post_auth_login_error}", Out.TEXT)
+        if inv.tls_handshake_hint:
+            self.ptprint(f"    {warn_b} tlsHandshakeHint: {inv.tls_handshake_hint}", Out.TEXT)
+        if inv.obsolete_tls_suspected:
+            self.ptprint(
+                f"    {fk('[✗]', color='VULN')} {VULNS.FtpObsoleteTls.value}: post-auth TLS suggests obsolete protocol.",
+                Out.TEXT,
+            )
+
+        for label, sess, title_fn in (
+            (
+                "preAuth",
+                inv.pre_auth,
+                lambda sr: f"Pre-authentication resilience ({sr.resilience_rating})",
+            ),
+            (
+                "postAuth",
+                inv.post_auth,
+                lambda sr: f"Post-authentication checks ({sr.resilience_rating})",
+            ),
+        ):
+            if sess is None:
+                continue
+            self.ptprint(title_fn(sess), Out.INFO)
+            if sess.null_byte_truncation_suspected:
+                self.ptprint(f"    {warn_b} nullByteTruncationSuspected in {label}", Out.TEXT)
+            if sess.had_connection_drop:
+                self.ptprint(f"    {warn_b} Connection drop observed in {label}", Out.TEXT)
+            post_auth = label == "postAuth"
+            for p in sess.probes:
+                self._inv_probe_detail_lines(p, post_auth)
 
     def test_command_audit(self, creds: Creds | None) -> CommandAuditResult:
         """
@@ -4073,53 +4641,7 @@ class FTP(BaseModule):
                 audit_props["lowPortsAccepted"] = list(aa.low_ports_accepted)
             properties.update({"activeAudit": audit_props})
             if not self.use_json:
-                self.ptprint("Active mode policy", Out.INFO)
-                for s in aa.steps:
-                    c = s.code
-                    code_s = f" [{c}]" if c is not None else ""
-                    cmd_s = s.command if s.command else "(no command)"
-                    self.ptprint(f"    [{s.phase}/{s.name}] {cmd_s}{code_s}", Out.TEXT)
-                    self.ptprint(f"        {s.reply[:500]}{'…' if len(s.reply) > 500 else ''}", Out.TEXT)
-                    if s.list_reply:
-                        lc = s.list_code
-                        lc_s = f" [list {lc}]" if lc is not None else ""
-                        self.ptprint(
-                            f"        list:{lc_s} {s.list_reply[:400]}{'…' if len(s.list_reply or '') > 400 else ''}",
-                            Out.TEXT,
-                        )
-                    if s.interpretation:
-                        self.ptprint(f"        hint: {s.interpretation}", Out.TEXT)
-                    if s.note:
-                        self.ptprint(f"        note: {s.note}", Out.TEXT)
-                if not aa.post_auth_ran:
-                    warn = get_colored_text("[!]", color="WARNING")
-                    self.ptprint(
-                        f"    {warn} Post-login steps skipped (no credentials); use --anonymous or -u USER -p PASS (or wordlists)",
-                        Out.TEXT,
-                    )
-                if aa.foreign_ip_accepted:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(
-                        f"    {icon} PORT accepted for non-client IP (bounce risk; tested {doc_net_ip})",
-                        Out.TEXT,
-                    )
-                    self.ptprint(
-                        "    Verify with a packet capture whether the server opens TCP to the stated IP:port.",
-                        Out.TEXT,
-                    )
-                if aa.low_port_accepted:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    lp = ", ".join(str(p) for p in aa.low_ports_accepted) if aa.low_ports_accepted else "<1000"
-                    self.ptprint(
-                        f"    {icon} PORT accepted for low data port(s): {lp} (RFC 2577: suggest reject < 1024)",
-                        Out.TEXT,
-                    )
-                if aa.list_after_own_port_ok is False:
-                    warn = get_colored_text("[!]", color="WARNING")
-                    self.ptprint(
-                        f"    {warn} Active-mode LIST failed; may be NAT/firewall on tester side",
-                        Out.TEXT,
-                    )
+                self._print_active_audit_terminal(aa)
 
             if aa.foreign_ip_accepted or aa.low_port_accepted:
                 parts = []
@@ -4168,26 +4690,7 @@ class FTP(BaseModule):
             }
             properties.update({"ftpCommandAudit": audit_json})
             if not self.use_json:
-                self.ptprint("Command surface audit", Out.INFO)
-                if ca.response_truncated:
-                    self.ptprint("    [!] At least one response was truncated (64 KiB cap)", Out.TEXT)
-                if ca.site_help_all_pre_error:
-                    self.ptprint(
-                        f"    {get_colored_text('[!]', color='WARNING')} SITE HELP ALL (pre-auth): {ca.site_help_all_pre_error}",
-                        Out.TEXT,
-                    )
-                if ca.site_help_all_post_error:
-                    self.ptprint(
-                        f"    {get_colored_text('[!]', color='WARNING')} SITE HELP ALL (post-auth): {ca.site_help_all_post_error}",
-                        Out.TEXT,
-                    )
-                for r in ca.matched_risks:
-                    col = "VULN" if r.tier in ("critical", "high") else "WARNING"
-                    icon = get_colored_text("[✗]" if r.tier in ("critical", "high") else "[!]", color=col)
-                    self.ptprint(f"    {icon} [{r.tier}] {r.token} — {r.source}", Out.TEXT)
-                if not ca.matched_risks:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} No high-risk SITE / EXEC patterns in captured HELP/FEAT/SITE output", Out.TEXT)
+                self._print_cmd_audit_terminal(ca)
             vuln_risks = [r for r in ca.matched_risks if r.tier in ("critical", "high")]
             if vuln_risks:
                 parts = [f"{r.tier}: {r.token} ({r.source})" for r in vuln_risks]
@@ -4316,64 +4819,7 @@ class FTP(BaseModule):
             }
             properties.update({"ftpInvalidCommandAudit": inv_json})
             if not self.use_json:
-                self.ptprint("Invalid command resilience (raw socket)", Out.INFO)
-                if inv.setup_error:
-                    self.ptprint(f"    [✗] {inv.setup_error}", Out.TEXT)
-                    if inv.tls_handshake_hint:
-                        hi = get_colored_text("[!]", color="WARNING")
-                        self.ptprint(f"    {hi} tlsHandshakeHint: {inv.tls_handshake_hint}", Out.TEXT)
-                    if inv.obsolete_tls_suspected:
-                        vo = get_colored_text("[✗]", color="VULN")
-                        self.ptprint(
-                            f"    {vo} {VULNS.FtpObsoleteTls.value}: server likely requires obsolete TLS (<1.2); "
-                            "see JSON tlsHandshakeHint / setupError.",
-                            Out.TEXT,
-                        )
-                else:
-                    col = (
-                        "VULN"
-                        if inv.overall_resilience_rating == "Vulnerable"
-                        else ("WARNING" if inv.overall_resilience_rating == "Degraded" else "NOTVULN")
-                    )
-                    icon = get_colored_text(
-                        "[✗]" if col == "VULN" else ("[!]" if col == "WARNING" else "[✓]"),
-                        color=col,
-                    )
-                    self.ptprint(
-                        f"    {icon} resilienceRating={inv.overall_resilience_rating}"
-                        + (f" | nullByteTruncationSuspected={inv.null_byte_truncation_suspected}" if inv.null_byte_truncation_suspected else ""),
-                        Out.TEXT,
-                    )
-                    if inv.post_auth_login_error:
-                        self.ptprint(f"    [!] post-auth: {inv.post_auth_login_error}", Out.TEXT)
-                    if not inv.setup_error and inv.tls_handshake_hint:
-                        hi = get_colored_text("[!]", color="WARNING")
-                        self.ptprint(f"    {hi} tlsHandshakeHint: {inv.tls_handshake_hint}", Out.TEXT)
-                    if not inv.setup_error and inv.obsolete_tls_suspected:
-                        vo = get_colored_text("[✗]", color="VULN")
-                        self.ptprint(
-                            f"    {vo} {VULNS.FtpObsoleteTls.value}: post-auth TLS setup suggests obsolete protocol.",
-                            Out.TEXT,
-                        )
-                    for label, sess in (("preAuth", inv.pre_auth), ("postAuth", inv.post_auth)):
-                        if sess is None:
-                            continue
-                        self.ptprint(f"    --- {label} ({sess.resilience_rating}) ---", Out.TEXT)
-                        for p in sess.probes:
-                            c = str(p.reply_code) if p.reply_code is not None else "—"
-                            self.ptprint(
-                                f"    [{p.probe_id}] {p.intent_label} preview={p.line_sent_preview!r} → {c} | {p.classification}",
-                                Out.TEXT,
-                            )
-                            if p.null_byte_outcome:
-                                self.ptprint(f"        nullByteOutcome: {p.null_byte_outcome}", Out.TEXT)
-                            if p.follow_up_command:
-                                fc = str(p.follow_up_reply_code) if p.follow_up_reply_code is not None else "—"
-                                self.ptprint(
-                                    f"        follow-up {p.follow_up_command} → {fc}: "
-                                    + f"{(p.follow_up_reply_snippet or '')[:180]}{'…' if (p.follow_up_reply_snippet and len(p.follow_up_reply_snippet) > 180) else ''}",
-                                    Out.TEXT,
-                                )
+                self._print_invalid_cmd_audit_terminal(inv)
             if inv.overall_resilience_rating == "Vulnerable":
                 vuln_extra = ""
                 if _inv_null_byte_critical(inv):

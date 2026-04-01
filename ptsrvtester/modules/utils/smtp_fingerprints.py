@@ -728,7 +728,7 @@ class ServerIdentifyResult:
     tls_cert_san: list[str] | None = None
     tls_cert_self_signed: bool = False
     tls_upgrade_failed: bool = False  # True if STARTTLS was attempted but cert not extracted
-    tls_upgrade_error: str | None = None  # Exception message when STARTTLS failed (for --debug)
+    tls_upgrade_error: str | None = None  # Exception message when STARTTLS failed (for -vv/--verbose)
     transport_tls: bool = False  # True if SMTP socket was TLS at end of identify probe (465/--tls/STARTTLS)
     starttls_advertised: bool = False  # STARTTLS appeared in EHLO (plaintext policy / UI)
     tls_policy: str | None = None  # "mandatory" | "opportunistic" | "n/a"

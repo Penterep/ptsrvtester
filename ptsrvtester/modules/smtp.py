@@ -769,13 +769,18 @@ class BounceReplayResult(NamedTuple):
     test_id_return_path: str
 
 
-def _bounce_replay_addr_from_args(args) -> str | None:
-    """`-br <email>` is stored as bounce_replay: list[str] | None."""
-    br = getattr(args, "bounce_replay", None)
-    if isinstance(br, (list, tuple)) and len(br) >= 1 and br[0]:
-        s = str(br[0]).strip()
-        return s if s else None
-    return None
+def _bounce_replay_active(args) -> bool:
+    """True when `-br` / `--bounce-replay` was passed."""
+    return bool(getattr(args, "bounce_replay", False))
+
+
+def _bounce_replay_from_addr(args) -> str | None:
+    """Controlled bounce address: `-m` / `--mail-from` when `-br` is active."""
+    if not _bounce_replay_active(args):
+        return None
+    m = getattr(args, "mail_from", None) or ""
+    s = str(m).strip()
+    return s if s else None
 
 
 def _classify_connection_error(exc: BaseException) -> tuple[str, str]:
@@ -1036,6 +1041,8 @@ class SMTPResults:
 
 
 class VULNS(Enum):
+    """Per-method AUTH codes kept for compatibility; JSON flat output for -A uses AuthMethods only."""
+    AuthMethods = "PTV-SVC-SMTP-AUTHMETHODS"
     AuthAnonymous = "PTV-SVC-SMTP-AUTHANONYMOUS"
     AuthCramMd5 = "PTV-SVC-SMTP-AUTHCRAMMD5"
     AuthDigestMd5 = "PTV-SVC-SMTP-AUTHDIGESTMD5"
@@ -1119,8 +1126,7 @@ class SMTPArgs(ArgsWithBruteforce):
                 "ptsrvtester smtp -b -c --ntlm 127.0.0.1",
                 "ptsrvtester smtp -id mail.example.com:25",
                 "ptsrvtester smtp -id --id-aggressive smtp.example.com:25",
-                "ptsrvtester smtp -br test@example.com smtp.example.com:25",
-                "ptsrvtester smtp -br test@example.com -te nobody@target.com smtp.example.com:25",
+                "ptsrvtester smtp -br -m attacker@example.com -r foo@foo.com smtp.example.com:25",
                 "ptsrvtester smtp -bomb -r victim@example.com smtp.example.com:587",
                 "ptsrvtester smtp -av -r victim@example.com smtp.example.com:587",
                 "ptsrvtester smtp -bomb -av -r victim@example.com smtp.example.com:25",
@@ -1144,10 +1150,10 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-iv", "--invalid-commands", "", "Test invalid/non-standard SMTP commands"],
                 ["-ho", "--helo-only", "", "Test if server supports only HELO without EHLO extensions"],
                 ["-hb", "--helo-bypass", "", "Test HELO/EHLO value for bypassing security restrictions"],
-                ["-m", "--mail-from", "<email>", "Sender address (MAIL FROM); used by -bomb, -av, -sh, -al"],
-                ["-r", "--rcpt-to", "<email>", "Recipient (To); required for -bomb, -av, -ssrf, -zipxxe, -sh, -bcc, -al; recommended for -flood"],
-                ["-br", "--bounce-replay", "<email>", "Bounce/backscatter test (controlled address); two probes: MAIL FROM, then Return-Path header"],
-                ["-te", "--bounce-recipient", "<email>", "Non-existent RCPT TO for bounce test (default: auto-generated)"],
+                ["-m", "--mail-from", "<email>", "Sender address (MAIL FROM); used by -bomb, -av, -sh, -al, -br"],
+                ["-r", "--rcpt-to", "<email>", "Recipient (To); required for -bomb, -av, -ssrf, -zipxxe, -sh, -bcc, -al, -br; recommended for -flood"],
+                ["-fn", "--from-name", "<name>", "Sender display name in From header; used by -bomb, -av, -ssrf, -zipxxe (no validation)"],
+                ["-cc", "--cc", "<emails>", "CC recipients, comma-separated; used by -bomb, -av, -ssrf; required for -bcc (no validation)"],
                 ["-sh", "--spoof-headers", "", "Test header spoofing (From, Reply-To, Return-Path); -r recipient (required); -m envelope (MAIL FROM); -u/-p for port 587"],
                 ["", "--spoofhdr-variants", "<v1,v2,...>", "Variants: from,reply_to,return_path (default: all); -r recipient, -m envelope"],
                 ["", "--spoofhdr-timeout", "<sec>", "Timeout per message for Spoof headers test (default: 30)"],
@@ -1157,7 +1163,7 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-al", "--alias-test", "", "Alias & addressing bypass; -r required; -m envelope; -u/-p for port 587"],
                 ["", "--alias-variants", "<v1,v2,...>", "Variants: case,case_domain,dotted,plus,percent,bang_simple,bang_nested (default: all)"],
                 ["", "--alias-timeout", "<sec>", "Timeout per variant for Alias test (default: 30)"],
-                ["-ie", "--isencrypt", "", "Check encryption methods"],
+                ["-ie", "--is-encrypt", "", "Check encryption methods"],
                 ["", "--ntlm", "", "Inspect NTLM authentication"],
                 ["-e", "--enumerate", "[VRFY/EXPN/RCPT/ALL]", "User enumeration (default: ALL)"],
                 ["-w", "--wordlist", "<wordlist>", "Usernames for enumeration"],
@@ -1167,21 +1173,18 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-rl", "--recipient-limit", "", "Test RCPT TO recipient limit per message"],
                 ["-d", "--domain", "<domain>", "Recipient domain for RCPT TO limit test"],
                 ["-or", "--open-relay", "", "Test open relay"],
-                ["", "--role", "", "Identify server role (MTA / Submission / Hybrid)"],
+                ["-ri", "--role-identify", "", "Identify server role (MTA / Submission / Hybrid)"],
                 ["-I", "--interactive", "", "Interactive SMTP CLI"],
-                ["", "", "", ""],
                 ["-bl", "--blacklist-test", "", "Test against blacklists"],
                 ["-s", "--spf-test", "", "Test SPF records (requires domain name)"],
-                ["", "", "", ""],
                 ["-f", "--fqdn", "<fqdn>", "FQDN for EHLO/HELO (default: from target or system hostname)"],
                 ["", "--tls", "", "Use implicit SSL/TLS"],
                 ["", "--starttls", "", "Use explicit SSL/TLS"],
-                ["", "", "", ""],
                 ["-u", "--user", "<username>", "Single username for bruteforce"],
                 ["-U", "--users", "<wordlist>", "File with usernames"],
                 ["-p", "--password", "<password>", "Single password for bruteforce"],
                 ["-P", "--passwords", "<wordlist>", "File with passwords"],
-                ["", "", "", ""],
+                ["-br", "--bounce-replay", "", "Bounce/backscatter test; requires -m (controlled MAIL FROM) and -r (RCPT TO); two probes: MAIL FROM + DATA, then Return-Path in DATA"],
                 ["-bomb", "--bomb", "", "Test mail flooding / rate limiting"],
                 ["", "--bomb-count", "<n>", "Number of messages to send (default: 100)"],
                 ["", "--bomb-timeout", "<sec>", "Max time for entire test (default: 60)"],
@@ -1193,8 +1196,6 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["", "--antivirus-zip-bomb", "", "Include zip_bomb category (DoS risk!)"],
                 ["", "--antivirus-timeout", "<sec>", "Timeout per message for antivirus test (default: 30)"],
                 ["", "--antivirus-skip-absent", "", "Skip categories with no definition files"],
-                ["", "--from-name", "<name>", "Sender display name (no validation)"],
-                ["", "--cc", "<emails>", "CC recipients, comma-separated (no validation)"],
                 ["-ssrf", "--ssrf", "", "Test SSRF – server fetches links; requires -r and --ssrf-canary-url"],
                 ["", "--ssrf-canary-url", "<URL>", "Canary URL for SSRF test (Interactsh, ngrok, etc.)"],
                 ["", "--ssrf-variants", "<v1,v2,...>", "SSRF variants: plain,html_link,html_img,html_iframe,multipart,ssrf_malformed,ssrf_nested (default: all)"],
@@ -1210,8 +1211,8 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["", "--zipxxe-zip-bomb", "", "Include zip_bomb variant (minimal ~200KB; DoS risk!)"],
                 ["", "--zipxxe-zip-bomb-full", "", "Include zip_bomb_full (~100KB→~100MB; extreme DoS risk!)"],
                 ["", "--zipxxe-timeout", "<sec>", "SMTP timeout per message (default: 30)"],
-                ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
+                ["-vv", "--verbose", "", "Enable verbose mode"],
             ]}
         ]
 
@@ -1219,8 +1220,7 @@ class SMTPArgs(ArgsWithBruteforce):
         examples = """example usage:
   ptsrvtester smtp -h
   ptsrvtester smtp -e ALL -sd -w wordlist.txt mail.example.com:25
-  ptsrvtester smtp -br test@example.com smtp.example.com:25
-  ptsrvtester smtp -br test@example.com -te nobody@target.com smtp.example.com:25
+  ptsrvtester smtp -br -m attacker@example.com -r foo@foo.com smtp.example.com:25
   ptsrvtester smtp -bomb -r victim@example.com smtp.example.com:587
   ptsrvtester smtp -av -r victim@example.com smtp.example.com:587
   ptsrvtester smtp -ssrf -r victim@example.com --ssrf-canary-url https://xyz.oast.fun/ssrf smtp.example.com:587
@@ -1335,29 +1335,36 @@ class SMTPArgs(ArgsWithBruteforce):
         )
         direct.add_argument(
             "-m", "--mail-from", type=str,
-            help="Sender address (MAIL FROM); used by -bomb, -av (default: bombtest/avtest@{fqdn})",
+            help="Sender address (MAIL FROM); used by -bomb, -av, -br (default: bombtest/avtest@{fqdn} when not set)",
         )
         direct.add_argument(
             "-r", "--rcpt-to", type=str,
-            help="Recipient address (RCPT TO); required for -bomb, -av, -ssrf, -zipxxe, -sh",
+            help="Recipient address (RCPT TO); required for -bomb, -av, -ssrf, -zipxxe, -sh, -br",
+        )
+        direct.add_argument(
+            "-fn",
+            "--from-name",
+            type=str,
+            metavar="name",
+            dest="from_name",
+            default=None,
+            help="Sender display name in From header; used by -bomb, -av, -ssrf, -zipxxe (no validation)",
+        )
+        direct.add_argument(
+            "-cc",
+            "--cc",
+            type=str,
+            metavar="emails",
+            dest="cc",
+            default=None,
+            help="CC recipients, comma-separated; used by -bomb, -av, -ssrf; required for -bcc (no validation)",
         )
         direct.add_argument(
             "-br",
             "--bounce-replay",
-            nargs=1,
-            metavar="email",
+            action="store_true",
             dest="bounce_replay",
-            default=None,
-            help="Bounce/backscatter test: your controlled address (two sends: MAIL FROM only, then Return-Path in DATA)",
-        )
-        direct.add_argument(
-            "-te",
-            "--bounce-recipient",
-            type=str,
-            metavar="email",
-            dest="bounce_recipient",
-            default=None,
-            help="Non-existent RCPT TO for bounce test (default: auto-generated)",
+            help="Bounce/backscatter test; requires -m (controlled MAIL FROM) and -r (RCPT TO); two probes on one connection",
         )
         direct.add_argument(
             "-sh",
@@ -1381,22 +1388,6 @@ class SMTPArgs(ArgsWithBruteforce):
             metavar="sec",
             dest="spoofhdr_timeout",
             help="Timeout per message for Spoof headers test (default: 30)",
-        )
-        direct.add_argument(
-            "--from-name",
-            type=str,
-            metavar="name",
-            dest="from_name",
-            default=None,
-            help="Sender display name (no validation)",
-        )
-        direct.add_argument(
-            "--cc",
-            type=str,
-            metavar="emails",
-            dest="cc",
-            default=None,
-            help="CC recipients, comma-separated (no validation)",
         )
         direct.add_argument(
             "--bcc",
@@ -1446,8 +1437,9 @@ class SMTPArgs(ArgsWithBruteforce):
         )
         direct.add_argument(
             "-ie",
-            "--isencrypt",
+            "--is-encrypt",
             action="store_true",
+            dest="isencrypt",
             help="Check encryption methods",
         )
         direct.add_argument("--ntlm", action="store_true", help="inspect NTLM authentication")
@@ -1495,7 +1487,10 @@ class SMTPArgs(ArgsWithBruteforce):
         )
         direct.add_argument("-or", "--open-relay", action="store_true", help="Test Open relay")
         direct.add_argument(
-            "--role", action="store_true",
+            "-ri",
+            "--role-identify",
+            action="store_true",
+            dest="role",
             help="Identify server role (MTA / Submission / Hybrid)",
         )
         direct.add_argument(
@@ -1754,6 +1749,14 @@ class SMTP(BaseModule):
         alias_test_requested = getattr(args, "alias_test", False)
         if alias_test_requested and (not args.rcpt_to or not str(args.rcpt_to).strip()):
             raise argparse.ArgumentError(None, "-al/--alias-test requires -r/--rcpt-to (base recipient)")
+        bounce_replay_requested = getattr(args, "bounce_replay", False)
+        if bounce_replay_requested:
+            if not args.mail_from or not str(args.mail_from).strip():
+                raise argparse.ArgumentError(
+                    None, "-br/--bounce-replay requires -m/--mail-from (controlled bounce / MAIL FROM address)"
+                )
+            if not args.rcpt_to or not str(args.rcpt_to).strip():
+                raise argparse.ArgumentError(None, "-br/--bounce-replay requires -r/--rcpt-to (recipient)")
         # Canary required only for XXE variants; billion_laughs and zip_bomb work without it
         if zipxxe_requested:
             variants_arg = getattr(args, "zipxxe_variants", None)
@@ -1836,7 +1839,7 @@ class SMTP(BaseModule):
             or getattr(self.args, "helo_bypass", False)
             or getattr(self.args, "identify", False)
             or getattr(self.args, "id_aggressive", False)
-            or _bounce_replay_addr_from_args(self.args)
+            or _bounce_replay_active(self.args)
             or getattr(self.args, "bomb", False)
             or getattr(self.args, "antivirus", False)
             or getattr(self.args, "ssrf", False)
@@ -2006,7 +2009,7 @@ class SMTP(BaseModule):
 
         # Only -br (bounce-replay): test if server sends bounces to MAIL FROM without validation
         only_bounce_replay = (
-            bool(_bounce_replay_addr_from_args(self.args))
+            _bounce_replay_active(self.args)
             and not self.args.banner
             and not self.args.commands
             and not self.args.interactive
@@ -2060,7 +2063,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "invalid_commands", False)
             and not getattr(self.args, "helo_only", False)
             and not getattr(self.args, "helo_bypass", False)
-            and not _bounce_replay_addr_from_args(self.args)
+            and not _bounce_replay_active(self.args)
         )
         if only_standalone_ts_tests:
             for test_name in ts_ordered_tests:
@@ -2123,7 +2126,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "invalid_commands", False)
             and not getattr(self.args, "helo_only", False)
             and not getattr(self.args, "helo_bypass", False)
-            and not _bounce_replay_addr_from_args(self.args)
+            and not _bounce_replay_active(self.args)
             and not getattr(self.args, "bomb", False)
             and not getattr(self.args, "antivirus", False)
             and not getattr(self.args, "ssrf", False)
@@ -2158,7 +2161,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "invalid_commands", False)
             and not getattr(self.args, "helo_only", False)
             and not getattr(self.args, "helo_bypass", False)
-            and not _bounce_replay_addr_from_args(self.args)
+            and not _bounce_replay_active(self.args)
             and not getattr(self.args, "bomb", False)
             and not getattr(self.args, "antivirus", False)
             and not getattr(self.args, "ssrf", False)
@@ -2194,7 +2197,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "invalid_commands", False)
             and not getattr(self.args, "helo_only", False)
             and not getattr(self.args, "helo_bypass", False)
-            and not _bounce_replay_addr_from_args(self.args)
+            and not _bounce_replay_active(self.args)
             and not getattr(self.args, "bomb", False)
             and not getattr(self.args, "antivirus", False)
             and not getattr(self.args, "ssrf", False)
@@ -6452,7 +6455,7 @@ class SMTP(BaseModule):
             # SNI (Server Name Indication): Zoho, Microsoft, Yandex require SNI in TLS handshake.
             # Priority: 1) user-supplied hostname (target), 2) EHLO first line, 3) banner 220, 4) PTR, 5) IP.
             tls_upgrade_attempted = False
-            tls_upgrade_error: str | None = None  # Stored for --debug when cert not extracted
+            tls_upgrade_error: str | None = None  # Stored for -vv/--verbose when cert not extracted
             if not isinstance(getattr(smtp, "sock", None), ssl.SSLSocket) and ehlo_raw and re.search(r"starttls", ehlo_raw, re.I):
                 tls_upgrade_attempted = True
                 # Prefer user-supplied hostname (e.g. mx.zoho.eu) – most reliable for cloud providers
@@ -6642,7 +6645,7 @@ class SMTP(BaseModule):
         use_tls = self.args.tls or port == 465
         use_starttls = self.args.starttls and not use_tls
 
-        bounce_addr = _bounce_replay_addr_from_args(self.args)
+        bounce_addr = _bounce_replay_from_addr(self.args)
         if not bounce_addr:
             return BounceReplayResult(
                 vulnerable=False,
@@ -6654,7 +6657,7 @@ class SMTP(BaseModule):
                 test_id="",
                 smtp_trace=(),
                 tarpitting_or_timeout=False,
-                detail="-br <email> required (your controlled address for MAIL FROM / bounce checks)",
+                detail="-br requires -m/--mail-from (controlled address for MAIL FROM / bounce checks)",
                 message_accepted_return_path=False,
                 test_id_return_path="",
             )
@@ -6662,14 +6665,23 @@ class SMTP(BaseModule):
         bounce_addr = str(bounce_addr).strip()
         test_id = f"{random.getrandbits(32):08x}"
         test_id_rp = f"{random.getrandbits(32):08x}"
-        bounce_recipient = getattr(self.args, "bounce_recipient", None)
-        if bounce_recipient and str(bounce_recipient).strip() and "@" in str(bounce_recipient):
-            recipient = str(bounce_recipient).strip()
-        else:
-            domain = "example.com"
-            if self.target and "." in str(self.target) and not str(self.target).replace(".", "").isdigit():
-                domain = _registrable_domain_psl(str(self.target)) or str(self.target)
-            recipient = f"check-backscatter-{random.getrandbits(32):08x}@{domain}"
+        rcpt_raw = getattr(self.args, "rcpt_to", None) or ""
+        recipient = str(rcpt_raw).strip()
+        if not recipient:
+            return BounceReplayResult(
+                vulnerable=False,
+                indeterminate=True,
+                message_accepted=False,
+                rcpt_rejected_in_session=False,
+                bounce_addr=bounce_addr,
+                recipient_used="",
+                test_id=test_id,
+                smtp_trace=(),
+                tarpitting_or_timeout=False,
+                detail="-br requires -r/--rcpt-to (recipient)",
+                message_accepted_return_path=False,
+                test_id_return_path="",
+            )
 
         msg_id_domain = "example.com"
         if "@" in bounce_addr:
@@ -9692,7 +9704,7 @@ class SMTP(BaseModule):
                 self.ptprint("EHLO extensions (STARTTLS)", Out.INFO)
                 icon = get_colored_text("[*]", color="INFO")
                 self.ptprint(
-                    f"    {icon} STARTTLS EHLO not available (second connection or upgrade failed; try -d for debug)",
+                    f"    {icon} Failed to establish STARTTLS connection or STARTTLS command is not available in EHLO (try -vv for debug)",
                     Out.TEXT,
                 )
 
@@ -10383,7 +10395,7 @@ class SMTP(BaseModule):
                 dbg_tail = (
                     f"; {r.tls_upgrade_error}"
                     if self.args.debug and getattr(r, "tls_upgrade_error", None)
-                    else "; try --debug"
+                    else "; try -vv or --verbose"
                 )
                 if tls_up_fail:
                     msg = (
@@ -11302,27 +11314,13 @@ class SMTP(BaseModule):
         """Collect global vulnerabilities for flat (non-node) JSON output."""
         vulns: list[dict] = []
 
-        _AUTH_VULN_MAP = {
-            "ANONYMOUS": VULNS.AuthAnonymous.value,
-            "CRAM-MD5": VULNS.AuthCramMd5.value,
-            "DIGEST-MD5": VULNS.AuthDigestMd5.value,
-            "GSSAPI": VULNS.AuthGssapi.value,
-            "KERBEROS_V4": VULNS.AuthKerberos.value,
-            "LOGIN": VULNS.AuthLogin.value,
-            "NTLM": VULNS.AuthNtlm.value,
-            "PLAIN": VULNS.AuthPlain.value,
-        }
         if self.results.authentications_requested:
             info = self.results.info
-            seen_vuln_codes: set[str] = set()
             if info is not None and info.ehlo:
                 for display, level in _parse_ehlo_commands(info.ehlo, connection_encrypted=False):
                     if display.upper().startswith("AUTH ") and level == "ERROR":
-                        method = display.split()[1].upper() if len(display.split()) > 1 else ""
-                        vc = _AUTH_VULN_MAP.get(method)
-                        if vc and vc not in seen_vuln_codes:
-                            seen_vuln_codes.add(vc)
-                            vulns.append({"vuln_code": vc})
+                        vulns.append({"vuln_code": VULNS.AuthMethods.value})
+                        break
             return vulns
 
         _CMD_VULN_MAP = {

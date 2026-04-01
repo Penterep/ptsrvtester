@@ -74,6 +74,7 @@ class LDAPArgs(BaseArgs):
                 ["writetest", "<options>", "", "Test write permissions"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
+                ["-vv", "--verbose", "", "Enable verbose mode"],
             ]}
         ]
 

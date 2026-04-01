@@ -74,6 +74,7 @@ class DNSArgs(BaseArgs):
                 ["zone-walk-complete", "<options>", "", "Complete zone walking using NSEC"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
+                ["-vv", "--verbose", "", "Enable verbose mode"],
             ]}
         ]
 

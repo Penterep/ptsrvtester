@@ -146,6 +146,7 @@ class SSHArgs(ArgsWithBruteforce):
                 ["", "--privkeys", "<directory>", "Directory with private keys"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
+                ["-vv", "--verbose", "", "Enable verbose mode"],
             ]}
         ]
 

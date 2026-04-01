@@ -239,6 +239,7 @@ class XRDPArgs(BaseArgs):
                 ["bruteforce", "<options>", "", "Brute-force XRDP server credentials"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
+                ["-vv", "--verbose", "", "Enable verbose mode"],
             ]},
             {"note": [
                 "REQUIREMENTS:",

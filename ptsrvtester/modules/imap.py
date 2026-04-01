@@ -178,7 +178,7 @@ class IMAPArgs(ArgsWithBruteforce):
                 ["-i", "--info", "", "Grab banner, ID and CAPABILITY"],
                 ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
                 ["-c", "--commands", "", "Grab ID and CAPABILITY only"],
-                ["-ie", "--isencrypt", "", "Test encryption options (plaintext, STARTTLS, TLS)"],
+                ["-ie", "--is-encrypt", "", "Test encryption options (plaintext, STARTTLS, TLS)"],
                 ["-A", "--anonymous", "", "Check anonymous authentication"],
                 ["-N", "--ntlm", "", "Inspect NTLM authentication"],
                 ["", "", "", ""],
@@ -191,6 +191,7 @@ class IMAPArgs(ArgsWithBruteforce):
                 ["-P", "--passwords", "<wordlist>", "File with passwords"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
+                ["-vv", "--verbose", "", "Enable verbose mode"],
             ]}
         ]
 
@@ -232,8 +233,9 @@ class IMAPArgs(ArgsWithBruteforce):
         recon.add_argument("-c", "--commands", action="store_true", help="grab ID and CAPABILITY only")
         recon.add_argument(
             "-ie",
-            "--isencrypt",
+            "--is-encrypt",
             action="store_true",
+            dest="isencrypt",
             help="test encryption options on port (plaintext, STARTTLS, TLS)",
         )
         recon.add_argument(

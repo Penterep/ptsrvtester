@@ -118,7 +118,7 @@ def get_help():
             ["-v", "--version", "", "Show script version and exit"],
             ["-h", "--help", "", "Show this help message and exit"],
             ["-j", "--json", "", "Output in JSON format"],
-            ["", "--debug", "", "Enable debug messages"],
+            ["-vv", "--verbose", "", "Enable verbose mode"],
         ]
         }]
 
@@ -202,7 +202,13 @@ def parse_args() -> BaseArgs:
         "-v", "--version", action="version", version=f"%(prog)s {__version__}", help="print version"
     )
     parser.add_argument("-j", "--json", action="store_true", help="use Penterep JSON output format")
-    parser.add_argument("--debug", action="store_true", help="enable debug messages")
+    parser.add_argument(
+        "-vv",
+        "--verbose",
+        action="store_true",
+        dest="debug",
+        help="Enable verbose mode",
+    )
 
     # Subparser for every application module
     subparsers = parser.add_subparsers(required=True, dest="module", parser_class=CustomArgumentParser)
@@ -211,7 +217,13 @@ def parse_args() -> BaseArgs:
     # Global options must be on each subparser too (subparser parses the remainder of argv)
     for subp in subparsers.choices.values():
         subp.add_argument("-j", "--json", action="store_true", help="use Penterep JSON output format")
-        subp.add_argument("--debug", action="store_true", help="enable debug messages")
+        subp.add_argument(
+            "-vv",
+            "--verbose",
+            action="store_true",
+            dest="debug",
+            help="Enable verbose mode",
+        )
 
     # First parse to get the module name, second parse to get the module-specific arguments
     try:

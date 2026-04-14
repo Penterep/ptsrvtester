@@ -30,7 +30,7 @@ class Target:
 
 
 class ArgsWithBruteforce(BaseArgs):
-    user: str | None
+    user: str | list[str] | None
     users: str | None  # renamed from users_file
     password: str | None  # renamed from passw
     passwords: str | None  # renamed from passw_file
@@ -38,7 +38,12 @@ class ArgsWithBruteforce(BaseArgs):
     threads: int
 
 
-def add_bruteforce_args(parser: argparse.ArgumentParser):
+def add_bruteforce_args(
+    parser: argparse.ArgumentParser,
+    *,
+    user_nargs: str | None = None,
+    user_help: str | None = None,
+):
     """
     Adds bruteforce arguments to ArgumentParser
     - username or file with usernames
@@ -48,6 +53,8 @@ def add_bruteforce_args(parser: argparse.ArgumentParser):
 
     Args:
         parser (argparse.ArgumentParser)
+        user_nargs: if "+", -u accepts one or more usernames (list); else single string.
+        user_help: override help for -u (default: "username" or "username(s)" when user_nargs="+").
     """
     bruteforce = parser.add_argument_group(
         "LOGIN / BRUTEFORCE",
@@ -57,7 +64,21 @@ def add_bruteforce_args(parser: argparse.ArgumentParser):
     # username / users file
     bruteuser = bruteforce.add_mutually_exclusive_group()
     bruteuser.title = "bruteuser"
-    bruteuser.add_argument("-u", "--user", type=str, help="username")
+    _u_help = user_help or (
+        "username(s); with -e, names are used for VRFY/EXPN/RCPT enumeration (combine with -w)"
+        if user_nargs == "+"
+        else "username"
+    )
+    if user_nargs == "+":
+        bruteuser.add_argument(
+            "-u",
+            "--user",
+            nargs="+",
+            metavar="NAME",
+            help=_u_help,
+        )
+    else:
+        bruteuser.add_argument("-u", "--user", type=str, help=_u_help)
     bruteuser.add_argument("-U", "--users", type=str, help="file containing usernames")
 
     # password / passwords file
@@ -253,11 +274,11 @@ def get_mode(args: argparse.Namespace) -> str:
         return "PLAIN"
 
 
-def text_or_file(text: str | None, filepath: str | None) -> list[str]:
+def text_or_file(text: str | list[str] | None, filepath: str | None) -> list[str]:
     """Returns either `text` or `filepath` contents while prefering `text`
 
     Args:
-        text (str | None): value
+        text (str | list[str] | None): single value or list (e.g. SMTP -u with nargs+)
         filepath (str | None): file with values
 
     Returns:
@@ -265,7 +286,10 @@ def text_or_file(text: str | None, filepath: str | None) -> list[str]:
     """
     result = []
     if text is not None:
-        result = [text]
+        if isinstance(text, list):
+            result = [str(t).strip() for t in text if t is not None and str(t).strip()]
+        else:
+            result = [text]
     elif filepath is not None:
         _encodings = ("utf-8", "cp1250", "iso-8859-2", "cp1252", "latin-1")
         try:

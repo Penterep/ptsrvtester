@@ -1,4 +1,4 @@
-import argparse, ipaddress, json, queue, random, re, secrets, shutil, smtplib, socket, ssl, statistics, struct, subprocess, sys, textwrap, threading, time, unicodedata, zipfile, dns.resolver
+import argparse, ipaddress, json, os, queue, random, re, secrets, shutil, smtplib, socket, ssl, statistics, struct, subprocess, sys, textwrap, threading, time, unicodedata, zipfile, dns.resolver
 from base64 import b64decode, b64encode
 from io import BytesIO
 from dataclasses import dataclass
@@ -429,7 +429,7 @@ class NTLMResult(NamedTuple):
 
 class MaxConnectionsResult(NamedTuple):
     max: int | None
-    ban_minutes: float | None
+    ban_seconds: int | None
 
 
 class RcptLimitResult(NamedTuple):
@@ -767,6 +767,10 @@ class BounceReplayResult(NamedTuple):
     detail: str | None
     message_accepted_return_path: bool  # Second probe: DATA with Return-Path header
     test_id_return_path: str
+    probe1_detail: str | None = None        # Detail from Probe 1 _phase()
+    probe2_detail: str | None = None        # Detail from Probe 2 _phase()
+    probe1_indeterminate: bool = False      # True when Probe 1 timed out / connection lost
+    probe2_indeterminate: bool = False      # True when Probe 2 timed out / connection lost
 
 
 def _bounce_replay_active(args) -> bool:
@@ -1135,12 +1139,12 @@ class SMTPArgs(ArgsWithBruteforce):
                 "ptsrvtester smtp -bomb -flood -r victim@example.com smtp.example.com:25",
                 "ptsrvtester smtp -sh -r victim@example.com smtp.example.com:25",
                 "ptsrvtester smtp -sh -r victim@example.com -u user -p pass smtp.example.com:587",
-                "ptsrvtester smtp -bcc -r to@example.com --cc cc@example.com --bcc bcc@example.com smtp.example.com:25"
+                "ptsrvtester smtp -bcc bcc@example.com -r to@example.com --cc cc@example.com smtp.example.com:25"
             ]},
             {"options": [
                 ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
                 ["-id", "--identify", "", "Identify SMTP server software from typical responses"],
-                ["", "--id-aggressive", "", "Use VRFY/EXPN and RFC-edge probing for enhanced fingerprinting; may trigger WAF/IDS"],
+                ["", "--id-aggressive", "", "Enhanced fingerprinting via VRFY/EXPN and RFC-edge probing (may trigger WAF/IDS)"],
                 ["-c", "--commands", "", "Grab EHLO (alias for -A, different JSON)"],
                 ["-A", "--authentications", "", "Grab EHLO (alias for -c, different JSON)"],
                 ["-af", "--auth-format", "", "AUTH LOGIN identity shape probe (username vs e-mail vs NetBIOS)"],
@@ -1150,27 +1154,27 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-iv", "--invalid-commands", "", "Test invalid/non-standard SMTP commands"],
                 ["-ho", "--helo-only", "", "Test if server supports only HELO without EHLO extensions"],
                 ["-hb", "--helo-bypass", "", "Test HELO/EHLO value for bypassing security restrictions"],
-                ["-m", "--mail-from", "<email>", "Sender address (MAIL FROM); used by -bomb, -av, -sh, -al, -br"],
-                ["-r", "--rcpt-to", "<email>", "Recipient (To); required for -bomb, -av, -ssrf, -zipxxe, -sh, -bcc, -al, -br; recommended for -flood"],
-                ["-fn", "--from-name", "<name>", "Sender display name in From header; used by -bomb, -av, -ssrf, -zipxxe (no validation)"],
-                ["-cc", "--cc", "<emails>", "CC recipients, comma-separated; used by -bomb, -av, -ssrf; required for -bcc (no validation)"],
-                ["-sh", "--spoof-headers", "", "Test header spoofing (From, Reply-To, Return-Path); -r recipient (required); -m envelope (MAIL FROM); -u/-p for port 587"],
-                ["", "--spoofhdr-variants", "<v1,v2,...>", "Variants: from,reply_to,return_path (default: all); -r recipient, -m envelope"],
+                ["-m", "--mail-from", "<email>", "Sender address (MAIL FROM)"],
+                ["-r", "--rcpt-to", "<email>", "Recipient (To); required for -bomb, -av, -ssrf, -zipxxe, -sh, -bcc, -al, -br"],
+                ["-fn", "--from-name", "<name>", "Sender display name in From header"],
+                ["-cc", "--cc", "<emails>", "CC recipients, comma-separated; required for -bcc"],
+                ["-sh", "--spoof-headers", "", "Test header spoofing (From, Reply-To, Return-Path); requires -r"],
+                ["", "--spoofhdr-variants", "<v1,v2,...>", "Variants: from,reply_to,return_path (default: all)"],
                 ["", "--spoofhdr-timeout", "<sec>", "Timeout per message for Spoof headers test (default: 30)"],
-                ["-bcc", "--bcc-test", "", "BCC disclosure test; -r, --cc, --bcc required; -m envelope; -u/-p for port 587"],
-                ["", "--bcc", "<emails>", "BCC recipients, comma-separated; required for -bcc test"],
-                ["", "--bcc-timeout", "<sec>", "Timeout for Bcc test (default: 30)"],
-                ["-al", "--alias-test", "", "Alias & addressing bypass; -r required; -m envelope; -u/-p for port 587"],
+                ["-bcc", "--bcc-test", "<emails>", "BCC disclosure test; requires -r and --cc"],
+                ["", "--bcc-timeout", "<sec>", "Timeout for BCC test (default: 30)"],
+                ["-al", "--alias-test", "", "Alias & addressing bypass; requires -r"],
                 ["", "--alias-variants", "<v1,v2,...>", "Variants: case,case_domain,dotted,plus,percent,bang_simple,bang_nested (default: all)"],
-                ["", "--alias-timeout", "<sec>", "Timeout per variant for Alias test (default: 30)"],
+                ["", "--alias-timeout", "<sec>", "Timeout per variant (default: 30)"],
                 ["-ie", "--is-encrypt", "", "Check encryption methods"],
                 ["", "--ntlm", "", "Inspect NTLM authentication"],
                 ["-e", "--enumerate", "[VRFY/EXPN/RCPT/ALL]", "User enumeration (default: ALL)"],
-                ["-w", "--wordlist", "<wordlist>", "Usernames for enumeration"],
+                ["-w", "--wordlist", "<wordlist>", "Usernames file for -e"],
                 ["-t", "--threads", "<threads>", "Threads for enumeration (default: 1)"],
+                ["", "--enum-reconnect-after", "<n>", "Reconnect after n consecutive failures during enum (default: 4)"],
                 ["-sd", "--slow-down", "", "Test slow-down protection (requires -e)"],
-                ["-mc", "--max-connections", "", "Max connections test"],
-                ["-rl", "--recipient-limit", "", "Test RCPT TO recipient limit per message"],
+                ["-mc", "--max-connections", "<n>", "Max connections test (default: 50 attempts)"],
+                ["-rl", "--recipient-limit", "<n>", "Test RCPT TO recipient limit per message (default: 50 attempts)"],
                 ["-d", "--domain", "<domain>", "Recipient domain for RCPT TO limit test"],
                 ["-or", "--open-relay", "", "Test open relay"],
                 ["-ri", "--role-identify", "", "Identify server role (MTA / Submission / Hybrid)"],
@@ -1180,27 +1184,27 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-f", "--fqdn", "<fqdn>", "FQDN for EHLO/HELO (default: from target or system hostname)"],
                 ["", "--tls", "", "Use implicit SSL/TLS"],
                 ["", "--starttls", "", "Use explicit SSL/TLS"],
-                ["-u", "--user", "<username>", "Single username for bruteforce"],
+                ["-u", "--user", "<name> …", "Username(s); for bruteforce and -e enumeration targets"],
                 ["-U", "--users", "<wordlist>", "File with usernames"],
                 ["-p", "--password", "<password>", "Single password for bruteforce"],
                 ["-P", "--passwords", "<wordlist>", "File with passwords"],
-                ["-br", "--bounce-replay", "", "Bounce/backscatter test; requires -m (controlled MAIL FROM) and -r (RCPT TO); two probes: MAIL FROM + DATA, then Return-Path in DATA"],
+                ["-br", "--bounce-replay", "", "Bounce/backscatter test; requires -m (MAIL FROM) and -r (RCPT TO)"],
                 ["-bomb", "--bomb", "", "Test mail flooding / rate limiting"],
                 ["", "--bomb-count", "<n>", "Number of messages to send (default: 100)"],
                 ["", "--bomb-timeout", "<sec>", "Max time for entire test (default: 60)"],
                 ["", "--bomb-delay", "<sec>", "Delay between messages (default: 0)"],
                 ["", "--bomb-threads", "<n>", "Parallel threads for flooding (default: 1)"],
-                ["", "--bomb-randomize", "", "Add unique ID to each message (bypass duplicate detection)"],
+                ["", "--bomb-randomize", "", "Add unique ID to each message"],
                 ["-av", "--antivirus", "", "Test antivirus/antispam protection; requires -r"],
                 ["", "--antivirus-categories", "<cat1,cat2,...>", "Categories: eicar,double_ext,executable,nested_archive,encoded_content,html_sanitization,xxe,mime_malformed (default: all except zip_bomb)"],
                 ["", "--antivirus-zip-bomb", "", "Include zip_bomb category (DoS risk!)"],
-                ["", "--antivirus-timeout", "<sec>", "Timeout per message for antivirus test (default: 30)"],
+                ["", "--antivirus-timeout", "<sec>", "Timeout per message (default: 30)"],
                 ["", "--antivirus-skip-absent", "", "Skip categories with no definition files"],
                 ["-ssrf", "--ssrf", "", "Test SSRF – server fetches links; requires -r and --ssrf-canary-url"],
                 ["", "--ssrf-canary-url", "<URL>", "Canary URL for SSRF test (Interactsh, ngrok, etc.)"],
-                ["", "--ssrf-variants", "<v1,v2,...>", "SSRF variants: plain,html_link,html_img,html_iframe,multipart,ssrf_malformed,ssrf_nested (default: all)"],
+                ["", "--ssrf-variants", "<v1,v2,...>", "Variants: plain,html_link,html_img,html_iframe,multipart,ssrf_malformed,ssrf_nested (default: all)"],
                 ["", "--ssrf-internal-urls", "", "Also test internal URLs (127.0.0.1, localhost)"],
-                ["", "--ssrf-timeout", "<sec>", "Timeout per message for SSRF test (default: 30)"],
+                ["", "--ssrf-timeout", "<sec>", "Timeout per message (default: 30)"],
                 ["-flood", "--flood", "", "Test queue flood – SIZE extension, queue overload"],
                 ["", "--flood-count", "<n>", "Messages for queue stress (default: 150, max 500)"],
                 ["", "--flood-timeout", "<sec>", "Max time for queue stress (default: 90)"],
@@ -1210,7 +1214,7 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["", "--zipxxe-variants", "<v1,v2,...>", "Variants: billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx,xxe_body (default: all); zip_bomb/zip_bomb_full via flags"],
                 ["", "--zipxxe-zip-bomb", "", "Include zip_bomb variant (minimal ~200KB; DoS risk!)"],
                 ["", "--zipxxe-zip-bomb-full", "", "Include zip_bomb_full (~100KB→~100MB; extreme DoS risk!)"],
-                ["", "--zipxxe-timeout", "<sec>", "SMTP timeout per message (default: 30)"],
+                ["", "--zipxxe-timeout", "<sec>", "Timeout per message (default: 30)"],
                 ["-h", "--help", "", "Show this help message and exit"],
                 ["-vv", "--verbose", "", "Enable verbose mode"],
             ]}
@@ -1228,7 +1232,7 @@ class SMTPArgs(ArgsWithBruteforce):
   ptsrvtester smtp -bomb -av -ssrf -flood -zipxxe -r victim@example.com --ssrf-canary-url http://cb --zipxxe-canary-url http://cb smtp.example.com:25
   ptsrvtester smtp -sh -r victim@example.com smtp.example.com:25
   ptsrvtester smtp -sh -r victim@example.com -u user -p pass smtp.example.com:587
-  ptsrvtester smtp -bcc -r to@example.com --cc cc@example.com --bcc bcc@example.com smtp.example.com:25
+  ptsrvtester smtp -bcc bcc@example.com -r to@example.com --cc cc@example.com smtp.example.com:25
   ptsrvtester smtp -al -r admin@example.com smtp.example.com:25"""
 
         parser = subparsers.add_parser(
@@ -1390,19 +1394,13 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Timeout per message for Spoof headers test (default: 30)",
         )
         direct.add_argument(
-            "--bcc",
-            type=str,
-            metavar="emails",
-            dest="bcc",
-            default=None,
-            help="BCC recipients, comma-separated; required for -bcc test (no validation)",
-        )
-        direct.add_argument(
             "-bcc",
             "--bcc-test",
-            action="store_true",
+            type=str,
+            metavar="<emails>",
             dest="bcc_test",
-            help="BCC disclosure test; -r, --cc, --bcc required; -m envelope; -u/-p for port 587",
+            default=None,
+            help="BCC disclosure test; BCC emails comma-separated; -r and --cc required; -m envelope; -u/-p for port 587",
         )
         direct.add_argument(
             "--bcc-timeout",
@@ -1443,7 +1441,12 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Check encryption methods",
         )
         direct.add_argument("--ntlm", action="store_true", help="inspect NTLM authentication")
-        direct.add_argument("-w", "--wordlist", type=str, help="Usernames for enumeration")
+        direct.add_argument(
+            "-w",
+            "--wordlist",
+            type=str,
+            help="File with usernames for enumeration (-e); combine with -u",
+        )
         direct.add_argument(
             "-t",
             "--threads",
@@ -1452,6 +1455,16 @@ class SMTPArgs(ArgsWithBruteforce):
             metavar="threads",
             dest="enum_threads",
             help="Threads for enumeration (default: 1)",
+        )
+        direct.add_argument(
+            "--enum-reconnect-after",
+            type=int,
+            default=None,
+            metavar="N",
+            dest="enum_reconnect_after",
+            help="Reconnect after a successful find and after N consecutive failed attempts "
+                 "during enumeration. Combats teergrube (server-side accumulated delays). "
+                 "Without this flag no extra reconnects are performed (default: disabled).",
         )
         direct.add_argument(
             "-e",
@@ -1470,13 +1483,23 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Test against slow-down protection during enumeration (requires -e)",
         )
         direct.add_argument(
-            "-mc", "--max-connections", action="store_true", help="Max connections test"
+            "-mc", "--max-connections",
+            nargs="?",
+            type=int,
+            const=50,
+            default=None,
+            metavar="N",
+            help="Max connections test (N = max attempts, default: 50)",
         )
         direct.add_argument(
             "-rl", "--recipient-limit",
-            action="store_true",
+            nargs="?",
+            type=int,
+            const=50,
+            default=None,
+            metavar="N",
             dest="rcpt_limit",
-            help="Test RCPT TO recipient limit per message",
+            help="Test RCPT TO recipient limit per message (N = max failed-RCPT probe attempts, default: 50)",
         )
         direct.add_argument(
             "-d", "--domain",
@@ -1497,7 +1520,7 @@ class SMTPArgs(ArgsWithBruteforce):
             "-I", "--interactive", action="store_true", help="Establish interactive SMTP CLI"
         )
 
-        add_bruteforce_args(parser)
+        add_bruteforce_args(parser, user_nargs="+")
 
         stress = parser.add_argument_group(
             "BOMB / ANTIVIRUS / SSRF / FLOOD / ZIPXXE",
@@ -1736,16 +1759,15 @@ class SMTP(BaseModule):
         spoof_headers_requested = getattr(args, "spoof_headers", False)
         if spoof_headers_requested and (not args.rcpt_to or not str(args.rcpt_to).strip()):
             raise argparse.ArgumentError(None, "-sh/--spoof-headers requires -r/--rcpt-to (recipient)")
-        bcc_test_requested = getattr(args, "bcc_test", False)
+        bcc_test_requested = getattr(args, "bcc_test", None)
         if bcc_test_requested:
             if not args.rcpt_to or not str(args.rcpt_to).strip():
-                raise argparse.ArgumentError(None, "-bcc/--bcc-test requires -r/--rcpt-to (To recipient)")
+                raise argparse.ArgumentError(None, "-bcc requires -r/--rcpt-to (To recipient)")
             cc_val = getattr(args, "cc", None) or ""
-            bcc_val = getattr(args, "bcc", None) or ""
             if not cc_val.strip():
-                raise argparse.ArgumentError(None, "-bcc/--bcc-test requires --cc (Cc recipient)")
-            if not bcc_val.strip():
-                raise argparse.ArgumentError(None, "-bcc/--bcc-test requires --bcc (Bcc recipient)")
+                raise argparse.ArgumentError(None, "-bcc requires --cc (Cc recipient)")
+            if not str(bcc_test_requested).strip():
+                raise argparse.ArgumentError(None, "-bcc requires BCC email addresses as argument")
         alias_test_requested = getattr(args, "alias_test", False)
         if alias_test_requested and (not args.rcpt_to or not str(args.rcpt_to).strip()):
             raise argparse.ArgumentError(None, "-al/--alias-test requires -r/--rcpt-to (base recipient)")
@@ -1775,14 +1797,29 @@ class SMTP(BaseModule):
         self.use_json = args.json
         self.ptjsonlib = ptjsonlib
         self.already_enumerated = None
+        self._enum_progress_print_lock = threading.Lock()
+        self._enum_mt_progress_line_active = False
+        self._enum_clock_thread: threading.Thread | None = None
+        self._enum_clock_stop = threading.Event()
+        self._enum_clock_state: dict[str, int | str] | None = None
+        # Line-buffer / write-through stdout so enum progress is not held until block ends
+        if not self.use_json and hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(line_buffering=True, write_through=True)
+            except (OSError, ValueError, AttributeError):
+                pass
 
         self.max_connections_is_error = None
         self.is_slow_down = None
         self.fqdn = "example.com" if not args.fqdn else args.fqdn
 
-        # Load enumeration wordlist; keep only lines whose local part is valid (RFC 5322/6531)
+        # Enumeration usernames: -w file and/or -u name … (with -e); keep valid local parts (RFC 5322/6531)
+        raw: list[str] = []
         if args.wordlist:
             raw = list(filter(lambda x: x != "", text_or_file(None, args.wordlist)))
+        if args.enumerate is not None and args.user is not None:
+            raw.extend(x for x in text_or_file(args.user, None) if x != "")
+        if raw:
             self.wordlist = [u for u in raw if self._is_valid_local_part(u.split("@")[0].strip())]
             self._wordlist_skipped = len(raw) - len(self.wordlist)
         else:
@@ -2286,7 +2323,7 @@ class SMTP(BaseModule):
         if only_enumerate:
             self.ptprint("User Enumeration & Catch All mailbox", Out.INFO)
             try:
-                smtp_enum, status, reply = self.connect()
+                smtp_enum, status, reply = self.connect(timeout=15.0)
                 if status != 220:
                     raise Exception(self.bytes_to_str(reply) if reply else "Connect failed")
                 banner = reply.decode()
@@ -2360,20 +2397,7 @@ class SMTP(BaseModule):
         if only_rcpt_limit:
             self.ptprint("RCPT TO limit", Out.INFO)
             try:
-                # Populate results.info (banner + EHLO) so _get_rcpt_limit_domain() uses server hostname
-                # like in run-all; we do not stream banner/ehlo to the user.
-                _, info = self.initial_info(get_commands=True)
-                self.results.info = InfoResult(
-                    info.banner,
-                    info.ehlo,
-                    getattr(info, "ehlo_starttls", None),
-                )
-                self.results.resolved_domain = self._get_domain_from_banner_or_ptr(self.results.info)
-                self.results.banner_requested = False
-                self.results.commands_requested = False
-                smtp_rc = self.get_smtp_handler()
-                smtp_rc.docmd("EHLO", self.fqdn)
-                self.results.rcpt_limit = self.test_rcpt_limit(smtp_rc)
+                self.results.rcpt_limit = self.test_rcpt_limit()
                 self._stream_rcpt_limit_result()
             except TestFailedError as e:
                 self.results.rcpt_limit_error = str(e)
@@ -2727,7 +2751,7 @@ class SMTP(BaseModule):
 
             if self.args.enumerate is not None:
                 self.ptprint("User Enumeration & Catch All mailbox", Out.INFO)
-                smtp_enum = self.get_smtp_handler()
+                smtp_enum = self.get_smtp_handler(timeout=15.0)
                 smtp_enum.docmd("EHLO", self.fqdn)
                 try:
                     self.results.catch_all = self.test_catchall(smtp_enum)
@@ -2744,9 +2768,7 @@ class SMTP(BaseModule):
             if getattr(self.args, "rcpt_limit", False):
                 self.ptprint("RCPT TO limit", Out.INFO)
                 try:
-                    smtp_rc = self.get_smtp_handler()
-                    smtp_rc.docmd("EHLO", self.fqdn)
-                    self.results.rcpt_limit = self.test_rcpt_limit(smtp_rc)
+                    self.results.rcpt_limit = self.test_rcpt_limit()
                 except TestFailedError as e:
                     self.results.rcpt_limit_error = str(e)
                 except Exception as e:
@@ -2886,7 +2908,7 @@ class SMTP(BaseModule):
         save_enum = self.args.enumerate
         try:
             self.args.enumerate = "ALL"
-            smtp_enum = self.get_smtp_handler()
+            smtp_enum = self.get_smtp_handler(timeout=15.0)
             smtp_enum.docmd("EHLO", self.fqdn)
             try:
                 self.results.catch_all = self.test_catchall(smtp_enum)
@@ -2923,9 +2945,13 @@ class SMTP(BaseModule):
             self.results.ntlm_error = str(e)
         self._stream_ntlm_result()
 
-    def connect(self) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL, int, bytes]:
+    def connect(self, timeout: float = 15.0) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL, int, bytes]:
         """Port 465 is implicit TLS only (SMTPS), so we use TLS even without --tls.
-        For IP targets we connect manually with server_hostname=None so SNI does not break."""
+        For IP targets we connect manually with server_hostname=None so SNI does not break.
+
+        timeout controls the socket read/write deadline for all operations on the
+        returned SMTP object.  Callers that need a non-default value (e.g. enumeration
+        uses 30 s; retry after server silence uses 10 s) pass it explicitly."""
         try:
             if self.args.tls or self.args.target.port == 465:
                 ctx = ssl._create_unverified_context()
@@ -2935,14 +2961,14 @@ class SMTP(BaseModule):
                     server_hostname = None
                 except ValueError:
                     server_hostname = host
-                sock = socket.create_connection((host, port), timeout=15.0)
+                sock = socket.create_connection((host, port), timeout=timeout)
                 sock_ssl = ctx.wrap_socket(sock, server_hostname=server_hostname)
-                smtp = smtplib.SMTP(timeout=15.0)
+                smtp = smtplib.SMTP(timeout=timeout)
                 smtp.sock = sock_ssl
                 smtp.file = None
                 status, reply = smtp.getreply()
             else:
-                smtp = smtplib.SMTP(timeout=15.0)
+                smtp = smtplib.SMTP(timeout=timeout)
                 status, reply = smtp.connect(self.args.target.ip, self.args.target.port)
                 if self.args.starttls and status == 220:
                     status_stls, _ = smtp.docmd("STARTTLS")
@@ -2961,6 +2987,7 @@ class SMTP(BaseModule):
                         smtp.esmtp_features = {}
                         smtp.does_esmtp = False
 
+            self._smtp_sock_set_tcp_nodelay(smtp)
             return smtp, status, reply
         except Exception as e:
             mode = "TLS" if (self.args.tls or self.args.target.port == 465) else get_mode(self.args)
@@ -2972,8 +2999,19 @@ class SMTP(BaseModule):
                 msg += " (port 587 typically requires --starttls)"
             self._fail(msg)
 
-    def get_smtp_handler(self) -> smtplib.SMTP:
-        smtp_handler, status, reply = self.connect()
+    @staticmethod
+    def _smtp_sock_set_tcp_nodelay(smtp) -> None:
+        """Disable Nagle on the SMTP TCP socket so small segments (e.g. multi-line replies) arrive sooner."""
+        sk = getattr(smtp, "sock", None)
+        if sk is None:
+            return
+        try:
+            sk.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def get_smtp_handler(self, timeout: float = 15.0) -> smtplib.SMTP:
+        smtp_handler, status, reply = self.connect(timeout=timeout)
         if status == 220:
             return smtp_handler
         else:
@@ -2996,7 +3034,7 @@ class SMTP(BaseModule):
             raise Exception(f"Server responded {status}: {self.bytes_to_str(reply)}")
 
     def wait_for_unban(self, seconds, ban_duration=0, retries_left=12):
-        """Wait for server to unban, then try to reconnect. Returns (ban_minutes, reconnected)."""
+        """Wait for server to unban, then try to reconnect. Returns (ban_seconds, reconnected)."""
         self.noop_smtp_connections()
         ban_duration += seconds
         time.sleep(seconds)
@@ -3004,10 +3042,10 @@ class SMTP(BaseModule):
             self.ptdebug(f">", end="")
             self._get_smtp_connection()
             self.ptdebug(f"\r", end="")
-            return (ban_duration / 60, True)
+            return (ban_duration, True)
         except Exception as e:
             if retries_left <= 0:
-                return (ban_duration / 60, False)
+                return (ban_duration, False)
             return self.wait_for_unban(5, ban_duration, retries_left - 1)
 
     def noop_smtp_connections(self):
@@ -3034,15 +3072,65 @@ class SMTP(BaseModule):
         ban_duration = None
         ban_reconnected = True
 
+        max_attempts = getattr(self.args, "max_connections", 50) or 50
         self.ptdebug(f"Max smtp connections test", title=True)
-        start_time = time.time()
+        start_time = time.perf_counter()
+
+        _show_progress = not self.args.json and not self.args.debug
+        # Shared label updated by main thread; ticker reads it every 0.2 s.
+        _live_label: list[str] = ["Testing connections...  attempt 0"]
+        _ticker_stop = threading.Event()
+
+        def _render_progress() -> None:
+            elapsed = time.perf_counter() - start_time
+            h = int(elapsed // 3600)
+            m = int((elapsed % 3600) // 60)
+            s = int(elapsed % 60)
+            line = f"    {h}:{m:02d}:{s:02d}  {_live_label[0]}"
+            sys.stdout.write(f"\r{line:<79}")
+            sys.stdout.flush()
+
+        def _ticker() -> None:
+            while not _ticker_stop.wait(timeout=0.2):
+                _render_progress()
+
+        def _end_progress() -> None:
+            _ticker_stop.set()
+            _render_progress()
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        def _connect_in_thread():
+            """Run _get_smtp_connection in a background thread; ticker handles display."""
+            _result = [None]
+            _error = [None]
+            _done = threading.Event()
+
+            def _worker():
+                try:
+                    _result[0] = self._get_smtp_connection()
+                except Exception as exc:
+                    _error[0] = exc
+                finally:
+                    _done.set()
+
+            threading.Thread(target=_worker, daemon=True).start()
+            _done.wait()
+            if _error[0] is not None:
+                raise _error[0]
+            return _result[0]
+
+        if _show_progress:
+            threading.Thread(target=_ticker, daemon=True).start()
+
         self.ptdebug(f"", Out.INFO, end="")
-        for index, i in enumerate(range(100)):
+        for index, i in enumerate(range(max_attempts)):
+            _live_label[0] = f"Testing connections...  attempt {index + 1}"
             try:
                 self.ptdebug(f">", end="")
-                self.smtp_list.append(self._get_smtp_connection())
+                self.smtp_list.append(_connect_in_thread())
                 if self.noop_smtp_connections() and not is_disconnect:
-                    is_disconnect = time.time() - start_time
+                    is_disconnect = time.perf_counter() - start_time
             except Exception as e:
                 allowed_connections = len(self.smtp_list)
                 self.ptdebug(f"\r", end="")
@@ -3051,6 +3139,8 @@ class SMTP(BaseModule):
                     Out.INFO,
                 )
                 if index == 0:
+                    if _show_progress:
+                        _end_progress()
                     self._fail(f"Could not retrieve initial smtp connection - {e}")
                 self.smtp_list.pop()
                 try:
@@ -3058,13 +3148,19 @@ class SMTP(BaseModule):
                 except Exception as e:
                     self.ptdebug(f"You're banned, reconnecting in 60 seconds ...", Out.INFO)
                     self.ptdebug(f"", Out.INFO, end="")
+                    _live_label[0] = "Waiting for timeout..."
                     ban_duration, ban_reconnected = self.wait_for_unban(60)
                     if not ban_reconnected:
                         self.ptdebug(
                             f"Could not reconnect after ban (max retries exceeded)",
                             Out.INFO,
                         )
+                if _show_progress:
+                    _end_progress()
                 break
+        else:
+            if _show_progress:
+                _end_progress()
 
         # close all smtp connections and delete *self.smtp_list*
         self.close_smtp_connections()
@@ -3076,7 +3172,7 @@ class SMTP(BaseModule):
             )
         if ban_duration:
             if ban_reconnected:
-                self.ptdebug(f"Unblocked after {ban_duration} minutes", Out.INFO)
+                self.ptdebug(f"Unblocked after {ban_duration} seconds", Out.INFO)
         else:
             self.ptdebug(f"Not banned", Out.INFO)
 
@@ -3406,12 +3502,21 @@ class SMTP(BaseModule):
             pass
         return "test.com"
 
-    def _run_rcpt_limit_for_domain(self, smtp: smtplib.SMTP, domain: str) -> RcptLimitResult:
+    def _run_rcpt_limit_for_domain(
+        self,
+        smtp: smtplib.SMTP,
+        domain: str,
+        max_probe: int = 50,
+        live_label: list[str] | None = None,
+        render_fn=None,
+    ) -> RcptLimitResult:
         """Run MAIL FROM + RCPT TO loop for a given domain. Used so we can retry with parent domain.
         Continues on 554/550/553/450 (policy rejection) to probe session error limit (smtpd_hard_error_limit).
+        max_probe controls how many failed-RCPT attempts are made before concluding there is no session limit.
+        live_label/render_fn are passed from test_rcpt_limit for live progress display.
         """
         max_try = 2000
-        MAX_FAILED_PROBE = 50  # Probe limit for session error detection when all RCPTs get 554
+        MAX_FAILED_PROBE = max_probe  # Probe limit for session error detection when all RCPTs get 554
 
         try:
             status, reply = smtp.docmd("MAIL FROM:", "<>")
@@ -3426,70 +3531,126 @@ class SMTP(BaseModule):
         first_policy_response: str | None = None  # First 554/550/553/450 for display
 
         for i in range(1, max_try + 1):
-            try:
-                status, reply = smtp.docmd("RCPT TO:", f"<{i}@{domain}>")
-                reply_str = self.bytes_to_str(reply)
-                if status == 250:
-                    accepted += 1
-                    continue
-                limit_response = f"[{status}] {reply_str}".strip()
-                if first_policy_response is None and status in (450, 550, 553, 554):
-                    first_policy_response = limit_response
+            if live_label is not None:
+                live_label[0] = f"Testing RCPT limit...  attempt {i}"
+            if render_fn is not None:
+                render_fn()
+                try:
+                    status, reply = smtp.docmd("RCPT TO:", f"<{i}@{domain}>")
+                    reply_str = self.bytes_to_str(reply)
+                    if status == 250:
+                        accepted += 1
+                        continue
+                    limit_response = f"[{status}] {reply_str}".strip()
+                    if first_policy_response is None and status in (450, 550, 553, 554):
+                        first_policy_response = limit_response
 
-                # Policy rejection (relay/sender/recipient) – continue to probe session limit
-                if status in (450, 550, 553, 554):
-                    failed += 1
-                    if accepted == 0 and failed >= MAX_FAILED_PROBE:
-                        self.ptdebug(
-                            f"Server allows {failed} failed RCPTs without disconnect (no smtpd_hard_error_limit)",
-                            Out.VULN,
-                        )
+                    # Policy rejection (relay/sender/recipient) – continue to probe session limit
+                    if status in (450, 550, 553, 554):
+                        failed += 1
+                        if accepted == 0 and failed >= MAX_FAILED_PROBE:
+                            self.ptdebug(
+                                f"Server allows {failed} failed RCPTs without disconnect (no smtpd_hard_error_limit)",
+                                Out.VULN,
+                            )
+                            return RcptLimitResult(
+                                0, False, first_policy_response, rejected_addresses=True,
+                                failed_before_limit=failed, session_limit_triggered=False, no_session_limit=True,
+                            )
+                        continue
+
+                    # Session limit: 421 (rate limit / too many errors)
+                    if status == 421:
+                        self.ptdebug(f"Server session limit after {i} attempts: {limit_response}", Out.INFO)
                         return RcptLimitResult(
-                            0, False, first_policy_response, rejected_addresses=True,
-                            failed_before_limit=failed, session_limit_triggered=False, no_session_limit=True,
+                            accepted, True, limit_response, rejected_addresses=(accepted == 0),
+                            failed_before_limit=i, session_limit_triggered=True, no_session_limit=False,
                         )
-                    continue
 
-                # Session limit: 421 (rate limit / too many errors)
-                if status == 421:
-                    self.ptdebug(f"Server session limit after {i} attempts: {limit_response}", Out.INFO)
+                    # Per-message RCPT limit: 452 Too many recipients
+                    if status == 452:
+                        self.ptdebug(f"Server per-message limit after {accepted} recipients: {limit_response}", Out.INFO)
+                        return RcptLimitResult(accepted, True, limit_response, False)
+
+                    # Other 5xx
+                    if 500 <= status <= 599:
+                        self.ptdebug(f"Server limit after {accepted} recipients: {limit_response}", Out.INFO)
+                        return RcptLimitResult(accepted, True, limit_response, False)
+
+                    return RcptLimitResult(accepted, False, limit_response, False)
+                except (smtplib.SMTPServerDisconnected, ConnectionResetError, BrokenPipeError, EOFError, OSError) as e:
+                    self.ptdebug(f"Server closed connection after {i} attempts", Out.INFO)
                     return RcptLimitResult(
-                        accepted, True, limit_response, rejected_addresses=(accepted == 0),
+                        accepted, True, str(e), rejected_addresses=(accepted == 0),
                         failed_before_limit=i, session_limit_triggered=True, no_session_limit=False,
                     )
-
-                # Per-message RCPT limit: 452 Too many recipients
-                if status == 452:
-                    self.ptdebug(f"Server per-message limit after {accepted} recipients: {limit_response}", Out.INFO)
-                    return RcptLimitResult(accepted, True, limit_response, False)
-
-                # Other 5xx
-                if 500 <= status <= 599:
-                    self.ptdebug(f"Server limit after {accepted} recipients: {limit_response}", Out.INFO)
-                    return RcptLimitResult(accepted, True, limit_response, False)
-
-                return RcptLimitResult(accepted, False, limit_response, False)
-            except (smtplib.SMTPServerDisconnected, ConnectionResetError, BrokenPipeError, EOFError, OSError) as e:
-                self.ptdebug(f"Server closed connection after {i} attempts", Out.INFO)
-                return RcptLimitResult(
-                    accepted, True, str(e), rejected_addresses=(accepted == 0),
-                    failed_before_limit=i, session_limit_triggered=True, no_session_limit=False,
-                )
 
         self.ptdebug(f"No limit observed up to {accepted} recipients", Out.VULN)
         return RcptLimitResult(accepted, False, None, False)
 
-    def test_rcpt_limit(self, smtp: smtplib.SMTP) -> RcptLimitResult:
+    def test_rcpt_limit(self) -> RcptLimitResult:
         """
         Test RCPT TO limit per message: send MAIL FROM then many RCPT TO
         until server rejects (452 Too many recipients, 421, 5xx) or closes.
         When domain is taken from server (banner/EHLO) and server rejects with 550/553,
         retry with parent domain (e.g. calm.festiveloft.net -> festiveloft.net).
+        Ticker starts immediately so elapsed time includes connection setup.
         """
-        self.ptdebug("RCPT TO limit test (per message)", title=True)
-        domain = self._get_rcpt_limit_domain()
+        _show_progress = not self.args.json and not self.args.debug
+        _start_time = time.perf_counter()
+        _live_label: list[str] = ["Connecting..."]
+        _ticker_stop = threading.Event()
+
+        def _render_progress() -> None:
+            elapsed = time.perf_counter() - _start_time
+            h = int(elapsed // 3600)
+            m = int((elapsed % 3600) // 60)
+            s = int(elapsed % 60)
+            line = f"    {h}:{m:02d}:{s:02d}  {_live_label[0]}"
+            sys.stdout.write(f"\r{line:<79}")
+            sys.stdout.flush()
+
+        def _ticker() -> None:
+            while not _ticker_stop.wait(timeout=0.2):
+                _render_progress()
+
+        def _end_progress() -> None:
+            _ticker_stop.set()
+            _render_progress()
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        if _show_progress:
+            threading.Thread(target=_ticker, daemon=True).start()
+
+        smtp: smtplib.SMTP | None = None
         try:
-            result = self._run_rcpt_limit_for_domain(smtp, domain)
+            self.ptdebug("RCPT TO limit test (per message)", title=True)
+
+            # In standalone mode results.info is not yet set; populate it for domain resolution.
+            if not getattr(self.results, "info", None):
+                _, info = self.initial_info(get_commands=True)
+                self.results.info = InfoResult(
+                    info.banner,
+                    info.ehlo,
+                    getattr(info, "ehlo_starttls", None),
+                )
+                self.results.resolved_domain = self._get_domain_from_banner_or_ptr(self.results.info)
+                self.results.banner_requested = False
+                self.results.commands_requested = False
+
+            domain = self._get_rcpt_limit_domain()
+            max_probe = getattr(self.args, "rcpt_limit", 50) or 50
+
+            smtp = self.get_smtp_handler()
+            smtp.docmd("EHLO", self.fqdn)
+
+            _live_label[0] = "Testing RCPT limit...  attempt 0"
+            result = self._run_rcpt_limit_for_domain(
+                smtp, domain, max_probe=max_probe,
+                live_label=_live_label,
+                render_fn=_render_progress if _show_progress else None,
+            )
             domain_used = domain
 
             # If server rejected (e.g. "User unknown" for full hostname) and user did not set -d,
@@ -3509,7 +3670,12 @@ class SMTP(BaseModule):
                         smtp.docmd("RSET")
                     except Exception:
                         pass
-                    result = self._run_rcpt_limit_for_domain(smtp, parent)
+                    _live_label[0] = "Testing RCPT limit...  attempt 0"
+                    result = self._run_rcpt_limit_for_domain(
+                        smtp, parent, max_probe=max_probe,
+                        live_label=_live_label,
+                        render_fn=_render_progress if _show_progress else None,
+                    )
                     domain_used = parent
 
             return RcptLimitResult(
@@ -3523,10 +3689,13 @@ class SMTP(BaseModule):
                 getattr(result, "no_session_limit", False),
             )
         finally:
-            try:
-                smtp.close()
-            except Exception:
-                pass
+            if _show_progress:
+                _end_progress()
+            if smtp is not None:
+                try:
+                    smtp.close()
+                except Exception:
+                    pass
 
     def start_interactive_mode(self, smtp: smtplib.SMTP):
         self.ptprint("\n", end="")
@@ -3653,6 +3822,489 @@ class SMTP(BaseModule):
 
         return {"rcpt": is_slow_down}
 
+    @staticmethod
+    def _format_enum_elapsed(start: float) -> str:
+        """Elapsed since start with centiseconds (distinct stamps when lines flush together)."""
+        elapsed = max(0.0, time.time() - start)
+        total_sec = int(elapsed)
+        cs = int((elapsed - total_sec) * 100)
+        if cs >= 100:
+            cs = 99
+        h, rem = divmod(total_sec, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+    def _enumeration_requested_method_set(self) -> set[str]:
+        if self.args.enumerate is None:
+            return {"EXPN", "VRFY", "RCPT"}
+        if isinstance(self.args.enumerate, list):
+            return {m.upper() for m in self.args.enumerate if m}
+        return {self.args.enumerate.upper()} if self.args.enumerate else {"EXPN", "VRFY", "RCPT"}
+
+    def _wordlist_enumeration_will_run(
+        self, enumeration_vulns: dict[str, bool | None], catch_all: str | None
+    ) -> bool:
+        """True when do_enumeration will actually iterate the wordlist (not only skip messages)."""
+        if enumeration_vulns["expn"]:
+            return catch_all != "configured"
+        if enumeration_vulns["vrfy"]:
+            return catch_all != "configured"
+        if enumeration_vulns["rcpt"]:
+            return catch_all not in ("indeterminate", "configured")
+        return False
+
+    def _stream_enumeration_method_rows(
+        self, enum_results: list[EnumResult], catch_all: str | None
+    ) -> None:
+        """Print EXPN/VRFY/RCPT status lines (same as first loop in _stream_enumeration_result)."""
+        requested_set = self._enumeration_requested_method_set()
+        filtered = [e for e in enum_results if e.method.upper() in requested_set]
+        warn_icon = get_colored_text("[!]", color="WARNING")
+        for e in filtered:
+            if catch_all == "configured":
+                self.ptprint(
+                    f"    {warn_icon} {e.method.upper()} method: Indeterminate (Useless due to Catch All)",
+                    Out.TEXT,
+                )
+            elif e.blocked_by_rbl:
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(
+                    f"    {icon} {e.method.upper()} method protected by RBL/Reputation (Client IP blocked)",
+                    Out.TEXT,
+                )
+                if e.server_reply:
+                    for line in (e.server_reply or "").replace("\r", "").splitlines():
+                        self.ptprint(f"        {line.strip()}", Out.TEXT)
+            else:
+                slowdown = ""
+                if e.slowdown is not None:
+                    slowdown = " (rate limited)" if e.slowdown else " (not rate limited)"
+                icon = get_colored_text("[✗]", color="VULN") if e.vulnerable else get_colored_text("[✓]", color="NOTVULN")
+                if e.vulnerable:
+                    if e.server_reply:
+                        raw = (e.server_reply or "").replace("\r", "").splitlines()
+                        parts = [re.sub(r" +", " ", p.strip()) for p in raw if p.strip()]
+                        if parts:
+                            if len(parts) == 1:
+                                self.ptprint(f"    {icon} {e.method.upper()} method is enabled ({parts[0]}){slowdown}", Out.TEXT)
+                            else:
+                                self.ptprint(
+                                    f"    {icon} {e.method.upper()} method is enabled ({parts[0]}{')' if len(parts) == 1 else ''}{slowdown if len(parts) == 1 else ''}",
+                                    Out.TEXT,
+                                )
+                                for i, part in enumerate(parts[1:]):
+                                    is_last = i == len(parts) - 2
+                                    self.ptprint(f"        {part}{')' if is_last else ''}{slowdown if is_last else ''}", Out.TEXT)
+                        else:
+                            self.ptprint(f"    {icon} {e.method.upper()} method is enabled{slowdown}", Out.TEXT)
+                    else:
+                        self.ptprint(f"    {icon} {e.method.upper()} method is enabled{slowdown}", Out.TEXT)
+                else:
+                    if e.server_reply and "Relay protection active" in e.server_reply:
+                        status = "is deny (Relay protection active)"
+                    elif e.server_reply and "Administrative prohibition" in e.server_reply:
+                        status = "is deny (Administrative prohibition)"
+                    else:
+                        status = "is deny"
+                    self.ptprint(f"    {icon} {e.method.upper()} method {status}{slowdown}", Out.TEXT)
+
+    @staticmethod
+    def _expn_vrfy_result_strings(reply_str: str) -> list[str]:
+        """Extract display/enum strings from EXPN/VRFY success reply (bracketed paths, emails, fallback)."""
+        found = re.findall(r"<([^<>]*)>", reply_str)
+        found = [x.strip() for x in found if x.strip()]
+        if found:
+            out: list[str] = []
+            seen: set[str] = set()
+            for x in found:
+                if x not in seen:
+                    seen.add(x)
+                    out.append(x)
+            return out
+        for line in reply_str.replace("\r\n", "\n").split("\n"):
+            m = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", line)
+            if m:
+                return [m.group(0)]
+        lines = [ln.strip() for ln in reply_str.replace("\r\n", "\n").split("\n") if ln.strip()]
+        if lines:
+            tail = re.sub(r"^\d{3}\s*", "", lines[0]).strip()
+            if tail and len(tail) < 500:
+                return [tail]
+        return []
+
+    @staticmethod
+    def _smtp_command_streaming(
+        smtp,
+        cmd: str,
+        args: str,
+        on_first_hit=None,
+        debug: bool = False,
+    ) -> tuple[int, bytes]:
+        """Send SMTP command and call on_first_hit(line_bytes) on the very first positive
+        (non-5xx) response line – before reading continuation lines.
+        Returns (errcode, reply_bytes) identical to smtplib.SMTP.docmd.
+        Falls back to smtp.docmd when the underlying file object is not accessible.
+
+        debug=True (-vv) enables timestamped tracing to stderr (fd 2) so the
+        caller can pinpoint whether delays are in readline() or in on_first_hit."""
+        _MAXLINE: int = getattr(smtplib, "_MAXLINE", 8192)
+
+        def _dbg(msg: str) -> None:
+            if debug:
+                ts = time.perf_counter()
+                os.write(2, f"[DBG enum {ts:.3f}] {msg}\n".encode("utf-8", errors="replace"))
+
+        file = getattr(smtp, "file", None)
+        if file is None:
+            _dbg(f"no file object, falling back to docmd({cmd!r})")
+            status, reply = smtp.docmd(cmd, args)
+            if on_first_hit is not None and not (500 <= status <= 599):
+                _dbg("calling on_first_hit (docmd fallback)")
+                t0 = time.perf_counter()
+                on_first_hit(reply[:512] if isinstance(reply, bytes) else reply)
+                _dbg(f"on_first_hit done ({time.perf_counter()-t0:.3f}s)")
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+            return status, reply
+
+        # IMPORTANT: do NOT call setblocking(True) here – that is equivalent to
+        # settimeout(None) and removes the timeout set on the socket at creation time
+        # (15 s by default, 30 s for enumeration connections), causing readline() to
+        # block indefinitely on continuation lines.
+
+        # Re-assert TCP_NODELAY immediately before sending the command.
+        # _smtp_sock_set_tcp_nodelay() is called once in connect(), but after
+        # STARTTLS the sock attribute is replaced with a new SSLSocket that may
+        # not have inherited the option; also enforces it after any reconnect.
+        # Do NOT use buffering=0 on makefile() – that causes byte-by-byte reads.
+        try:
+            sk = getattr(smtp, "sock", None)
+            if sk is not None:
+                sk.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except (OSError, AttributeError):
+            pass
+
+        smtp.putcmd(cmd, args)
+        _dbg(f"putcmd sent: {cmd} {args!r}")
+
+        resp: list[bytes] = []
+        first_hit_fired = False
+        code = -1
+        line_no = 0
+
+        while True:
+            line_no += 1
+            t_rl = time.perf_counter()
+            try:
+                line = file.readline(_MAXLINE + 1)
+            except (TimeoutError, socket.timeout):
+                _dbg(f"readline #{line_no} TIMEOUT after {time.perf_counter()-t_rl:.3f}s (resp so far: {len(resp)} lines)")
+                # Server stopped sending continuation lines within the timeout window.
+                # Return whatever we already collected (first positive line was already
+                # delivered via on_first_hit, so the finding is already printed).
+                if resp:
+                    break
+                raise smtplib.SMTPServerDisconnected("SMTP readline timed out")
+            except OSError as e:
+                _dbg(f"readline #{line_no} OSError after {time.perf_counter()-t_rl:.3f}s: {e}")
+                raise smtplib.SMTPServerDisconnected(f"Connection unexpectedly closed: {e}")
+
+            _dbg(f"readline #{line_no} took {time.perf_counter()-t_rl:.3f}s → {repr(line[:40])}")
+
+            if not line:
+                _dbg(f"readline #{line_no} returned empty (server closed connection)")
+                if resp:
+                    break
+                raise smtplib.SMTPServerDisconnected("Connection unexpectedly closed")
+            if len(line) > _MAXLINE:
+                raise smtplib.SMTPResponseException(500, b"Line too long")
+
+            resp.append(line[4:].strip(b" \t\r\n"))
+            try:
+                code = int(line[:3])
+            except (ValueError, IndexError):
+                code = -1
+
+            if not first_hit_fired and on_first_hit is not None and code != -1 and not (500 <= code <= 599):
+                first_hit_fired = True
+                _dbg(f"calling on_first_hit (code={code})")
+                t0 = time.perf_counter()
+                on_first_hit(line[4:].strip(b" \t\r\n"))
+                _dbg(f"on_first_hit done ({time.perf_counter()-t0:.3f}s)")
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+            is_last = line[3:4] != b"-"
+            _dbg(f"line #{line_no} code={code} last={is_last} char4={repr(line[3:4])}")
+            if is_last:
+                break
+
+        _dbg(f"streaming done: code={code} lines={len(resp)}")
+        return code, b"\n".join(resp)
+
+    @staticmethod
+    def _expn_vrfy_quick_display(reply, fallback_user: str) -> str:
+        """Fast display string from raw EXPN/VRFY reply (bounded scan; full parse may follow)."""
+        if isinstance(reply, bytes):
+            chunk = reply[:16384].decode("utf-8", errors="replace")
+        else:
+            chunk = str(reply)[:16384]
+        for m in re.finditer(r"<([^<>]{1,512})>", chunk):
+            x = m.group(1).strip()
+            if x:
+                return x
+        m = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", chunk)
+        if m:
+            return m.group(0)
+        lines = [ln.strip() for ln in chunk.replace("\r\n", "\n").split("\n") if ln.strip()]
+        if lines:
+            tail = re.sub(r"^\d{3}\s*", "", lines[0]).strip()
+            if tail and len(tail) < 500:
+                return tail
+        return fallback_user
+
+    @staticmethod
+    def _rcpt_reply_has_unknown(reply) -> bool:
+        """True if RCPT reply suggests unknown user (scan without full UTF-8 decode when bytes)."""
+        if isinstance(reply, bytes):
+            return b"UNKNOWN" in reply.upper()
+        return "UNKNOWN" in str(reply).upper()
+
+    @staticmethod
+    def _rcpt_response_suggests_bad_domain(response: str | None) -> bool:
+        """True when the RCPT server response indicates a domain-level rejection
+        (wrong / unroutable domain) rather than a user-level rejection.
+        Used to decide whether to show the -d/--domain hint.
+
+        A '550 User unknown' answer means the domain IS known to the server –
+        only the local part is absent – so no domain hint is needed.
+        Responses that do suggest a bad domain include relay-policy errors,
+        unresolvable-domain notices, and catch-all domain rejections."""
+        if not response:
+            return False
+        up = response.upper()
+        DOMAIN_INDICATORS = (
+            "RELAY ACCESS DENIED",
+            "RELAY DENIED",
+            "RELAYING DENIED",
+            "NO SUCH DOMAIN",
+            "DOMAIN NOT FOUND",
+            "DOMAIN DOES NOT EXIST",
+            "UNROUTEABLE",
+            "UNRESOLVABLE",
+            "CANNOT ROUTE",
+            "INVALID DOMAIN",
+            "BAD DESTINATION",
+            "NO ROUTE TO HOST",
+        )
+        return any(kw in up for kw in DOMAIN_INDICATORS)
+
+    @staticmethod
+    def _raw_write(data: bytes) -> None:
+        """Write bytes directly to fd 1 (stdout) via os.write(), bypassing all
+        Python I/O layers (TextIOWrapper + BufferedWriter).  On Linux, os.write()
+        to a TTY/pty is atomic for writes ≤ PIPE_BUF (4096 bytes) and is safe to
+        call from multiple threads simultaneously – each write is serialised by the
+        kernel.  Fallback to sys.stdout.buffer if fileno() is unavailable."""
+        try:
+            os.write(1, data)
+        except OSError:
+            try:
+                fd = sys.stdout.fileno()
+                os.write(fd, data)
+            except Exception:
+                try:
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
+                except Exception:
+                    pass
+
+    def _enum_clock_paint_unlocked(self) -> None:
+        """Redraw dynamic Checking line; caller must hold _enum_progress_print_lock."""
+        st = self._enum_clock_state
+        if st is None:
+            return
+        start = getattr(self, "_enum_progress_start", None) or time.time()
+        elapsed = self._format_enum_elapsed(start)
+        idx = int(st["idx"])
+        total = int(st["total"])
+        label = str(st["label"])
+        pct = min(100, max(1, int(100 * idx / total))) if total > 0 else 100
+        line_core = f"  {elapsed} ({pct}%) Checking:  {label}"
+        self._raw_write(f"\033[2K\r{line_core}".encode("utf-8", errors="replace"))
+
+    def _enum_clock_loop(self) -> None:
+        """Background refresh while waiting on SMTP (single-thread only).
+
+        Critical: state is read under a brief lock; stdout I/O is performed
+        OUTSIDE the lock so that the main thread (printing a finding) can always
+        acquire the lock instantly and is never blocked by slow PTY/flush calls.
+        """
+        while not self._enum_clock_stop.is_set():
+            if self._enum_clock_stop.wait(0.1):
+                break
+            if self.use_json:
+                time.sleep(0.05)
+                continue
+            # Read state snapshot under lock (microseconds only).
+            with self._enum_progress_print_lock:
+                st = self._enum_clock_state
+            # All I/O via os.write() (kernel-atomic, no Python buffer) so
+            # main thread is never blocked waiting on this thread's I/O.
+            if st is not None and not self._enum_clock_stop.is_set():
+                start = getattr(self, "_enum_progress_start", None) or time.time()
+                elapsed = self._format_enum_elapsed(start)
+                idx = int(st["idx"])
+                total = int(st["total"])
+                label = str(st["label"])
+                pct = min(100, max(1, int(100 * idx / total))) if total > 0 else 100
+                line_core = f"  {elapsed} ({pct}%) Checking:  {label}"
+                self._raw_write(f"\033[2K\r{line_core}".encode("utf-8", errors="replace"))
+            time.sleep(0.05)
+
+    def _enum_clock_ensure_started(self) -> None:
+        if self.use_json or getattr(self.args, "enum_threads", 1) > 1:
+            return
+        t = self._enum_clock_thread
+        if t is not None and t.is_alive():
+            if not self._enum_clock_stop.is_set():
+                return  # thread running normally
+            # Stop was signalled for a finding; wait briefly for thread to exit.
+            t.join(timeout=0.15)
+            if t.is_alive():
+                return  # will be retried on next _enum_wait_begin
+        self._enum_clock_stop.clear()
+        self._enum_clock_thread = threading.Thread(
+            target=self._enum_clock_loop,
+            daemon=True,
+            name="ptsrvtester-enum-clock",
+        )
+        self._enum_clock_thread.start()
+
+    def _enum_clock_shutdown(self) -> None:
+        """Stop clock thread after EXPN/VRFY/RCPT enumeration block."""
+        self._enum_wait_end()
+        self._enum_clock_stop.set()
+        t = self._enum_clock_thread
+        if t is not None:
+            if t.is_alive():
+                t.join(timeout=2.0)
+            self._enum_clock_thread = None
+        self._enum_clock_stop = threading.Event()
+
+    def _enum_wait_begin(self, idx: int, total: int, label: str) -> None:
+        """Start live clock line for one SMTP check (single-thread only)."""
+        if self.use_json:
+            return
+        if getattr(self.args, "enum_threads", 1) > 1:
+            return
+        with self._enum_progress_print_lock:
+            self._enum_clock_state = {"idx": idx, "total": total, "label": label}
+        self._enum_clock_ensure_started()
+        with self._enum_progress_print_lock:
+            self._enum_clock_paint_unlocked()
+
+    def _enum_pause_clock_for_finding(self) -> None:
+        """No-op: clock now runs continuously throughout enumeration.
+        Stopped only once at the end via _enum_clock_shutdown()."""
+
+    def _enum_streaming_emit_first_finding(self, idx: int, total: int, display: str) -> None:
+        """Print first finding with minimum latency.
+
+        Clock keeps running – os.write() calls are kernel-serialised on Linux TTY
+        (atomic for writes < PIPE_BUF / 4096 bytes), so concurrent clock and
+        finding writes never interleave at the byte level.
+        The leading \\n moves the finding to its own line below the live clock line.
+        """
+        if self.use_json or getattr(self.args, "enum_threads", 1) > 1:
+            return
+        start = getattr(self, "_enum_progress_start", None) or time.time()
+        elapsed = self._format_enum_elapsed(start)
+        pct = min(100, max(1, int(100 * idx / total))) if total > 0 else 100
+        line = f"  {elapsed} ({pct}%)  {display}\n"
+        # Leading \n ensures the finding appears on a fresh line below the clock.
+        # os.write() bypasses BufferedWriter – no race with the clock thread.
+        self._raw_write(("\n" + line).encode("utf-8", errors="replace"))
+
+    def _enum_wait_end(self) -> None:
+        """No-op: clock runs continuously throughout enumeration.
+        State is updated per-user by _enum_wait_begin(); stopped only once
+        at the very end by _enum_clock_shutdown()."""
+
+    def _enum_stdout_line_immediate(self, text: str, end: str = "\n") -> None:
+        """Thread-safe line + flush. With multiple threads, write via binary buffer to avoid TextIO batching."""
+        if self.use_json:
+            return
+        chunk = text + end
+        mt = getattr(self.args, "enum_threads", 1) > 1
+        with self._enum_progress_print_lock:
+            buf = getattr(sys.stdout, "buffer", None)
+            if mt and buf is not None:
+                try:
+                    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                    buf.write(chunk.encode(enc, errors="replace"))
+                    buf.flush()
+                    return
+                except (BrokenPipeError, TypeError, ValueError, OSError):
+                    pass
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+
+    def _enum_mt_progress_reset(self) -> None:
+        self._enum_mt_progress_line_active = False
+
+    def _enum_mt_progress_update(self, done: int, total: int) -> None:
+        """One-line progress for multi-thread enum (TTY only); avoids spamming Checking per user."""
+        if self.use_json or getattr(self.args, "enum_threads", 1) <= 1 or total <= 0:
+            return
+        start = getattr(self, "_enum_progress_start", None) or time.time()
+        elapsed = self._format_enum_elapsed(start)
+        pct = min(100, max(0, int(100 * done / total)))
+        line_core = f"  {elapsed} ({pct}%)  [{done}/{total}]"
+        with self._enum_progress_print_lock:
+            self._enum_mt_progress_line_active = True
+            if sys.stdout.isatty():
+                sys.stdout.write(f"\033[2K\r{line_core}")
+                sys.stdout.flush()
+
+    def _enum_mt_progress_finalize(self) -> None:
+        if self.use_json or getattr(self.args, "enum_threads", 1) <= 1:
+            return
+        with self._enum_progress_print_lock:
+            if self._enum_mt_progress_line_active:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self._enum_mt_progress_line_active = False
+
+    def _enum_progress_newline(self) -> None:
+        if self.use_json:
+            return
+        # Use _raw_write so we don't touch BufferedWriter while clock may also be
+        # writing to it (avoiding non-thread-safe concurrent BufferedWriter access).
+        self._raw_write(b"\n")
+
+    def _print_enum_finding(self, idx: int, total: int, payload: str) -> None:
+        if self.use_json:
+            return
+        start = getattr(self, "_enum_progress_start", None) or time.time()
+        elapsed = self._format_enum_elapsed(start)
+        pct = min(100, max(1, int(100 * idx / total))) if total > 0 else 100
+        if getattr(self.args, "enum_threads", 1) > 1:
+            line = f"  {elapsed} ({pct}%)  Found: {payload}"
+            self._enum_stdout_line_immediate(line)
+        else:
+            # Single-thread: clock keeps running concurrently.  The clock writes
+            # \033[2K\r<text> (no trailing newline) so the cursor stays on the
+            # clock line.  Prefixing with \033[2K\r here clears that stale clock
+            # text before writing the alias/finding, then \n advances past it.
+            # os.write() is kernel-serialised so there is no race with the clock.
+            line = f"\033[2K\r  {elapsed} ({pct}%)  {payload}\n"
+            self._raw_write(line.encode("utf-8", errors="replace"))
+
     def expn_vrfy_enumeration(self, method, smtp) -> list[str]:
         enum_threads = getattr(self.args, "enum_threads", 1)
         ehlo = (self.results.info and self.results.info.ehlo) or ""
@@ -3665,100 +4317,245 @@ class SMTP(BaseModule):
         self.ptdebug(f"Enumerating users:" + (f" ({enum_threads} threads)" if enum_threads > 1 else ""), Out.INFO)
         enumerated_users: list[str] = []
         total_aliases = 0 if method == "EXPN" else None
+        wl_total = len(self.wordlist)
 
         def _skip_non_ascii_no_utf8(s: str) -> bool:
             return not supports_smtputf8 and any(ord(c) >= 128 for c in s)
 
-        if enum_threads <= 1:
-            if supports_smtputf8:
-                smtp.command_encoding = "utf-8"
-            for user in self.wordlist:
-                if _skip_non_ascii_no_utf8(user):
-                    continue
-                try:
-                    status, reply = smtp.docmd(method, user)
-                except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
-                    self.ptdebug(
-                        f"{method} enumeration interrupted (connection closed/reset): {e}",
-                        Out.INFO,
-                    )
+        try:
+            if enum_threads <= 1:
+                if supports_smtputf8:
+                    smtp.command_encoding = "utf-8"
+
+                reconnect_after = getattr(self.args, "enum_reconnect_after", None)
+                consecutive_failures = 0
+
+                def _do_enum_reconnect() -> None:
+                    """Reconnect to reset accumulated teergrube / rate-limit state.
+                    Called after a successful find (when --enum-reconnect-after is set)
+                    and after N consecutive failures."""
+                    nonlocal smtp, consecutive_failures
+                    consecutive_failures = 0
+                    # Update clock label so the user can see reconnect is in progress
+                    # and does not mistake the old user label for a wordlist restart.
+                    if not self.use_json and enum_threads <= 1:
+                        with self._enum_progress_print_lock:
+                            if self._enum_clock_state is not None:
+                                self._enum_clock_state = dict(self._enum_clock_state)
+                                self._enum_clock_state["label"] = "(reconnecting...)"
                     try:
-                        smtp = self.get_smtp_handler()
-                        smtp.docmd("EHLO", f"{self.fqdn}")
+                        smtp = self.get_smtp_handler(timeout=15.0)
+                        smtp.docmd("EHLO", self.fqdn)
                         if supports_smtputf8:
                             smtp.command_encoding = "utf-8"
-                        status, reply = smtp.docmd(method, user)
                     except Exception:
-                        break
-                if status != 550:
-                    user_email = re.findall(r"<(.*?)>", self.bytes_to_str(reply))
-                    if user_email:
-                        enumerated_users.extend(user_email)
-                        self.ptdebug(user_email[0])
-                    if method == "EXPN" and len(user_email) > 1:
-                        for alias in user_email[1:]:
-                            total_aliases += len(user_email[1:])
-                            self.ptdebug(f"   {alias}", Out.ADDITIONS)
-        else:
-            user_queue: queue.Queue[str | None] = queue.Queue()
-            for u in self.wordlist:
-                if not _skip_non_ascii_no_utf8(u):
-                    user_queue.put(u)
-            for _ in range(enum_threads):
-                user_queue.put(None)
-            result_lock = threading.Lock()
+                        pass  # best-effort; next putcmd will trigger the existing error handler
 
-            def worker() -> None:
-                try:
-                    conn = self.get_smtp_handler()
-                    conn.docmd("EHLO", f"{self.fqdn}")
-                    if supports_smtputf8:
-                        conn.command_encoding = "utf-8"
-                except Exception:
-                    return
-                while True:
-                    user = user_queue.get()
-                    if user is None:
-                        user_queue.task_done()
-                        break
+                for idx, user in enumerate(self.wordlist, start=1):
+                    if _skip_non_ascii_no_utf8(user):
+                        continue
+                    if not self.use_json:
+                        self._enum_wait_begin(idx, wl_total, user)
+
+                    # Streaming callback: fires on the FIRST positive response line,
+                    # before any continuation lines arrive.
+                    _cur_idx = idx
+                    _first_preview: list[str] = []
+
+                    def _on_first_hit(line_bytes, _u=user, _i=_cur_idx):
+                        display = self._expn_vrfy_quick_display(line_bytes, _u)
+                        _first_preview.append(display)
+                        if not self.use_json:
+                            self._enum_streaming_emit_first_finding(_i, wl_total, display)
+
                     try:
-                        status, reply = conn.docmd(method, user)
-                    except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
+                        status, reply = self._smtp_command_streaming(
+                            smtp, method, user,
+                            on_first_hit=None if self.use_json else _on_first_hit,
+                            debug=getattr(self.args, "debug", False),
+                        )
+                    except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
+                        self.ptdebug(
+                            f"{method} enumeration interrupted (connection closed/reset): {e}",
+                            Out.INFO,
+                        )
+                        # Reconnect and immediately retry the same user.
+                        # Use a shorter 10 s timeout: if the server was intentionally
+                        # silent on the old connection (rate-limit / greylisting), a
+                        # fresh TCP connection almost always gets a fast reply, so 10 s
+                        # is more than enough and avoids a second full 30 s stall.
+                        _first_preview.clear()
                         try:
-                            conn = self.get_smtp_handler()
-                            conn.docmd("EHLO", f"{self.fqdn}")
+                            smtp = self.get_smtp_handler(timeout=10.0)
+                            smtp.docmd("EHLO", f"{self.fqdn}")
                             if supports_smtputf8:
-                                conn.command_encoding = "utf-8"
-                            status, reply = conn.docmd(method, user)
+                                smtp.command_encoding = "utf-8"
+                            status, reply = self._smtp_command_streaming(
+                                smtp, method, user,
+                                on_first_hit=None if self.use_json else _on_first_hit,
+                                debug=getattr(self.args, "debug", False),
+                            )
+                            # Retry succeeded: restore 15 s timeout so the rest of
+                            # the wordlist is not stuck with the short 10 s window.
+                            try:
+                                smtp.sock.settimeout(15.0)
+                            except Exception:
+                                pass
                         except Exception:
-                            user_queue.task_done()
-                            continue
+                            # Retry also failed – preserve connection for next user.
+                            try:
+                                smtp = self.get_smtp_handler(timeout=15.0)
+                                smtp.docmd("EHLO", f"{self.fqdn}")
+                                if supports_smtputf8:
+                                    smtp.command_encoding = "utf-8"
+                            except Exception:
+                                break
+                            status, reply = 550, b""
+                    finally:
+                        if not self.use_json and enum_threads <= 1:
+                            self._enum_wait_end()
                     if status != 550:
-                        user_email = re.findall(r"<(.*?)>", self.bytes_to_str(reply))
-                        if user_email:
-                            with result_lock:
-                                enumerated_users.extend(user_email)
-                                self.ptdebug(user_email[0])
-                    user_queue.task_done()
+                        preview = _first_preview[0] if _first_preview else self._expn_vrfy_quick_display(reply, user)
+                        if not _first_preview and not self.use_json:
+                            self._enum_streaming_emit_first_finding(idx, wl_total, preview)
+                        reply_str = self.bytes_to_str(reply)
+                        user_email = self._expn_vrfy_result_strings(reply_str)
+                        if not user_email:
+                            user_email = [preview]
+                        enumerated_users.extend(user_email)
+                        if not self.use_json:
+                            for em in user_email:
+                                if em != preview:
+                                    self._print_enum_finding(idx, wl_total, em)
+                        elif self.use_json:
+                            self.ptdebug(user_email[0])
+                        if method == "EXPN" and len(user_email) > 1:
+                            for alias in user_email[1:]:
+                                total_aliases += len(user_email[1:])
+                                self.ptdebug(f"   {alias}", Out.ADDITIONS)
+                        # Reconnect after a find only when --enum-reconnect-after is set;
+                        # resets accumulated teergrube delay on the connection.
+                        if reconnect_after is not None and reconnect_after != -1:
+                            _do_enum_reconnect()
+                    else:
+                        consecutive_failures += 1
+                        if (reconnect_after is not None and reconnect_after > 0
+                                and consecutive_failures >= reconnect_after):
+                            _do_enum_reconnect()
+                if not self.use_json and enum_threads <= 1:
+                    self._enum_progress_newline()
+            else:
+                user_queue: queue.Queue[str | None] = queue.Queue()
+                work_total = 0
+                for u in self.wordlist:
+                    if not _skip_non_ascii_no_utf8(u):
+                        user_queue.put(u)
+                        work_total += 1
+                for _ in range(enum_threads):
+                    user_queue.put(None)
+                result_lock = threading.Lock()
+                progress_lock = threading.Lock()
+                completed = [0]
+                processed = [0]
 
-            threads_list = [threading.Thread(target=worker) for _ in range(enum_threads)]
-            for t in threads_list:
-                t.start()
-            for t in threads_list:
-                t.join()
-            total_aliases = 0
+                def bump_completed() -> int:
+                    with progress_lock:
+                        completed[0] += 1
+                        return completed[0]
 
-        additional_message = (
-            f"(total {len(enumerated_users) + (total_aliases or 0)} with aliases)"
-            if method == "EXPN"
-            else ""
-        )
-        self.ptdebug(f" ")
-        self.ptdebug(f"-- Enumerated {len(enumerated_users)} emails {additional_message} --")
-        self.ptdebug(f" ")
+                def bump_processed() -> int:
+                    with progress_lock:
+                        processed[0] += 1
+                        return processed[0]
 
-        self.already_enumerated = True
-        return enumerated_users
+                if not self.use_json:
+                    self._enum_mt_progress_reset()
+
+                def worker() -> None:
+                    conn = None
+                    while True:
+                        user = user_queue.get()
+                        if user is None:
+                            user_queue.task_done()
+                            break
+                        cur = bump_completed()
+                        try:
+                            if conn is None:
+                                try:
+                                    conn = self.get_smtp_handler()
+                                    conn.docmd("EHLO", f"{self.fqdn}")
+                                    if supports_smtputf8:
+                                        conn.command_encoding = "utf-8"
+                                except Exception:
+                                    continue
+
+                            _mt_preview: list[str] = []
+
+                            def _mt_on_first_hit(line_bytes, _u=user, _c=cur):
+                                display = self._expn_vrfy_quick_display(line_bytes, _u)
+                                _mt_preview.append(display)
+                                if not self.use_json:
+                                    self._print_enum_finding(_c, work_total, display)
+
+                            try:
+                                status, reply = self._smtp_command_streaming(
+                                    conn, method, user,
+                                    on_first_hit=None if self.use_json else _mt_on_first_hit,
+                                    debug=getattr(self.args, "debug", False),
+                                )
+                            except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
+                                try:
+                                    conn = self.get_smtp_handler()
+                                    conn.docmd("EHLO", f"{self.fqdn}")
+                                    if supports_smtputf8:
+                                        conn.command_encoding = "utf-8"
+                                    status, reply = conn.docmd(method, user)
+                                except Exception:
+                                    continue
+                            if status != 550:
+                                preview = _mt_preview[0] if _mt_preview else self._expn_vrfy_quick_display(reply, user)
+                                if not _mt_preview and not self.use_json:
+                                    self._print_enum_finding(cur, work_total, preview)
+                                reply_str = self.bytes_to_str(reply)
+                                user_email = self._expn_vrfy_result_strings(reply_str)
+                                if not user_email:
+                                    user_email = [preview]
+                                with result_lock:
+                                    enumerated_users.extend(user_email)
+                                if not self.use_json:
+                                    for em in user_email:
+                                        if em != preview:
+                                            self._print_enum_finding(cur, work_total, em)
+                                elif self.use_json:
+                                    self.ptdebug(user_email[0])
+                        finally:
+                            p = bump_processed()
+                            if not self.use_json:
+                                self._enum_mt_progress_update(p, work_total)
+                            user_queue.task_done()
+
+                threads_list = [threading.Thread(target=worker) for _ in range(enum_threads)]
+                for t in threads_list:
+                    t.start()
+                for t in threads_list:
+                    t.join()
+                if not self.use_json:
+                    self._enum_mt_progress_finalize()
+                total_aliases = 0
+
+            additional_message = (
+                f"(total {len(enumerated_users) + (total_aliases or 0)} with aliases)"
+                if method == "EXPN"
+                else ""
+            )
+            self.ptdebug(f" ")
+            self.ptdebug(f"-- Enumerated {len(enumerated_users)} emails {additional_message} --")
+            self.ptdebug(f" ")
+
+            self.already_enumerated = True
+            return enumerated_users
+        finally:
+            self._enum_clock_shutdown()
 
     @staticmethod
     def _is_rbl_blocked(reply_text: str) -> bool:
@@ -4076,90 +4873,191 @@ class SMTP(BaseModule):
             )
         self.ptdebug(f"Enumerating users (domain: {domain}):" + (f" ({enum_threads} threads)" if enum_threads > 1 else ""), Out.INFO)
         enumerated_users: list[str] = []
+        wl_total = len(self.wordlist)
 
         def _skip(local: str) -> bool:
             return not supports_smtputf8 and any(ord(c) >= 128 for c in local)
 
-        if enum_threads <= 1:
-            if supports_smtputf8:
-                smtp.command_encoding = "utf-8"
-            for user in self.wordlist:
-                local = user.split("@")[0].strip()
-                if _skip(local):
-                    continue
-                try:
-                    status, reply = smtp.docmd("RCPT TO:", f"<{local}@{domain}>")
-                except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
-                    self.ptdebug(
-                        f"RCPT enumeration interrupted (connection closed/reset): {e}",
-                        Out.INFO,
-                    )
+        try:
+            if enum_threads <= 1:
+                if supports_smtputf8:
+                    smtp.command_encoding = "utf-8"
+
+                reconnect_after = getattr(self.args, "enum_reconnect_after", None)
+                consecutive_failures = 0
+
+                def _do_rcpt_reconnect() -> None:
+                    """Reconnect to reset accumulated teergrube / rate-limit state.
+                    Called after a successful find (when --enum-reconnect-after is set)
+                    and after N consecutive failures."""
+                    nonlocal smtp, consecutive_failures
+                    consecutive_failures = 0
+                    # Update clock label so the user can see reconnect is in progress
+                    # and does not mistake the old user label for a wordlist restart.
+                    if not self.use_json and enum_threads <= 1:
+                        with self._enum_progress_print_lock:
+                            if self._enum_clock_state is not None:
+                                self._enum_clock_state = dict(self._enum_clock_state)
+                                self._enum_clock_state["label"] = "(reconnecting...)"
                     try:
-                        smtp = self.get_smtp_handler()
-                        smtp.docmd("EHLO", f"{self.fqdn}")
+                        smtp = self.get_smtp_handler(timeout=15.0)
+                        smtp.docmd("EHLO", self.fqdn)
                         if supports_smtputf8:
                             smtp.command_encoding = "utf-8"
                         smtp.docmd("MAIL FROM:", "<mail@from.me>")
-                        status, reply = smtp.docmd("RCPT TO:", f"<{local}@{domain}>")
                     except Exception:
-                        break
-                if status != 550 and not "UNKNOWN" in self.bytes_to_str(reply).upper():
-                    enumerated_users.append(local)
-                    self.ptdebug(local)
-        else:
-            locals_to_try = [u.split("@")[0].strip() for u in self.wordlist if not _skip(u.split("@")[0].strip())]
-            user_queue: queue.Queue[str | None] = queue.Queue()
-            for local in locals_to_try:
-                user_queue.put(local)
-            for _ in range(enum_threads):
-                user_queue.put(None)
-            result_lock = threading.Lock()
+                        pass  # best-effort; next docmd will trigger the existing error handler
 
-            def rcpt_worker() -> None:
-                try:
-                    conn = self.get_smtp_handler()
-                    conn.docmd("EHLO", f"{self.fqdn}")
-                    if supports_smtputf8:
-                        conn.command_encoding = "utf-8"
-                    conn.docmd("MAIL FROM:", "<mail@from.me>")
-                except Exception:
-                    return
-                while True:
-                    local = user_queue.get()
-                    if local is None:
-                        user_queue.task_done()
-                        break
+                for idx, user in enumerate(self.wordlist, start=1):
+                    local = user.split("@")[0].strip()
+                    if _skip(local):
+                        continue
+                    label = f"{local}@{domain}"
+                    if not self.use_json:
+                        self._enum_wait_begin(idx, wl_total, label)
                     try:
-                        status, reply = conn.docmd("RCPT TO:", f"<{local}@{domain}>")
-                    except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
+                        status, reply = smtp.docmd("RCPT TO:", f"<{local}@{domain}>")
+                    except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
+                        self.ptdebug(
+                            f"RCPT enumeration interrupted (connection closed/reset): {e}",
+                            Out.INFO,
+                        )
+                        # Reconnect + immediate retry with 10 s timeout (same rationale
+                        # as in expn_vrfy_enumeration: fresh TCP connection gets a fast
+                        # reply from servers that silence old connections deliberately).
                         try:
-                            conn = self.get_smtp_handler()
-                            conn.docmd("EHLO", f"{self.fqdn}")
+                            smtp = self.get_smtp_handler(timeout=10.0)
+                            smtp.docmd("EHLO", f"{self.fqdn}")
                             if supports_smtputf8:
-                                conn.command_encoding = "utf-8"
-                            conn.docmd("MAIL FROM:", "<mail@from.me>")
-                            status, reply = conn.docmd("RCPT TO:", f"<{local}@{domain}>")
+                                smtp.command_encoding = "utf-8"
+                            smtp.docmd("MAIL FROM:", "<mail@from.me>")
+                            status, reply = smtp.docmd("RCPT TO:", f"<{local}@{domain}>")
+                            # Retry succeeded: restore 15 s timeout for remaining users.
+                            try:
+                                smtp.sock.settimeout(15.0)
+                            except Exception:
+                                pass
                         except Exception:
-                            user_queue.task_done()
-                            continue
-                    if status != 550 and not "UNKNOWN" in self.bytes_to_str(reply).upper():
-                        with result_lock:
-                            enumerated_users.append(local)
+                            # Retry also failed – preserve connection for next user.
+                            try:
+                                smtp = self.get_smtp_handler(timeout=15.0)
+                                smtp.docmd("EHLO", f"{self.fqdn}")
+                                if supports_smtputf8:
+                                    smtp.command_encoding = "utf-8"
+                                smtp.docmd("MAIL FROM:", "<mail@from.me>")
+                            except Exception:
+                                break
+                            status, reply = 550, b""
+                    finally:
+                        if not self.use_json and enum_threads <= 1:
+                            self._enum_wait_end()
+                    if status != 550 and not self._rcpt_reply_has_unknown(reply):
+                        if not self.use_json:
+                            # Stop clock before printing (same logic as
+                            # Clock keeps running; _print_enum_finding uses
+                            # \033[2K\r to clear the clock line before writing.
+                            self._enum_progress_newline()
+                            self._print_enum_finding(idx, wl_total, label)
+                        elif self.use_json:
                             self.ptdebug(local)
-                    user_queue.task_done()
+                        enumerated_users.append(local)
+                        # Reconnect after a find only when --enum-reconnect-after is set;
+                        # resets accumulated teergrube delay on the connection.
+                        if reconnect_after is not None and reconnect_after != -1:
+                            _do_rcpt_reconnect()
+                    else:
+                        consecutive_failures += 1
+                        if (reconnect_after is not None and reconnect_after > 0
+                                and consecutive_failures >= reconnect_after):
+                            _do_rcpt_reconnect()
+                if not self.use_json and enum_threads <= 1:
+                    self._enum_progress_newline()
+            else:
+                locals_to_try = [u.split("@")[0].strip() for u in self.wordlist if not _skip(u.split("@")[0].strip())]
+                work_total = len(locals_to_try)
+                user_queue: queue.Queue[str | None] = queue.Queue()
+                for local in locals_to_try:
+                    user_queue.put(local)
+                for _ in range(enum_threads):
+                    user_queue.put(None)
+                result_lock = threading.Lock()
+                progress_lock = threading.Lock()
+                completed = [0]
+                processed = [0]
 
-            threads_list = [threading.Thread(target=rcpt_worker) for _ in range(enum_threads)]
-            for t in threads_list:
-                t.start()
-            for t in threads_list:
-                t.join()
+                def bump_completed() -> int:
+                    with progress_lock:
+                        completed[0] += 1
+                        return completed[0]
 
-        self.ptdebug(f" ")
-        self.ptdebug(f"-- Enumerated {len(enumerated_users)} users --")
-        self.ptdebug(f" ")
+                def bump_processed() -> int:
+                    with progress_lock:
+                        processed[0] += 1
+                        return processed[0]
 
-        self.already_enumerated = True
-        return enumerated_users
+                if not self.use_json:
+                    self._enum_mt_progress_reset()
+
+                def rcpt_worker() -> None:
+                    conn = None
+                    while True:
+                        local = user_queue.get()
+                        if local is None:
+                            user_queue.task_done()
+                            break
+                        cur = bump_completed()
+                        label = f"{local}@{domain}"
+                        try:
+                            if conn is None:
+                                try:
+                                    conn = self.get_smtp_handler()
+                                    conn.docmd("EHLO", f"{self.fqdn}")
+                                    if supports_smtputf8:
+                                        conn.command_encoding = "utf-8"
+                                    conn.docmd("MAIL FROM:", "<mail@from.me>")
+                                except Exception:
+                                    continue
+                            try:
+                                status, reply = conn.docmd("RCPT TO:", f"<{local}@{domain}>")
+                            except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
+                                try:
+                                    conn = self.get_smtp_handler()
+                                    conn.docmd("EHLO", f"{self.fqdn}")
+                                    if supports_smtputf8:
+                                        conn.command_encoding = "utf-8"
+                                    conn.docmd("MAIL FROM:", "<mail@from.me>")
+                                    status, reply = conn.docmd("RCPT TO:", f"<{local}@{domain}>")
+                                except Exception:
+                                    continue
+                            if status != 550 and not self._rcpt_reply_has_unknown(reply):
+                                if not self.use_json:
+                                    self._print_enum_finding(cur, work_total, label)
+                                elif self.use_json:
+                                    self.ptdebug(local)
+                                with result_lock:
+                                    enumerated_users.append(local)
+                        finally:
+                            p = bump_processed()
+                            if not self.use_json:
+                                self._enum_mt_progress_update(p, work_total)
+                            user_queue.task_done()
+
+                threads_list = [threading.Thread(target=rcpt_worker) for _ in range(enum_threads)]
+                for t in threads_list:
+                    t.start()
+                for t in threads_list:
+                    t.join()
+                if not self.use_json:
+                    self._enum_mt_progress_finalize()
+
+            self.ptdebug(f" ")
+            self.ptdebug(f"-- Enumerated {len(enumerated_users)} users --")
+            self.ptdebug(f" ")
+
+            self.already_enumerated = True
+            return enumerated_users
+        finally:
+            self._enum_clock_shutdown()
 
     def bytes_to_str(self, text):
         return text.decode("utf-8")
@@ -4186,7 +5084,7 @@ class SMTP(BaseModule):
 
     def test_blacklist(self, target: str) -> tuple[BlacklistResult | None, bool]:
         """Run blacklist check. Returns (result, skipped_private). skipped_private=True for private IP (no API call)."""
-        self.ptdebug("Testing target against blacklists:", title=True)
+        self.ptdebug("    Testing target against blacklists:", title=True)
         if self.target_is_ip and _is_private_ip(target):
             self.ptdebug("Blacklist test skipped: private/internal IP (not on public blacklists)", Out.INFO)
             return (None, True)
@@ -4495,7 +5393,7 @@ class SMTP(BaseModule):
         All -u / -w entries are probed; enumerated_users lists those differing from invalid baseline.
         """
         if self.args.user:
-            candidates = [self.args.user.strip()]
+            candidates = text_or_file(self.args.user, None)
         else:
             candidates = [u.strip() for u in (self.wordlist or []) if u.strip()]
         if not candidates:
@@ -6855,6 +7753,8 @@ class SMTP(BaseModule):
                     detail=det1 or "Probe 1 incomplete",
                     message_accepted_return_path=False,
                     test_id_return_path="",
+                    probe1_detail=det1,
+                    probe1_indeterminate=True,
                 )
 
             try:
@@ -6910,6 +7810,10 @@ class SMTP(BaseModule):
                 detail=detail,
                 message_accepted_return_path=acc2,
                 test_id_return_path=test_id_rp if acc2 else "",
+                probe1_detail=det1,
+                probe2_detail=det2,
+                probe1_indeterminate=False,
+                probe2_indeterminate=indet2,
             )
 
         except (socket.timeout, ConnectionRefusedError, OSError) as e:
@@ -7862,7 +8766,7 @@ class SMTP(BaseModule):
         port = self.args.target.port
         rcpt_to = str(self.args.rcpt_to).strip()
         cc_raw = getattr(self.args, "cc", None) or ""
-        bcc_raw = getattr(self.args, "bcc", None) or ""
+        bcc_raw = getattr(self.args, "bcc_test", None) or ""
         cc_list = [a.strip() for a in cc_raw.split(",") if a.strip()]
         bcc_list = [a.strip() for a in bcc_raw.split(",") if a.strip()]
         mail_from = self.args.mail_from or f"bcctest@{self.fqdn}"
@@ -9374,7 +10278,34 @@ class SMTP(BaseModule):
         if self.args.slow_down:
             self.test_slowdown_enumeration(smtp, enumeration_vulns)
 
+        enumeration_results: dict[str, list[str] | None] | None = None
+        catch_all = getattr(self.results, "catch_all", None)
+        self._enum_methods_streamed_early = False
+        self._enum_hits_streamed_live = False
+
         if self.wordlist is not None:
+            if not self.use_json:
+                partial_enum_rows: list[EnumResult] = []
+                for method in enumeration_vulns.keys():
+                    if (vulnerable := enumeration_vulns[method]) is not None:
+                        if self.args.slow_down:
+                            slow_down = self.slow_down_results[method]
+                        else:
+                            slow_down = None
+                        test_replies = getattr(self, "_enum_test_replies", {})
+                        server_reply = test_replies.get(method)
+                        blocked_by_rbl = method in getattr(self, "_enum_blocked_by_rbl", set())
+                        partial_enum_rows.append(
+                            EnumResult(method, vulnerable, slow_down, None, server_reply, blocked_by_rbl)
+                        )
+                self._stream_enumeration_method_rows(partial_enum_rows, catch_all)
+                self._enum_methods_streamed_early = True
+                if self._wordlist_enumeration_will_run(enumeration_vulns, catch_all):
+                    # Out.TEXT: no INFO bullet; color only via get_colored_text → single "[+]"
+                    self.ptprint(get_colored_text("[+] Enumerated", "INFO"), Out.TEXT)
+                    sys.stdout.flush()
+                    self._enum_progress_start = time.time()
+                    self._enum_hits_streamed_live = True
             enumeration_results = self.do_enumeration(smtp, enumeration_vulns)
 
         enum_results: list[EnumResult] = []
@@ -9386,7 +10317,7 @@ class SMTP(BaseModule):
                 else:
                     slow_down = None
 
-                if self.wordlist is not None:
+                if self.wordlist is not None and enumeration_results is not None:
                     wordlist_result = enumeration_results[method]
                 else:
                     wordlist_result = None
@@ -9851,14 +10782,24 @@ class SMTP(BaseModule):
                 for line in (rlim.server_response or "").replace("\r", "").splitlines():
                     self.ptprint(f"        {line}", Out.TEXT)
             if getattr(rlim, "no_session_limit", False):
-                vuln_icon = get_colored_text("[✗]", color="VULN")
-                failed = getattr(rlim, "failed_before_limit", 0)
+                # All test addresses were rejected – we cannot conclude that session
+                # limits are absent, only that the server did not disconnect during the
+                # rejected-address probes.  Show a neutral informational message instead
+                # of a vulnerability finding so the two lines don't contradict each other.
+                # Show the -d hint only when the response suggests a domain-level error
+                # (relay denied, no such domain, …).  A "550 User unknown" reply means
+                # the domain is recognised – only the local part is absent – so no hint.
+                needs_domain_hint = (
+                    not getattr(self.args, "domain", None)
+                    and self._rcpt_response_suggests_bad_domain(rlim.server_response)
+                )
+                domain_hint = " Try -d/--domain <domain>." if needs_domain_hint else ""
                 self.ptprint(
-                    f"    {vuln_icon} Server does not limit failed RCPT attempts per session "
-                    f"(allowed {failed} attempts without disconnect – no smtpd_hard_error_limit)",
+                    f"    {info_icon} Could not determine session RCPT limit – "
+                    f"all test addresses were rejected.{domain_hint}",
                     Out.TEXT,
                 )
-            if not getattr(self.args, "domain", None):
+            elif not getattr(self.args, "domain", None) and self._rcpt_response_suggests_bad_domain(rlim.server_response):
                 self.ptprint(
                     f"    {info_icon} Try -d/--domain <domain> to set recipient domain for this test",
                     Out.TEXT,
@@ -9955,62 +10896,69 @@ class SMTP(BaseModule):
         else:
             requested_set = {self.args.enumerate.upper()} if self.args.enumerate else {"EXPN", "VRFY", "RCPT"}
         filtered = [e for e in enum_results if e.method.upper() in requested_set]
+        skip_methods = getattr(self, "_enum_methods_streamed_early", False)
+        skip_hits = getattr(self, "_enum_hits_streamed_live", False)
+        if skip_methods:
+            self._enum_methods_streamed_early = False
+        if skip_hits:
+            self._enum_hits_streamed_live = False
+
         warn_icon = get_colored_text("[!]", color="WARNING")
-        for e in filtered:
-            if catch_all == "configured":
-                self.ptprint(
-                    f"    {warn_icon} {e.method.upper()} method: Indeterminate (Useless due to Catch All)",
-                    Out.TEXT,
-                )
-            elif e.blocked_by_rbl:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(
-                    f"    {icon} {e.method.upper()} method protected by RBL/Reputation (Client IP blocked)",
-                    Out.TEXT,
-                )
-                if e.server_reply:
-                    for line in (e.server_reply or "").replace("\r", "").splitlines():
-                        self.ptprint(f"        {line.strip()}", Out.TEXT)
-            else:
-                slowdown = ""
-                if e.slowdown is not None:
-                    slowdown = " (rate limited)" if e.slowdown else " (not rate limited)"
-                icon = get_colored_text("[✗]", color="VULN") if e.vulnerable else get_colored_text("[✓]", color="NOTVULN")
-                if e.vulnerable:
+        if not skip_methods:
+            for e in filtered:
+                if catch_all == "configured":
+                    self.ptprint(
+                        f"    {warn_icon} {e.method.upper()} method: Indeterminate (Useless due to Catch All)",
+                        Out.TEXT,
+                    )
+                elif e.blocked_by_rbl:
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(
+                        f"    {icon} {e.method.upper()} method protected by RBL/Reputation (Client IP blocked)",
+                        Out.TEXT,
+                    )
                     if e.server_reply:
-                        raw = (e.server_reply or "").replace("\r", "").splitlines()
-                        parts = [re.sub(r" +", " ", p.strip()) for p in raw if p.strip()]
-                        if parts:
-                            if len(parts) == 1:
-                                self.ptprint(f"    {icon} {e.method.upper()} method is enabled ({parts[0]}){slowdown}", Out.TEXT)
+                        for line in (e.server_reply or "").replace("\r", "").splitlines():
+                            self.ptprint(f"        {line.strip()}", Out.TEXT)
+                else:
+                    slowdown = ""
+                    if e.slowdown is not None:
+                        slowdown = " (rate limited)" if e.slowdown else " (not rate limited)"
+                    icon = get_colored_text("[✗]", color="VULN") if e.vulnerable else get_colored_text("[✓]", color="NOTVULN")
+                    if e.vulnerable:
+                        if e.server_reply:
+                            raw = (e.server_reply or "").replace("\r", "").splitlines()
+                            parts = [re.sub(r" +", " ", p.strip()) for p in raw if p.strip()]
+                            if parts:
+                                if len(parts) == 1:
+                                    self.ptprint(f"    {icon} {e.method.upper()} method is enabled ({parts[0]}){slowdown}", Out.TEXT)
+                                else:
+                                    self.ptprint(
+                                        f"    {icon} {e.method.upper()} method is enabled ({parts[0]}{')' if len(parts) == 1 else ''}{slowdown if len(parts) == 1 else ''}",
+                                        Out.TEXT,
+                                    )
+                                    for i, part in enumerate(parts[1:]):
+                                        is_last = i == len(parts) - 2
+                                        self.ptprint(f"        {part}{')' if is_last else ''}{slowdown if is_last else ''}", Out.TEXT)
                             else:
-                                self.ptprint(
-                                    f"    {icon} {e.method.upper()} method is enabled ({parts[0]}{')' if len(parts) == 1 else ''}{slowdown if len(parts) == 1 else ''}",
-                                    Out.TEXT,
-                                )
-                                for i, part in enumerate(parts[1:]):
-                                    is_last = i == len(parts) - 2
-                                    self.ptprint(f"        {part}{')' if is_last else ''}{slowdown if is_last else ''}", Out.TEXT)
+                                self.ptprint(f"    {icon} {e.method.upper()} method is enabled{slowdown}", Out.TEXT)
                         else:
                             self.ptprint(f"    {icon} {e.method.upper()} method is enabled{slowdown}", Out.TEXT)
                     else:
-                        self.ptprint(f"    {icon} {e.method.upper()} method is enabled{slowdown}", Out.TEXT)
-                else:
-                    # Show policy note when available (relay protection / admin prohibition)
-                    if e.server_reply and "Relay protection active" in e.server_reply:
-                        status = "is deny (Relay protection active)"
-                    elif e.server_reply and "Administrative prohibition" in e.server_reply:
-                        status = "is deny (Administrative prohibition)"
-                    else:
-                        status = "is deny"
-                    self.ptprint(f"    {icon} {e.method.upper()} method {status}{slowdown}", Out.TEXT)
-        for e in filtered:
-            if e.vulnerable and (results := e.results) is not None:
-                sorted_results = sorted(results, key=str)
-                email_count = sum(1 for r in sorted_results if "@" in str(r))
-                self.ptprint(f"Enumerated {email_count} users", Out.INFO)
-                for r in sorted_results:
-                    self.ptprint(f"    {r}")
+                        # Show policy note when available (relay protection / admin prohibition)
+                        if e.server_reply and "Relay protection active" in e.server_reply:
+                            status = "is deny (Relay protection active)"
+                        elif e.server_reply and "Administrative prohibition" in e.server_reply:
+                            status = "is deny (Administrative prohibition)"
+                        else:
+                            status = "is deny"
+                        self.ptprint(f"    {icon} {e.method.upper()} method {status}{slowdown}", Out.TEXT)
+        if not skip_hits:
+            for e in filtered:
+                if e.vulnerable and (results := e.results) is not None:
+                    sorted_results = sorted(results, key=str)
+                    for r in sorted_results:
+                        self.ptprint(f"    {r}")
         info_icon = get_colored_text("[*]", color="INFO")
         if catch_all == "configured":
             self.ptprint(f"    {info_icon} Catch All mailbox configured", Out.TEXT)
@@ -10054,8 +11002,12 @@ class SMTP(BaseModule):
         if ae is None:
             return
         if ae.indeterminate:
-            icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(f"    {icon} Indeterminate: {ae.detail or 'Could not determine'}", Out.TEXT)
+            if ae.detail == "Server does not advertise AUTH LOGIN or AUTH NTLM":
+                icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(f"    {icon} Not vulnerable: {ae.detail}", Out.TEXT)
+            else:
+                icon = get_colored_text("[*]", color="INFO")
+                self.ptprint(f"    {icon} Indeterminate: {ae.detail or 'Could not determine'}", Out.TEXT)
             return
         if ae.vulnerable:
             icon = get_colored_text("[✗]", color="VULN")
@@ -10546,40 +11498,103 @@ class SMTP(BaseModule):
                     )
 
     def _stream_bounce_replay_result(self) -> None:
+        err_icon = get_colored_text("[✗]", color="VULN")
+        ok_icon = get_colored_text("[✓]", color="NOTVULN")
+        info_icon = get_colored_text("[*]", color="INFO")
+        warn_icon = get_colored_text("[!]", color="WARNING")
+        dbg_icon = get_colored_text("[i]", color="INFO")
+
         if (err := self.results.bounce_replay_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Bounce replay test failed: {err}", Out.TEXT)
+            self.ptprint(f"    {err_icon} Bounce replay test failed: {err}", Out.TEXT)
             return
         br = self.results.bounce_replay
         if br is None:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
-        warn_icon = get_colored_text("[!]", color="WARNING")
-        if not self.use_json and br.smtp_trace:
-            for line in br.smtp_trace:
-                self.ptprint(f"    {info_icon} {line}", Out.TEXT)
-        if br.tarpitting_or_timeout:
-            self.ptprint(f"    {warn_icon} Timeout (30s) - possible greylisting or tarpitting", Out.TEXT)
-        if br.indeterminate:
-            self.ptprint(f"    {info_icon} Indeterminate: {br.detail or 'Could not complete'}", Out.TEXT)
-        elif br.message_accepted or getattr(br, "message_accepted_return_path", False):
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} POTENTIALLY VULNERABLE", Out.TEXT)
-            self.ptprint(
-                "    Server accepted DATA for a non-deliverable RCPT (high backscatter risk).",
-                Out.TEXT,
-            )
-            self.ptprint(f"    Check {br.bounce_addr} for NDR/bounce within 2–5 minutes.", Out.TEXT)
-            if br.test_id:
-                self.ptprint(f"    Probe 1 test ID: {br.test_id} (X-PT-Test-ID)", Out.TEXT)
-            if getattr(br, "message_accepted_return_path", False) and getattr(br, "test_id_return_path", ""):
-                self.ptprint(f"    Probe 2 (Return-Path) test ID: {br.test_id_return_path}", Out.TEXT)
-        elif br.rcpt_rejected_in_session:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} NOT VULNERABLE: RCPT rejected in session – no bounce expected", Out.TEXT)
-        else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} {br.detail or 'Test completed'}", Out.TEXT)
+
+        def _probe_icon_msg(accepted: bool, indet: bool, detail: str | None) -> tuple:
+            """Return (icon, message) for a single probe outcome."""
+            if accepted:
+                return warn_icon, f"Mail was sent - check {br.bounce_addr} for NDR within 2-5 min"
+            if indet:
+                return info_icon, f"Indeterminate: {detail or 'Could not complete'}"
+            if not detail:
+                return info_icon, "Could not complete"
+            if "RCPT rejected in session" in detail:
+                return ok_icon, "Not vulnerable: RCPT rejected in session – no bounce expected"
+            if "NOT VULNERABLE:" in detail:
+                clean = detail.replace("NOT VULNERABLE: ", "")
+                if any(kw in clean for kw in ("RCPT unexpected", "DATA rejected")):
+                    return warn_icon, f"Mail could not be sent: {clean}"
+                return ok_icon, f"Not vulnerable: {clean}"
+            return warn_icon, f"Mail could not be sent: {detail}"
+
+        def _split_trace(trace: tuple[str, ...]):
+            """Split smtp_trace into pre-probe lines, Probe 1 label/lines, Probe 2 label/lines."""
+            pre: list[str] = []
+            p1: list[str] = []
+            p2: list[str] = []
+            p1_label = ""
+            p2_label = ""
+            cur = pre
+            for line in trace:
+                if line.startswith("---"):
+                    if cur is pre:
+                        p1_label = line.strip("- ").strip()
+                        cur = p1
+                    else:
+                        p2_label = line.strip("- ").strip()
+                        cur = p2
+                else:
+                    cur.append(line)
+            return pre, p1_label, p1, p2_label, p2
+
+        pre_lines, p1_label, p1_lines, p2_label, p2_lines = _split_trace(br.smtp_trace)
+        has_probe1 = bool(p1_label or p1_lines)
+        has_probe2 = bool(p2_label or p2_lines)
+
+        # Pre-probe failure or missing args (no probe sections in trace)
+        if not has_probe1:
+            if self.args.debug and pre_lines:
+                for line in pre_lines:
+                    self.ptprint(f"    {dbg_icon} {line}", Out.TEXT)
+            icon, msg = _probe_icon_msg(False, br.indeterminate, br.detail)
+            self.ptprint(f"    {icon} {msg}", Out.TEXT)
+            return
+
+        # --- Probe 1: From header without Return-Path ---
+        self.ptprint(f"    {info_icon} Test From header without Return-Path", Out.TEXT)
+        if self.args.debug:
+            for line in pre_lines:
+                self.ptprint(f"        {dbg_icon} {line}", Out.TEXT)
+            if p1_label:
+                self.ptprint(f"        {dbg_icon} {p1_label.replace('Probe 1: ', '')}", Out.TEXT)
+            for line in p1_lines:
+                self.ptprint(f"        {dbg_icon} {line}", Out.TEXT)
+        p1_icon, p1_msg = _probe_icon_msg(
+            br.message_accepted, br.probe1_indeterminate, br.probe1_detail
+        )
+        self.ptprint(f"    {p1_icon} {p1_msg}", Out.TEXT)
+        if br.message_accepted and br.test_id:
+            self.ptprint(f"        Test ID: {br.test_id} (X-PT-Test-ID)", Out.TEXT)
+
+        # Probe 1 was indeterminate → Probe 2 never ran
+        if br.probe1_indeterminate and not has_probe2:
+            return
+
+        # --- Probe 2: From + Return-Path headers ---
+        self.ptprint(f"    {info_icon} Test From headers and Return-Path", Out.TEXT)
+        if self.args.debug:
+            if p2_label:
+                self.ptprint(f"        {dbg_icon} {p2_label.replace('Probe 2: ', '')}", Out.TEXT)
+            for line in p2_lines:
+                self.ptprint(f"        {dbg_icon} {line}", Out.TEXT)
+        p2_accepted = getattr(br, "message_accepted_return_path", False)
+        p2_icon, p2_msg = _probe_icon_msg(
+            p2_accepted, br.probe2_indeterminate, br.probe2_detail
+        )
+        self.ptprint(f"    {p2_icon} {p2_msg}", Out.TEXT)
+        if p2_accepted and getattr(br, "test_id_return_path", ""):
+            self.ptprint(f"        Test ID: {br.test_id_return_path} (X-PT-Test-ID)", Out.TEXT)
 
     def _stream_mail_bomb_result(self) -> None:
         if (err := self.results.mail_bomb_error) is not None:
@@ -11027,17 +12042,17 @@ class SMTP(BaseModule):
             icon = get_colored_text("[✗]", color="VULN")
             status_text = " (high value)"
         self.ptprint(f"    {icon} Max connections per IP: {max_con.max}{status_text}", Out.TEXT)
-        if max_con.ban_minutes is None:
+        if max_con.ban_seconds is None:
             icon = get_colored_text("[✓]", color="NOTVULN")
             self.ptprint(f"    {icon} Timeout: not detected", Out.TEXT)
         else:
-            if max_con.ban_minutes < 10:
+            if max_con.ban_seconds < 600:
                 icon = get_colored_text("[✓]", color="NOTVULN")
                 status_text = ""
             else:
                 icon = get_colored_text("[✗]", color="VULN")
                 status_text = " (high value)"
-            self.ptprint(f"    {icon} Timeout: {max_con.ban_minutes:.1f} min{status_text}", Out.TEXT)
+            self.ptprint(f"    {icon} Timeout: {max_con.ban_seconds} sec{status_text}", Out.TEXT)
 
     def _on_brute_success(self, cred: Creds) -> None:
         """Callback for real-time streaming of found credentials (thread-safe)."""
@@ -11275,8 +12290,8 @@ class SMTP(BaseModule):
                 con_parts.append(f"Max connections per IP: {max_con.max}")
             else:
                 con_parts.append("Max connections per IP: not detected")
-            if max_con.ban_minutes is not None:
-                con_parts.append(f"Timeout: {max_con.ban_minutes} min")
+            if max_con.ban_seconds is not None:
+                con_parts.append(f"Timeout: {max_con.ban_seconds} sec")
             else:
                 con_parts.append("Timeout: not detected")
             parts.append("\r\n".join(con_parts))
@@ -12222,6 +13237,14 @@ class SMTP(BaseModule):
         if (br_err := self.results.bounce_replay_error) is not None:
             properties.update({"bounceReplayError": br_err})
         elif (br := self.results.bounce_replay) is not None:
+            def _trace_line_clean(line: str) -> str:
+                if line.startswith("---") and line.endswith("---"):
+                    return line.strip("- ").strip()
+                return line
+            br_description = (
+                "\r\n".join(_trace_line_clean(l) for l in br.smtp_trace)
+                if br.smtp_trace else None
+            )
             br_props: dict = {
                 "vulnerable": br.vulnerable,
                 "indeterminate": br.indeterminate,
@@ -12235,6 +13258,7 @@ class SMTP(BaseModule):
                 "smtpTrace": list(br.smtp_trace),
                 "tarpittingOrTimeout": br.tarpitting_or_timeout,
                 "detail": br.detail,
+                "description": br_description,
             }
             properties.update({"bounceReplay": br_props})
             if br.message_accepted or getattr(br, "message_accepted_return_path", False):
@@ -12491,10 +13515,10 @@ class SMTP(BaseModule):
                 properties.update({"maxConnections": None})
             else:
                 properties.update({"maxConnections": max_con.max})
-                if max_con.ban_minutes is None:
+                if max_con.ban_seconds is None:
                     properties.update({"banDuration": None})
                 else:
-                    properties.update({"banDuration": max_con.ban_minutes})
+                    properties.update({"banDuration": max_con.ban_seconds})
 
         # Login bruteforce
         if (creds := self.results.creds) is not None:
@@ -12504,7 +13528,10 @@ class SMTP(BaseModule):
                     json_lines.append(f"user: {cred.user}, password: {cred.passw}")
 
                 if self.args.user is not None:
-                    user_str = f"username: {self.args.user}"
+                    if isinstance(self.args.user, list):
+                        user_str = f"usernames: {', '.join(self.args.user)}"
+                    else:
+                        user_str = f"username: {self.args.user}"
                 else:
                     user_str = f"usernames: {self.args.users}"
 

@@ -1,4 +1,5 @@
-import argparse, ftplib, ipaddress, random, re, secrets, socket, ssl, statistics, threading, time
+import argparse, collections, ftplib, ipaddress, posixpath, random, re, secrets, select, socket, ssl, statistics, threading, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from enum import Enum
@@ -312,6 +313,190 @@ class FtpUserEnumResult:
     pass_text_similarity_min: float | None  # pairwise min of max(raw, template) SequenceMatcher
     detail: str
     timing_notes: tuple[str, ...] = ()
+    timing_control_median_ms: float | None = None
+    timing_wordlist_median_ms: float | None = None
+    timing_slow_usernames_ms: tuple[tuple[str, float], ...] = ()
+
+
+@dataclass
+class PasvPortRangeProbe:
+    """One sample in PTL-SVC-FTP-PASIVE passive data-port spread check."""
+
+    sample_index: int
+    data_port: int | None
+    error: str | None
+
+
+@dataclass
+class PasvPortRangeResult:
+    """
+    Repeated PASV + LIST samples on separate control sessions (PTL-SVC-FTP-PASIVE).
+    wide_passive_range: observed max-min across successful samples exceeds threshold
+    (firewall-unfriendly spread in this run).
+    """
+
+    probes: tuple[PasvPortRangeProbe, ...]
+    successful_ports: tuple[int, ...]
+    min_port: int | None
+    max_port: int | None
+    observed_span: int | None
+    max_span_threshold: int
+    min_samples_for_verdict: int
+    wide_passive_range: bool
+    inconclusive: bool
+    detail: str
+
+
+@dataclass
+class ConnLimitsParallelOutcome:
+    """Parallel pre-auth control connections (PTL-SVC-FTP-CONN)."""
+
+    attempted: int
+    succeeded: int
+    failed: int
+    error_samples: tuple[str, ...]
+
+
+@dataclass
+class ConnLimitsSequentialOutcome:
+    """Rapid sequential control connections."""
+
+    attempts: int
+    succeeded: int
+    failed: int
+    inter_connect_delay_ms: float
+    error_samples: tuple[str, ...]
+
+
+@dataclass
+class ConnLimitsPasvSpam:
+    """Repeated PASV on one control session without data transfer."""
+
+    attempts: int
+    reply227: int
+    reply530: int
+    reply_other: int
+    last_reply_snippet: str | None
+    error: str | None
+
+
+@dataclass
+class ConnLimitsIdleProbe:
+    """Idle / slow-control behaviour."""
+
+    performed: bool
+    wait_seconds: float
+    kick_observed: bool  # 421/426 or EOF while idle
+    note: str
+
+
+@dataclass
+class ConnLimitsSlowAuth:
+    """USER … long wait … PASS (wrong password)."""
+
+    performed: bool
+    gap_seconds: float
+    still_connected_after_pass: bool | None
+    pass_reply_snippet: str | None
+    note: str
+
+
+@dataclass
+class ConnLimitsAuditResult:
+    """
+    Connection / rate / idle limits observation (PTL-SVC-FTP-CONN).
+    limits_insufficient_suspected: heuristic from bounded probes — not full DoS.
+    """
+
+    crypto_mode: str  # plain | implicit_tls | starttls
+    parallel: ConnLimitsParallelOutcome
+    sequential: ConnLimitsSequentialOutcome
+    pasv_pre_auth: ConnLimitsPasvSpam
+    pasv_post_auth: ConnLimitsPasvSpam | None
+    idle_pre_auth: ConnLimitsIdleProbe
+    slow_auth: ConnLimitsSlowAuth
+    idle_post_auth: ConnLimitsIdleProbe | None
+    limits_insufficient_suspected: bool
+    risk_factors: tuple[str, ...]
+    detail: str
+
+
+def _conn_limits_parallel_suspect(par: ConnLimitsParallelOutcome) -> bool:
+    return par.attempted >= 10 and par.failed == 0 and par.succeeded == par.attempted
+
+
+def _conn_limits_sequential_suspect(seq: ConnLimitsSequentialOutcome) -> bool:
+    return seq.attempts >= 20 and seq.failed == 0 and seq.succeeded == seq.attempts
+
+
+def _conn_limits_pasv_pre_suspect(pp: ConnLimitsPasvSpam) -> bool:
+    return pp.attempts >= 15 and pp.reply227 >= 14 and pp.error is None
+
+
+def _conn_limits_pasv_post_suspect(po: ConnLimitsPasvSpam | None) -> bool:
+    if po is None:
+        return False
+    return po.attempts >= 15 and po.reply227 >= 14 and po.error is None
+
+
+def _conn_limits_idle_pre_suspect(ipr: ConnLimitsIdleProbe) -> bool:
+    return ipr.performed and ipr.wait_seconds >= 60.0 and not ipr.kick_observed
+
+
+def _conn_limits_slow_auth_suspect(sa: ConnLimitsSlowAuth) -> bool:
+    return sa.performed and sa.gap_seconds >= 40.0 and sa.still_connected_after_pass is True
+
+
+def _conn_limits_idle_post_suspect(ipo: ConnLimitsIdleProbe | None) -> bool:
+    return (
+        ipo is not None
+        and ipo.performed
+        and ipo.wait_seconds >= 60.0
+        and not ipo.kick_observed
+        and "NOOP succeeded" in ipo.note
+    )
+
+
+@dataclass
+class ChrootCwdProbeRow:
+    """Single CWD probe after fresh login (PTL-SVC-FTP-CHROOT)."""
+
+    probe_id: str
+    path: str
+    success: bool
+    pwd_after: str | None
+    error_or_reply: str | None
+
+
+@dataclass
+class ChrootDotdotResult:
+    """Repeated CWD .. from post-login directory."""
+
+    steps_ok: int
+    pwd_initial: str
+    pwd_final: str | None
+    stopped_reason: str
+
+
+@dataclass
+class ChrootAuditResult:
+    """
+    User isolation / chroot-style checks: absolute CWD targets, .. chain, /etc/passwd SIZE.
+    isolation_broken_suspected: heuristic; chroot with jail root '/' may still false-negative/positive — confirm manually.
+    """
+
+    pwd_initial: str
+    cwd_probes: tuple[ChrootCwdProbeRow, ...]
+    dotdot: ChrootDotdotResult
+    home_parent_accessible: bool
+    system_paths_accessible: tuple[str, ...]
+    passwd_size_ok: bool
+    shadow_size_ok: bool
+    dotdot_parent_escape_suspected: bool
+    isolation_broken_suspected: bool
+    detail: str
+    passwd_size_bytes: int | None = None
+    shadow_size_bytes: int | None = None
 
 
 @dataclass
@@ -342,6 +527,12 @@ class FTPResults:
     invalid_cmd_audit_error: str | None = None
     user_enum: FtpUserEnumResult | None = None
     user_enum_error: str | None = None
+    pasv_port_range: PasvPortRangeResult | None = None
+    pasv_port_range_error: str | None = None
+    conn_limits: ConnLimitsAuditResult | None = None
+    conn_limits_error: str | None = None
+    chroot_audit: ChrootAuditResult | None = None
+    chroot_audit_error: str | None = None
 
 
 class VULNS(Enum):
@@ -353,6 +544,9 @@ class VULNS(Enum):
     FtpInvalidCommandHandling = "PTL-SVC-FTP-INVCOMM"
     FtpObsoleteTls = "PTL-SVC-FTP-OLD-TLS"
     FtpUserEnumeration = "PTL-SVC-FTP-USRENUM"
+    FtpPassivePortRange = "PTL-SVC-FTP-PASIVE"
+    FtpConnectionLimits = "PTL-SVC-FTP-CONN"
+    FtpChrootIsolation = "PTL-SVC-FTP-CHROOT"
 
 
 # endregion
@@ -388,6 +582,9 @@ class FTPArgs(ArgsWithBruteforce):
                 "ptsrvtester ftp -AC --cmd-audit-active 127.0.0.1",
                 "ptsrvtester ftp -iv 127.0.0.1",
                 "ptsrvtester ftp -eu --user-enum-wordlist users.txt 127.0.0.1",
+                "ptsrvtester ftp -AR 127.0.0.1",
+                "ptsrvtester ftp -L 127.0.0.1",
+                "ptsrvtester ftp -u user -p pass -J 127.0.0.1",
             ]},
             {"options": [
                 ["-i", "--info", "", "Grab banner and inspect HELP, SYST, STAT commands"],
@@ -400,6 +597,18 @@ class FTPArgs(ArgsWithBruteforce):
                 ["-B", "--bounce", "", "FTP bounce attack"],
                 ["", "--bounce-file", "<file>", "File with request to send (requires --access)"],
                 ["-m", "--modes", "", "Test passive/active data modes + PASV IP leakage"],
+                ["-R", "--pasv-port-audit", "", "Passive data port spread (PASV+LIST)"],
+                ["", "--pasv-port-audit-samples", "<n>", "Samples for -R (default 8, min 4)"],
+                ["", "--pasv-port-audit-max-span", "<n>", "Max acceptable max-min across samples (default 8192)"],
+                ["-L", "--conn-limits-audit", "", "Connection/rate/idle/PASV limits; bounded probes"],
+                ["", "--conn-limits-parallel", "<n>", "Simultaneous pre-auth sessions for -L (default 12, max 40)"],
+                ["", "--conn-limits-sequential", "<n>", "Rapid sequential connects for -L (default 24, max 80)"],
+                ["", "--conn-limits-pasv-attempts", "<n>", "PASV spam count per session for -L (default 18, max 60)"],
+                ["", "--conn-limits-idle-pre-auth", "<s>", "Pre-login idle seconds (0=skip); 421/close check"],
+                ["", "--conn-limits-slow-auth-gap", "<s>", "Seconds between USER and PASS (0=skip); wrong PASS"],
+                ["", "--conn-limits-idle-post-auth", "<s>", "Post-login idle seconds if creds (0=skip); NOOP after"],
+                ["-J", "--chroot-audit", "", "User isolation: CWD .., /etc, /home, SIZE passwd"],
+                ["", "--chroot-audit-paths", "<list>", "Extra comma-separated absolute paths for -J"],
                 ["-M", "--active-audit", "", "Quick PORT/PASV policy audit"],
                 ["", "--active-audit-full", "", "Full methodology: isolated sessions, raw LIST (D0), PORT+LIST, hints"],
                 ["", "--active-audit-low-ports", "<list>", "Comma-separated data ports <1000 for full audit (default 80,443,21)"],
@@ -442,6 +651,10 @@ class FTPArgs(ArgsWithBruteforce):
   ptsrvtester ftp -AC 127.0.0.1
   ptsrvtester ftp -u myuser -p mypass -C --cmd-audit-active 127.0.0.1
   ptsrvtester ftp -Aae -w paths.txt 127.0.0.1
+  ptsrvtester ftp -AR 127.0.0.1
+  ptsrvtester ftp -L 127.0.0.1
+  ptsrvtester ftp -u user -p pass -J 127.0.0.1
+  ptsrvtester ftp -AL --conn-limits-idle-pre-auth 120 127.0.0.1
   ptsrvtester -j ftp -u admin -P passwords.txt --brute-threads 20 127.0.0.1:21
 
 Credentials:
@@ -559,10 +772,113 @@ Credentials:
             dest="modes",
             help="test passive/active data modes and PASV IP leakage",
         )
+        modes_grp.add_argument(
+            "-R",
+            "--pasv-port-audit",
+            action="store_true",
+            dest="pasv_port_audit",
+            help="repeated passive LIST: check whether data ports stay in a narrow range",
+        )
+        modes_grp.add_argument(
+            "--pasv-port-audit-samples",
+            type=int,
+            default=8,
+            dest="pasv_port_audit_samples",
+            metavar="<n>",
+            help="number of separate login sessions / LIST transfers for -R (default 8)",
+        )
+        modes_grp.add_argument(
+            "--pasv-port-audit-max-span",
+            type=int,
+            default=8192,
+            dest="pasv_port_audit_max_span",
+            metavar="<n>",
+            help="if max(dataPort)-min(dataPort) across successful -R samples exceeds this, flag wide range (default 8192)",
+        )
+
+        conn_grp = parser.add_argument_group(
+            "CONNECTION LIMITS",
+            "Bounded probes for concurrent sessions, PASV spam, optional idle/slow auth",
+        )
+        conn_grp.add_argument(
+            "-L",
+            "--conn-limits-audit",
+            action="store_true",
+            dest="conn_limits_audit",
+            help="parallel + sequential connects, PASV without transfer; optional idle/slow-auth (use only on authorized targets)",
+        )
+        conn_grp.add_argument(
+            "--conn-limits-parallel",
+            type=int,
+            default=12,
+            dest="conn_limits_parallel",
+            metavar="<n>",
+            help="parallel pre-auth control connections in one burst (default 12, max 40)",
+        )
+        conn_grp.add_argument(
+            "--conn-limits-sequential",
+            type=int,
+            default=24,
+            dest="conn_limits_sequential",
+            metavar="<n>",
+            help="rapid sequential connects after parallel phase (default 24, max 80)",
+        )
+        conn_grp.add_argument(
+            "--conn-limits-pasv-attempts",
+            type=int,
+            default=18,
+            dest="conn_limits_pasv_attempts",
+            metavar="<n>",
+            help="PASV commands per control session without data transfer (default 18, max 60)",
+        )
+        conn_grp.add_argument(
+            "--conn-limits-idle-pre-auth",
+            type=float,
+            default=0.0,
+            dest="conn_limits_idle_pre_auth",
+            metavar="<s>",
+            help="after 220, wait N seconds and watch for 421/close (0 = skip; try 60–300 on lab)",
+        )
+        conn_grp.add_argument(
+            "--conn-limits-slow-auth-gap",
+            type=float,
+            default=0.0,
+            dest="conn_limits_slow_auth_gap",
+            metavar="<s>",
+            help="pause between USER and wrong PASS in seconds (0 = skip; try 45–120)",
+        )
+        conn_grp.add_argument(
+            "--conn-limits-idle-post-auth",
+            type=float,
+            default=0.0,
+            dest="conn_limits_idle_post_auth",
+            metavar="<s>",
+            help="after login, idle N seconds then NOOP (0 = skip; requires creds)",
+        )
+
+        chroot_grp = parser.add_argument_group(
+            "USER ISOLATION / CHROOT",
+            "CWD probes and .. chain after login; confirm on authorized targets",
+        )
+        chroot_grp.add_argument(
+            "-J",
+            "--chroot-audit",
+            action="store_true",
+            dest="chroot_audit",
+            help="test whether account can reach host-style paths (/etc, /root, ..) or /home parent",
+        )
+        chroot_grp.add_argument(
+            "--chroot-audit-paths",
+            type=str,
+            default="",
+            dest="chroot_audit_paths",
+            metavar="<list>",
+            help="additional absolute paths to try with CWD (comma-separated), merged with built-in set",
+        )
 
         audit_grp = parser.add_argument_group(
             "ACTIVE MODE POLICY",
-            "PORT/PASV command policy and bounce-related checks (PTL-SVC-FTP-ACTIVE)",
+            "PORT/PASV command policy and bounce-related checks",
         )
         audit_grp.add_argument(
             "-M",
@@ -605,7 +921,7 @@ Credentials:
 
         inv_grp = parser.add_argument_group(
             "INVALID COMMAND RESILIENCE",
-            "Non-standard inputs on control channel (PTL-SVC-FTP-INVCOMM); uses raw bytes on socket",
+            "Non-standard inputs on control channel; uses raw bytes on socket",
         )
         inv_grp.add_argument(
             "-iv",
@@ -617,7 +933,7 @@ Credentials:
 
         ue_grp = parser.add_argument_group(
             "USERNAME ENUMERATION",
-            "USER/PASS with fixed wrong password (PTL-SVC-FTP-USRENUM); distinct replies vs RFC 2577",
+            "USER/PASS with fixed wrong password; distinct replies vs RFC 2577",
         )
         ue_grp.add_argument(
             "-eu",
@@ -714,6 +1030,54 @@ class FTP(BaseModule):
                     "--modes requires credentials (--anonymous or known account -u/-p or wordlists)",
                 )
 
+        if getattr(args, "pasv_port_audit", False):
+            if not args.access and not args.anonymous and not check_if_brute(args):
+                raise argparse.ArgumentError(
+                    None,
+                    "--pasv-port-audit (-R) requires credentials (--anonymous or known account -u/-p or wordlists)",
+                )
+            ps = int(getattr(args, "pasv_port_audit_samples", 8) or 8)
+            if ps < 4:
+                raise argparse.ArgumentError(None, "--pasv-port-audit-samples must be >= 4")
+            mx = int(getattr(args, "pasv_port_audit_max_span", 8192) or 8192)
+            if mx < 256:
+                raise argparse.ArgumentError(None, "--pasv-port-audit-max-span must be >= 256")
+
+        if getattr(args, "conn_limits_audit", False):
+            cp = int(getattr(args, "conn_limits_parallel", 12) or 12)
+            if cp < 1 or cp > 40:
+                raise argparse.ArgumentError(None, "--conn-limits-parallel must be between 1 and 40")
+            cs = int(getattr(args, "conn_limits_sequential", 24) or 24)
+            if cs < 0 or cs > 80:
+                raise argparse.ArgumentError(None, "--conn-limits-sequential must be 0..80")
+            pa = int(getattr(args, "conn_limits_pasv_attempts", 18) or 18)
+            if pa < 0 or pa > 60:
+                raise argparse.ArgumentError(None, "--conn-limits-pasv-attempts must be 0..60")
+            idle_pre = float(getattr(args, "conn_limits_idle_pre_auth", 0) or 0)
+            if idle_pre < 0 or idle_pre > 3600:
+                raise argparse.ArgumentError(None, "--conn-limits-idle-pre-auth must be 0..3600 seconds")
+            sg = float(getattr(args, "conn_limits_slow_auth_gap", 0) or 0)
+            if sg < 0 or sg > 3600:
+                raise argparse.ArgumentError(None, "--conn-limits-slow-auth-gap must be 0..3600 seconds")
+            idle_post = float(getattr(args, "conn_limits_idle_post_auth", 0) or 0)
+            if idle_post < 0 or idle_post > 3600:
+                raise argparse.ArgumentError(None, "--conn-limits-idle-post-auth must be 0..3600 seconds")
+            if idle_post > 0 and not args.access and not args.anonymous and not check_if_brute(args):
+                raise argparse.ArgumentError(
+                    None,
+                    "--conn-limits-idle-post-auth > 0 requires credentials (--anonymous or -u/-p or wordlists)",
+                )
+
+        if getattr(args, "chroot_audit", False):
+            if not args.access and not args.anonymous and not check_if_brute(args):
+                raise argparse.ArgumentError(
+                    None,
+                    "--chroot-audit (-J) requires credentials (--anonymous or known account -u/-p or wordlists)",
+                )
+            cps = (getattr(args, "chroot_audit_paths", None) or "").strip()
+            if len(cps) > 4000:
+                raise argparse.ArgumentError(None, "--chroot-audit-paths string is too long (max 4000 chars)")
+
         if getattr(args, "cmd_audit_active", False):
             if not args.access and not args.anonymous and not check_if_brute(args):
                 raise argparse.ArgumentError(
@@ -771,6 +1135,9 @@ class FTP(BaseModule):
             or self.do_brute
             or getattr(self.args, "enum_paths", False)
             or getattr(self.args, "modes", False)
+            or getattr(self.args, "pasv_port_audit", False)
+            or getattr(self.args, "conn_limits_audit", False)
+            or getattr(self.args, "chroot_audit", False)
             or getattr(self.args, "active_audit", False)
             or getattr(self.args, "active_audit_full", False)
             or getattr(self.args, "cmd_audit", False)
@@ -794,6 +1161,9 @@ class FTP(BaseModule):
             or self.do_brute
             or getattr(a, "enum_paths", False)
             or getattr(a, "modes", False)
+            or getattr(a, "pasv_port_audit", False)
+            or getattr(a, "conn_limits_audit", False)
+            or getattr(a, "chroot_audit", False)
             or getattr(a, "active_audit", False)
             or getattr(a, "active_audit_full", False)
             or getattr(a, "cmd_audit", False)
@@ -937,6 +1307,42 @@ class FTP(BaseModule):
                     self.results.modes_error = str(e)
             else:
                 self.results.modes_error = "No credentials for mode test (use --anonymous or -u/-p known account or wordlists)"
+
+        # Passive data port spread (PTL-SVC-FTP-PASIVE)
+        if getattr(self.args, "pasv_port_audit", False):
+            creds = self._get_path_enum_creds()
+            if creds is not None:
+                try:
+                    n = max(4, int(getattr(self.args, "pasv_port_audit_samples", 8) or 8))
+                    mxsp = max(256, int(getattr(self.args, "pasv_port_audit_max_span", 8192) or 8192))
+                    self.results.pasv_port_range = self.test_pasv_port_range_audit(creds, n, mxsp)
+                except Exception as e:
+                    self.results.pasv_port_range_error = str(e)
+            else:
+                self.results.pasv_port_range_error = (
+                    "No credentials for passive port audit (use --anonymous or -u/-p known account or wordlists)"
+                )
+
+        # Connection / rate / idle limits (PTL-SVC-FTP-CONN)
+        if getattr(self.args, "conn_limits_audit", False):
+            try:
+                creds_post = self._get_path_enum_creds()
+                self.results.conn_limits = self.test_connection_limits_audit(creds_post)
+            except Exception as e:
+                self.results.conn_limits_error = str(e)
+
+        # User isolation / chroot-style audit (PTL-SVC-FTP-CHROOT)
+        if getattr(self.args, "chroot_audit", False):
+            creds = self._get_path_enum_creds()
+            if creds is not None:
+                try:
+                    self.results.chroot_audit = self.test_chroot_audit(creds)
+                except Exception as e:
+                    self.results.chroot_audit_error = str(e)
+            else:
+                self.results.chroot_audit_error = (
+                    "No credentials for chroot audit (use --anonymous or -u/-p known account or wordlists)"
+                )
 
         # PORT/PASV policy audit (PTL-SVC-FTP-ACTIVE)
         if getattr(self.args, "active_audit_full", False) or getattr(self.args, "active_audit", False):
@@ -1573,7 +1979,7 @@ class FTP(BaseModule):
 
         if len(user_codes) >= 2:
             enumeration_suspected = True
-            detail_parts.append("Distinct USER-stage numeric codes across probes (RFC 2577 §7 misalignment).")
+            detail_parts.append("Distinct USER-stage numeric codes across probes (RFC 2577 section 7 misalignment).")
 
         if len(user_codes) == 1 and len(user_line_norms) >= 2:
             enumeration_suspected = True
@@ -1593,6 +1999,10 @@ class FTP(BaseModule):
         tarpit_hint = False
         if do_timing and used_keep_alive:
             tarpit_hint = self._user_enum_keepalive_tarpitting_hint(ok_rows)
+
+        timing_control_median_ms: float | None = None
+        timing_wordlist_median_ms: float | None = None
+        slow_samples: list[tuple[str, float]] = []
 
         if do_timing:
             wu = self._FTP_USER_ENUM_TIMING_WARMUP
@@ -1625,6 +2035,14 @@ class FTP(BaseModule):
                 if len(cand_adj) >= 1 and len(ctrl_adj) >= 1:
                     mc = float(statistics.median(ctrl_adj))
                     mw = float(statistics.median(cand_adj))
+                    timing_control_median_ms = mc
+                    timing_wordlist_median_ms = mw
+                    thr = mc * 2.0 + 20.0
+                    for r in cand_rows:
+                        if r.pass_elapsed_ms is not None:
+                            ms = float(r.pass_elapsed_ms)
+                            if ms > thr:
+                                slow_samples.append((r.username, ms))
                     if mw > mc * 2.0 + 20.0:
                         would_time_anomaly = True
                         time_detail = (
@@ -1636,6 +2054,7 @@ class FTP(BaseModule):
 
             if would_time_anomaly and tarpit_hint:
                 timing_anomaly = False
+                slow_samples.clear()
                 detail_parts.append(
                     "Timing comparison suppressed: sequential PASS latency grows like tarpitting/delay policy, "
                     "not a reliable user-oracle signal in --user-enum-keep-alive mode."
@@ -1671,6 +2090,9 @@ class FTP(BaseModule):
             pass_text_similarity_min=sim_min,
             detail=" ".join(detail_parts),
             timing_notes=tuple(tnotes),
+            timing_control_median_ms=timing_control_median_ms,
+            timing_wordlist_median_ms=timing_wordlist_median_ms,
+            timing_slow_usernames_ms=tuple(slow_samples),
         )
 
     def test_user_enumeration(self) -> FtpUserEnumResult:
@@ -1790,6 +2212,886 @@ class FTP(BaseModule):
                 pass
 
         return ModesResult(passive_ok=passive_ok, active_ok=active_ok, pasv_ip_leak=pasv_ip_leak)
+
+    def _pasv_list_data_port_once(self, ftp: ftplib.FTP) -> tuple[int | None, str | None]:
+        """
+        Force passive mode, open a real LIST data channel, return the server's TCP data port
+        (client socket getpeername), then drain listing and complete the transfer.
+        """
+        ftp.set_pasv(True)
+        to = 20.0
+        old_to = None
+        try:
+            try:
+                old_to = ftp.sock.gettimeout()
+                ftp.sock.settimeout(to)
+            except Exception:
+                pass
+            sock = ftp.transfercmd("LIST")
+            port: int | None = None
+            try:
+                sock.settimeout(to)
+                peer = sock.getpeername()
+                if isinstance(peer, tuple) and len(peer) >= 2:
+                    port = int(peer[1])
+                while True:
+                    chunk = sock.recv(8192)
+                    if not chunk:
+                        break
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            try:
+                ftp.voidresp()
+            except ftplib.Error as e:
+                # Some servers still completed data; port observation remains useful
+                if port is None:
+                    return None, str(e).strip() or repr(e)
+            return port, None
+        except Exception as e:
+            err = str(e).strip() or type(e).__name__
+            try:
+                ftp.close()
+            except Exception:
+                pass
+            return None, err
+        finally:
+            try:
+                if old_to is not None:
+                    ftp.sock.settimeout(old_to)
+            except Exception:
+                pass
+
+    def test_pasv_port_range_audit(
+        self, creds: Creds, sample_count: int, max_span_threshold: int
+    ) -> PasvPortRangeResult:
+        """
+        PTL-SVC-FTP-PASIVE: several separate control connections, each login + passive LIST;
+        if observed port spread (max-min) exceeds max_span_threshold, flag wide passive range
+        (firewall rule burden / larger attack surface).
+        """
+        min_for_verdict = 4
+        probes: list[PasvPortRangeProbe] = []
+        ports_ok: list[int] = []
+
+        for i in range(sample_count):
+            ftp = self.connect()
+            err: str | None = None
+            port: int | None = None
+            try:
+                ftp.login(creds.user, creds.passw)
+                port, err = self._pasv_list_data_port_once(ftp)
+                if port is not None:
+                    ports_ok.append(port)
+            except Exception as e:
+                err = str(e).strip() or type(e).__name__
+            finally:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+            probes.append(PasvPortRangeProbe(sample_index=i, data_port=port, error=err))
+
+        ok_t = tuple(ports_ok)
+        if len(ports_ok) < min_for_verdict:
+            detail = (
+                f"Only {len(ports_ok)}/{sample_count} passive LIST transfers yielded a data port; "
+                "need at least 4 for a spread estimate. Check connectivity, TLS vs plaintext, or permissions."
+            )
+            return PasvPortRangeResult(
+                probes=tuple(probes),
+                successful_ports=ok_t,
+                min_port=min(ports_ok) if ports_ok else None,
+                max_port=max(ports_ok) if ports_ok else None,
+                observed_span=(max(ports_ok) - min(ports_ok)) if len(ports_ok) >= 2 else None,
+                max_span_threshold=max_span_threshold,
+                min_samples_for_verdict=min_for_verdict,
+                wide_passive_range=False,
+                inconclusive=True,
+                detail=detail,
+            )
+
+        lo, hi = min(ports_ok), max(ports_ok)
+        span = hi - lo
+        wide = span > max_span_threshold
+        detail = (
+            f"Observed data ports across {len(ports_ok)} successful sample(s): "
+            f"min={lo}, max={hi}, span={span} (threshold maxSpan={max_span_threshold}). "
+            + (
+                "Spread is large in this run — firewall policies may need a very wide passive port allow-list."
+                if wide
+                else "Spread stays within the configured threshold (prefer also documenting the server's configured passive range in policy)."
+            )
+        )
+        return PasvPortRangeResult(
+            probes=tuple(probes),
+            successful_ports=ok_t,
+            min_port=lo,
+            max_port=hi,
+            observed_span=span,
+            max_span_threshold=max_span_threshold,
+            min_samples_for_verdict=min_for_verdict,
+            wide_passive_range=wide,
+            inconclusive=False,
+            detail=detail,
+        )
+
+    def _conn_limits_read220_quit(self, sock: socket.socket) -> tuple[bool, str | None]:
+        sock.settimeout(12.0)
+        buf = b""
+        try:
+            while b"\n" not in buf and len(buf) < 8192:
+                c = sock.recv(2048)
+                if not c:
+                    return False, "EOF before banner line"
+                buf += c
+                if b"220" in buf:
+                    break
+            if b"220" not in buf:
+                return False, "no 220 in initial response"
+            try:
+                sock.sendall(b"QUIT\r\n")
+            except OSError:
+                pass
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    def _conn_limits_drain_banner_raw(self, sock: socket.socket) -> tuple[bool, str | None]:
+        sock.settimeout(12.0)
+        buf = b""
+        while b"220" not in buf and len(buf) < 16384:
+            c = sock.recv(2048)
+            if not c:
+                return False, "EOF before 220"
+            buf += c
+        return True, None
+
+    @staticmethod
+    def _conn_limits_readline_socket(
+        sock: socket.socket, buf: bytearray, timeout: float = 30.0
+    ) -> tuple[str, bool]:
+        sock.settimeout(timeout)
+        while True:
+            if b"\n" in buf:
+                idx = buf.index(b"\n")
+                raw = bytes(buf[: idx + 1])
+                del buf[: idx + 1]
+                return raw.decode(errors="replace").strip(), False
+            chunk = sock.recv(4096)
+            if not chunk:
+                return "", True
+            buf.extend(chunk)
+
+    def _conn_limits_one_handshake(self) -> tuple[bool, str | None]:
+        host = self.args.target.ip
+        port = self.args.target.port
+        try:
+            if self.args.tls:
+                ctx = ssl.create_default_context()
+                raw = socket.create_connection((host, port), timeout=10)
+                try:
+                    ss = ctx.wrap_socket(raw, server_hostname=host)
+                except Exception:
+                    try:
+                        raw.close()
+                    except Exception:
+                        pass
+                    raise
+                ok, err = self._conn_limits_read220_quit(ss)
+                try:
+                    ss.close()
+                except Exception:
+                    pass
+                return ok, err
+            if self.args.starttls:
+                f = ftplib.FTP_TLS()
+                f.connect(host, port, timeout=10)
+                f.sock.settimeout(12.0)
+                f.auth()
+                try:
+                    f.quit()
+                except Exception:
+                    try:
+                        f.close()
+                    except Exception:
+                        pass
+                return True, None
+            raw = socket.create_connection((host, port), timeout=10)
+            ok, err = self._conn_limits_read220_quit(raw)
+            try:
+                raw.close()
+            except Exception:
+                pass
+            return ok, err
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _conn_limits_parallel_phase(self, n: int) -> ConnLimitsParallelOutcome:
+        errs: list[str] = []
+        ok_c = 0
+        fail_c = 0
+
+        def _worker(_i: int) -> tuple[bool, str | None]:
+            return self._conn_limits_one_handshake()
+
+        with ThreadPoolExecutor(max_workers=max(1, n)) as ex:
+            futures = [ex.submit(_worker, i) for i in range(n)]
+            for fut in as_completed(futures):
+                s_ok, err = fut.result()
+                if s_ok:
+                    ok_c += 1
+                else:
+                    fail_c += 1
+                    if err and len(errs) < 5:
+                        errs.append(err)
+        return ConnLimitsParallelOutcome(
+            attempted=n, succeeded=ok_c, failed=fail_c, error_samples=tuple(errs)
+        )
+
+    def _conn_limits_sequential_phase(self, n: int, delay_s: float) -> ConnLimitsSequentialOutcome:
+        errs: list[str] = []
+        ok_c = 0
+        fail_c = 0
+        for _ in range(n):
+            s_ok, err = self._conn_limits_one_handshake()
+            if s_ok:
+                ok_c += 1
+            else:
+                fail_c += 1
+                if err and len(errs) < 5:
+                    errs.append(err)
+            if delay_s > 0:
+                time.sleep(delay_s)
+        return ConnLimitsSequentialOutcome(
+            attempts=n,
+            succeeded=ok_c,
+            failed=fail_c,
+            inter_connect_delay_ms=delay_s * 1000.0,
+            error_samples=tuple(errs),
+        )
+
+    def _conn_limits_pasv_pre_auth_session(self, attempts: int) -> ConnLimitsPasvSpam:
+        if attempts <= 0:
+            return ConnLimitsPasvSpam(0, 0, 0, 0, None, None)
+        host = self.args.target.ip
+        port = self.args.target.port
+        n227 = n530 = nother = 0
+        last: str | None = None
+        err: str | None = None
+        try:
+            if self.args.starttls:
+                ftp = ftplib.FTP_TLS()
+                ftp.connect(host, port, timeout=10)
+                ftp.sock.settimeout(25.0)
+                ftp.auth()
+                for _ in range(attempts):
+                    r = ftp.sendcmd("PASV")
+                    last = r[:200]
+                    c = self._reply_code(r)
+                    if c == 227:
+                        n227 += 1
+                    elif c == 530:
+                        n530 += 1
+                    else:
+                        nother += 1
+                try:
+                    ftp.quit()
+                except Exception:
+                    ftp.close()
+                return ConnLimitsPasvSpam(attempts, n227, n530, nother, last, None)
+
+            if self.args.tls:
+                ctx = ssl.create_default_context()
+                raw = socket.create_connection((host, port), timeout=10)
+                ss = ctx.wrap_socket(raw, server_hostname=host)
+                okb, e = self._conn_limits_drain_banner_raw(ss)
+                if not okb:
+                    try:
+                        ss.close()
+                    except Exception:
+                        pass
+                    return ConnLimitsPasvSpam(0, 0, 0, 0, None, e or "banner")
+                buf = bytearray()
+                for _ in range(attempts):
+                    ss.sendall(b"PASV\r\n")
+                    line, eof = self._conn_limits_readline_socket(ss, buf, 25.0)
+                    if eof and not line:
+                        err = "EOF during PASV phase"
+                        break
+                    last = line[:200]
+                    c = self._reply_code(line) if line else None
+                    if c == 227:
+                        n227 += 1
+                    elif c == 530:
+                        n530 += 1
+                    else:
+                        nother += 1
+                try:
+                    ss.sendall(b"QUIT\r\n")
+                except Exception:
+                    pass
+                try:
+                    ss.close()
+                except Exception:
+                    pass
+                return ConnLimitsPasvSpam(attempts, n227, n530, nother, last, err)
+
+            raw = socket.create_connection((host, port), timeout=10)
+            okb, e = self._conn_limits_drain_banner_raw(raw)
+            if not okb:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+                return ConnLimitsPasvSpam(0, 0, 0, 0, None, e or "banner")
+            buf = bytearray()
+            for _ in range(attempts):
+                raw.sendall(b"PASV\r\n")
+                line, eof = self._conn_limits_readline_socket(raw, buf, 25.0)
+                if eof and not line:
+                    err = "EOF during PASV phase"
+                    break
+                last = line[:200]
+                c = self._reply_code(line) if line else None
+                if c == 227:
+                    n227 += 1
+                elif c == 530:
+                    n530 += 1
+                else:
+                    nother += 1
+            try:
+                raw.sendall(b"QUIT\r\n")
+            except Exception:
+                pass
+            try:
+                raw.close()
+            except Exception:
+                pass
+            return ConnLimitsPasvSpam(attempts, n227, n530, nother, last, err)
+        except Exception as e:
+            return ConnLimitsPasvSpam(attempts, n227, n530, nother, last, str(e))
+
+    def _conn_limits_pasv_post_auth_session(self, creds: Creds, attempts: int) -> ConnLimitsPasvSpam:
+        if attempts <= 0:
+            return ConnLimitsPasvSpam(0, 0, 0, 0, None, None)
+        n227 = n530 = nother = 0
+        last: str | None = None
+        ftp = self.connect()
+        try:
+            ftp.login(creds.user, creds.passw)
+            ftp.sock.settimeout(25.0)
+            for _ in range(attempts):
+                r = ftp.sendcmd("PASV")
+                last = r[:200]
+                c = self._reply_code(r)
+                if c == 227:
+                    n227 += 1
+                elif c == 530:
+                    n530 += 1
+                else:
+                    nother += 1
+            try:
+                ftp.quit()
+            except Exception:
+                ftp.close()
+            return ConnLimitsPasvSpam(attempts, n227, n530, nother, last, None)
+        except Exception as e:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+            return ConnLimitsPasvSpam(attempts, n227, n530, nother, last, str(e))
+
+    def _conn_limits_idle_pre_auth(self, wait_sec: float) -> ConnLimitsIdleProbe:
+        if wait_sec <= 0:
+            return ConnLimitsIdleProbe(False, 0.0, False, "skipped")
+        kick = False
+        note = ""
+        ftp: ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit | None = None
+        try:
+            ftp = self.connect()
+            sock = ftp.sock
+            deadline = time.monotonic() + wait_sec
+            while time.monotonic() < deadline:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    break
+                r, _, _ = select.select([sock], [], [], min(1.0, max(0.01, rem)))
+                if r:
+                    try:
+                        d = sock.recv(8192)
+                        if not d:
+                            kick = True
+                            note = "peer closed during idle"
+                            break
+                        if b"421" in d or b"426" in d:
+                            kick = True
+                            note = "421/426 during idle"
+                            break
+                    except OSError as e:
+                        kick = True
+                        note = str(e)
+                        break
+            if not kick:
+                note = "no 421/close within idle window"
+        except Exception as e:
+            return ConnLimitsIdleProbe(True, wait_sec, False, str(e))
+        finally:
+            if ftp:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+        return ConnLimitsIdleProbe(True, wait_sec, kick, note)
+
+    def _conn_limits_slow_auth(self, gap: float) -> ConnLimitsSlowAuth:
+        if gap <= 0:
+            return ConnLimitsSlowAuth(False, 0.0, None, None, "skipped")
+        marker_user = "ptsrv_conn_slow_probe"
+        marker_pass = "PtsrvWrongPass!9~"
+        host = self.args.target.ip
+        port = self.args.target.port
+        try:
+            if self.args.tls:
+                ctx = ssl.create_default_context()
+                raw = socket.create_connection((host, port), timeout=10)
+                ss = ctx.wrap_socket(raw, server_hostname=host)
+                okb, err = self._conn_limits_drain_banner_raw(ss)
+                if not okb:
+                    try:
+                        ss.close()
+                    except Exception:
+                        pass
+                    return ConnLimitsSlowAuth(True, gap, None, None, err or "no banner")
+                buf = bytearray()
+                ss.sendall(f"USER {marker_user}\r\n".encode())
+                _line_u, eof = self._conn_limits_readline_socket(ss, buf, 15.0)
+                if eof and not _line_u:
+                    try:
+                        ss.close()
+                    except Exception:
+                        pass
+                    return ConnLimitsSlowAuth(True, gap, False, None, "EOF after USER")
+                time.sleep(gap)
+                ss.sendall(f"PASS {marker_pass}\r\n".encode())
+                line_p, eof2 = self._conn_limits_readline_socket(ss, buf, 20.0)
+                still = bool(line_p) or not eof2
+                try:
+                    ss.close()
+                except Exception:
+                    pass
+                return ConnLimitsSlowAuth(True, gap, still, (line_p or "")[:180], "implicit TLS control")
+            if self.args.starttls:
+                f = ftplib.FTP_TLS()
+                f.connect(host, port, timeout=10)
+                f.sock.settimeout(25.0)
+                f.auth()
+                f.putcmd(f"USER {marker_user}")
+                _ = f.getmultiline()
+                time.sleep(gap)
+                f.putcmd(f"PASS {marker_pass}")
+                resp = f.getmultiline()
+                snippet = resp[:180]
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                return ConnLimitsSlowAuth(True, gap, True, snippet, "STARTTLS control")
+            raw = socket.create_connection((host, port), timeout=10)
+            okb, err = self._conn_limits_drain_banner_raw(raw)
+            if not okb:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+                return ConnLimitsSlowAuth(True, gap, None, None, err or "no banner")
+            buf = bytearray()
+            raw.sendall(f"USER {marker_user}\r\n".encode())
+            _line_u, eof = self._conn_limits_readline_socket(raw, buf, 15.0)
+            if eof and not _line_u:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+                return ConnLimitsSlowAuth(True, gap, False, None, "EOF after USER")
+            time.sleep(gap)
+            raw.sendall(f"PASS {marker_pass}\r\n".encode())
+            line_p, eof2 = self._conn_limits_readline_socket(raw, buf, 20.0)
+            still = bool(line_p) or not eof2
+            try:
+                raw.close()
+            except Exception:
+                pass
+            return ConnLimitsSlowAuth(True, gap, still, (line_p or "")[:180], "plaintext control")
+        except Exception as e:
+            return ConnLimitsSlowAuth(True, gap, None, None, str(e))
+
+    def _conn_limits_idle_post_auth(self, creds: Creds, wait_sec: float) -> ConnLimitsIdleProbe:
+        if wait_sec <= 0:
+            return ConnLimitsIdleProbe(False, 0.0, False, "skipped")
+        kick = False
+        note = ""
+        ftp: ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit | None = None
+        try:
+            ftp = self.connect()
+            ftp.login(creds.user, creds.passw)
+            sock = ftp.sock
+            deadline = time.monotonic() + wait_sec
+            while time.monotonic() < deadline:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    break
+                r, _, _ = select.select([sock], [], [], min(1.0, max(0.01, rem)))
+                if r:
+                    try:
+                        d = sock.recv(8192)
+                        if not d:
+                            kick = True
+                            note = "peer closed during post-login idle"
+                            break
+                        if b"421" in d or b"426" in d:
+                            kick = True
+                            note = "421/426 during post-login idle"
+                            break
+                    except OSError as e:
+                        kick = True
+                        note = str(e)
+                        break
+            if not kick:
+                try:
+                    ftp.voidcmd("NOOP")
+                    note = "NOOP succeeded after idle window (weak idle kick)"
+                except ftplib.Error as e:
+                    note = f"NOOP after idle: {e}"
+                    if "421" in str(e):
+                        kick = True
+        except Exception as e:
+            return ConnLimitsIdleProbe(True, wait_sec, False, str(e))
+        finally:
+            if ftp:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+        return ConnLimitsIdleProbe(True, wait_sec, kick, note)
+
+    def test_connection_limits_audit(self, creds_post: Creds | None) -> ConnLimitsAuditResult:
+        """PTL-SVC-FTP-CONN: bounded connection / PASV / optional idle & slow-auth probes."""
+        par_n = max(1, int(getattr(self.args, "conn_limits_parallel", 12) or 12))
+        seq_n = max(0, int(getattr(self.args, "conn_limits_sequential", 24) or 24))
+        pasv_n = max(0, int(getattr(self.args, "conn_limits_pasv_attempts", 18) or 18))
+        idle_pre = float(getattr(self.args, "conn_limits_idle_pre_auth", 0) or 0)
+        slow_gap = float(getattr(self.args, "conn_limits_slow_auth_gap", 0) or 0)
+        idle_post = float(getattr(self.args, "conn_limits_idle_post_auth", 0) or 0)
+
+        if self.args.tls:
+            crypto_mode = "implicit_tls"
+        elif self.args.starttls:
+            crypto_mode = "starttls"
+        else:
+            crypto_mode = "plain"
+
+        parallel = self._conn_limits_parallel_phase(par_n)
+        sequential = (
+            self._conn_limits_sequential_phase(seq_n, 0.02)
+            if seq_n > 0
+            else ConnLimitsSequentialOutcome(0, 0, 0, 20.0, ())
+        )
+        pasv_pre = self._conn_limits_pasv_pre_auth_session(pasv_n)
+        pasv_post = (
+            self._conn_limits_pasv_post_auth_session(creds_post, pasv_n)
+            if creds_post is not None and pasv_n > 0
+            else None
+        )
+        idle_pre_r = self._conn_limits_idle_pre_auth(idle_pre)
+        slow_r = self._conn_limits_slow_auth(slow_gap)
+        idle_post_r = (
+            self._conn_limits_idle_post_auth(creds_post, idle_post)
+            if creds_post is not None and idle_post > 0
+            else None
+        )
+
+        risk_factors: list[str] = []
+        if _conn_limits_parallel_suspect(parallel):
+            risk_factors.append(
+                f"Parallel burst: all {parallel.attempted} simultaneous control sessions completed (220 + QUIT) with no refusal."
+            )
+        if _conn_limits_sequential_suspect(sequential):
+            risk_factors.append(
+                f"Sequential rapid connect: {sequential.succeeded} back-to-back control sessions succeeded without visible throttle."
+            )
+        if _conn_limits_pasv_pre_suspect(pasv_pre):
+            risk_factors.append(
+                "Pre-auth PASV spam: most PASV replies were 227 (many passive ports offered before login; 530 on some lines may still be login-gating, not flood control)."
+            )
+        if pasv_post is not None and _conn_limits_pasv_post_suspect(pasv_post):
+            risk_factors.append(
+                "Post-auth PASV spam: high rate of 227 replies on one session without error — passive allocations may be unbounded here."
+            )
+        if _conn_limits_idle_pre_suspect(idle_pre_r):
+            risk_factors.append(
+                f"Pre-login idle ~{int(idle_pre_r.wait_seconds)}s: no 421/close observed on control channel."
+            )
+        if _conn_limits_slow_auth_suspect(slow_r):
+            risk_factors.append(
+                "Slow authentication: long pause between USER and PASS did not drop the control connection before PASS reply."
+            )
+        if _conn_limits_idle_post_suspect(idle_post_r):
+            risk_factors.append(
+                "Post-login idle: NOOP still succeeded after long silence — authenticated idle timeout may be weak."
+            )
+
+        suspected = len(risk_factors) > 0
+        detail = (
+            f"cryptoMode={crypto_mode}; parallel {parallel.succeeded}/{parallel.attempted}; "
+            f"sequential {sequential.succeeded}/{sequential.attempts}; "
+            f"PASV pre 227/530/other={pasv_pre.reply227}/{pasv_pre.reply530}/{pasv_pre.reply_other}"
+            + (
+                f"; PASV post 227/530/other={pasv_post.reply227}/{pasv_post.reply530}/{pasv_post.reply_other}"
+                if pasv_post
+                else ""
+            )
+            + ". Heuristic only — tune probes and confirm on spare lab; not a full DoS test."
+        )
+        return ConnLimitsAuditResult(
+            crypto_mode=crypto_mode,
+            parallel=parallel,
+            sequential=sequential,
+            pasv_pre_auth=pasv_pre,
+            pasv_post_auth=pasv_post,
+            idle_pre_auth=idle_pre_r,
+            slow_auth=slow_r,
+            idle_post_auth=idle_post_r,
+            limits_insufficient_suspected=suspected,
+            risk_factors=tuple(risk_factors),
+            detail=detail,
+        )
+
+    _CHROOT_STRONG_CWD_PATHS = frozenset(
+        {
+            "/etc",
+            "/root",
+            "/proc",
+            "/sys",
+            "/var/log",
+            "/var/www",
+            "/srv",
+            "/dev",
+            "/boot",
+            "/bin",
+            "/sbin",
+            "/usr",
+        }
+    )
+    _CHROOT_DOTDOT_MAX_STEPS = 32
+
+    @staticmethod
+    def _chroot_norm_pwd(p: str) -> str:
+        s = (p or "").strip().strip('"').strip("'")
+        if not s:
+            return "/"
+        return posixpath.normpath(s.replace("\\", "/"))
+
+    @staticmethod
+    def _chroot_strict_ancestor(ancestor: str, descendant: str) -> bool:
+        a = FTP._chroot_norm_pwd(ancestor)
+        d = FTP._chroot_norm_pwd(descendant)
+        if a == d:
+            return False
+        if a == "/":
+            return d != "/"
+        base = a.rstrip("/")
+        return d.startswith(base + "/")
+
+    @staticmethod
+    def _parse_chroot_extra_paths(spec: str) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for i, part in enumerate(spec.split(",")):
+            p = part.strip()
+            if p:
+                out.append((f"extra_{i}", p))
+        return out
+
+    def _chroot_probe_cwd_fresh(self, creds: Creds, path: str, probe_id: str) -> ChrootCwdProbeRow:
+        ftp = self.connect()
+        try:
+            ftp.login(creds.user, creds.passw)
+            ftp.cwd(path)
+            pa = ftp.pwd()
+            return ChrootCwdProbeRow(probe_id, path, True, pa, None)
+        except ftplib.error_perm as e:
+            return ChrootCwdProbeRow(probe_id, path, False, None, str(e).strip()[:400])
+        except Exception as e:
+            return ChrootCwdProbeRow(probe_id, path, False, None, str(e).strip()[:400])
+        finally:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    def _chroot_probe_size_fresh(self, creds: Creds, remote_path: str) -> tuple[bool, str | None, int | None]:
+        ftp = self.connect()
+        try:
+            ftp.login(creds.user, creds.passw)
+            sz = ftp.size(remote_path)
+            if isinstance(sz, int) and sz >= 0:
+                return True, None, sz
+            return False, None, None
+        except Exception as e:
+            return False, str(e).strip()[:240], None
+        finally:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    def _chroot_dotdot_chain(self, creds: Creds, max_steps: int | None = None) -> ChrootDotdotResult:
+        """
+        Repeated CWD ... Early exit: server rejects .., PWD stops changing (at chroot/top),
+        or PWD read fails. max_steps is only a safety cap for abnormal symlink loops.
+        """
+        cap = max_steps if max_steps is not None else self._CHROOT_DOTDOT_MAX_STEPS
+        ftp = self.connect()
+        p0 = ""
+        try:
+            ftp.login(creds.user, creds.passw)
+            p0 = ftp.pwd()
+            last = p0
+            steps = 0
+            reason = "max_steps_cap"
+            for _ in range(cap):
+                try:
+                    ftp.cwd("..")
+                except ftplib.error_perm:
+                    reason = "cwd_dotdot_rejected"
+                    break
+                except Exception as e:
+                    reason = f"error:{type(e).__name__}"
+                    break
+                try:
+                    pn = ftp.pwd()
+                except Exception:
+                    reason = "pwd_failed"
+                    break
+                if self._chroot_norm_pwd(pn) == self._chroot_norm_pwd(last):
+                    reason = "pwd_unchanged"
+                    break
+                last = pn
+                steps += 1
+            return ChrootDotdotResult(steps, p0, last, reason)
+        except Exception as e:
+            return ChrootDotdotResult(0, p0 or "?", None, str(e)[:160])
+        finally:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    def test_chroot_audit(self, creds: Creds) -> ChrootAuditResult:
+        """PTL-SVC-FTP-CHROOT: CWD to host-like paths, .. chain, SIZE on /etc/passwd."""
+        ftp0 = self.connect()
+        pwd_initial: str
+        try:
+            ftp0.login(creds.user, creds.passw)
+            pwd_initial = ftp0.pwd()
+        finally:
+            try:
+                ftp0.close()
+            except Exception:
+                pass
+
+        base_probes: list[tuple[str, str]] = [
+            ("slash", "/"),
+            ("etc", "/etc"),
+            ("root_dir", "/root"),
+            ("home", "/home"),
+            ("proc", "/proc"),
+            ("sys", "/sys"),
+            ("var_log", "/var/log"),
+            ("var_www", "/var/www"),
+            ("srv", "/srv"),
+            ("dev", "/dev"),
+            ("bin", "/bin"),
+            ("tmp", "/tmp"),
+        ]
+        extra = self._parse_chroot_extra_paths(getattr(self.args, "chroot_audit_paths", "") or "")
+        seen: set[str] = {p for _, p in base_probes}
+        for eid, pth in extra:
+            if pth not in seen:
+                base_probes.append((eid, pth))
+                seen.add(pth)
+
+        rows: list[ChrootCwdProbeRow] = []
+        for pid, pth in base_probes:
+            rows.append(self._chroot_probe_cwd_fresh(creds, pth, pid))
+
+        dot = self._chroot_dotdot_chain(creds)
+        pwd0n = self._chroot_norm_pwd(pwd_initial)
+        pwd_fn = self._chroot_norm_pwd(dot.pwd_final or pwd_initial)
+        dotdot_escape = False
+        if dot.pwd_final and pwd0n and pwd_fn:
+            if self._chroot_strict_ancestor(pwd_fn, pwd0n) and pwd_fn != "/":
+                dotdot_escape = True
+
+        home_parent_ok = any(r.path == "/home" and r.success for r in rows)
+        home_sibling = bool(
+            home_parent_ok
+            and pwd0n.startswith("/home/")
+            and pwd0n.rstrip("/") != "/home"
+        )
+
+        strong_hits: list[str] = []
+        for r in rows:
+            if r.success and r.path in self._CHROOT_STRONG_CWD_PATHS:
+                strong_hits.append(r.path)
+
+        passwd_ok, _, passwd_sz = self._chroot_probe_size_fresh(creds, "/etc/passwd")
+        shadow_ok, _, shadow_sz = self._chroot_probe_size_fresh(creds, "/etc/shadow")
+
+        broken = (
+            len(strong_hits) > 0
+            or passwd_ok
+            or shadow_ok
+            or home_sibling
+            or dotdot_escape
+        )
+
+        parts: list[str] = []
+        if strong_hits:
+            parts.append(f"CWD succeeded to sensitive path(s): {', '.join(sorted(set(strong_hits)))}.")
+        if passwd_ok:
+            parts.append("SIZE /etc/passwd succeeded (file visible to this account).")
+        if shadow_ok:
+            parts.append("SIZE /etc/shadow succeeded (highly anomalous — verify).")
+        if home_sibling:
+            parts.append("CWD /home succeeded while login PWD was under /home/<user> (possible cross-user directory access).")
+        if dotdot_escape:
+            parts.append(
+                f"Repeated CWD .. reached strict parent of login directory (final PWD ~ {pwd_fn!r}, steps={dot.steps_ok})."
+            )
+        if not parts:
+            parts.append(
+                "No obvious host-level path breakout in this probe set; chroot may still use a synthetic '/' — confirm manually."
+            )
+
+        detail = " ".join(parts)
+        return ChrootAuditResult(
+            pwd_initial=pwd_initial,
+            cwd_probes=tuple(rows),
+            dotdot=dot,
+            home_parent_accessible=home_parent_ok,
+            system_paths_accessible=tuple(sorted(set(strong_hits))),
+            passwd_size_ok=passwd_ok,
+            shadow_size_ok=shadow_ok,
+            dotdot_parent_escape_suspected=dotdot_escape,
+            isolation_broken_suspected=broken,
+            detail=detail,
+            passwd_size_bytes=passwd_sz if passwd_ok else None,
+            shadow_size_bytes=shadow_sz if shadow_ok else None,
+        )
 
     @staticmethod
     def _reply_code(reply: str) -> int | None:
@@ -1996,7 +3298,7 @@ class FTP(BaseModule):
         return None, None
 
     def _print_active_audit_terminal(self, aa: ActiveAuditResult) -> None:
-        """Structured terminal output for PTL-SVC-FTP-ACTIVE (aligned with other FTP sections)."""
+        """Structured terminal output for active mode policy audit (aligned with other FTP sections)."""
         fk = get_colored_text
         star_h = fk("[*]", color="INFO")
         bounce_header = False
@@ -2122,7 +3424,7 @@ class FTP(BaseModule):
         self.ptprint(f"    {star_h} Active mode:     {active_txt}", Out.TEXT)
 
         if active_vuln:
-            overall = f"{fk('[✗]', color='VULN')} PTL-SVC-FTP-ACTIVE: review PORT policy (bounce / low port)"
+            overall = f"{fk('[✗]', color='VULN')} Review PORT policy (bounce / low port)"
         elif ipv4_skip:
             overall = f"{fk('[!]', color='WARNING')} Inconclusive (partial audit)"
         else:
@@ -3103,7 +4405,7 @@ class FTP(BaseModule):
                 self.ptprint(f"    {warn_b} tlsHandshakeHint: {inv.tls_handshake_hint}", Out.TEXT)
             if inv.obsolete_tls_suspected:
                 self.ptprint(
-                    f"    {fk('[✗]', color='VULN')} {VULNS.FtpObsoleteTls.value}: server likely requires obsolete TLS (<1.2); "
+                    f"    {fk('[✗]', color='VULN')} Obsolete TLS: server likely requires obsolete TLS (<1.2); "
                     "see JSON tlsHandshakeHint / setupError.",
                     Out.TEXT,
                 )
@@ -3130,7 +4432,7 @@ class FTP(BaseModule):
             self.ptprint(f"    {warn_b} tlsHandshakeHint: {inv.tls_handshake_hint}", Out.TEXT)
         if inv.obsolete_tls_suspected:
             self.ptprint(
-                f"    {fk('[✗]', color='VULN')} {VULNS.FtpObsoleteTls.value}: post-auth TLS suggests obsolete protocol.",
+                f"    {fk('[✗]', color='VULN')} Obsolete TLS: post-auth TLS suggests obsolete protocol.",
                 Out.TEXT,
             )
 
@@ -4275,6 +5577,689 @@ class FTP(BaseModule):
 
         return True
 
+    def _print_conn_limits_audit_terminal(self, cl: ConnLimitsAuditResult) -> None:
+        """Structured terminal report for connection limits audit (aligned with SMTP-style ptprint nesting).
+
+        Icon semantics: [*] = block titles; [i] = neutral facts; [✓] / [✗] = verdicts (RISK lines use [✗]).
+        Audit summary: one primary verdict line + one [i] caveat (heuristic / not DoS).
+        """
+        fk = get_colored_text
+        d1 = "    "
+        d2 = "        "
+        d3 = "            "  # Under each PASV "Phase:" — metrics & verdicts visually nested under the phase line.
+        star = fk("[*]", color="INFO")
+        info_i = fk("[i]", color="INFO")
+        tick = fk("[✓]", color="NOTVULN")
+        cross = fk("[✗]", color="VULN")
+
+        self.ptprint("Connection limits audit", Out.INFO)
+
+        self.ptprint(f"{d1}{star} Connectivity & session burst", Out.TEXT)
+        self.ptprint(
+            f"{d2}{info_i} Setup: cryptoMode={cl.crypto_mode} | parallel {cl.parallel.succeeded}/{cl.parallel.attempted}"
+            f" | sequential {cl.sequential.succeeded}/{cl.sequential.attempts}",
+            Out.TEXT,
+        )
+        if cl.parallel.error_samples:
+            self.ptprint(
+                f"{d2}{info_i} Parallel errors (sample): {cl.parallel.error_samples[0][:120]}",
+                Out.TEXT,
+            )
+        if cl.sequential.error_samples and cl.sequential.failed:
+            self.ptprint(
+                f"{d2}{info_i} Sequential errors (sample): {cl.sequential.error_samples[0][:120]}",
+                Out.TEXT,
+            )
+
+        if _conn_limits_parallel_suspect(cl.parallel):
+            self.ptprint(
+                f"{d2}{info_i} Parallel burst: All {cl.parallel.attempted} simultaneous control sessions completed "
+                f"(220 + QUIT) with no refusal.",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"{d2}{cross} RISK: No observed concurrency cap on this probe; many simultaneous clients could stress resources.",
+                Out.TEXT,
+            )
+        elif cl.parallel.attempted >= 10 and (cl.parallel.failed > 0 or cl.parallel.succeeded < cl.parallel.attempted):
+            self.ptprint(
+                f"{d2}{tick} Parallel burst: {cl.parallel.succeeded}/{cl.parallel.attempted} sessions completed; "
+                f"{cl.parallel.failed} failed or refused — possible concurrency or policy limits.",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d2}{info_i} Parallel burst: {cl.parallel.succeeded}/{cl.parallel.attempted} sessions completed "
+                f"(probe volume below the N≥10 parallel heuristic threshold).",
+                Out.TEXT,
+            )
+
+        if cl.sequential.attempts <= 0:
+            self.ptprint(f"{d2}{info_i} Sequential rapid connect: skipped (0 attempts)", Out.TEXT)
+        elif _conn_limits_sequential_suspect(cl.sequential):
+            self.ptprint(
+                f"{d2}{info_i} Sequential rapid connect: {cl.sequential.succeeded} back-to-back control sessions "
+                f"succeeded without visible throttle.",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"{d2}{cross} RISK: No visible new-connection throttle in this rapid series.",
+                Out.TEXT,
+            )
+        elif cl.sequential.attempts >= 20 and (
+            cl.sequential.failed > 0 or cl.sequential.succeeded < cl.sequential.attempts
+        ):
+            self.ptprint(
+                f"{d2}{tick} Sequential rapid connect: {cl.sequential.succeeded}/{cl.sequential.attempts} succeeded; "
+                f"{cl.sequential.failed} failed — possible rate or policy limiting.",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d2}{info_i} Sequential rapid connect: {cl.sequential.succeeded}/{cl.sequential.attempts} sessions "
+                f"(probe volume below the N≥20 sequential heuristic threshold).",
+                Out.TEXT,
+            )
+
+        self.ptprint(f"{d1}{star} Idle & control timing (optional probes)", Out.TEXT)
+        ipr = cl.idle_pre_auth
+        if not ipr.performed:
+            self.ptprint(
+                f"{d2}{info_i} Idle pre-login: not probed (set --conn-limits-idle-pre-auth > 0)",
+                Out.TEXT,
+            )
+        elif _conn_limits_idle_pre_suspect(ipr):
+            self.ptprint(
+                f"{d2}{info_i} Idle pre-login ~{ipr.wait_seconds:.0f}s: no 421/426/close observed — weak pre-auth idle limit suspected.",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"{d2}{cross} RISK: Long-lived anonymous control sessions may be possible before login.",
+                Out.TEXT,
+            )
+        elif ipr.kick_observed:
+            self.ptprint(
+                f"{d2}{tick} Idle pre-login ~{ipr.wait_seconds:.0f}s: server closed or sent kick — {ipr.note[:120]}",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d2}{info_i} Idle pre-login ~{ipr.wait_seconds:.0f}s: no kick in window — {ipr.note[:120]}",
+                Out.TEXT,
+            )
+
+        sa = cl.slow_auth
+        if not sa.performed:
+            self.ptprint(
+                f"{d2}{info_i} Slow USER→PASS gap: not probed (set --conn-limits-slow-auth-gap > 0)",
+                Out.TEXT,
+            )
+        elif _conn_limits_slow_auth_suspect(sa):
+            self.ptprint(
+                f"{d2}{info_i} Slow authentication: {sa.gap_seconds:.0f}s gap before PASS did not drop the session before reply.",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"{d2}{cross} RISK: Slowloris-style pacing on the control channel may be tolerated.",
+                Out.TEXT,
+            )
+        elif sa.still_connected_after_pass is False:
+            self.ptprint(
+                f"{d2}{tick} Slow USER→PASS gap {sa.gap_seconds:.0f}s: connection dropped or hard-failed — possible anti-slow-auth policy.",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d2}{info_i} Slow USER→PASS gap {sa.gap_seconds:.0f}s: still_connected_after_pass={sa.still_connected_after_pass}",
+                Out.TEXT,
+            )
+
+        ipo = cl.idle_post_auth
+        if ipo is None:
+            self.ptprint(
+                f"{d2}{info_i} Idle post-login: skipped (no credentials or --conn-limits-idle-post-auth=0)",
+                Out.TEXT,
+            )
+        elif not ipo.performed:
+            self.ptprint(f"{d2}{info_i} Idle post-login: not probed", Out.TEXT)
+        elif _conn_limits_idle_post_suspect(ipo):
+            self.ptprint(
+                f"{d2}{info_i} Idle post-login ~{ipo.wait_seconds:.0f}s: NOOP still succeeded — weak authenticated idle timeout suspected.",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"{d2}{cross} RISK: Authenticated sessions may linger without timely disconnect.",
+                Out.TEXT,
+            )
+        elif ipo.kick_observed:
+            self.ptprint(
+                f"{d2}{tick} Idle post-login ~{ipo.wait_seconds:.0f}s: kick observed — {ipo.note[:120]}",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d2}{info_i} Idle post-login ~{ipo.wait_seconds:.0f}s: {ipo.note[:120]}",
+                Out.TEXT,
+            )
+
+        self.ptprint(f"{d1}{star} Passive port allocation (PASV spam)", Out.TEXT)
+        pp = cl.pasv_pre_auth
+        self.ptprint(f"{d2}{star} Phase: Pre-authentication", Out.TEXT)
+        err_bit = f" | err: {pp.error}" if pp.error else ""
+        self.ptprint(
+            f"{d3}{info_i} 227 (Ready): {pp.reply227} | 530 (Rejected): {pp.reply530} | Other: {pp.reply_other}{err_bit}",
+            Out.TEXT,
+        )
+        if _conn_limits_pasv_pre_suspect(pp):
+            self.ptprint(
+                f"{d3}{cross} Pre-auth PASV: high 227 rate — passive data ports may be allocated before authentication.",
+                Out.TEXT,
+            )
+        elif pp.error and pp.reply227 > 0:
+            self.ptprint(
+                f"{d3}{info_i} Result: PASV phase ended with an error after some 227 replies — inconclusive for pre-auth spam.",
+                Out.TEXT,
+            )
+        elif pp.error:
+            self.ptprint(
+                f"{d3}{tick} Result: No pre-login 227 flood observed; session ended early ({pp.error[:100]}).",
+                Out.TEXT,
+            )
+        elif pp.reply227 == 0:
+            self.ptprint(
+                f"{d3}{tick} Result: Server rejects or gates PASV before login (no 227 Ready flood in this run).",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d3}{info_i} Result: PASV pre-auth replies did not match the high–227 spam heuristic.",
+                Out.TEXT,
+            )
+
+        po = cl.pasv_post_auth
+        if po is None:
+            self.ptprint(f"{d2}{star} Phase: Post-authentication — skipped (no credentials)", Out.TEXT)
+        else:
+            self.ptprint(f"{d2}{star} Phase: Post-authentication", Out.TEXT)
+            err_po = f" | err: {po.error}" if po.error else ""
+            self.ptprint(
+                f"{d3}{info_i} 227 (Ready): {po.reply227} | 530 (Rejected): {po.reply530} | Other: {po.reply_other}{err_po}",
+                Out.TEXT,
+            )
+            if _conn_limits_pasv_post_suspect(po):
+                self.ptprint(
+                    f"{d3}{cross} Post-auth PASV: high 227 rate on one session — passive allocations may be unbounded "
+                    f"or weakly capped.",
+                    Out.TEXT,
+                )
+            elif po.error:
+                self.ptprint(
+                    f"{d3}{info_i} Result: PASV phase ended with an error — inconclusive for post-auth spam.",
+                    Out.TEXT,
+                )
+            else:
+                self.ptprint(
+                    f"{d3}{info_i} Result: PASV post-auth replies did not match the unbounded-227 heuristic.",
+                    Out.TEXT,
+                )
+
+        self.ptprint(f"{d1}{star} Audit summary & heuristics", Out.TEXT)
+        if cl.limits_insufficient_suspected:
+            self.ptprint(
+                f"{d2}{cross} LIMITS_INSUFFICIENT — bounded probes matched patterns associated with weak FTP limits "
+                f"(connections, rate, PASV, and/or idle).",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d2}{tick} LIMITS_OK — bounded probes did not match insufficient-limit patterns in this run.",
+                Out.TEXT,
+            )
+        self.ptprint(
+            f"{d2}{info_i} Heuristic-only ({cl.parallel.attempted} parallel / {cl.sequential.attempts} sequential); "
+            f"tune --conn-limits-* on a lab target — not a full DoS test; confirm in a controlled, authorized environment.",
+            Out.TEXT,
+        )
+
+    def _print_pasv_port_range_terminal(self, ppr: PasvPortRangeResult) -> None:
+        """Structured terminal report for passive port spread audit (aligned with connection limits / SMTP-style nesting)."""
+        fk = get_colored_text
+        d1 = "    "
+        d2 = "        "
+        star = fk("[*]", color="INFO")
+        info_i = fk("[i]", color="INFO")
+        warn_bang = fk("[!]", color="WARNING")
+        tick = fk("[✓]", color="NOTVULN")
+        cross = fk("[✗]", color="VULN")
+
+        if self.args.tls:
+            crypto_mode = "implicit_tls"
+        elif self.args.starttls:
+            crypto_mode = "starttls"
+        else:
+            crypto_mode = "plain"
+
+        self.ptprint("Passive port range audit", Out.INFO)
+
+        self.ptprint(f"{d1}{star} Port sampling & analysis", Out.TEXT)
+        self.ptprint(
+            f"{d2}{info_i} Setup: samples {len(ppr.probes)} | threshold {ppr.max_span_threshold} | cryptoMode={crypto_mode}",
+            Out.TEXT,
+        )
+        n_ok = len(ppr.successful_ports)
+        n_all = len(ppr.probes)
+        if n_ok < n_all:
+            self.ptprint(f"{d2}{info_i} Successful data channels: {n_ok}/{n_all}", Out.TEXT)
+
+        ports_csv = ", ".join(str(p) for p in ppr.successful_ports) if ppr.successful_ports else "(none)"
+        self.ptprint(f"{d2}{info_i} Collected ports: {ports_csv}", Out.TEXT)
+
+        if ppr.min_port is not None and ppr.max_port is not None and ppr.observed_span is not None:
+            self.ptprint(
+                f"{d2}{info_i} Observed range: {ppr.min_port} - {ppr.max_port} (span: {ppr.observed_span})",
+                Out.TEXT,
+            )
+        elif ppr.min_port is not None and ppr.max_port is not None:
+            self.ptprint(
+                f"{d2}{info_i} Observed range: {ppr.min_port} - {ppr.max_port}",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d2}{info_i} Observed range: n/a (insufficient data ports for min/max)",
+                Out.TEXT,
+            )
+
+        if ppr.inconclusive:
+            self.ptprint(
+                f"{d2}{warn_bang} Result: Inconclusive (need ≥{ppr.min_samples_for_verdict} successful passive LIST samples).",
+                Out.TEXT,
+            )
+        elif ppr.wide_passive_range:
+            self.ptprint(
+                f"{d2}{cross} Result: Wide passive range detected (span {ppr.observed_span} > {ppr.max_span_threshold}).",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d2}{tick} Result: Narrow passive range detected (span {ppr.observed_span} <= {ppr.max_span_threshold}).",
+                Out.TEXT,
+            )
+
+        self.ptprint(f"{d1}{star} Audit summary & heuristics", Out.TEXT)
+        if ppr.inconclusive:
+            self.ptprint(f"{d2}{info_i} Status: PASSIVE_RANGE_INCONCLUSIVE", Out.TEXT)
+            self.ptprint(
+                f"{d2}{info_i} Finding: Not enough successful samples to judge passive port spread against threshold.",
+                Out.TEXT,
+            )
+            self.ptprint(f"{d2}{info_i} Note: {ppr.detail}", Out.TEXT)
+        elif ppr.wide_passive_range:
+            self.ptprint(f"{d2}{cross} Status: PASSIVE_RANGE_WIDE", Out.TEXT)
+            self.ptprint(
+                f"{d2}{cross} Finding: Wide passive port range detected.",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"{d2}{cross} RISK: Excessive port exposure complicates firewall filtering and increases attack surface.",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"{d2}{info_i} Note: Configure 'pasv_min_port' and 'pasv_max_port' to a smaller range (e.g., 100-200 ports).",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(f"{d2}{tick} Status: PASSIVE_RANGE_OK", Out.TEXT)
+            self.ptprint(
+                f"{d2}{tick} Finding: Server appears to use a restricted passive port range.",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"{d2}{info_i} Note: Observed span ({ppr.observed_span}) is well within the security threshold ({ppr.max_span_threshold}).",
+                Out.TEXT,
+            )
+
+    def _print_chroot_audit_terminal(self, ch: ChrootAuditResult) -> None:
+        """Structured user-isolation report (aggregate CWD stats + highlighted breaches; matches pasv/conn-limits style)."""
+        fk = get_colored_text
+        d1 = "    "
+        d2 = "        "
+        star = fk("[*]", color="INFO")
+        info_i = fk("[i]", color="INFO")
+        tick = fk("[✓]", color="NOTVULN")
+        cross = fk("[✗]", color="VULN")
+
+        dd = ch.dotdot
+        pwd0n = self._chroot_norm_pwd(ch.pwd_initial)
+        home_sibling = bool(
+            ch.home_parent_accessible
+            and pwd0n.startswith("/home/")
+            and pwd0n.rstrip("/") != "/home"
+        )
+
+        self.ptprint("User isolation audit", Out.INFO)
+
+        self.ptprint(f"{d1}{star} Path traversal & system access probes", Out.TEXT)
+        self.ptprint(f"{d2}{info_i} Login PWD: {ch.pwd_initial!r}", Out.TEXT)
+
+        paths = [r.path for r in ch.cwd_probes]
+        n = len(paths)
+        preview_n = 5
+        paths_preview = ", ".join(paths[:preview_n]) + (", ..." if n > preview_n else "")
+        self.ptprint(f"{d2}{info_i} System paths: {n} tested ({paths_preview})", Out.TEXT)
+
+        allowed_rows = [r for r in ch.cwd_probes if r.success]
+        n_ok = len(allowed_rows)
+        n_rej = n - n_ok
+        allowed_q = ", ".join(repr(r.path) for r in allowed_rows) if allowed_rows else "(none)"
+        self.ptprint(
+            f"{d2}{info_i} Path results: {n_rej}/{n} rejected, {n_ok}/{n} allowed ({allowed_q})",
+            Out.TEXT,
+        )
+
+        for r in ch.cwd_probes:
+            if r.success and r.path in self._CHROOT_STRONG_CWD_PATHS:
+                pwd_bit = f" (PWD: {r.pwd_after!r})" if r.pwd_after else ""
+                self.ptprint(
+                    f"{d2}{cross} Critical path accessible: CWD {r.path!r} succeeded{pwd_bit}",
+                    Out.TEXT,
+                )
+        if home_sibling:
+            self.ptprint(
+                f"{d2}{cross} Cross-user exposure: CWD '/home' succeeded while login PWD is under '/home/<account>' "
+                "(possible sibling home access).",
+                Out.TEXT,
+            )
+        if ch.dotdot_parent_escape_suspected:
+            self.ptprint(
+                f"{d2}{cross} Directory traversal: '..' chain suggests escape above the post-login directory root.",
+                Out.TEXT,
+            )
+        if ch.passwd_size_ok:
+            sz = ch.passwd_size_bytes
+            sz_bit = f" ({sz} bytes)" if sz is not None else ""
+            self.ptprint(f"{d2}{cross} Sensitive file found: SIZE '/etc/passwd'{sz_bit}", Out.TEXT)
+        if ch.shadow_size_ok:
+            sz = ch.shadow_size_bytes
+            sz_bit = f" ({sz} bytes)" if sz is not None else ""
+            self.ptprint(f"{d2}{cross} Sensitive file found: SIZE '/etc/shadow'{sz_bit}", Out.TEXT)
+
+        self.ptprint(
+            f"{d2}{info_i} Directory traversal: up to {self._CHROOT_DOTDOT_MAX_STEPS} × '..' attempted "
+            f"({dd.steps_ok} successful step(s); final PWD ~ {dd.pwd_final!r}, {dd.stopped_reason})",
+            Out.TEXT,
+        )
+
+        if ch.isolation_broken_suspected:
+            self.ptprint(
+                f"{d2}{cross} Result: Isolation breach suspected; host paths visible.",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d2}{tick} Result: No host filesystem breakout detected.",
+                Out.TEXT,
+            )
+
+        self.ptprint(f"{d1}{star} Audit summary & heuristics", Out.TEXT)
+        if ch.isolation_broken_suspected:
+            self.ptprint(f"{d2}{cross} Status: CHROOT_BROKEN_SUSPECTED", Out.TEXT)
+            self.ptprint(
+                f"{d2}{cross} Finding: Insecure configuration; account can access host system paths.",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"{d2}{info_i} Note: {ch.detail}",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(f"{d2}{tick} Status: CHROOT_OK", Out.TEXT)
+            self.ptprint(
+                f"{d2}{tick} Finding: Account appears properly isolated within a chroot/jail.",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"{d2}{info_i} Note: No obvious host-level path breakout; chroot may still use a synthetic '/'.",
+                Out.TEXT,
+            )
+            self.ptprint(
+                f"{d2}{info_i} Note: Heuristic check only — confirm manually in critical environments.",
+                Out.TEXT,
+            )
+
+    def _user_enum_probe_signature(self, r: FtpUserEnumProbeRow) -> tuple[int | None, str]:
+        """Comparable (code, normalized text) for USER/PASS outcome (wordlist vs control probes)."""
+        if r.error:
+            return (None, "")
+        if r.user_reply_code in (331, 332):
+            return (r.pass_reply_code, self._norm_ftp_reply_text(r.pass_reply_line or ""))
+        return (r.user_reply_code, self._norm_ftp_reply_text(r.user_reply_line or ""))
+
+    @staticmethod
+    def _user_enum_format_probe_reply(r: FtpUserEnumProbeRow) -> str:
+        if r.error:
+            return f"(probe error: {r.error[:100]})"
+        if r.user_reply_code in (331, 332):
+            c = r.pass_reply_code
+            line = (r.pass_reply_line or "").strip()
+        else:
+            c = r.user_reply_code
+            line = (r.user_reply_line or "").strip()
+        line = re.sub(r"\s+", " ", line)
+        return f"{c} {line}"[:160].strip()
+
+    def _print_user_enum_terminal(self, ue: FtpUserEnumResult) -> None:
+        """Structured username enumeration report (aggregate responses + highlighted outliers; RFC 2577)."""
+        fk = get_colored_text
+        d1 = "    "
+        d2 = "        "
+        star = fk("[*]", color="INFO")
+        info_i = fk("[i]", color="INFO")
+        warn_bang = fk("[!]", color="WARNING")
+        tick = fk("[✓]", color="NOTVULN")
+        cross = fk("[✗]", color="VULN")
+
+        do_timing = bool(getattr(self.args, "user_enum_timing", False))
+        keep_alive = bool(getattr(self.args, "user_enum_keep_alive", False))
+        threads = max(1, int(getattr(self.args, "user_enum_threads", 1) or 1))
+        n_word = sum(1 for p in ue.probes if p.probe_kind == "wordlist")
+        n_ctrl = sum(1 for p in ue.probes if p.probe_kind.startswith("control"))
+        n_err = sum(1 for p in ue.probes if p.error)
+
+        if keep_alive:
+            mode = "keep-alive"
+        elif threads > 1:
+            mode = f"multi-session ({threads} threads)"
+        else:
+            mode = "multi-session"
+
+        self.ptprint("Username enumeration audit (-eu / PTL-SVC-FTP-USRENUM)", Out.INFO)
+
+        self.ptprint(f"{d1}{star} Probe configuration & heuristics", Out.TEXT)
+        strat = (
+            "USER then wrong PASS (timing-aware, RFC 2577)"
+            if do_timing
+            else "USER then fixed bad PASS (RFC 2577)"
+        )
+        self.ptprint(f"{d2}{info_i} Strategy: {strat}", Out.TEXT)
+        self.ptprint(
+            f"{d2}{info_i} Wordlist: {n_word} entries + {n_ctrl} controls | threads: {threads} | mode: {mode}",
+            Out.TEXT,
+        )
+        analysis_bits = "Response codes, fuzzy text matching, sequence behavior"
+        if do_timing:
+            analysis_bits += ", PASS-phase latency (--user-enum-timing)"
+        self.ptprint(f"{d2}{info_i} Analysis: {analysis_bits}", Out.TEXT)
+        if n_err:
+            self.ptprint(f"{d2}{info_i} Probes with errors: {n_err} (see JSON)", Out.TEXT)
+
+        self.ptprint(f"{d1}{star} Enumeration findings", Out.TEXT)
+
+        wl_ok = [r for r in ue.probes if r.probe_kind == "wordlist" and r.error is None]
+        ctr = collections.Counter()
+        dominant_sig: tuple[int | None, str] | None = None
+        dom_count = 0
+        dom_row: FtpUserEnumProbeRow | None = None
+        if wl_ok:
+            sigs = [self._user_enum_probe_signature(r) for r in wl_ok]
+            ctr = collections.Counter(sigs)
+            dominant_sig, dom_count = ctr.most_common(1)[0]
+            dom_code, _norm_dom = dominant_sig
+            n_wl = len(wl_ok)
+            if len(ctr) == 1:
+                self.ptprint(
+                    f"{d2}{info_i} Response consistency: {n_wl}/{n_wl} wordlist probes share code {dom_code} "
+                    f"with identical normalized message.",
+                    Out.TEXT,
+                )
+            else:
+                n_diff = n_wl - dom_count
+                self.ptprint(
+                    f"{d2}{info_i} Response consistency: {dom_count}/{n_wl} wordlist probes share the dominant pattern "
+                    f"(code {dom_code}); {n_diff} differ.",
+                    Out.TEXT,
+                )
+            dom_row = next((r for r in wl_ok if self._user_enum_probe_signature(r) == dominant_sig), None)
+            dominant_phrase = self._user_enum_format_probe_reply(dom_row) if dom_row else "n/a"
+            for r in wl_ok:
+                if self._user_enum_probe_signature(r) != dominant_sig:
+                    self.ptprint(
+                        f"{d2}{cross} Differentiation: User {r.username!r} returned "
+                        f"{self._user_enum_format_probe_reply(r)!r} instead of {dominant_phrase!r}",
+                        Out.TEXT,
+                    )
+        elif n_word:
+            self.ptprint(
+                f"{d2}{info_i} Response consistency: no successful wordlist probes (all had errors).",
+                Out.TEXT,
+            )
+
+        ctrl_ok = [r for r in ue.probes if r.probe_kind.startswith("control") and r.error is None]
+        if ctrl_ok and wl_ok and len(ctr) == 1 and dominant_sig is not None and dom_row is not None:
+            ctrl_match = sum(1 for r in ctrl_ok if self._user_enum_probe_signature(r) == dominant_sig)
+            self.ptprint(
+                f"{d2}{info_i} Control probes: {ctrl_match}/{len(ctrl_ok)} matched the wordlist response pattern.",
+                Out.TEXT,
+            )
+            for r in ctrl_ok:
+                if self._user_enum_probe_signature(r) != dominant_sig:
+                    self.ptprint(
+                        f"{d2}{cross} Differentiation: Control user {r.username!r} returned "
+                        f"{self._user_enum_format_probe_reply(r)!r} instead of "
+                        f"{self._user_enum_format_probe_reply(dom_row)!r}",
+                        Out.TEXT,
+                    )
+
+        if do_timing:
+            if ue.timing_control_median_ms is not None:
+                self.ptprint(
+                    f"{d2}{info_i} Control baseline: median {ue.timing_control_median_ms:.1f} ms "
+                    f"for control usernames (PASS phase, post-warmup cohort where applicable).",
+                    Out.TEXT,
+                )
+                if ue.timing_wordlist_median_ms is not None:
+                    self.ptprint(
+                        f"{d2}{info_i} Wordlist cohort median: {ue.timing_wordlist_median_ms:.1f} ms.",
+                        Out.TEXT,
+                    )
+            else:
+                self.ptprint(
+                    f"{d2}{info_i} Timing: insufficient PASS timings for median comparison "
+                    f"(need ≥2 wordlist and ≥1 control with 331/332).",
+                    Out.TEXT,
+                )
+            if ue.timing_slow_usernames_ms:
+                parts = ", ".join(f"{u!r} ({ms:.1f}ms)" for u, ms in ue.timing_slow_usernames_ms[:12])
+                if len(ue.timing_slow_usernames_ms) > 12:
+                    parts += ", …"
+                self.ptprint(
+                    f"{d2}{warn_bang} Timing anomaly (per user vs control threshold): {parts}",
+                    Out.TEXT,
+                )
+            if "timingSuppressedSuspectedTarpitting" in ue.timing_notes:
+                self.ptprint(
+                    f"{d2}{info_i} Timing: cohort comparison suppressed (possible tarpitting / delay policy in keep-alive run).",
+                    Out.TEXT,
+                )
+
+        if ue.enumeration_suspected:
+            self.ptprint(
+                f"{d2}{cross} Result: Response differentiation suggests a username enumeration oracle (RFC 2577).",
+                Out.TEXT,
+            )
+        elif ue.timing_anomaly_suspected:
+            self.ptprint(
+                f"{d2}{tick} Result: No obvious code/message leakage detected.",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d2}{tick} Result: No differentiation in server responses detected.",
+                Out.TEXT,
+            )
+
+        self.ptprint(f"{d1}{star} Audit summary & heuristics", Out.TEXT)
+        if ue.enumeration_suspected and ue.timing_anomaly_suspected:
+            self.ptprint(f"{d2}{cross} Status: USER_ENUM_SUSPECTED", Out.TEXT)
+            self.ptprint(
+                f"{d2}{cross} Finding: Server responses and/or timing differ in ways that may enable username guessing.",
+                Out.TEXT,
+            )
+        elif ue.enumeration_suspected:
+            self.ptprint(f"{d2}{cross} Status: USER_ENUM_SUSPECTED", Out.TEXT)
+            self.ptprint(
+                f"{d2}{cross} Finding: Server responses appear to differentiate between tested usernames.",
+                Out.TEXT,
+            )
+        elif ue.timing_anomaly_suspected:
+            self.ptprint(f"{d2}{warn_bang} Status: USER_ENUM_SUSPECTED (via timing)", Out.TEXT)
+            self.ptprint(
+                f"{d2}{cross} Finding: Server timing differs significantly for certain usernames.",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(f"{d2}{tick} Status: USER_ENUM_OK", Out.TEXT)
+            self.ptprint(
+                f"{d2}{tick} Finding: Server responses appear consistent for all tested usernames.",
+                Out.TEXT,
+            )
+
+        codes_s = ", ".join(str(c) for c in ue.distinct_user_reply_codes) if ue.distinct_user_reply_codes else "n/a"
+        if not ue.enumeration_suspected and not ue.timing_anomaly_suspected:
+            if wl_ok and len(ctr) == 1 and dominant_sig is not None:
+                dc = dominant_sig[0]
+                self.ptprint(
+                    f"{d2}{info_i} Note: Response codes ({codes_s}) and messages were uniform across "
+                    f"{len(wl_ok)} wordlist probes (terminal code {dc}).",
+                    Out.TEXT,
+                )
+            elif wl_ok:
+                self.ptprint(
+                    f"{d2}{info_i} Note: USER-stage code set: {codes_s}; see differentiation lines and JSON.",
+                    Out.TEXT,
+                )
+
+        if not do_timing:
+            self.ptprint(
+                f"{d2}{info_i} Note: Timing analysis was skipped (use --user-enum-timing for latency audit).",
+                Out.TEXT,
+            )
+        elif ue.timing_control_median_ms is not None and ue.timing_slow_usernames_ms:
+            slow = ue.timing_slow_usernames_ms[0]
+            self.ptprint(
+                f"{d2}{info_i} Note: Control median was {ue.timing_control_median_ms:.1f} ms; "
+                f"example slow candidate {slow[0]!r} took {slow[1]:.1f} ms.",
+                Out.TEXT,
+            )
+        elif do_timing and ue.timing_control_median_ms is not None and not ue.timing_anomaly_suspected:
+            self.ptprint(
+                f"{d2}{info_i} Note: PASS-phase medians within expected range for this sample (no timing flag).",
+                Out.TEXT,
+            )
+
+        if ue.enumeration_suspected or ue.timing_anomaly_suspected:
+            self.ptprint(f"{d2}{info_i} Note: {ue.detail}", Out.TEXT)
+
     # region output
 
     def output(self) -> None:
@@ -4606,6 +6591,176 @@ class FTP(BaseModule):
                     icon = get_colored_text("[✗]", color="VULN")
                     self.ptprint(f"    {icon} PASV Internal IP Leak: server advertised {modes.pasv_ip_leak}", Out.TEXT)
 
+        # Passive data port spread (PTL-SVC-FTP-PASIVE)
+        if ppr_err := getattr(self.results, "pasv_port_range_error", None):
+            properties.update({"ftpPasvPortRangeError": ppr_err})
+            if not self.use_json:
+                self.ptprint("Passive port range audit", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {ppr_err}", Out.TEXT)
+        elif (ppr := getattr(self.results, "pasv_port_range", None)) is not None:
+            ppr_json = {
+                "sampleCount": len(ppr.probes),
+                "successfulSamples": len(ppr.successful_ports),
+                "dataPorts": list(ppr.successful_ports),
+                "minPort": ppr.min_port,
+                "maxPort": ppr.max_port,
+                "observedSpan": ppr.observed_span,
+                "maxSpanThreshold": ppr.max_span_threshold,
+                "minSamplesForVerdict": ppr.min_samples_for_verdict,
+                "widePassiveRange": ppr.wide_passive_range,
+                "inconclusive": ppr.inconclusive,
+                "detail": ppr.detail,
+                "probes": [
+                    {
+                        "sampleIndex": pr.sample_index,
+                        "dataPort": pr.data_port,
+                        "error": pr.error,
+                    }
+                    for pr in ppr.probes
+                ],
+            }
+            properties.update({"ftpPasvPortRange": ppr_json})
+            if not self.use_json:
+                self._print_pasv_port_range_terminal(ppr)
+            if ppr.wide_passive_range and not ppr.inconclusive:
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.FtpPassivePortRange.value,
+                        "vuln_request": "Repeated PASV + LIST (--pasv-port-audit / -R)",
+                        "vuln_response": ppr.detail,
+                    }
+                )
+
+        # Connection limits audit (PTL-SVC-FTP-CONN)
+        if cl_err := getattr(self.results, "conn_limits_error", None):
+            properties.update({"ftpConnLimitsError": cl_err})
+            if not self.use_json:
+                self.ptprint("Connection limits audit", Out.INFO)
+                ii = get_colored_text("[i]", color="INFO")
+                self.ptprint(f"    {ii} Audit failed: {cl_err}", Out.TEXT)
+        elif (cl := getattr(self.results, "conn_limits", None)) is not None:
+            pp = cl.pasv_pre_auth
+            po = cl.pasv_post_auth
+            cl_json: dict = {
+                "cryptoMode": cl.crypto_mode,
+                "parallel": {
+                    "attempted": cl.parallel.attempted,
+                    "succeeded": cl.parallel.succeeded,
+                    "failed": cl.parallel.failed,
+                    "errorSamples": list(cl.parallel.error_samples),
+                },
+                "sequential": {
+                    "attempts": cl.sequential.attempts,
+                    "succeeded": cl.sequential.succeeded,
+                    "failed": cl.sequential.failed,
+                    "interConnectDelayMs": cl.sequential.inter_connect_delay_ms,
+                    "errorSamples": list(cl.sequential.error_samples),
+                },
+                "pasvPreAuth": {
+                    "attempts": pp.attempts,
+                    "reply227": pp.reply227,
+                    "reply530": pp.reply530,
+                    "replyOther": pp.reply_other,
+                    "lastReplySnippet": pp.last_reply_snippet,
+                    "error": pp.error,
+                },
+                "pasvPostAuth": None
+                if po is None
+                else {
+                    "attempts": po.attempts,
+                    "reply227": po.reply227,
+                    "reply530": po.reply530,
+                    "replyOther": po.reply_other,
+                    "lastReplySnippet": po.last_reply_snippet,
+                    "error": po.error,
+                },
+                "idlePreAuth": {
+                    "performed": cl.idle_pre_auth.performed,
+                    "waitSeconds": cl.idle_pre_auth.wait_seconds,
+                    "kickObserved": cl.idle_pre_auth.kick_observed,
+                    "note": cl.idle_pre_auth.note,
+                },
+                "slowAuth": {
+                    "performed": cl.slow_auth.performed,
+                    "gapSeconds": cl.slow_auth.gap_seconds,
+                    "stillConnectedAfterPass": cl.slow_auth.still_connected_after_pass,
+                    "passReplySnippet": cl.slow_auth.pass_reply_snippet,
+                    "note": cl.slow_auth.note,
+                },
+                "idlePostAuth": None
+                if cl.idle_post_auth is None
+                else {
+                    "performed": cl.idle_post_auth.performed,
+                    "waitSeconds": cl.idle_post_auth.wait_seconds,
+                    "kickObserved": cl.idle_post_auth.kick_observed,
+                    "note": cl.idle_post_auth.note,
+                },
+                "limitsInsufficientSuspected": cl.limits_insufficient_suspected,
+                "riskFactors": list(cl.risk_factors),
+                "detail": cl.detail,
+            }
+            properties.update({"ftpConnLimitsAudit": cl_json})
+            if not self.use_json:
+                self._print_conn_limits_audit_terminal(cl)
+            if cl.limits_insufficient_suspected:
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.FtpConnectionLimits.value,
+                        "vuln_request": "Connection / rate / idle / PASV probes (--conn-limits-audit / -L)",
+                        "vuln_response": "; ".join(cl.risk_factors) if cl.risk_factors else cl.detail,
+                    }
+                )
+
+        # Chroot / user isolation audit (PTL-SVC-FTP-CHROOT)
+        if ch_err := getattr(self.results, "chroot_audit_error", None):
+            properties.update({"ftpChrootAuditError": ch_err})
+            if not self.use_json:
+                self.ptprint("User isolation audit", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {ch_err}", Out.TEXT)
+        elif (ch := getattr(self.results, "chroot_audit", None)) is not None:
+            dd = ch.dotdot
+            ch_json = {
+                "pwdInitial": ch.pwd_initial,
+                "cwdProbes": [
+                    {
+                        "probeId": r.probe_id,
+                        "path": r.path,
+                        "success": r.success,
+                        "pwdAfter": r.pwd_after,
+                        "errorOrReply": r.error_or_reply,
+                    }
+                    for r in ch.cwd_probes
+                ],
+                "dotdot": {
+                    "stepsOk": dd.steps_ok,
+                    "pwdInitial": dd.pwd_initial,
+                    "pwdFinal": dd.pwd_final,
+                    "stoppedReason": dd.stopped_reason,
+                },
+                "homeParentAccessible": ch.home_parent_accessible,
+                "systemPathsAccessible": list(ch.system_paths_accessible),
+                "passwdSizeOk": ch.passwd_size_ok,
+                "shadowSizeOk": ch.shadow_size_ok,
+                "dotdotParentEscapeSuspected": ch.dotdot_parent_escape_suspected,
+                "isolationBrokenSuspected": ch.isolation_broken_suspected,
+                "detail": ch.detail,
+                "passwdSizeBytes": ch.passwd_size_bytes,
+                "shadowSizeBytes": ch.shadow_size_bytes,
+            }
+            properties.update({"ftpChrootAudit": ch_json})
+            if not self.use_json:
+                self._print_chroot_audit_terminal(ch)
+            if ch.isolation_broken_suspected:
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.FtpChrootIsolation.value,
+                        "vuln_request": "CWD / .. / SIZE probes (--chroot-audit / -J)",
+                        "vuln_response": ch.detail,
+                    }
+                )
+
         # Active mode policy audit (PTL-SVC-FTP-ACTIVE)
         if active_audit_error := getattr(self.results, "active_audit_error", None):
             properties.update({"activeAuditError": active_audit_error})
@@ -4859,7 +7014,7 @@ class FTP(BaseModule):
         if ue_err := getattr(self.results, "user_enum_error", None):
             properties.update({"ftpUserEnumerationError": ue_err})
             if not self.use_json:
-                self.ptprint("FTP username enumeration (-eu)", Out.INFO)
+                self.ptprint("Username enumeration audit (-eu / PTL-SVC-FTP-USRENUM)", Out.INFO)
                 icon = get_colored_text("[✗]", color="VULN")
                 self.ptprint(f"    {icon} {ue_err}", Out.TEXT)
         elif (ue := getattr(self.results, "user_enum", None)) is not None:
@@ -4871,6 +7026,9 @@ class FTP(BaseModule):
                 "enumerationSuspected": ue.enumeration_suspected,
                 "timingAnomalySuspected": ue.timing_anomaly_suspected,
                 "timingNotes": list(ue.timing_notes),
+                "timingControlMedianMs": ue.timing_control_median_ms,
+                "timingWordlistMedianMs": ue.timing_wordlist_median_ms,
+                "timingSlowUsernamesMs": [{"username": u, "passElapsedMs": ms} for u, ms in ue.timing_slow_usernames_ms],
                 "passTextSimilarityMin": ue.pass_text_similarity_min,
                 "detail": ue.detail,
                 "probes": [
@@ -4891,36 +7049,7 @@ class FTP(BaseModule):
             }
             properties.update({"ftpUserEnumeration": ue_json})
             if not self.use_json:
-                self.ptprint("FTP username enumeration (-eu)", Out.INFO)
-                col = (
-                    "VULN"
-                    if ue.enumeration_suspected or ue.timing_anomaly_suspected
-                    else "NOTVULN"
-                )
-                icon = get_colored_text(
-                    "[✗]" if col == "VULN" else "[✓]",
-                    color=col,
-                )
-                self.ptprint(
-                    f"    {icon} enumerationSuspected={ue.enumeration_suspected}"
-                    f" timingAnomaly={ue.timing_anomaly_suspected}",
-                    Out.TEXT,
-                )
-                if ue.timing_notes:
-                    self.ptprint(f"    timingNotes: {', '.join(ue.timing_notes)}", Out.TEXT)
-                self.ptprint(f"    {ue.detail}", Out.TEXT)
-                for p in ue.probes:
-                    uc = str(p.user_reply_code) if p.user_reply_code is not None else "—"
-                    pc = str(p.pass_reply_code) if p.pass_reply_code is not None else "—"
-                    ms = f"{p.pass_elapsed_ms:.1f}ms" if p.pass_elapsed_ms is not None else "—"
-                    noop = "NOOP_ok" if p.connection_ok_after else "NOOP_fail"
-                    uname_disp = f"{p.username[:48]}…" if len(p.username) > 48 else p.username
-                    self.ptprint(
-                        f"    [{p.probe_kind}] {uname_disp!r} USER→{uc} PASS→{pc} {ms} {noop}",
-                        Out.TEXT,
-                    )
-                    if p.error:
-                        self.ptprint(f"        error: {p.error}", Out.TEXT)
+                self._print_user_enum_terminal(ue)
             if ue.enumeration_suspected or ue.timing_anomaly_suspected:
                 deferred_vulns.append(
                     {

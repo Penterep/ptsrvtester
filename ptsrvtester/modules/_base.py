@@ -1,6 +1,7 @@
 import argparse
 from abc import ABC, abstractmethod
 from enum import Enum
+from typing import Optional
 
 from ptlibs import ptprinthelper
 from ptlibs.ptjsonlib import PtJsonLib
@@ -71,23 +72,58 @@ class BaseModule(ABC):
     def output(self) -> None:
         raise NotImplementedError
 
-    def ptdebug(self, string: str, out: Out = Out.TEXT, title: bool = False, end: str = "\n"):
-        """Prints only in verbose mode (-vv/--verbose).
+    def ptdebug(
+        self,
+        string: str,
+        out: Out = Out.TEXT,
+        title: bool = False,
+        end: str = "\n",
+        *,
+        indent_override: Optional[int] = None,
+    ) -> None:
+        """Verbose-only (-vv / ``args.debug``): ``ptprinthelper.ptprint`` in ADDITIONS.
 
-        Uses gray (ADDITIONS in ptdefs) like ptprint(..., \"ADDITIONS\", ..., colortext=True).
-        Suppressed when --json is set. ``out`` and ``title`` are kept for call-site compatibility.
+        Default indent is 4 spaces for every line (subsection ``title=True`` uses the same
+        indent so blocks align under section headings like ``[+] RCPT TO limit``).
+        Use ``indent_override=0`` when continuing the same physical line (e.g. table cells).
+        ``out`` and ``title`` are kept for call-site compatibility; color is always ADDITIONS.
+        Suppressed when ``--json`` is set.
         """
-        if not self.args.debug:
+        if not self.args.debug or self.args.json:
             return
 
-        ptprinthelper.ptprint(
-            string,
-            "ADDITIONS",
-            not self.args.json,
-            end=end,
-            flush=True,
-            colortext=True,
-        )
+        if indent_override is not None:
+            indent = indent_override
+        else:
+            indent = 4
+
+        lines = string.splitlines()
+        if not lines:
+            lines = [string]
+
+        if len(lines) == 1:
+            ptprinthelper.ptprint(
+                lines[0],
+                "ADDITIONS",
+                True,
+                end=end,
+                flush=True,
+                colortext=True,
+                indent=indent,
+            )
+            return
+
+        for i, line in enumerate(lines):
+            last = i == len(lines) - 1
+            ptprinthelper.ptprint(
+                line,
+                "ADDITIONS",
+                True,
+                end=end if last else "\n",
+                flush=True,
+                colortext=True,
+                indent=indent,
+            )
 
     def ptprint(
         self,

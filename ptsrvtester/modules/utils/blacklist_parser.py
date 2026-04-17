@@ -108,8 +108,8 @@ class BlacklistParser:
         max_width = help_calc_column_width(result["table_result"])
         table_heading = f"STATUS{' '*(max_width[0]-6+5)}BLACKLIST{' '*(max_width[1]-9+2)}REASON{' '*(max_width[2]-6+7)}TTL{' '*(max_width[3]-3+2)}"
         sep = "-" * (len(table_heading) + max_width[3] + 1)
-        self.ptdebug(f"    {sep}")
-        self.ptdebug(f"    {table_heading}")
+        self.ptdebug(sep)
+        self.ptdebug(table_heading)
         for table_row in result["table_result"]:
             table_row_before_colors = table_row[0]
             if table_row[0] == "OK":
@@ -118,10 +118,10 @@ class BlacklistParser:
                 status = get_colored_text(table_row[0], color="VULN")
             else:
                 status = table_row[0]
-            self.ptdebug(f"    {status}", end=" " * (max_width[0] - len(table_row_before_colors) + 5))
-            self.ptdebug(f"{table_row[1]}", end=" " * (max_width[1] - len(table_row[1]) + 2))
-            self.ptdebug(f"{table_row[2]}", end=" " * (max_width[2] - len(table_row[2]) + 7))
-            self.ptdebug(f"{table_row[3]}", end=" " * (max_width[3] - len(table_row[3]) + 2))
-            self.ptdebug(" ")
-        self.ptdebug(f"\n    {result['title']}")
-        self.ptdebug(f"\n    {result['listed_info']}\n")
+            self.ptdebug(f"{status}", end=" " * (max_width[0] - len(table_row_before_colors) + 5))
+            self.ptdebug(f"{table_row[1]}", end=" " * (max_width[1] - len(table_row[1]) + 2), indent_override=0)
+            self.ptdebug(f"{table_row[2]}", end=" " * (max_width[2] - len(table_row[2]) + 7), indent_override=0)
+            self.ptdebug(f"{table_row[3]}", end=" " * (max_width[3] - len(table_row[3]) + 2), indent_override=0)
+            self.ptdebug(" ", indent_override=0)
+        self.ptdebug(result["title"])
+        self.ptdebug(result["listed_info"])

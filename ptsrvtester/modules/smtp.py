@@ -427,9 +427,41 @@ class NTLMResult(NamedTuple):
     ntlm: NTLMInfo | None
 
 
-class MaxConnectionsResult(NamedTuple):
-    max: int | None
-    ban_seconds: int | None
+class RateLimitResult(NamedTuple):
+    connected: int | None            # Max simultaneous connections accepted
+    rate_limit_seconds: float | None  # Seconds until new conn accepted after limit
+    timeout_seconds: float | None    # Seconds until server disconnected idle conn
+    timeout_exceeded: bool           # True if > 5 min (max timeout reached)
+
+
+# RCPT TO limit (-rl): max RCPT attempts per session (default); policy-reject early stop (no accept yet).
+RCPT_LIMIT_DEFAULT_ATTEMPTS = 1000
+RCPT_LIMIT_POLICY_REJECT_CAP = 50
+# Terminal verdict / JSON ManyRcpt: OK ≤100, warning 101–500, error / vuln >500
+RCPT_LIMIT_VERDICT_OK_MAX = 100
+RCPT_LIMIT_VERDICT_WARN_MAX = 500
+
+# Parallel SMTP sessions (-rt / --rate-limit): default max ramp-up attempts
+RATE_LIMIT_DEFAULT_ATTEMPTS = 100
+
+# Common MTA / doc placeholder hostnames: -pd may still infer them; flag for analysts
+ACCEPTED_DOMAIN_PLACEHOLDER_DOMAINS: frozenset[str] = frozenset(
+    {
+        "example.com",
+        "example.net",
+        "example.org",
+        "example.invalid",
+        "test.com",
+        "localhost",
+        "localhost.localdomain",
+    }
+)
+
+
+def _accepted_domain_is_placeholder(domain: str | None) -> bool:
+    if not domain or not str(domain).strip():
+        return False
+    return str(domain).strip().lower().rstrip(".") in ACCEPTED_DOMAIN_PLACEHOLDER_DOMAINS
 
 
 class RcptLimitResult(NamedTuple):
@@ -443,6 +475,16 @@ class RcptLimitResult(NamedTuple):
     failed_before_limit: int = 0  # Number of failed RCPTs before 421 or disconnect
     session_limit_triggered: bool = False  # True if server disconnected or returned 421
     no_session_limit: bool = False  # True if server allowed N failed RCPTs without disconnecting
+
+
+class AcceptedDomainProbeResult(NamedTuple):
+    """Informational RCPT probe (-pd): inferred recipient domain; no vulnerability code in JSON."""
+    domain: str | None
+    confidence: str  # high | medium | low | none
+    detail: str | None = None
+    candidates_tested: tuple[str, ...] = ()
+    universal_accept_detected: bool = False
+    likely_placeholder_domain: bool = False
 
 
 class EnumResult(NamedTuple):
@@ -994,8 +1036,8 @@ class SMTPResults:
     banner_requested: bool = False
     commands_requested: bool = False
     authentications_requested: bool = False
-    max_connections: MaxConnectionsResult | None = None
-    max_connections_error: str | None = None  # When run-all max connections test fails
+    rate_limit: RateLimitResult | None = None
+    rate_limit_error: str | None = None
     ntlm: NTLMResult | None = None
     ntlm_error: str | None = None  # When run-all NTLM test fails
     open_relay: bool | None = None
@@ -1042,6 +1084,8 @@ class SMTPResults:
     alias_test_error: str | None = None
     identify: "ServerIdentifyResult | None" = None
     identify_error: str | None = None
+    accepted_domain_probe: AcceptedDomainProbeResult | None = None
+    accepted_domain_probe_error: str | None = None
 
 
 class VULNS(Enum):
@@ -1071,7 +1115,7 @@ class VULNS(Enum):
     CryptOnly = "PTV-SVC-CRYPTONLY"
     HybridRole = "PTV-SMTP-HYBRIDROLE"
     ManyRcpt = "PTV-SVC-SMTP-MANYRCPT"
-    NoSessionLimit = "PTV-SVC-SMTP-NOSESSIONLIMIT"
+    ManyRcptReject = "PTV-SVC-SMTP-MANYRCPTREJECT"
     NoStarttls = "PTV-SVC-SMTP-NOSTARTTLS"
     NTLM = "PTV-SVC-NTLMINFO"
     OpenRelay = "PTV-SVC-SMTP-RELAY"
@@ -1112,13 +1156,14 @@ class SMTPArgs(ArgsWithBruteforce):
     fqdn: str | None
     enumerate: list[str] | str | None
     blacklist_test: bool
-    max_connections: bool
+    rate_limit: bool
     slow_down: bool
     spf_test: bool
     open_relay: bool
     interactive: bool
     isencrypt: bool
     role: bool
+    probe_accepted_domain: bool
 
     @staticmethod
     def get_help():
@@ -1139,7 +1184,8 @@ class SMTPArgs(ArgsWithBruteforce):
                 "ptsrvtester smtp -bomb -flood -r victim@example.com smtp.example.com:25",
                 "ptsrvtester smtp -sh -r victim@example.com smtp.example.com:25",
                 "ptsrvtester smtp -sh -r victim@example.com -u user -p pass smtp.example.com:587",
-                "ptsrvtester smtp -bcc bcc@example.com -r to@example.com --cc cc@example.com smtp.example.com:25"
+                "ptsrvtester smtp -bcc bcc@example.com -r to@example.com --cc cc@example.com smtp.example.com:25",
+                "ptsrvtester smtp -pd mail.example.com:25",
             ]},
             {"options": [
                 ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
@@ -1173,9 +1219,10 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-t", "--threads", "<threads>", "Threads for enumeration (default: 1)"],
                 ["", "--enum-reconnect-after", "<n>", "Reconnect after n consecutive failures during enum (default: 4)"],
                 ["-sd", "--slow-down", "", "Test slow-down protection (requires -e)"],
-                ["-mc", "--max-connections", "<n>", "Max connections test (default: 50 attempts)"],
-                ["-rl", "--recipient-limit", "<n>", "Test RCPT TO recipient limit per message (default: 50 attempts)"],
+                ["-rt", "--rate-limit", "<n>", f"Rate limiting test (default: {RATE_LIMIT_DEFAULT_ATTEMPTS} attempts)"],
+                ["-rl", "--recipient-limit", "<n>", "Test RCPT TO limit (default: 1000 RCPT attempts; aborts after 50 policy rejects if none accepted)"],
                 ["-d", "--domain", "<domain>", "Recipient domain for RCPT TO limit test"],
+                ["-pd", "--probe-accepted-domain", "", "Probe which recipient domain RCPT treats as local"],
                 ["-or", "--open-relay", "", "Test open relay"],
                 ["-ri", "--role-identify", "", "Identify server role (MTA / Submission / Hybrid)"],
                 ["-I", "--interactive", "", "Interactive SMTP CLI"],
@@ -1233,7 +1280,8 @@ class SMTPArgs(ArgsWithBruteforce):
   ptsrvtester smtp -sh -r victim@example.com smtp.example.com:25
   ptsrvtester smtp -sh -r victim@example.com -u user -p pass smtp.example.com:587
   ptsrvtester smtp -bcc bcc@example.com -r to@example.com --cc cc@example.com smtp.example.com:25
-  ptsrvtester smtp -al -r admin@example.com smtp.example.com:25"""
+  ptsrvtester smtp -al -r admin@example.com smtp.example.com:25
+  ptsrvtester smtp -pd mail.example.com:25"""
 
         parser = subparsers.add_parser(
             name,
@@ -1483,23 +1531,29 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Test against slow-down protection during enumeration (requires -e)",
         )
         direct.add_argument(
-            "-mc", "--max-connections",
+            "-rt", "--rate-limit",
             nargs="?",
             type=int,
-            const=50,
+            const=RATE_LIMIT_DEFAULT_ATTEMPTS,
             default=None,
             metavar="N",
-            help="Max connections test (N = max attempts, default: 50)",
+            help=(
+                "Rate limiting test (N = max simultaneous connections to attempt, "
+                f"default: {RATE_LIMIT_DEFAULT_ATTEMPTS})"
+            ),
         )
         direct.add_argument(
             "-rl", "--recipient-limit",
             nargs="?",
             type=int,
-            const=50,
+            const=1000,
             default=None,
             metavar="N",
             dest="rcpt_limit",
-            help="Test RCPT TO recipient limit per message (N = max failed-RCPT probe attempts, default: 50)",
+            help=(
+                "Test RCPT TO per-message limit (N = max RCPT TO attempts per session, default: 1000; "
+                f"stops after {RCPT_LIMIT_POLICY_REJECT_CAP} consecutive policy rejections if none accepted)"
+            ),
         )
         direct.add_argument(
             "-d", "--domain",
@@ -1507,6 +1561,13 @@ class SMTPArgs(ArgsWithBruteforce):
             metavar="domain",
             default=None,
             help="Recipient domain for RCPT TO limit test (default: from server banner/EHLO)",
+        )
+        direct.add_argument(
+            "-pd",
+            "--probe-accepted-domain",
+            action="store_true",
+            dest="probe_accepted_domain",
+            help="Probe which recipient domain RCPT treats as local",
         )
         direct.add_argument("-or", "--open-relay", action="store_true", help="Test Open relay")
         direct.add_argument(
@@ -1809,7 +1870,7 @@ class SMTP(BaseModule):
             except (OSError, ValueError, AttributeError):
                 pass
 
-        self.max_connections_is_error = None
+        self.rate_limit_is_error = None
         self.is_slow_down = None
         self.fqdn = "example.com" if not args.fqdn else args.fqdn
 
@@ -1891,8 +1952,9 @@ class SMTP(BaseModule):
             or self.args.open_relay
             or getattr(self.args, "role", False)
             or self.args.enumerate is not None
-            or self.args.max_connections
+            or self.args.rate_limit
             or getattr(self.args, "rcpt_limit", False)
+            or getattr(self.args, "probe_accepted_domain", False)
             or self.do_brute
         )
 
@@ -1948,8 +2010,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_invalid_commands:
@@ -1973,8 +2036,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
         )
@@ -1999,8 +2063,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
             and not getattr(self.args, "helo_only", False)
@@ -2026,8 +2091,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
             and not getattr(self.args, "helo_only", False)
@@ -2055,8 +2121,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
             and not getattr(self.args, "helo_only", False)
@@ -2094,8 +2161,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
             and not getattr(self.args, "helo_only", False)
@@ -2157,8 +2225,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
             and not getattr(self.args, "helo_only", False)
@@ -2192,8 +2261,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
             and not getattr(self.args, "helo_only", False)
@@ -2228,8 +2298,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
             and not getattr(self.args, "helo_only", False)
@@ -2260,7 +2331,7 @@ class SMTP(BaseModule):
             and not self.args.ntlm
             and not self.args.open_relay
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not self.do_brute
         ):
             if not self.use_json:
@@ -2279,8 +2350,9 @@ class SMTP(BaseModule):
             and not self.args.ntlm
             and not self.args.open_relay
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_role:
@@ -2302,8 +2374,6 @@ class SMTP(BaseModule):
                 self._stream_role_result()
             except Exception as e:
                 self.results.info_error = str(e)
-                if not self.use_json:
-                    self.ptprint(f"Error: {e}", Out.ERROR)
             return
 
         # Standalone enumeration only: no banner, no initial_info, just this test
@@ -2316,8 +2386,9 @@ class SMTP(BaseModule):
             and not self.args.ntlm
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_enumerate:
@@ -2344,8 +2415,6 @@ class SMTP(BaseModule):
                 self._stream_enumeration_result()
             except Exception as e:
                 self.results.info_error = str(e)
-                if not self.use_json:
-                    self.ptprint(f"Error: {e}", Out.ERROR)
             return
 
         # Standalone commands or authentications (EHLO): -A and -c are aliases, same test
@@ -2358,8 +2427,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_commands_or_auth:
@@ -2376,8 +2446,6 @@ class SMTP(BaseModule):
                 self._stream_ehlo_result()
             except Exception as e:
                 self.results.info_error = str(e)
-                if not self.use_json:
-                    self.ptprint(f"Error: {e}", Out.ERROR)
             return
 
         # Standalone RCPT TO limit only: no banner, no other tests, just this test
@@ -2391,7 +2459,8 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_rcpt_limit:
@@ -2404,8 +2473,31 @@ class SMTP(BaseModule):
                 self._stream_rcpt_limit_result()
             except Exception as e:
                 self.results.info_error = str(e)
-                if not self.use_json:
-                    self.ptprint(f"Error: {e}", Out.ERROR)
+            return
+
+        # Standalone accepted-domain probe only (informational; no PTv code)
+        only_probe_accepted_domain = (
+            getattr(self.args, "probe_accepted_domain", False)
+            and not self.args.banner
+            and not self.args.commands
+            and not self.args.interactive
+            and not self.args.isencrypt
+            and not self.args.ntlm
+            and not self.args.open_relay
+            and not getattr(self.args, "role", False)
+            and self.args.enumerate is None
+            and not self.args.rate_limit
+            and not getattr(self.args, "rcpt_limit", False)
+            and not self.do_brute
+        )
+        if only_probe_accepted_domain:
+            self.ptprint("Accepted recipient domain (probe)", Out.INFO)
+            try:
+                self.results.accepted_domain_probe = self.test_probe_accepted_domain()
+                self._stream_accepted_domain_probe_result()
+            except Exception as e:
+                self.results.accepted_domain_probe_error = str(e)
+                self._stream_accepted_domain_probe_result()
             return
 
         # Standalone interactive only: no banner output, just connect and start CLI
@@ -2418,8 +2510,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_interactive and not self.use_json:
@@ -2428,8 +2521,6 @@ class SMTP(BaseModule):
                 self.start_interactive_mode(smtp)
             except Exception as e:
                 self.results.info_error = str(e)
-                if not self.use_json:
-                    self.ptprint(f"Error: {e}", Out.ERROR)
             return
 
         # Standalone NTLM only: no banner output, just this test
@@ -2442,8 +2533,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_ntlm:
@@ -2454,8 +2546,6 @@ class SMTP(BaseModule):
                 self._stream_ntlm_result()
             except Exception as e:
                 self.results.info_error = str(e)
-                if not self.use_json:
-                    self.ptprint(f"Error: {e}", Out.ERROR)
             return
 
         # Standalone open relay only: no banner output, just this test
@@ -2468,8 +2558,9 @@ class SMTP(BaseModule):
             and not self.args.ntlm
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_open_relay:
@@ -2482,13 +2573,11 @@ class SMTP(BaseModule):
                 self._stream_open_relay_result()
             except Exception as e:
                 self.results.info_error = str(e)
-                if not self.use_json:
-                    self.ptprint(f"Error: {e}", Out.ERROR)
             return
 
-        # Standalone max connections only: no banner, no initial_info, just this test
-        only_max_connections = (
-            self.args.max_connections
+        # Standalone rate limit only: no banner, no initial_info, just this test
+        only_rate_limit = (
+            self.args.rate_limit
             and not self.args.banner
             and not self.args.commands
             and not self.args.interactive
@@ -2498,16 +2587,17 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
-        if only_max_connections:
-            self.ptprint("Connections", Out.INFO)
+        if only_rate_limit:
+            self.ptprint("Rate limiting", Out.INFO)
             try:
-                self.results.max_connections = self.max_connections_test()
-                self._stream_max_connections_result()
+                self.results.rate_limit = self.rate_limit_test()
+                self._stream_rate_limit_result()
             except Exception as e:
-                self.results.max_connections_error = str(e)
-                self._stream_max_connections_result()
+                self.results.rate_limit_error = str(e)
+                self._stream_rate_limit_result()
             return
 
         # Standalone AUTH LOGIN format probe only (PTL-SVC-SMTP-AUTH-FORMAT)
@@ -2522,8 +2612,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_auth_format:
@@ -2548,8 +2639,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_auth_enum:
@@ -2573,8 +2665,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_helo_validation:
@@ -2598,8 +2691,9 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role", False)
             and self.args.enumerate is None
-            and not self.args.max_connections
+            and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_auth_downgrade:
@@ -2628,7 +2722,7 @@ class SMTP(BaseModule):
             or self.args.open_relay
             or getattr(self.args, "role", False)
             or self.args.enumerate is not None
-            or self.args.max_connections
+            or self.args.rate_limit
             or getattr(self.args, "rcpt_limit", False)
             or self.do_brute
         )
@@ -2760,10 +2854,10 @@ class SMTP(BaseModule):
                 self.results.enum_results = self.enumeration(smtp_enum)
                 self._stream_enumeration_result()
 
-            if self.args.max_connections:
-                self.ptprint("Connections", Out.INFO)
-                self.results.max_connections = self.max_connections_test()
-                self._stream_max_connections_result()
+            if self.args.rate_limit:
+                self.ptprint("Rate limiting", Out.INFO)
+                self.results.rate_limit = self.rate_limit_test()
+                self._stream_rate_limit_result()
 
             if getattr(self.args, "rcpt_limit", False):
                 self.ptprint("RCPT TO limit", Out.INFO)
@@ -2793,7 +2887,8 @@ class SMTP(BaseModule):
         """Run all tests in sequence. On failure: print error, continue with next.
 
         Excluded from run-all (use flags explicitly):
-        - max_connections: opens many connections, triggers rate limits (421).
+        - rate_limit (-rt): opens many connections simultaneously, triggers rate limits (421).
+        - rcpt_limit (-rl): many RCPT TO probes per session; use -rl explicitly if needed.
         - invalid_commands (-iv): high server load (fuzzing, long inputs, many connections).
           Use -iv flag explicitly if needed.
         """
@@ -2923,18 +3018,6 @@ class SMTP(BaseModule):
             self.args.enumerate = save_enum
         self._stream_enumeration_result()
 
-        # 6c. RCPT TO limit (per message)
-        self.ptprint("RCPT TO limit", Out.INFO)
-        try:
-            smtp_rc = self.get_smtp_handler()
-            smtp_rc.docmd("EHLO", self.fqdn)
-            self.results.rcpt_limit = self.test_rcpt_limit(smtp_rc)
-        except TestFailedError as e:
-            self.results.rcpt_limit_error = str(e)
-        except Exception as e:
-            self.results.rcpt_limit_error = str(e)
-        self._stream_rcpt_limit_result()
-
         # 7. NTLM
         self.ptprint("NTLM information", Out.INFO)
         try:
@@ -2998,6 +3081,42 @@ class SMTP(BaseModule):
             if self.args.target.port == 587 and not self.args.starttls and "refused" in str(e).lower():
                 msg += " (port 587 typically requires --starttls)"
             self._fail(msg)
+
+    def _connect_silent(self, timeout: float = 15.0) -> smtplib.SMTP:
+        """Like connect() but NEVER calls _fail() – raises plain Exception on failure.
+        Used exclusively by rate_limit_test so no error is printed for failed attempts."""
+        try:
+            if self.args.tls or self.args.target.port == 465:
+                ctx = ssl._create_unverified_context()
+                host, port = self.args.target.ip, self.args.target.port
+                try:
+                    ipaddress.ip_address(host)
+                    server_hostname = None
+                except ValueError:
+                    server_hostname = host
+                sock = socket.create_connection((host, port), timeout=timeout)
+                sock_ssl = ctx.wrap_socket(sock, server_hostname=server_hostname)
+                smtp = smtplib.SMTP(timeout=timeout)
+                smtp.sock = sock_ssl
+                smtp.file = None
+                status, reply = smtp.getreply()
+            else:
+                smtp = smtplib.SMTP(timeout=timeout)
+                status, reply = smtp.connect(self.args.target.ip, self.args.target.port)
+            if status != 220:
+                try:
+                    smtp.close()
+                except Exception:
+                    pass
+                raise Exception(
+                    f"Could not connect to the target server "
+                    f"{self.args.target.ip}:{self.args.target.port}: server responded {status}"
+                )
+            self._smtp_sock_set_tcp_nodelay(smtp)
+            smtp.docmd("EHLO", self.fqdn)
+            return smtp
+        except Exception:
+            raise
 
     @staticmethod
     def _smtp_sock_set_tcp_nodelay(smtp) -> None:
@@ -3065,118 +3184,261 @@ class SMTP(BaseModule):
                 continue
         del self.smtp_list
 
-    def max_connections_test(self) -> MaxConnectionsResult:
-        self.smtp_list = []
-        allowed_connections = None
-        is_disconnect = False
-        ban_duration = None
-        ban_reconnected = True
-
-        max_attempts = getattr(self.args, "max_connections", 50) or 50
-        self.ptdebug(f"Max smtp connections test", title=True)
-        start_time = time.perf_counter()
-
+    def rate_limit_test(self) -> RateLimitResult:
+        """Rate limiting test – 3 phases:
+        Phase 1 – Connected: sequential ramp-up (pause between attempts), keep all open.
+        Phase 2 – Duration: while Phase 1 sockets stay open, retry new connection every 5 s (max 300 s).
+        Phase 3 – Timeout: NOOP loop on freshest connection until disconnect or 300 s cap.
+        """
         _show_progress = not self.args.json and not self.args.debug
-        # Shared label updated by main thread; ticker reads it every 0.2 s.
-        _live_label: list[str] = ["Testing connections...  attempt 0"]
-        _ticker_stop = threading.Event()
+        max_attempts = getattr(self.args, "rate_limit", None) or RATE_LIMIT_DEFAULT_ATTEMPTS
+        return self._rate_limit_test_impl(_show_progress, max_attempts)
 
-        def _render_progress() -> None:
-            elapsed = time.perf_counter() - start_time
-            h = int(elapsed // 3600)
-            m = int((elapsed % 3600) // 60)
-            s = int(elapsed % 60)
-            line = f"    {h}:{m:02d}:{s:02d}  {_live_label[0]}"
-            sys.stdout.write(f"\r{line:<79}")
-            sys.stdout.flush()
+    def _rate_limit_test_impl(
+        self, _show_progress: bool, max_attempts: int
+    ) -> RateLimitResult:
+        # Must be bound before any branch: Phase 2 is skipped when connected == max_attempts,
+        # but Phase 3 still reads success_conn (Python treats it as local due to assigns below).
+        success_conn: smtplib.SMTP | None = None
+        rate_limit_seconds: float | None = None
 
-        def _ticker() -> None:
-            while not _ticker_stop.wait(timeout=0.2):
-                _render_progress()
+        LABEL_W = 26
+        MAX_TIMEOUT = 300
+        MAX_RATE_LIMIT_WAIT = 300
+        RETRY_INTERVAL = 5
+        PHASE1_DELAY = 0.15  # seconds between connection attempts (ramp-up)
 
-        def _end_progress() -> None:
-            _ticker_stop.set()
-            _render_progress()
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        _print_lock = threading.Lock()
 
-        def _connect_in_thread():
-            """Run _get_smtp_connection in a background thread; ticker handles display."""
-            _result = [None]
-            _error = [None]
+        self.ptdebug("Rate limiting test", title=True)
+        self.ptdebug(
+            f"Target {self.args.target.ip}:{self.args.target.port} — up to {max_attempts} parallel "
+            f"sessions (ramp {PHASE1_DELAY}s), duration probe max {MAX_RATE_LIMIT_WAIT}s, "
+            f"idle NOOP timeout max {MAX_TIMEOUT}s."
+        )
+
+        def _write_live(label: str, value: str) -> None:
+            line = f"    {label:<{LABEL_W}}{value}"
+            with _print_lock:
+                sys.stdout.write(f"\r{line:<79}")
+                sys.stdout.flush()
+
+        def _finalize_line(label: str, value: str) -> None:
+            line = f"    {label:<{LABEL_W}}{value}"
+            with _print_lock:
+                sys.stdout.write(f"\r{line:<79}\n")
+                sys.stdout.flush()
+
+        # ── Phase 1: Connected ───────────────────────────────────────────────
+        # Sequential ramp-up: open one connection at a time, keep all open.
+        # Firing many threads simultaneously overwhelms the kernel TCP accept
+        # queue before the SMTP daemon (anvil) can count them, causing timeouts
+        # instead of clean 421 rejections. Sequential connections with a short
+        # pause allow the server to respond correctly at its actual limit.
+        connections: list = []
+        _first_error: list[str | None] = [None]
+
+        if _show_progress:
+            _write_live("Connected:", "0")
+
+        for _ in range(max_attempts):
+            # Open one new connection in a thread so the timeout doesn't stall
+            # the main loop while existing connections stay alive.
+            _result: list = [None]
+            _err: list[str | None] = [None]
             _done = threading.Event()
 
-            def _worker():
+            def _worker(_r=_result, _e=_err, _d=_done) -> None:
                 try:
-                    _result[0] = self._get_smtp_connection()
+                    _r[0] = self._connect_silent()
                 except Exception as exc:
-                    _error[0] = exc
+                    _e[0] = str(exc)
                 finally:
-                    _done.set()
+                    _d.set()
 
             threading.Thread(target=_worker, daemon=True).start()
             _done.wait()
-            if _error[0] is not None:
-                raise _error[0]
-            return _result[0]
 
-        if _show_progress:
-            threading.Thread(target=_ticker, daemon=True).start()
+            if _err[0] is not None:
+                if _first_error[0] is None:
+                    _first_error[0] = _err[0]
+                break  # server rejected – we reached the limit
 
-        self.ptdebug(f"", Out.INFO, end="")
-        for index, i in enumerate(range(max_attempts)):
-            _live_label[0] = f"Testing connections...  attempt {index + 1}"
-            try:
-                self.ptdebug(f">", end="")
-                self.smtp_list.append(_connect_in_thread())
-                if self.noop_smtp_connections() and not is_disconnect:
-                    is_disconnect = time.perf_counter() - start_time
-            except Exception as e:
-                allowed_connections = len(self.smtp_list)
-                self.ptdebug(f"\r", end="")
-                self.ptdebug(
-                    f"Maximum number of estabilished connections: {allowed_connections} {' '*(allowed_connections-35)}",
-                    Out.INFO,
-                )
-                if index == 0:
-                    if _show_progress:
-                        _end_progress()
-                    self._fail(f"Could not retrieve initial smtp connection - {e}")
-                self.smtp_list.pop()
-                try:
-                    self.smtp_list.append(self._get_smtp_connection())
-                except Exception as e:
-                    self.ptdebug(f"You're banned, reconnecting in 60 seconds ...", Out.INFO)
-                    self.ptdebug(f"", Out.INFO, end="")
-                    _live_label[0] = "Waiting for timeout..."
-                    ban_duration, ban_reconnected = self.wait_for_unban(60)
-                    if not ban_reconnected:
-                        self.ptdebug(
-                            f"Could not reconnect after ban (max retries exceeded)",
-                            Out.INFO,
-                        )
-                if _show_progress:
-                    _end_progress()
-                break
-        else:
+            connections.append(_result[0])
             if _show_progress:
-                _end_progress()
+                _write_live("Connected:", str(len(connections)))
+            time.sleep(PHASE1_DELAY)
 
-        # close all smtp connections and delete *self.smtp_list*
-        self.close_smtp_connections()
+        connected = len(connections)
+        if _show_progress:
+            _finalize_line("Connected:", str(connected))
 
-        if is_disconnect:
-            self.ptdebug(
-                f"Refreshed connection is disconnected after: {round(is_disconnect)} seconds",
-                Out.INFO,
-            )
-        if ban_duration:
-            if ban_reconnected:
-                self.ptdebug(f"Unblocked after {ban_duration} seconds", Out.INFO)
+        self.ptdebug(f"Phase 1 (ramp-up): {connected}/{max_attempts} connections established.")
+        if _first_error[0] is not None and connected < max_attempts:
+            self.ptdebug(f"Ramp-up stopped at limit / error: {_first_error[0]}")
+
+        # If no connection succeeded at all, fail with a single error message.
+        if connected == 0:
+            raise TestFailedError(_first_error[0] or "Could not establish any connection")
+
+        # ── Phase 2: Duration rate limiting ──────────────────────────────────
+        if connected < max_attempts:
+            start_rl = time.perf_counter()
+            _rl_stop = threading.Event()
+
+            if _show_progress:
+                _write_live("Duration rate limiting:", "00:00")
+
+            def _rl_ticker() -> None:
+                while not _rl_stop.wait(0.5):
+                    elapsed = time.perf_counter() - start_rl
+                    if _show_progress:
+                        _write_live(
+                            "Duration rate limiting:",
+                            f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}",
+                        )
+
+            if _show_progress:
+                threading.Thread(target=_rl_ticker, daemon=True).start()
+
+            while True:
+                elapsed = time.perf_counter() - start_rl
+                if elapsed >= MAX_RATE_LIMIT_WAIT:
+                    break
+                try:
+                    success_conn = self._connect_silent()
+                    rate_limit_seconds = time.perf_counter() - start_rl
+                    break
+                except Exception:
+                    pass
+                wait_end = time.perf_counter() + RETRY_INTERVAL
+                while time.perf_counter() < wait_end:
+                    time.sleep(0.2)
+
+            _rl_stop.set()
+            if success_conn is not None:
+                connections.append(success_conn)
+
+            if rate_limit_seconds is not None:
+                self.ptdebug(
+                    f"Phase 2 (duration): new connection accepted after {rate_limit_seconds:.1f}s "
+                    f"({len(connections)} sessions open)."
+                )
+            else:
+                self.ptdebug(
+                    f"Phase 2 (duration): no extra connection within {MAX_RATE_LIMIT_WAIT}s "
+                    f"(server still at cap or refusing)."
+                )
+
+            if _show_progress:
+                if rate_limit_seconds is not None:
+                    mm = int(rate_limit_seconds // 60)
+                    ss = int(rate_limit_seconds % 60)
+                    _finalize_line("Duration rate limiting:", f"{mm:02d}:{ss:02d}")
+                else:
+                    _finalize_line("Duration rate limiting:", ">05:00")
         else:
-            self.ptdebug(f"Not banned", Out.INFO)
+            self.ptdebug(
+                f"Phase 2 (duration): skipped — all {max_attempts} ramp-up connections accepted "
+                f"(no connection limit in phase 1)."
+            )
+            if _show_progress:
+                _finalize_line(
+                    "Duration rate limiting:",
+                    f"(skipped, all {max_attempts} attempts accepted)",
+                )
 
-        return MaxConnectionsResult(allowed_connections, ban_duration)
+        # ── Phase 3: Timeout ─────────────────────────────────────────────────
+        # Use the freshest available connection for accurate idle-timeout measurement:
+        # - success_conn from Phase 2 (just opened, idle time = 0) if it exists
+        # - else try one new _connect_silent() only when connected < N (at N open
+        #   sessions the server often rejects or stalls a 51st connect — avoid that)
+        # - else last Phase-1 connection (connections[-1]) — most recently opened
+        timeout_seconds: float | None = None
+        timeout_exceeded = False
+
+        _timeout_conn: smtplib.SMTP | None = success_conn
+        if _timeout_conn is None and connected < max_attempts:
+            try:
+                _timeout_conn = self._connect_silent()
+            except Exception:
+                _timeout_conn = None
+        if _timeout_conn is None and connections:
+            _timeout_conn = connections[-1]
+
+        if _timeout_conn is None:
+            self.ptdebug("Phase 3 (idle NOOP): skipped (no suitable SMTP session).")
+        else:
+            test_conn = _timeout_conn
+            start_to = time.perf_counter()
+            _to_stop = threading.Event()
+
+            if _show_progress:
+                _write_live("Timeout:", "00:00")
+
+            def _to_ticker() -> None:
+                while not _to_stop.wait(0.5):
+                    elapsed = time.perf_counter() - start_to
+                    if _show_progress:
+                        _write_live(
+                            "Timeout:",
+                            f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}",
+                        )
+
+            if _show_progress:
+                threading.Thread(target=_to_ticker, daemon=True).start()
+
+            while True:
+                elapsed = time.perf_counter() - start_to
+                if elapsed >= MAX_TIMEOUT:
+                    timeout_exceeded = True
+                    timeout_seconds = elapsed
+                    break
+                try:
+                    test_conn.noop()
+                except Exception:
+                    timeout_seconds = time.perf_counter() - start_to
+                    break
+                time.sleep(1)
+
+            _to_stop.set()
+            if _show_progress:
+                if timeout_seconds is not None:
+                    mm = int(timeout_seconds // 60)
+                    ss = int(timeout_seconds % 60)
+                    _finalize_line("Timeout:", f"{mm:02d}:{ss:02d}")
+
+            if timeout_seconds is not None:
+                if timeout_exceeded:
+                    self.ptdebug(
+                        f"Phase 3 (idle NOOP): no idle disconnect within {timeout_seconds:.0f}s (cap)."
+                    )
+                else:
+                    self.ptdebug(
+                        f"Phase 3 (idle NOOP): session ended after {timeout_seconds:.1f}s."
+                    )
+
+        all_conns = list(connections)
+        if _timeout_conn is not None and _timeout_conn not in all_conns:
+            all_conns.append(_timeout_conn)
+        for conn in all_conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        self.ptdebug(
+            f"Summary: connected={connected}, rate_limit_after_seconds={rate_limit_seconds!s}, "
+            f"idle_timeout_seconds={timeout_seconds!s}, idle_timeout_cap_hit={timeout_exceeded}."
+        )
+
+        return RateLimitResult(
+            connected=connected,
+            rate_limit_seconds=rate_limit_seconds,
+            timeout_seconds=timeout_seconds,
+            timeout_exceeded=timeout_exceeded,
+        )
+
 
     def open_relay_test(self, smtp, msg, mail_from, rcpt_to) -> bool:
         """OWASP/Nmap-style multi-vector open relay test. Tests: empty FROM, internal→external,
@@ -3506,17 +3768,19 @@ class SMTP(BaseModule):
         self,
         smtp: smtplib.SMTP,
         domain: str,
-        max_probe: int = 50,
+        max_rcpt_attempts: int = RCPT_LIMIT_DEFAULT_ATTEMPTS,
         live_label: list[str] | None = None,
-        render_fn=None,
+        attempt_hook=None,
     ) -> RcptLimitResult:
         """Run MAIL FROM + RCPT TO loop for a given domain. Used so we can retry with parent domain.
         Continues on 554/550/553/450 (policy rejection) to probe session error limit (smtpd_hard_error_limit).
-        max_probe controls how many failed-RCPT attempts are made before concluding there is no session limit.
-        live_label/render_fn are passed from test_rcpt_limit for live progress display.
+        Stops with no_session_limit after RCPT_LIMIT_POLICY_REJECT_CAP consecutive policy rejects when none accepted.
+        max_rcpt_attempts caps RCPT iterations when the server keeps accepting (per-message limit probe).
+        live_label/attempt_hook are passed from test_rcpt_limit for live progress display.
+        attempt_hook(i) is called once per attempt with the current attempt index.
         """
-        max_try = 2000
-        MAX_FAILED_PROBE = max_probe  # Probe limit for session error detection when all RCPTs get 554
+        max_try = max(1, int(max_rcpt_attempts))
+        policy_reject_cap = RCPT_LIMIT_POLICY_REJECT_CAP
 
         try:
             status, reply = smtp.docmd("MAIL FROM:", "<>")
@@ -3533,57 +3797,57 @@ class SMTP(BaseModule):
         for i in range(1, max_try + 1):
             if live_label is not None:
                 live_label[0] = f"Testing RCPT limit...  attempt {i}"
-            if render_fn is not None:
-                render_fn()
-                try:
-                    status, reply = smtp.docmd("RCPT TO:", f"<{i}@{domain}>")
-                    reply_str = self.bytes_to_str(reply)
-                    if status == 250:
-                        accepted += 1
-                        continue
-                    limit_response = f"[{status}] {reply_str}".strip()
-                    if first_policy_response is None and status in (450, 550, 553, 554):
-                        first_policy_response = limit_response
+            if attempt_hook is not None:
+                attempt_hook(i)
+            try:
+                status, reply = smtp.docmd("RCPT TO:", f"<{i}@{domain}>")
+                reply_str = self.bytes_to_str(reply)
+                if status == 250:
+                    accepted += 1
+                    continue
+                limit_response = f"[{status}] {reply_str}".strip()
+                if first_policy_response is None and status in (450, 550, 553, 554):
+                    first_policy_response = limit_response
 
-                    # Policy rejection (relay/sender/recipient) – continue to probe session limit
-                    if status in (450, 550, 553, 554):
-                        failed += 1
-                        if accepted == 0 and failed >= MAX_FAILED_PROBE:
-                            self.ptdebug(
-                                f"Server allows {failed} failed RCPTs without disconnect (no smtpd_hard_error_limit)",
-                                Out.VULN,
-                            )
-                            return RcptLimitResult(
-                                0, False, first_policy_response, rejected_addresses=True,
-                                failed_before_limit=failed, session_limit_triggered=False, no_session_limit=True,
-                            )
-                        continue
-
-                    # Session limit: 421 (rate limit / too many errors)
-                    if status == 421:
-                        self.ptdebug(f"Server session limit after {i} attempts: {limit_response}", Out.INFO)
-                        return RcptLimitResult(
-                            accepted, True, limit_response, rejected_addresses=(accepted == 0),
-                            failed_before_limit=i, session_limit_triggered=True, no_session_limit=False,
+                # Policy rejection (relay/sender/recipient) – continue to probe session limit
+                if status in (450, 550, 553, 554):
+                    failed += 1
+                    if accepted == 0 and failed >= policy_reject_cap:
+                        self.ptdebug(
+                            f"Server allows {failed} failed RCPTs without disconnect (no smtpd_hard_error_limit)",
+                            Out.VULN,
                         )
+                        return RcptLimitResult(
+                            0, False, first_policy_response, rejected_addresses=True,
+                            failed_before_limit=failed, session_limit_triggered=False, no_session_limit=True,
+                        )
+                    continue
 
-                    # Per-message RCPT limit: 452 Too many recipients
-                    if status == 452:
-                        self.ptdebug(f"Server per-message limit after {accepted} recipients: {limit_response}", Out.INFO)
-                        return RcptLimitResult(accepted, True, limit_response, False)
-
-                    # Other 5xx
-                    if 500 <= status <= 599:
-                        self.ptdebug(f"Server limit after {accepted} recipients: {limit_response}", Out.INFO)
-                        return RcptLimitResult(accepted, True, limit_response, False)
-
-                    return RcptLimitResult(accepted, False, limit_response, False)
-                except (smtplib.SMTPServerDisconnected, ConnectionResetError, BrokenPipeError, EOFError, OSError) as e:
-                    self.ptdebug(f"Server closed connection after {i} attempts", Out.INFO)
+                # Session limit: 421 (rate limit / too many errors)
+                if status == 421:
+                    self.ptdebug(f"Server session limit after {i} attempts: {limit_response}", Out.INFO)
                     return RcptLimitResult(
-                        accepted, True, str(e), rejected_addresses=(accepted == 0),
+                        accepted, True, limit_response, rejected_addresses=(accepted == 0),
                         failed_before_limit=i, session_limit_triggered=True, no_session_limit=False,
                     )
+
+                # Per-message RCPT limit: 452 Too many recipients
+                if status == 452:
+                    self.ptdebug(f"Server per-message limit after {accepted} recipients: {limit_response}", Out.INFO)
+                    return RcptLimitResult(accepted, True, limit_response, False)
+
+                # Other 5xx
+                if 500 <= status <= 599:
+                    self.ptdebug(f"Server limit after {accepted} recipients: {limit_response}", Out.INFO)
+                    return RcptLimitResult(accepted, True, limit_response, False)
+
+                return RcptLimitResult(accepted, False, limit_response, False)
+            except (smtplib.SMTPServerDisconnected, ConnectionResetError, BrokenPipeError, EOFError, OSError) as e:
+                self.ptdebug(f"Server closed connection after {i} attempts", Out.INFO)
+                return RcptLimitResult(
+                    accepted, True, str(e), rejected_addresses=(accepted == 0),
+                    failed_before_limit=i, session_limit_triggered=True, no_session_limit=False,
+                )
 
         self.ptdebug(f"No limit observed up to {accepted} recipients", Out.VULN)
         return RcptLimitResult(accepted, False, None, False)
@@ -3600,15 +3864,36 @@ class SMTP(BaseModule):
         _start_time = time.perf_counter()
         _live_label: list[str] = ["Connecting..."]
         _ticker_stop = threading.Event()
+        _attempt_ref: list[int] = [0]
+        _eta_ref: list[float | None] = [None]
+        _max_probe_ref: list[int] = [RCPT_LIMIT_DEFAULT_ATTEMPTS]
 
         def _render_progress() -> None:
-            elapsed = time.perf_counter() - _start_time
-            h = int(elapsed // 3600)
-            m = int((elapsed % 3600) // 60)
-            s = int(elapsed % 60)
-            line = f"    {h}:{m:02d}:{s:02d}  {_live_label[0]}"
+            attempt = _attempt_ref[0]
+            max_p = _max_probe_ref[0]
+            eta = _eta_ref[0]
+            if attempt > 0 and max_p > 0:
+                pct = min(100, int(attempt * 100 / max_p))
+                if eta is not None and eta >= 0:
+                    eta_m = int(eta // 60)
+                    eta_s = int(eta % 60)
+                    prefix = f"    {eta_m}:{eta_s:02d} {pct}%  "
+                else:
+                    prefix = f"    --:-- {pct}%  "
+            else:
+                prefix = "    "
+            line = f"{prefix}{_live_label[0]}"
             sys.stdout.write(f"\r{line:<79}")
             sys.stdout.flush()
+
+        def _update_attempt(i: int) -> None:
+            elapsed = time.perf_counter() - _start_time
+            _attempt_ref[0] = i
+            max_p = _max_probe_ref[0]
+            remaining = max_p - i
+            if i > 0:
+                _eta_ref[0] = max(0.0, remaining * (elapsed / i))
+            _render_progress()
 
         def _ticker() -> None:
             while not _ticker_stop.wait(timeout=0.2):
@@ -3616,8 +3901,7 @@ class SMTP(BaseModule):
 
         def _end_progress() -> None:
             _ticker_stop.set()
-            _render_progress()
-            sys.stdout.write("\n")
+            sys.stdout.write(f"\r{' ' * 79}\r")
             sys.stdout.flush()
 
         if _show_progress:
@@ -3640,16 +3924,23 @@ class SMTP(BaseModule):
                 self.results.commands_requested = False
 
             domain = self._get_rcpt_limit_domain()
-            max_probe = getattr(self.args, "rcpt_limit", 50) or 50
+            raw_rl = getattr(self.args, "rcpt_limit", None)
+            if raw_rl is None:
+                max_rcpt_attempts = RCPT_LIMIT_DEFAULT_ATTEMPTS
+            else:
+                max_rcpt_attempts = int(raw_rl)
+            if max_rcpt_attempts < 1:
+                max_rcpt_attempts = RCPT_LIMIT_DEFAULT_ATTEMPTS
+            _max_probe_ref[0] = max_rcpt_attempts
 
             smtp = self.get_smtp_handler()
             smtp.docmd("EHLO", self.fqdn)
 
             _live_label[0] = "Testing RCPT limit...  attempt 0"
             result = self._run_rcpt_limit_for_domain(
-                smtp, domain, max_probe=max_probe,
+                smtp, domain, max_rcpt_attempts=max_rcpt_attempts,
                 live_label=_live_label,
-                render_fn=_render_progress if _show_progress else None,
+                attempt_hook=_update_attempt if _show_progress else None,
             )
             domain_used = domain
 
@@ -3671,10 +3962,12 @@ class SMTP(BaseModule):
                     except Exception:
                         pass
                     _live_label[0] = "Testing RCPT limit...  attempt 0"
+                    _attempt_ref[0] = 0
+                    _eta_ref[0] = None
                     result = self._run_rcpt_limit_for_domain(
-                        smtp, parent, max_probe=max_probe,
+                        smtp, parent, max_rcpt_attempts=max_rcpt_attempts,
                         live_label=_live_label,
-                        render_fn=_render_progress if _show_progress else None,
+                        attempt_hook=_update_attempt if _show_progress else None,
                     )
                     domain_used = parent
 
@@ -3696,6 +3989,256 @@ class SMTP(BaseModule):
                     smtp.close()
                 except Exception:
                     pass
+
+    def _build_accepted_domain_probe_candidates(self) -> list[str]:
+        """Ordered domain candidates: -d only, else inferred + parent + invalid.invalid control."""
+        seen: set[str] = set()
+        out: list[str] = []
+
+        def add(d: str) -> None:
+            t = (d or "").strip().lower().rstrip(".")
+            if not t or "." not in t or t in seen:
+                return
+            seen.add(t)
+            out.append(t)
+
+        dom_arg = getattr(self.args, "domain", None)
+        if dom_arg and str(dom_arg).strip():
+            add(str(dom_arg).strip())
+        else:
+            add(self._get_rcpt_limit_domain())
+            if out:
+                base = out[-1]
+                if base.count(".") >= 2:
+                    add(self._to_parent_domain(base))
+        add("invalid.invalid")
+        return out[:12]
+
+    @staticmethod
+    def _rcpt_reply_suggests_unknown_user(reply: str | bytes) -> bool:
+        if isinstance(reply, bytes):
+            up = reply.upper()
+        else:
+            up = str(reply).upper()
+        keys = (
+            "UNKNOWN",
+            "USER UNKNOWN",
+            "NO SUCH USER",
+            "MAILBOX UNAVAILABLE",
+            "ADDRESS REJECTED",
+            "NOT FOUND",
+            "INVALID RECIPIENT",
+            "5.1.1",
+        )
+        return any(k in up for k in keys)
+
+    def _probe_rcpt_acceptance_for_domain(
+        self, smtp: smtplib.SMTP, domain: str, random_local: str
+    ) -> tuple[int, str, str]:
+        """Score one domain: (0–100, confidence high|medium|low|none, short detail)."""
+        try:
+            smtp.docmd("RSET")
+        except Exception:
+            pass
+        try:
+            st_m, rep_m = smtp.docmd("MAIL FROM:", "<>")
+        except Exception as e:
+            return (0, "none", f"MAIL FROM failed: {e}")
+        if st_m != 250:
+            return (0, "none", f"MAIL FROM not accepted ({st_m})")
+        try:
+            st_r, rep_r = smtp.docmd("RCPT TO:", f"<{random_local}@{domain}>")
+        except Exception as e:
+            return (0, "none", f"RCPT (probe) failed: {e}")
+        reply_r = self.bytes_to_str(rep_r) if rep_r else ""
+        if 400 <= st_r < 500:
+            return (5, "none", f"RCPT probe temporary rejection ({st_r}); try later")
+        try:
+            smtp.docmd("RSET")
+        except Exception:
+            pass
+        try:
+            st_m2, _ = smtp.docmd("MAIL FROM:", "<>")
+        except Exception as e:
+            return (0, "none", f"MAIL FROM after RSET failed: {e}")
+        if st_m2 != 250:
+            return (0, "none", f"MAIL FROM not accepted after RSET ({st_m2})")
+        try:
+            st_p, rep_p = smtp.docmd("RCPT TO:", f"<Postmaster@{domain}>")
+        except Exception as e:
+            return (0, "none", f"RCPT Postmaster failed: {e}")
+        reply_p = self.bytes_to_str(rep_p) if rep_p else ""
+        probe_ok = 200 <= st_r < 300
+        post_ok = 200 <= st_p < 300
+        bad_probe = self._rcpt_response_suggests_bad_domain(reply_r)
+        unk_probe = self._rcpt_reply_suggests_unknown_user(reply_r) or (
+            550 <= st_r < 560 and not bad_probe and not probe_ok
+        )
+        if bad_probe and not probe_ok:
+            return (0, "none", "Domain-level or relay rejection on probe RCPT")
+        # Same signal as -rl "rejected test addresses" with 5.1.1 user unknown: server treats @domain as local.
+        if not probe_ok and unk_probe and not bad_probe:
+            if post_ok:
+                return (
+                    95,
+                    "high",
+                    "Postmaster accepted; probe mailbox rejected as unknown user at this domain",
+                )
+            return (
+                92,
+                "high",
+                "Probe mailbox rejected as unknown user; server accepts this recipient domain; "
+                "Postmaster not accepted or blocked by policy",
+            )
+        if post_ok and probe_ok:
+            return (
+                40,
+                "low",
+                "Server accepts RCPT for probe and Postmaster (possible catch-all or deferred verify)",
+            )
+        if probe_ok and not post_ok:
+            return (
+                38,
+                "low",
+                "Server accepts probe mailbox; Postmaster not accepted (unusual)",
+            )
+        if not probe_ok and 550 <= st_r < 560 and not bad_probe and not unk_probe:
+            return (
+                25,
+                "none",
+                f"RCPT probe rejected ({st_r}) without clear unknown-user semantics",
+            )
+        return (0, "none", "No clear local-domain signal from RCPT responses")
+
+    def test_probe_accepted_domain(self) -> AcceptedDomainProbeResult:
+        """Informational: infer which @domain RCPT treats as locally relevant (RFC 5321 RCPT semantics)."""
+        if not getattr(self.results, "info", None):
+            _, info = self.initial_info(get_commands=True)
+            self.results.info = InfoResult(
+                info.banner,
+                info.ehlo,
+                getattr(info, "ehlo_starttls", None),
+            )
+            self.results.resolved_domain = self._get_domain_from_banner_or_ptr(self.results.info)
+            self.results.banner_requested = False
+            self.results.commands_requested = False
+        candidates = self._build_accepted_domain_probe_candidates()
+        random_local = f"ptsrvnx{secrets.token_hex(4)}"
+        best: tuple[int, str, str, str] | None = None  # score, domain, confidence, detail
+        universal = False
+        tried: list[str] = []
+        smtp: smtplib.SMTP | None = None
+        try:
+            smtp = self.get_smtp_handler()
+            smtp.docmd("EHLO", self.fqdn)
+            for dom in candidates:
+                tried.append(dom)
+                sc, conf, det = self._probe_rcpt_acceptance_for_domain(smtp, dom, random_local)
+                if dom.lower() == "invalid.invalid" and sc >= 38:
+                    universal = True
+                if dom.lower() != "invalid.invalid":
+                    if best is None or sc > best[0]:
+                        best = (sc, dom, conf, det)
+        finally:
+            if smtp is not None:
+                try:
+                    smtp.close()
+                except Exception:
+                    pass
+        min_score = 38
+        if best is None or best[0] < min_score:
+            detail = (best[3] if best else "") or (
+                "No tested domain produced a confident local-domain pattern."
+            )
+            if universal:
+                extra = (
+                    'Server is "Accept-All" or uses deferred verification '
+                    "(invalid.invalid accepted)."
+                )
+                detail = f"{detail} {extra}".strip() if detail else extra
+            return AcceptedDomainProbeResult(
+                None,
+                "none",
+                detail,
+                tuple(tried),
+                universal,
+            )
+        _sc, dom, conf, det = best
+        placeholder = _accepted_domain_is_placeholder(dom)
+        if conf == "high" and (universal or placeholder):
+            conf = "medium"
+        detail = det
+        return AcceptedDomainProbeResult(
+            dom, conf, detail, tuple(tried), universal, placeholder,
+        )
+
+    def _stream_accepted_domain_probe_result(self) -> None:
+        if self.use_json:
+            return
+        if (err := self.results.accepted_domain_probe_error) is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} Test failed: {err}", Out.TEXT)
+            return
+        r = self.results.accepted_domain_probe
+        if r is None:
+            return
+        info_icon = get_colored_text("[*]", color="INFO")
+        head_icon = get_colored_text("[i]", color="INFO")
+        warn_head_icon = get_colored_text("[!]", color="WARNING")
+        if r.universal_accept_detected:
+            self.ptprint(
+                f"    {info_icon} Server is \"Accept-All\" or uses deferred verification "
+                "(invalid.invalid accepted).",
+                Out.TEXT,
+            )
+        domain_line_icon = (
+            warn_head_icon
+            if (r.universal_accept_detected or getattr(r, "likely_placeholder_domain", False))
+            else head_icon
+        )
+        if r.domain and r.confidence != "none":
+            self.ptprint(
+                f"    {domain_line_icon} Accepted recipient domain: {r.domain} (confidence: {r.confidence})",
+                Out.TEXT,
+            )
+            if r.detail:
+                self.ptprint(f"    {info_icon} {r.detail}", Out.TEXT)
+            if getattr(r, "likely_placeholder_domain", False):
+                self.ptprint(
+                    f"    {warn_head_icon} WARNING: {r.domain} matches a known placeholder / example "
+                    "domain; this often reflects default MTA configuration, not an operational "
+                    "recipient namespace.",
+                    Out.TEXT,
+                )
+        else:
+            no_dom_icon = warn_head_icon if r.universal_accept_detected else head_icon
+            self.ptprint(
+                f"    {no_dom_icon} Could not determine an accepted recipient domain",
+                Out.TEXT,
+            )
+            if r.detail:
+                self.ptprint(f"    {info_icon} {r.detail}", Out.TEXT)
+
+    def _accepted_domain_probe_props_json(self) -> dict[str, object]:
+        """JSON fragment for -pd (no vulnerabilities)."""
+        out: dict[str, object] = {}
+        if (err := self.results.accepted_domain_probe_error) is not None:
+            out["acceptedRecipientDomainProbeError"] = err
+            return out
+        pr = self.results.accepted_domain_probe
+        if pr is None:
+            return out
+        obj: dict[str, object] = {
+            "domain": pr.domain,
+            "confidence": pr.confidence,
+            "candidatesTested": list(pr.candidates_tested),
+            "universalAcceptDetected": pr.universal_accept_detected,
+            "likelyPlaceholderDomain": pr.likely_placeholder_domain,
+        }
+        if pr.detail:
+            obj["detail"] = pr.detail
+        out["acceptedRecipientDomainProbe"] = obj
+        return out
 
     def start_interactive_mode(self, smtp: smtplib.SMTP):
         self.ptprint("\n", end="")
@@ -3823,9 +4366,9 @@ class SMTP(BaseModule):
         return {"rcpt": is_slow_down}
 
     @staticmethod
-    def _format_enum_elapsed(start: float) -> str:
-        """Elapsed since start with centiseconds (distinct stamps when lines flush together)."""
-        elapsed = max(0.0, time.time() - start)
+    def _format_enum_clock_duration(elapsed: float) -> str:
+        """Format a non-negative duration as H:MM:SS.cs (used for elapsed and ETA)."""
+        elapsed = max(0.0, float(elapsed))
         total_sec = int(elapsed)
         cs = int((elapsed - total_sec) * 100)
         if cs >= 100:
@@ -3833,6 +4376,21 @@ class SMTP(BaseModule):
         h, rem = divmod(total_sec, 3600)
         m, s = divmod(rem, 60)
         return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+    @staticmethod
+    def _format_enum_elapsed(start: float) -> str:
+        """Elapsed since start with centiseconds (distinct stamps when lines flush together)."""
+        return SMTP._format_enum_clock_duration(time.time() - start)
+
+    @staticmethod
+    def _enum_eta_remaining_seconds(completed: int, total: int, elapsed: float) -> float | None:
+        """ETA = remaining_tests * elapsed / completed (RFC-style rolling average)."""
+        if total <= 0 or completed <= 0:
+            return None
+        remaining = total - completed
+        if remaining <= 0:
+            return 0.0
+        return remaining * float(elapsed) / float(completed)
 
     def _enumeration_requested_method_set(self) -> set[str]:
         if self.args.enumerate is None:
@@ -4091,15 +4649,24 @@ class SMTP(BaseModule):
             "RELAY ACCESS DENIED",
             "RELAY DENIED",
             "RELAYING DENIED",
+            "RELAY NOT PERMITTED",
+            "NOT PERMITTED TO RELAY",
+            "RELAYING NOT PERMITTED",
+            "UNABLE TO RELAY",
+            "USER NOT LOCAL",
             "NO SUCH DOMAIN",
             "DOMAIN NOT FOUND",
             "DOMAIN DOES NOT EXIST",
+            "DOMAIN UNKNOWN",
+            "UNKNOWN DOMAIN",
             "UNROUTEABLE",
             "UNRESOLVABLE",
             "CANNOT ROUTE",
             "INVALID DOMAIN",
             "BAD DESTINATION",
             "NO ROUTE TO HOST",
+            "HOST NOT FOUND",
+            "NAME OR SERVICE NOT KNOWN",
         )
         return any(kw in up for kw in DOMAIN_INDICATORS)
 
@@ -4124,66 +4691,29 @@ class SMTP(BaseModule):
                     pass
 
     def _enum_clock_paint_unlocked(self) -> None:
-        """Redraw dynamic Checking line; caller must hold _enum_progress_print_lock."""
+        """One progress line per attempt: ETA, N% (vs wordlist / -u size), current label."""
         st = self._enum_clock_state
         if st is None:
             return
         start = getattr(self, "_enum_progress_start", None) or time.time()
-        elapsed = self._format_enum_elapsed(start)
         idx = int(st["idx"])
         total = int(st["total"])
         label = str(st["label"])
-        pct = min(100, max(1, int(100 * idx / total))) if total > 0 else 100
-        line_core = f"  {elapsed} ({pct}%) Checking:  {label}"
+        elapsed = max(0.0, time.time() - start)
+        completed = idx - 1
+        pct = min(100, int(100 * completed / total)) if total > 0 else 0
+        eta_sec = self._enum_eta_remaining_seconds(completed, total, elapsed)
+        time_part = (
+            self._format_enum_clock_duration(eta_sec)
+            if eta_sec is not None
+            else "--:--:00.00"
+        )
+        line_core = f"{time_part} {pct}% {label}"
         self._raw_write(f"\033[2K\r{line_core}".encode("utf-8", errors="replace"))
 
-    def _enum_clock_loop(self) -> None:
-        """Background refresh while waiting on SMTP (single-thread only).
-
-        Critical: state is read under a brief lock; stdout I/O is performed
-        OUTSIDE the lock so that the main thread (printing a finding) can always
-        acquire the lock instantly and is never blocked by slow PTY/flush calls.
-        """
-        while not self._enum_clock_stop.is_set():
-            if self._enum_clock_stop.wait(0.1):
-                break
-            if self.use_json:
-                time.sleep(0.05)
-                continue
-            # Read state snapshot under lock (microseconds only).
-            with self._enum_progress_print_lock:
-                st = self._enum_clock_state
-            # All I/O via os.write() (kernel-atomic, no Python buffer) so
-            # main thread is never blocked waiting on this thread's I/O.
-            if st is not None and not self._enum_clock_stop.is_set():
-                start = getattr(self, "_enum_progress_start", None) or time.time()
-                elapsed = self._format_enum_elapsed(start)
-                idx = int(st["idx"])
-                total = int(st["total"])
-                label = str(st["label"])
-                pct = min(100, max(1, int(100 * idx / total))) if total > 0 else 100
-                line_core = f"  {elapsed} ({pct}%) Checking:  {label}"
-                self._raw_write(f"\033[2K\r{line_core}".encode("utf-8", errors="replace"))
-            time.sleep(0.05)
-
     def _enum_clock_ensure_started(self) -> None:
-        if self.use_json or getattr(self.args, "enum_threads", 1) > 1:
-            return
-        t = self._enum_clock_thread
-        if t is not None and t.is_alive():
-            if not self._enum_clock_stop.is_set():
-                return  # thread running normally
-            # Stop was signalled for a finding; wait briefly for thread to exit.
-            t.join(timeout=0.15)
-            if t.is_alive():
-                return  # will be retried on next _enum_wait_begin
-        self._enum_clock_stop.clear()
-        self._enum_clock_thread = threading.Thread(
-            target=self._enum_clock_loop,
-            daemon=True,
-            name="ptsrvtester-enum-clock",
-        )
-        self._enum_clock_thread.start()
+        """Single-thread enum: no background ticker — progress updates only from _enum_wait_begin."""
+        return
 
     def _enum_clock_shutdown(self) -> None:
         """Stop clock thread after EXPN/VRFY/RCPT enumeration block."""
@@ -4212,59 +4742,34 @@ class SMTP(BaseModule):
         """No-op: clock now runs continuously throughout enumeration.
         Stopped only once at the end via _enum_clock_shutdown()."""
 
-    def _enum_streaming_emit_first_finding(self, idx: int, total: int, display: str) -> None:
-        """Print first finding with minimum latency.
-
-        Clock keeps running – os.write() calls are kernel-serialised on Linux TTY
-        (atomic for writes < PIPE_BUF / 4096 bytes), so concurrent clock and
-        finding writes never interleave at the byte level.
-        The leading \\n moves the finding to its own line below the live clock line.
-        """
+    def _enum_streaming_emit_first_finding(self, _idx: int, _total: int, display: str) -> None:
+        """Print first EXPN/VRFY hit on its own line (no time/%); progress line stays separate."""
         if self.use_json or getattr(self.args, "enum_threads", 1) > 1:
             return
-        start = getattr(self, "_enum_progress_start", None) or time.time()
-        elapsed = self._format_enum_elapsed(start)
-        pct = min(100, max(1, int(100 * idx / total))) if total > 0 else 100
-        line = f"  {elapsed} ({pct}%)  {display}\n"
-        # Leading \n ensures the finding appears on a fresh line below the clock.
-        # os.write() bypasses BufferedWriter – no race with the clock thread.
-        self._raw_write(("\n" + line).encode("utf-8", errors="replace"))
+        self._raw_write(f"\033[2K\r    {display}\n".encode("utf-8", errors="replace"))
 
     def _enum_wait_end(self) -> None:
         """No-op: clock runs continuously throughout enumeration.
         State is updated per-user by _enum_wait_begin(); stopped only once
         at the very end by _enum_clock_shutdown()."""
 
-    def _enum_stdout_line_immediate(self, text: str, end: str = "\n") -> None:
-        """Thread-safe line + flush. With multiple threads, write via binary buffer to avoid TextIO batching."""
-        if self.use_json:
-            return
-        chunk = text + end
-        mt = getattr(self.args, "enum_threads", 1) > 1
-        with self._enum_progress_print_lock:
-            buf = getattr(sys.stdout, "buffer", None)
-            if mt and buf is not None:
-                try:
-                    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-                    buf.write(chunk.encode(enc, errors="replace"))
-                    buf.flush()
-                    return
-                except (BrokenPipeError, TypeError, ValueError, OSError):
-                    pass
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-
     def _enum_mt_progress_reset(self) -> None:
         self._enum_mt_progress_line_active = False
 
     def _enum_mt_progress_update(self, done: int, total: int) -> None:
-        """One-line progress for multi-thread enum (TTY only); avoids spamming Checking per user."""
+        """One-line progress for multi-thread enum (TTY): ETA and % vs wordlist."""
         if self.use_json or getattr(self.args, "enum_threads", 1) <= 1 or total <= 0:
             return
         start = getattr(self, "_enum_progress_start", None) or time.time()
-        elapsed = self._format_enum_elapsed(start)
+        elapsed = max(0.0, time.time() - start)
         pct = min(100, max(0, int(100 * done / total)))
-        line_core = f"  {elapsed} ({pct}%)  [{done}/{total}]"
+        eta_sec = self._enum_eta_remaining_seconds(done, total, elapsed)
+        time_part = (
+            self._format_enum_clock_duration(eta_sec)
+            if eta_sec is not None
+            else "--:--:00.00"
+        )
+        line_core = f"{time_part} {pct}%"
         with self._enum_progress_print_lock:
             self._enum_mt_progress_line_active = True
             if sys.stdout.isatty():
@@ -4287,23 +4792,28 @@ class SMTP(BaseModule):
         # writing to it (avoiding non-thread-safe concurrent BufferedWriter access).
         self._raw_write(b"\n")
 
-    def _print_enum_finding(self, idx: int, total: int, payload: str) -> None:
+    def _print_enum_finding(
+        self, _idx: int, _total: int, payload: str, *, replace_progress: bool = True
+    ) -> None:
+        """Print one enumerated value; clear the live progress line when replace_progress (ST + MT)."""
         if self.use_json:
             return
-        start = getattr(self, "_enum_progress_start", None) or time.time()
-        elapsed = self._format_enum_elapsed(start)
-        pct = min(100, max(1, int(100 * idx / total))) if total > 0 else 100
         if getattr(self.args, "enum_threads", 1) > 1:
-            line = f"  {elapsed} ({pct}%)  Found: {payload}"
-            self._enum_stdout_line_immediate(line)
+            with self._enum_progress_print_lock:
+                if replace_progress:
+                    self._enum_mt_progress_line_active = False
+                    self._raw_write(
+                        f"\033[2K\r    {payload}\n".encode("utf-8", errors="replace")
+                    )
+                else:
+                    self._raw_write(
+                        f"    {payload}\n".encode("utf-8", errors="replace")
+                    )
+            return
+        elif replace_progress:
+            self._raw_write(f"\033[2K\r    {payload}\n".encode("utf-8", errors="replace"))
         else:
-            # Single-thread: clock keeps running concurrently.  The clock writes
-            # \033[2K\r<text> (no trailing newline) so the cursor stays on the
-            # clock line.  Prefixing with \033[2K\r here clears that stale clock
-            # text before writing the alias/finding, then \n advances past it.
-            # os.write() is kernel-serialised so there is no race with the clock.
-            line = f"\033[2K\r  {elapsed} ({pct}%)  {payload}\n"
-            self._raw_write(line.encode("utf-8", errors="replace"))
+            self._raw_write(f"    {payload}\n".encode("utf-8", errors="replace"))
 
     def expn_vrfy_enumeration(self, method, smtp) -> list[str]:
         enum_threads = getattr(self.args, "enum_threads", 1)
@@ -4342,7 +4852,8 @@ class SMTP(BaseModule):
                         with self._enum_progress_print_lock:
                             if self._enum_clock_state is not None:
                                 self._enum_clock_state = dict(self._enum_clock_state)
-                                self._enum_clock_state["label"] = "(reconnecting...)"
+                                self._enum_clock_state["label"] = "reconnecting..."
+                                self._enum_clock_paint_unlocked()
                     try:
                         smtp = self.get_smtp_handler(timeout=15.0)
                         smtp.docmd("EHLO", self.fqdn)
@@ -4417,7 +4928,7 @@ class SMTP(BaseModule):
                     if status != 550:
                         preview = _first_preview[0] if _first_preview else self._expn_vrfy_quick_display(reply, user)
                         if not _first_preview and not self.use_json:
-                            self._enum_streaming_emit_first_finding(idx, wl_total, preview)
+                            self._print_enum_finding(idx, wl_total, preview)
                         reply_str = self.bytes_to_str(reply)
                         user_email = self._expn_vrfy_result_strings(reply_str)
                         if not user_email:
@@ -4426,13 +4937,15 @@ class SMTP(BaseModule):
                         if not self.use_json:
                             for em in user_email:
                                 if em != preview:
-                                    self._print_enum_finding(idx, wl_total, em)
+                                    self._print_enum_finding(
+                                        idx, wl_total, em, replace_progress=False
+                                    )
                         elif self.use_json:
                             self.ptdebug(user_email[0])
                         if method == "EXPN" and len(user_email) > 1:
                             for alias in user_email[1:]:
                                 total_aliases += len(user_email[1:])
-                                self.ptdebug(f"   {alias}", Out.ADDITIONS)
+                                self.ptdebug(f"{alias}", Out.ADDITIONS)
                         # Reconnect after a find only when --enum-reconnect-after is set;
                         # resets accumulated teergrube delay on the connection.
                         if reconnect_after is not None and reconnect_after != -1:
@@ -4525,7 +5038,9 @@ class SMTP(BaseModule):
                                 if not self.use_json:
                                     for em in user_email:
                                         if em != preview:
-                                            self._print_enum_finding(cur, work_total, em)
+                                            self._print_enum_finding(
+                                                cur, work_total, em, replace_progress=False
+                                            )
                                 elif self.use_json:
                                     self.ptdebug(user_email[0])
                         finally:
@@ -4898,7 +5413,8 @@ class SMTP(BaseModule):
                         with self._enum_progress_print_lock:
                             if self._enum_clock_state is not None:
                                 self._enum_clock_state = dict(self._enum_clock_state)
-                                self._enum_clock_state["label"] = "(reconnecting...)"
+                                self._enum_clock_state["label"] = "reconnecting..."
+                                self._enum_clock_paint_unlocked()
                     try:
                         smtp = self.get_smtp_handler(timeout=15.0)
                         smtp.docmd("EHLO", self.fqdn)
@@ -4953,10 +5469,6 @@ class SMTP(BaseModule):
                             self._enum_wait_end()
                     if status != 550 and not self._rcpt_reply_has_unknown(reply):
                         if not self.use_json:
-                            # Stop clock before printing (same logic as
-                            # Clock keeps running; _print_enum_finding uses
-                            # \033[2K\r to clear the clock line before writing.
-                            self._enum_progress_newline()
                             self._print_enum_finding(idx, wl_total, label)
                         elif self.use_json:
                             self.ptdebug(local)
@@ -5084,12 +5596,12 @@ class SMTP(BaseModule):
 
     def test_blacklist(self, target: str) -> tuple[BlacklistResult | None, bool]:
         """Run blacklist check. Returns (result, skipped_private). skipped_private=True for private IP (no API call)."""
-        self.ptdebug("    Testing target against blacklists:", title=True)
+        self.ptdebug("Testing target against blacklists:", title=True)
         if self.target_is_ip and _is_private_ip(target):
             self.ptdebug("Blacklist test skipped: private/internal IP (not on public blacklists)", Out.INFO)
             return (None, True)
 
-        blacklist_parser = BlacklistParser(self.ptdebug, self.args.json)
+        blacklist_parser = BlacklistParser(self.ptdebug, self.args.json, self.args.debug)
 
         try:
             error_msg = blacklist_parser.lookup(target)
@@ -5151,7 +5663,7 @@ class SMTP(BaseModule):
         try:
             ns_query = resolver.resolve(domain, "NS", tcp=True)
             nameserver_list = [str(rdata)[:-1] for rdata in ns_query]
-            self.ptdebug("    " + "\n    ".join(nameserver_list))
+            self.ptdebug("\n".join(nameserver_list))
         except Exception as e:
             # Make error message more user-friendly
             error_msg = str(e)
@@ -5275,14 +5787,17 @@ class SMTP(BaseModule):
         )
         domain_str = (ntlm.netbios_domain or "") + (ntlm.dns_domain or "")
         if any(h in (domain_str or "").lower() for h in internal_hints):
-            self.ptdebug("  [*] Internal domain/hostname disclosed (common MS Exchange finding)", Out.VULN)
-        self.ptdebug(f"  Target name: {ntlm.target_name}")
-        self.ptdebug(f"  NetBios domain name: {ntlm.netbios_domain}")
-        self.ptdebug(f"  NetBios computer name: {ntlm.netbios_computer}")
-        self.ptdebug(f"  DNS domain name: {ntlm.dns_domain}")
-        self.ptdebug(f"  DNS computer name: {ntlm.dns_computer}")
-        self.ptdebug(f"  DNS tree: {ntlm.dns_tree}")
-        self.ptdebug(f"  OS version: {ntlm.os_version}")
+            self.ptdebug(
+                "[*] Internal domain/hostname disclosed (common MS Exchange finding)",
+                Out.VULN,
+            )
+        self.ptdebug(f"Target name: {ntlm.target_name}")
+        self.ptdebug(f"NetBios domain name: {ntlm.netbios_domain}")
+        self.ptdebug(f"NetBios computer name: {ntlm.netbios_computer}")
+        self.ptdebug(f"DNS domain name: {ntlm.dns_domain}")
+        self.ptdebug(f"DNS computer name: {ntlm.dns_computer}")
+        self.ptdebug(f"DNS tree: {ntlm.dns_tree}")
+        self.ptdebug(f"OS version: {ntlm.os_version}")
 
         return NTLMResult(True, ntlm)
 
@@ -10748,6 +11263,35 @@ class SMTP(BaseModule):
             icon = get_colored_text("[✓]", color="NOTVULN")
             self.ptprint(f"    {icon} Open relay is denied", Out.TEXT)
 
+    @staticmethod
+    def _rcpt_limit_recipient_verdict_icon(max_accepted: int) -> str:
+        """Terminal icon from accepted RCPT count before limit/cap: ≤100 OK, 101–500 warn, >500 error."""
+        n = max_accepted if max_accepted is not None else 0
+        if n <= RCPT_LIMIT_VERDICT_OK_MAX:
+            return get_colored_text("[✓]", color="NOTVULN")
+        if n <= RCPT_LIMIT_VERDICT_WARN_MAX:
+            return get_colored_text("[!]", color="WARNING")
+        return get_colored_text("[✗]", color="VULN")
+
+    def _maybe_stream_rcpt_limit_domain_hint(self, server_response: str | None) -> None:
+        """Print -d/--domain hint when auto domain looks wrong (relay / unroutable)."""
+        if getattr(self.args, "domain", None):
+            return
+        if not self._rcpt_response_suggests_bad_domain(server_response):
+            return
+        info_icon = get_colored_text("[*]", color="INFO")
+        self.ptprint(
+            f"    {info_icon} Try -d/--domain <domain> to set recipient domain for this test",
+            Out.TEXT,
+        )
+
+    def _stream_rcpt_limit_server_response_verbose(self, server_response: str | None) -> None:
+        """Full SMTP reply lines only with -vv/--verbose (``args.debug``)."""
+        if not server_response:
+            return
+        for line in (server_response or "").replace("\r", "").splitlines():
+            self.ptdebug(line, Out.TEXT)
+
     def _stream_rcpt_limit_result(self) -> None:
         rcptmax_advertised = None
         if (info := getattr(self.results, "info", None)) and getattr(info, "ehlo", None):
@@ -10771,40 +11315,7 @@ class SMTP(BaseModule):
                 f"    {info_icon} Advertised in EHLO (RFC 9422): RCPTMAX={rcptmax_advertised}",
                 Out.TEXT,
             )
-        if getattr(rlim, "rejected_addresses", False):
-            attempts = getattr(rlim, "failed_before_limit", 0)
-            attempts_suffix = f" (after {attempts} attempts)" if attempts else ""
-            self.ptprint(
-                f"    {info_icon} Could not test per-message limit: server rejects test addresses{attempts_suffix}",
-                Out.TEXT,
-            )
-            if rlim.server_response:
-                for line in (rlim.server_response or "").replace("\r", "").splitlines():
-                    self.ptprint(f"        {line}", Out.TEXT)
-            if getattr(rlim, "no_session_limit", False):
-                # All test addresses were rejected – we cannot conclude that session
-                # limits are absent, only that the server did not disconnect during the
-                # rejected-address probes.  Show a neutral informational message instead
-                # of a vulnerability finding so the two lines don't contradict each other.
-                # Show the -d hint only when the response suggests a domain-level error
-                # (relay denied, no such domain, …).  A "550 User unknown" reply means
-                # the domain is recognised – only the local part is absent – so no hint.
-                needs_domain_hint = (
-                    not getattr(self.args, "domain", None)
-                    and self._rcpt_response_suggests_bad_domain(rlim.server_response)
-                )
-                domain_hint = " Try -d/--domain <domain>." if needs_domain_hint else ""
-                self.ptprint(
-                    f"    {info_icon} Could not determine session RCPT limit – "
-                    f"all test addresses were rejected.{domain_hint}",
-                    Out.TEXT,
-                )
-            elif not getattr(self.args, "domain", None) and self._rcpt_response_suggests_bad_domain(rlim.server_response):
-                self.ptprint(
-                    f"    {info_icon} Try -d/--domain <domain> to set recipient domain for this test",
-                    Out.TEXT,
-                )
-        elif getattr(rlim, "session_limit_triggered", False):
+        if getattr(rlim, "session_limit_triggered", False):
             icon = get_colored_text("[✓]", color="NOTVULN")
             attempts = getattr(rlim, "failed_before_limit", 0)
             attempts_suffix = f" (after {attempts} attempts)" if attempts else ""
@@ -10812,23 +11323,36 @@ class SMTP(BaseModule):
                 f"    {icon} Session limit enforced (421 or disconnect){attempts_suffix}",
                 Out.TEXT,
             )
-            if rlim.server_response:
-                for line in (rlim.server_response or "").replace("\r", "").splitlines():
-                    self.ptprint(f"        {line}", Out.TEXT)
+            self._stream_rcpt_limit_server_response_verbose(rlim.server_response)
+        elif getattr(rlim, "rejected_addresses", False) and getattr(rlim, "no_session_limit", False):
+            warn_icon = get_colored_text("[!]", color="WARNING")
+            attempts = getattr(rlim, "failed_before_limit", 0)
+            if attempts:
+                self.ptprint(
+                    f"    {warn_icon} Could not test per-message limit: server rejects {attempts} tested addresses "
+                    f"(allowed {attempts} failed RCPTs without disconnect)",
+                    Out.TEXT,
+                )
+            else:
+                self.ptprint(
+                    f"    {warn_icon} Could not test per-message limit: server rejects tested addresses "
+                    "(allowed failed RCPTs without disconnect)",
+                    Out.TEXT,
+                )
+            self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
         elif rlim.limit_triggered:
-            icon = get_colored_text("[✓]", color="NOTVULN")
+            icon = self._rcpt_limit_recipient_verdict_icon(rlim.max_accepted)
             self.ptprint(f"    {icon} Per-message limit enforced after {rlim.max_accepted} recipients", Out.TEXT)
-            if rlim.server_response:
-                for line in (rlim.server_response or "").replace("\r", "").splitlines():
-                    self.ptprint(f"        {line}", Out.TEXT)
+            self._stream_rcpt_limit_server_response_verbose(rlim.server_response)
+            if rlim.max_accepted == 0:
+                self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
         else:
             if rlim.max_accepted == 0:
                 self.ptprint(f"    {info_icon} Could not test: no recipients accepted", Out.TEXT)
-                if rlim.server_response:
-                    for line in (rlim.server_response or "").replace("\r", "").splitlines():
-                        self.ptprint(f"        {line}", Out.TEXT)
+                self._stream_rcpt_limit_server_response_verbose(rlim.server_response)
+                self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
             else:
-                icon = get_colored_text("[✗]", color="VULN")
+                icon = self._rcpt_limit_recipient_verdict_icon(rlim.max_accepted)
                 self.ptprint(
                     f"    {icon} No limit or too high: {rlim.max_accepted} recipients accepted",
                     Out.TEXT,
@@ -11051,24 +11575,23 @@ class SMTP(BaseModule):
             self.ptprint(f"        {info_icon} Target domain used: (none — probe B skipped)", Out.TEXT)
         if af.target_domain_analyst_note:
             self.ptprint(f"        {info_icon} {af.target_domain_analyst_note}", Out.TEXT)
-        if self.args.debug:
-            if af.target_domain_source == "ehlo_last2" and af.target_domain_ehlo_hostname and af.target_domain_used:
-                self.ptdebug(
-                    f"AUTH-FORMAT: scan target is IP; EHLO hostname {af.target_domain_ehlo_hostname!r} "
-                    f"→ derived domain {af.target_domain_used!r} (last 2 labels, no PSL)",
-                    Out.INFO,
-                )
-            elif af.target_domain_source == "scan_last2" and af.target_domain_scan_hostname and af.target_domain_used:
-                self.ptdebug(
-                    f"AUTH-FORMAT: target domain from scan target {af.target_domain_scan_hostname!r} "
-                    f"→ {af.target_domain_used!r} (last 2 labels, no PSL)",
-                    Out.INFO,
-                )
-            elif af.target_domain_source == "none":
-                self.ptdebug(
-                    "AUTH-FORMAT: no derived domain for probe B (see analyst note above)",
-                    Out.INFO,
-                )
+        if af.target_domain_source == "ehlo_last2" and af.target_domain_ehlo_hostname and af.target_domain_used:
+            self.ptdebug(
+                f"AUTH-FORMAT: scan target is IP; EHLO hostname {af.target_domain_ehlo_hostname!r} "
+                f"→ derived domain {af.target_domain_used!r} (last 2 labels, no PSL)",
+                Out.INFO,
+            )
+        elif af.target_domain_source == "scan_last2" and af.target_domain_scan_hostname and af.target_domain_used:
+            self.ptdebug(
+                f"AUTH-FORMAT: target domain from scan target {af.target_domain_scan_hostname!r} "
+                f"→ {af.target_domain_used!r} (last 2 labels, no PSL)",
+                Out.INFO,
+            )
+        elif af.target_domain_source == "none":
+            self.ptdebug(
+                "AUTH-FORMAT: no derived domain for probe B (see analyst note above)",
+                Out.INFO,
+            )
         for r in af.rows:
             if r.skipped:
                 self.ptprint(f"        {info_icon} {r.label}: skipped ({r.skip_reason or 'n/a'})", Out.TEXT)
@@ -11554,22 +12077,20 @@ class SMTP(BaseModule):
 
         # Pre-probe failure or missing args (no probe sections in trace)
         if not has_probe1:
-            if self.args.debug and pre_lines:
-                for line in pre_lines:
-                    self.ptprint(f"    {dbg_icon} {line}", Out.TEXT)
+            for line in pre_lines:
+                self.ptdebug(f"{dbg_icon} {line}")
             icon, msg = _probe_icon_msg(False, br.indeterminate, br.detail)
             self.ptprint(f"    {icon} {msg}", Out.TEXT)
             return
 
         # --- Probe 1: From header without Return-Path ---
         self.ptprint(f"    {info_icon} Test From header without Return-Path", Out.TEXT)
-        if self.args.debug:
-            for line in pre_lines:
-                self.ptprint(f"        {dbg_icon} {line}", Out.TEXT)
-            if p1_label:
-                self.ptprint(f"        {dbg_icon} {p1_label.replace('Probe 1: ', '')}", Out.TEXT)
-            for line in p1_lines:
-                self.ptprint(f"        {dbg_icon} {line}", Out.TEXT)
+        for line in pre_lines:
+            self.ptdebug(f"{dbg_icon} {line}")
+        if p1_label:
+            self.ptdebug(f"{dbg_icon} {p1_label.replace('Probe 1: ', '')}")
+        for line in p1_lines:
+            self.ptdebug(f"{dbg_icon} {line}")
         p1_icon, p1_msg = _probe_icon_msg(
             br.message_accepted, br.probe1_indeterminate, br.probe1_detail
         )
@@ -11583,11 +12104,10 @@ class SMTP(BaseModule):
 
         # --- Probe 2: From + Return-Path headers ---
         self.ptprint(f"    {info_icon} Test From headers and Return-Path", Out.TEXT)
-        if self.args.debug:
-            if p2_label:
-                self.ptprint(f"        {dbg_icon} {p2_label.replace('Probe 2: ', '')}", Out.TEXT)
-            for line in p2_lines:
-                self.ptprint(f"        {dbg_icon} {line}", Out.TEXT)
+        if p2_label:
+            self.ptdebug(f"{dbg_icon} {p2_label.replace('Probe 2: ', '')}")
+        for line in p2_lines:
+            self.ptdebug(f"{dbg_icon} {line}")
         p2_accepted = getattr(br, "message_accepted_return_path", False)
         p2_icon, p2_msg = _probe_icon_msg(
             p2_accepted, br.probe2_indeterminate, br.probe2_detail
@@ -12021,38 +12541,30 @@ class SMTP(BaseModule):
             icon = get_colored_text("[✓]", color="NOTVULN")
             self.ptprint(f"    {icon} {ad.detail}", Out.TEXT)
 
-    def _stream_max_connections_result(self) -> None:
-        if (max_connections_error := self.results.max_connections_error) is not None:
+    def _stream_rate_limit_result(self) -> None:
+        if (err := self.results.rate_limit_error) is not None:
             icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Max connections test failed: {max_connections_error}", Out.TEXT)
+            self.ptprint(f"    {icon} Rate limiting test failed: {err}", Out.TEXT)
             return
-        max_con = self.results.max_connections
-        if max_con is None:
+        rl = self.results.rate_limit
+        if rl is None:
             return
-        if max_con.max is None:
-            self.ptprint("Maximum connections: no limit found", Out.VULN)
-            return
-        if max_con.max < 50:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            status_text = ""
-        elif max_con.max < 100:
+        if rl.timeout_exceeded:
             icon = get_colored_text("[!]", color="WARNING")
-            status_text = " (high value)"
-        else:
+            self.ptprint(
+                f"    {icon} Server holds connections open for more than 5 minutes",
+                Out.TEXT,
+            )
+        if rl.connected is not None and rl.connected >= 50:
             icon = get_colored_text("[✗]", color="VULN")
-            status_text = " (high value)"
-        self.ptprint(f"    {icon} Max connections per IP: {max_con.max}{status_text}", Out.TEXT)
-        if max_con.ban_seconds is None:
+            self.ptprint(
+                f"    {icon} Vulnerable: {rl.connected} simultaneous SMTP connections "
+                f"from one IP accepted",
+                Out.TEXT,
+            )
+        elif rl.connected is not None:
             icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} Timeout: not detected", Out.TEXT)
-        else:
-            if max_con.ban_seconds < 600:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                status_text = ""
-            else:
-                icon = get_colored_text("[✗]", color="VULN")
-                status_text = " (high value)"
-            self.ptprint(f"    {icon} Timeout: {max_con.ban_seconds} sec{status_text}", Out.TEXT)
+            self.ptprint(f"    {icon} Not vulnerable", Out.TEXT)
 
     def _on_brute_success(self, cred: Creds) -> None:
         """Callback for real-time streaming of found credentials (thread-safe)."""
@@ -12252,14 +12764,16 @@ class SMTP(BaseModule):
             parts.append(f"Role error: {role_err}")
 
         if (rlim := self.results.rcpt_limit) is not None:
-            if getattr(rlim, "rejected_addresses", False):
-                parts.append(f"Server rejects test addresses: {rlim.server_response}")
-                if getattr(rlim, "no_session_limit", False):
-                    failed = getattr(rlim, "failed_before_limit", 0)
-                    parts.append(f"No session error limit (allowed {failed} failed RCPTs without disconnect)")
-            elif getattr(rlim, "session_limit_triggered", False):
+            if getattr(rlim, "session_limit_triggered", False):
                 failed = getattr(rlim, "failed_before_limit", 0)
                 parts.append(f"Session limit enforced after {failed} failed RCPTs")
+            elif getattr(rlim, "rejected_addresses", False) and getattr(rlim, "no_session_limit", False):
+                parts.append(f"Server rejects test addresses: {rlim.server_response}")
+                failed = getattr(rlim, "failed_before_limit", 0)
+                parts.append(
+                    f"Could not test per-message limit: allowed {failed} failed RCPTs without disconnect "
+                    "(policy rejects, session not closed)"
+                )
             elif rlim.limit_triggered:
                 parts.append(f"Per-message limit enforced after {rlim.max_accepted} recipients")
             else:
@@ -12269,6 +12783,21 @@ class SMTP(BaseModule):
                     parts.append(f"No limit detected (tested {rlim.max_accepted} recipients)")
         elif (rcpt_err := self.results.rcpt_limit_error) is not None:
             parts.append(f"RCPT limit error: {rcpt_err}")
+
+        if (adp_err := self.results.accepted_domain_probe_error) is not None:
+            parts.append(f"Accepted recipient domain probe error: {adp_err}")
+        elif (adp := self.results.accepted_domain_probe) is not None:
+            if adp.domain:
+                parts.append(
+                    f"Accepted recipient domain: {adp.domain} (confidence: {adp.confidence})"
+                )
+                if getattr(adp, "likely_placeholder_domain", False):
+                    parts.append(
+                        "Likely placeholder/example domain (common default configuration), "
+                        "not necessarily an operational recipient namespace"
+                    )
+            else:
+                parts.append(adp.detail or "Accepted recipient domain: not determined")
 
         if (open_relay := self.results.open_relay) is not None:
             pass  # description empty per JSON pattern (vuln code speaks for itself)
@@ -12284,19 +12813,29 @@ class SMTP(BaseModule):
         elif self.results.blacklist_private_ip_skipped:
             parts.append("Blacklist check skipped (private IP)")
 
-        if max_con := self.results.max_connections:
-            con_parts = []
-            if max_con.max is not None:
-                con_parts.append(f"Max connections per IP: {max_con.max}")
+        if rl := self.results.rate_limit:
+            rl_parts = []
+            rl_parts.append(f"Connected: {rl.connected if rl.connected is not None else 'N/A'}")
+            # Phase 2 (Duration) always reflected in JSON description: measured time, skipped at cap,
+            # or full wait window with no new connection (matches console / three-phase test).
+            max_attempts = int(getattr(self.args, "rate_limit", None) or RATE_LIMIT_DEFAULT_ATTEMPTS)
+            if rl.rate_limit_seconds is not None:
+                mm = int(rl.rate_limit_seconds // 60)
+                ss = int(rl.rate_limit_seconds % 60)
+                rl_parts.append(f"Duration rate limiting: {mm:02d}:{ss:02d}")
+            elif rl.connected is not None and rl.connected >= max_attempts:
+                rl_parts.append(
+                    f"Duration rate limiting: (skipped, all {max_attempts} attempts accepted)"
+                )
             else:
-                con_parts.append("Max connections per IP: not detected")
-            if max_con.ban_seconds is not None:
-                con_parts.append(f"Timeout: {max_con.ban_seconds} sec")
-            else:
-                con_parts.append("Timeout: not detected")
-            parts.append("\r\n".join(con_parts))
-        elif (mc_err := self.results.max_connections_error) is not None:
-            parts.append(f"Connections error: {mc_err}")
+                rl_parts.append("Duration rate limiting: >05:00")
+            if rl.timeout_seconds is not None:
+                mm = int(rl.timeout_seconds // 60)
+                ss = int(rl.timeout_seconds % 60)
+                rl_parts.append(f"Timeout: {mm:02d}:{ss:02d}" + (" (exceeded 5 min)" if rl.timeout_exceeded else ""))
+            parts.append("\r\n".join(rl_parts))
+        elif (rl_err := self.results.rate_limit_error) is not None:
+            parts.append(f"Rate limiting error: {rl_err}")
 
         if (ntlm := self.results.ntlm) is not None and ntlm.ntlm is not None:
             n = ntlm.ntlm
@@ -12378,12 +12917,6 @@ class SMTP(BaseModule):
             if role_r.role == "hybrid":
                 vulns.append({"vuln_code": VULNS.HybridRole.value})
 
-        if (rlim := self.results.rcpt_limit) is not None:
-            if getattr(rlim, "no_session_limit", False):
-                vulns.append({"vuln_code": VULNS.NoSessionLimit.value})
-            elif rlim.limit_triggered and rlim.max_accepted is not None and rlim.max_accepted >= 100:
-                vulns.append({"vuln_code": VULNS.ManyRcpt.value})
-
         if self.results.open_relay:
             vulns.append({"vuln_code": VULNS.OpenRelay.value})
 
@@ -12391,8 +12924,8 @@ class SMTP(BaseModule):
             if blacklist.listed:
                 vulns.append({"vuln_code": VULNS.Blacklist.value})
 
-        if max_con := self.results.max_connections:
-            if max_con.max is not None and max_con.max >= 50:
+        if rl := self.results.rate_limit:
+            if rl.connected is not None and rl.connected >= 50:
                 vulns.append({"vuln_code": "PTV-SVC-SMTP-CONN"})
 
         if (ntlm := self.results.ntlm) is not None and ntlm.ntlm is not None:
@@ -12454,6 +12987,77 @@ class SMTP(BaseModule):
 
         return vulns
 
+    def _rcpt_limit_for_json(self, *, rcpt_vuln_detail: bool = False) -> tuple[dict, list[dict]]:
+        """RCPT TO limit (-rl) for JSON: property fragment (node-based scans only) + vulnerabilities.
+
+        Flat standalone ``-rl -j`` keeps only ``description`` (from ``_build_flat_description``) in
+        ``properties`` and minimal ``vulnerabilities`` entries (``vuln_code`` only), matching
+        historical output. Structured ``rcptLimit`` keys are merged into the software node properties
+        when ``output()`` uses the node-based branch.
+
+        When ``rcpt_vuln_detail`` is true (node-based ``output()``), ``ManyRcptReject`` entries
+        include ``vuln_request`` / ``vuln_response`` like the original software-node JSON.
+
+        ``PTV-SVC-SMTP-MANYRCPT`` is emitted only when ``maxAccepted`` exceeds 500 (strictly).
+        """
+        props: dict = {}
+        vulns: list[dict] = []
+        rcptmax_advertised = None
+        if (info := getattr(self.results, "info", None)) and getattr(info, "ehlo", None):
+            rcptmax_advertised = _parse_rcptmax_from_ehlo(info.ehlo)
+        if (rcpt_limit_err := self.results.rcpt_limit_error) is not None:
+            if rcptmax_advertised is not None:
+                props["rcptLimitAdvertised"] = rcptmax_advertised
+            props["rcptLimitError"] = rcpt_limit_err
+            return props, vulns
+        if (rlim := self.results.rcpt_limit) is None:
+            return props, vulns
+        if rcptmax_advertised is not None:
+            props["rcptLimitAdvertised"] = rcptmax_advertised
+        if getattr(rlim, "session_limit_triggered", False):
+            props["rcptLimit"] = {
+                "sessionLimitTriggered": True,
+                "failedBeforeLimit": getattr(rlim, "failed_before_limit", 0),
+                "maxAccepted": rlim.max_accepted,
+                "serverResponse": rlim.server_response,
+            }
+            return props, vulns
+        if getattr(rlim, "rejected_addresses", False):
+            rcpt_obj: dict = {"rejectedAddresses": True, "serverResponse": rlim.server_response}
+            if getattr(rlim, "no_session_limit", False):
+                rcpt_obj["manyRcptReject"] = True
+                rcpt_obj["failedBeforeLimit"] = getattr(rlim, "failed_before_limit", 0)
+                if rcpt_vuln_detail:
+                    fb = rcpt_obj["failedBeforeLimit"]
+                    vulns.append(
+                        {
+                            "vuln_code": VULNS.ManyRcptReject.value,
+                            "vuln_request": "RCPT TO limit test (policy rejects without session close)",
+                            "vuln_response": (
+                                f"Could not test per-message limit: server rejects {fb} tested addresses "
+                                f"(allowed {fb} failed RCPTs without disconnect)"
+                            ),
+                        }
+                    )
+                else:
+                    vulns.append({"vuln_code": VULNS.ManyRcptReject.value})
+            props["rcptLimit"] = rcpt_obj
+            return props, vulns
+        if rlim.limit_triggered:
+            props["rcptLimit"] = {"maxAccepted": rlim.max_accepted, "limitTriggered": True}
+            ma = rlim.max_accepted if rlim.max_accepted is not None else 0
+            if ma > RCPT_LIMIT_VERDICT_WARN_MAX:
+                vulns.append({"vuln_code": VULNS.ManyRcpt.value})
+            return props, vulns
+        if rlim.max_accepted == 0:
+            props["rcptLimit"] = {"maxAccepted": 0, "limitTriggered": False, "couldNotTest": True}
+        else:
+            props["rcptLimit"] = {"maxAccepted": rlim.max_accepted, "limitTriggered": False}
+            ma = rlim.max_accepted if rlim.max_accepted is not None else 0
+            if ma > RCPT_LIMIT_VERDICT_WARN_MAX:
+                vulns.append({"vuln_code": VULNS.ManyRcpt.value})
+        return props, vulns
+
     def output(self) -> None:
         # Connection error: use unified error format (status=error, empty nodes)
         if (info_error := getattr(self.results, "info_error", None)) is not None:
@@ -12467,6 +13071,8 @@ class SMTP(BaseModule):
         if not self._is_node_based_output():
             description = self._build_flat_description()
             flat_vulns = self._collect_flat_vulns()
+            _, _rcpt_vulns = self._rcpt_limit_for_json()
+            flat_vulns.extend(_rcpt_vulns)
             props: dict = {"description": description}
             if (ad := self.results.auth_downgrade) is not None:
                 props["authDowngrade"] = {
@@ -12765,6 +13371,9 @@ class SMTP(BaseModule):
                 }
             elif (flood_err := self.results.flood_error) is not None:
                 props["floodError"] = flood_err
+            _adp_props = self._accepted_domain_probe_props_json()
+            if _adp_props:
+                props.update(_adp_props)
             self.ptjsonlib.add_properties(props)
             for v in flat_vulns:
                 self.ptjsonlib.add_vulnerability(**v)
@@ -12918,53 +13527,13 @@ class SMTP(BaseModule):
             properties.update({"catchAll": catch_all})
 
         # RCPT TO limit
-        rcptmax_advertised = None
-        if (info := getattr(self.results, "info", None)) and getattr(info, "ehlo", None):
-            rcptmax_advertised = _parse_rcptmax_from_ehlo(info.ehlo)
-        if (rcpt_limit_err := self.results.rcpt_limit_error) is not None:
-            if rcptmax_advertised is not None:
-                properties.update({"rcptLimitAdvertised": rcptmax_advertised})
-            properties.update({"rcptLimitError": rcpt_limit_err})
-        elif (rlim := self.results.rcpt_limit) is not None:
-            if rcptmax_advertised is not None:
-                properties.update({"rcptLimitAdvertised": rcptmax_advertised})
-            if getattr(rlim, "rejected_addresses", False):
-                rcpt_obj: dict = {"rejectedAddresses": True, "serverResponse": rlim.server_response}
-                if getattr(rlim, "no_session_limit", False):
-                    rcpt_obj["noSessionLimit"] = True
-                    rcpt_obj["failedBeforeLimit"] = getattr(rlim, "failed_before_limit", 0)
-                    global_vulns.append(
-                        {
-                            "vuln_code": VULNS.NoSessionLimit.value,
-                            "vuln_request": "RCPT TO limit test (session error limit)",
-                            "vuln_response": f"Server allows {rcpt_obj['failedBeforeLimit']} failed RCPT attempts without disconnect (no smtpd_hard_error_limit)",
-                        }
-                    )
-                properties.update({"rcptLimit": rcpt_obj})
-            elif getattr(rlim, "session_limit_triggered", False):
-                properties.update(
-                    {
-                        "rcptLimit": {
-                            "sessionLimitTriggered": True,
-                            "failedBeforeLimit": getattr(rlim, "failed_before_limit", 0),
-                            "maxAccepted": rlim.max_accepted,
-                            "serverResponse": rlim.server_response,
-                        }
-                    }
-                )
-            elif rlim.limit_triggered:
-                properties.update(
-                    {"rcptLimit": {"maxAccepted": rlim.max_accepted, "limitTriggered": True}}
-                )
-            else:
-                if rlim.max_accepted == 0:
-                    properties.update(
-                        {"rcptLimit": {"maxAccepted": 0, "limitTriggered": False, "couldNotTest": True}}
-                    )
-                else:
-                    properties.update(
-                        {"rcptLimit": {"maxAccepted": rlim.max_accepted, "limitTriggered": False}}
-                    )
+        _rcpt_p, _rcpt_v = self._rcpt_limit_for_json(rcpt_vuln_detail=True)
+        properties.update(_rcpt_p)
+        global_vulns.extend(_rcpt_v)
+
+        _adp_props = self._accepted_domain_probe_props_json()
+        if _adp_props:
+            properties.update(_adp_props)
 
         # Blacklist information
         if (blacklist_error := self.results.blacklist_error) is not None:
@@ -13507,18 +14076,16 @@ class SMTP(BaseModule):
                 }
             })
 
-        # Connections
-        if (max_connections_error := self.results.max_connections_error) is not None:
-            properties.update({"maxConnectionsError": max_connections_error})
-        elif max_con := self.results.max_connections:
-            if max_con.max is None:
-                properties.update({"maxConnections": None})
-            else:
-                properties.update({"maxConnections": max_con.max})
-                if max_con.ban_seconds is None:
-                    properties.update({"banDuration": None})
-                else:
-                    properties.update({"banDuration": max_con.ban_seconds})
+        # Rate limiting
+        if (rl_err := self.results.rate_limit_error) is not None:
+            properties.update({"rateLimitError": rl_err})
+        elif rl := self.results.rate_limit:
+            properties.update({
+                "connected": rl.connected,
+                "rateLimitSeconds": rl.rate_limit_seconds,
+                "timeoutSeconds": rl.timeout_seconds,
+                "timeoutExceeded": rl.timeout_exceeded,
+            })
 
         # Login bruteforce
         if (creds := self.results.creds) is not None:

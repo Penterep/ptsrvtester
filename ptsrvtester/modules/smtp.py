@@ -8,7 +8,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from enum import Enum
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 from ptlibs.ptjsonlib import PtJsonLib
 from ..ptntlmauth.ptntlmauth import NTLMInfo, get_NegotiateMessage_data, decode_ChallengeMessage_blob
@@ -428,10 +428,16 @@ class NTLMResult(NamedTuple):
 
 
 class RateLimitResult(NamedTuple):
-    connected: int | None            # Max simultaneous connections accepted
-    rate_limit_seconds: float | None  # Seconds until new conn accepted after limit
-    timeout_seconds: float | None    # Seconds until server disconnected idle conn
-    timeout_exceeded: bool           # True if > 5 min (max timeout reached)
+    connected: int | None                  # Max simultaneous connections accepted
+    max_attempts: int                      # Attempt budget used for this run (for JSON context)
+    banned: bool                           # True if the server refused further connections within ramp-up
+    ban_duration_probe_ran: bool           # True only when ban-duration probe ran (implies banned)
+    ban_duration_seconds: float | None     # Seconds until server accepted new conn after ban (None if no ban)
+    ban_duration_exceeded: bool            # True if ban-duration probe hit the 5 min cap
+    initial_timeout_seconds: float | None  # Seconds the banner-only (no EHLO) session stayed open
+    initial_timeout_exceeded: bool         # True if banner-only session hit the 5 min cap
+    idle_timeout_seconds: float | None     # Seconds the after-EHLO session stayed open
+    idle_timeout_exceeded: bool            # True if after-EHLO session hit the 5 min cap
 
 
 # RCPT TO limit (-rl): max RCPT attempts per session (default); policy-reject early stop (no accept yet).
@@ -443,6 +449,13 @@ RCPT_LIMIT_VERDICT_WARN_MAX = 500
 
 # Parallel SMTP sessions (-rt / --rate-limit): default max ramp-up attempts
 RATE_LIMIT_DEFAULT_ATTEMPTS = 100
+
+# Rate limiting verdict thresholds (placeholder values – will be tuned later).
+RATE_LIMIT_CONN_VULN_THRESHOLD = 50            # >= this many simultaneous conns accepted → vulnerable
+RATE_LIMIT_BAN_MIN_SECONDS = 30                # ban shorter than this → vulnerable
+RATE_LIMIT_INITIAL_TIMEOUT_MAX_SECONDS = 60    # banner-only timeout longer than this → vulnerable
+RATE_LIMIT_IDLE_TIMEOUT_MAX_SECONDS = 180      # idle (after EHLO) timeout longer than this → vulnerable
+RATE_LIMIT_TIMEOUT_CAP_SECONDS = 300           # hard cap for any individual timeout / ban measurement
 
 # Common MTA / doc placeholder hostnames: -pd may still infer them; flag for analysts
 ACCEPTED_DOMAIN_PLACEHOLDER_DOMAINS: frozenset[str] = frozenset(
@@ -1138,6 +1151,11 @@ class VULNS(Enum):
     SpoofHeader = "PTL-SVC-SMTP-SPOOFHDR"
     BccTest = "PTL-SVC-SMTP-BCC"
     AliasBypass = "PTL-SVC-SMTP-ALIAS"
+    # Rate limiting / connection-limit sub-checks (placeholder codes – will be renamed later).
+    ManyConns = "PTV-SVC-SMTP-CONN"
+    BanDurationShort = "PTV-SVC-SMTP-BANSHORT"
+    InitialTimeoutLong = "PTV-SVC-SMTP-TOUTBANNER"
+    IdleTimeoutLong = "PTV-SVC-SMTP-TOUTIDLE"
 
 
 # endregion
@@ -1162,7 +1180,8 @@ class SMTPArgs(ArgsWithBruteforce):
     open_relay: bool
     interactive: bool
     isencrypt: bool
-    role: bool
+    role_identify: bool
+    smtp_role: str | None
     probe_accepted_domain: bool
 
     @staticmethod
@@ -1225,6 +1244,7 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-pd", "--probe-accepted-domain", "", "Probe which recipient domain RCPT treats as local"],
                 ["-or", "--open-relay", "", "Test open relay"],
                 ["-ri", "--role-identify", "", "Identify server role (MTA / Submission / Hybrid)"],
+                ["-R", "--role", "<mta|submission>", "Role of SMTP server (MTA or Submission)"],
                 ["-I", "--interactive", "", "Interactive SMTP CLI"],
                 ["-bl", "--blacklist-test", "", "Test against blacklists"],
                 ["-s", "--spf-test", "", "Test SPF records (requires domain name)"],
@@ -1574,8 +1594,18 @@ class SMTPArgs(ArgsWithBruteforce):
             "-ri",
             "--role-identify",
             action="store_true",
-            dest="role",
+            dest="role_identify",
             help="Identify server role (MTA / Submission / Hybrid)",
+        )
+        direct.add_argument(
+            "-R",
+            "--role",
+            type=str,
+            choices=["mta", "submission"],
+            default=None,
+            metavar="{mta,submission}",
+            dest="smtp_role",
+            help="Role of SMTP server (MTA or Submission); overrides port-based MTA/Submission hint",
         )
         direct.add_argument(
             "-I", "--interactive", action="store_true", help="Establish interactive SMTP CLI"
@@ -1950,7 +1980,7 @@ class SMTP(BaseModule):
             or self.args.interactive
             or self.args.ntlm
             or self.args.open_relay
-            or getattr(self.args, "role", False)
+            or getattr(self.args, "role_identify", False)
             or self.args.enumerate is not None
             or self.args.rate_limit
             or getattr(self.args, "rcpt_limit", False)
@@ -2008,7 +2038,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2034,7 +2064,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2061,7 +2091,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2089,7 +2119,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2119,7 +2149,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2159,7 +2189,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2223,7 +2253,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2259,7 +2289,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2296,7 +2326,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2342,7 +2372,7 @@ class SMTP(BaseModule):
 
         # Standalone role only: no banner, just connect, EHLO and identify role
         only_role = (
-            getattr(self.args, "role", False)
+            getattr(self.args, "role_identify", False)
             and not self.args.banner
             and not self.args.commands
             and not self.args.interactive
@@ -2385,7 +2415,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
@@ -2425,7 +2455,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2457,7 +2487,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "probe_accepted_domain", False)
@@ -2484,7 +2514,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2508,7 +2538,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2531,7 +2561,7 @@ class SMTP(BaseModule):
             and not self.args.interactive
             and not self.args.isencrypt
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2556,7 +2586,7 @@ class SMTP(BaseModule):
             and not self.args.interactive
             and not self.args.isencrypt
             and not self.args.ntlm
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2584,7 +2614,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
@@ -2610,7 +2640,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2637,7 +2667,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2663,7 +2693,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2689,7 +2719,7 @@ class SMTP(BaseModule):
             and not self.args.isencrypt
             and not self.args.ntlm
             and not self.args.open_relay
-            and not getattr(self.args, "role", False)
+            and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "rcpt_limit", False)
@@ -2720,7 +2750,7 @@ class SMTP(BaseModule):
             or self.args.isencrypt
             or self.args.ntlm
             or self.args.open_relay
-            or getattr(self.args, "role", False)
+            or getattr(self.args, "role_identify", False)
             or self.args.enumerate is not None
             or self.args.rate_limit
             or getattr(self.args, "rcpt_limit", False)
@@ -2728,7 +2758,7 @@ class SMTP(BaseModule):
         )
         if need_info:
             do_banner = self.args.banner
-            do_role = getattr(self.args, "role", False)
+            do_role = getattr(self.args, "role_identify", False)
             do_commands = (
                 self.args.commands
                 or getattr(self.args, "authentications", False)
@@ -3082,9 +3112,13 @@ class SMTP(BaseModule):
                 msg += " (port 587 typically requires --starttls)"
             self._fail(msg)
 
-    def _connect_silent(self, timeout: float = 15.0) -> smtplib.SMTP:
+    def _connect_silent(self, timeout: float = 15.0, send_ehlo: bool = True) -> smtplib.SMTP:
         """Like connect() but NEVER calls _fail() – raises plain Exception on failure.
-        Used exclusively by rate_limit_test so no error is printed for failed attempts."""
+        Used exclusively by rate_limit_test so no error is printed for failed attempts.
+
+        When ``send_ehlo`` is False, the function returns immediately after reading the 220
+        banner so the caller can measure the server's pre-EHLO (banner) idle timeout.
+        """
         try:
             if self.args.tls or self.args.target.port == 465:
                 ctx = ssl._create_unverified_context()
@@ -3113,7 +3147,8 @@ class SMTP(BaseModule):
                     f"{self.args.target.ip}:{self.args.target.port}: server responded {status}"
                 )
             self._smtp_sock_set_tcp_nodelay(smtp)
-            smtp.docmd("EHLO", self.fqdn)
+            if send_ehlo:
+                smtp.docmd("EHLO", self.fqdn)
             return smtp
         except Exception:
             raise
@@ -3185,26 +3220,32 @@ class SMTP(BaseModule):
         del self.smtp_list
 
     def rate_limit_test(self) -> RateLimitResult:
-        """Rate limiting test – 3 phases:
-        Phase 1 – Connected: sequential ramp-up (pause between attempts), keep all open.
-        Phase 2 – Duration: while Phase 1 sockets stay open, retry new connection every 5 s (max 300 s).
-        Phase 3 – Timeout: NOOP loop on freshest connection until disconnect or 300 s cap.
+        """Rate limiting test – parallel connection flood with two timeout probes.
+
+        Flow:
+          1. Connection A: connect + read 220 banner only (no EHLO). Start a watcher
+             thread that waits for the server to close the idle banner-only session and
+             records the elapsed "Initial response timeout".
+          2. Connection B: connect + EHLO. Watcher thread records the "Idle timeout".
+          3. Ramp-up: keep opening additional banner-only connections (sequential,
+             small delay) until the server refuses (ban) or the attempt budget is hit.
+          4. Ban-duration probe (only if banned): retry a new connection every 5 s
+             until one is accepted (or the 5 min cap is hit).
+          5. Wait for A and B watchers (or their 5 min caps) and emit verdicts.
+
+        A and B run concurrently with steps 3–4; their results are reported as soon
+        as they are available (or after the ban-duration step, whichever is later).
         """
-        _show_progress = not self.args.json and not self.args.debug
+        # Live progress stays on when -vv (--verbose → args.debug); only JSON mode disables it.
+        _show_progress = not self.args.json
         max_attempts = getattr(self.args, "rate_limit", None) or RATE_LIMIT_DEFAULT_ATTEMPTS
         return self._rate_limit_test_impl(_show_progress, max_attempts)
 
     def _rate_limit_test_impl(
         self, _show_progress: bool, max_attempts: int
     ) -> RateLimitResult:
-        # Must be bound before any branch: Phase 2 is skipped when connected == max_attempts,
-        # but Phase 3 still reads success_conn (Python treats it as local due to assigns below).
-        success_conn: smtplib.SMTP | None = None
-        rate_limit_seconds: float | None = None
-
-        LABEL_W = 26
-        MAX_TIMEOUT = 300
-        MAX_RATE_LIMIT_WAIT = 300
+        MAX_TIMEOUT = RATE_LIMIT_TIMEOUT_CAP_SECONDS
+        MAX_BAN_WAIT = RATE_LIMIT_TIMEOUT_CAP_SECONDS
         RETRY_INTERVAL = 5
         PHASE1_DELAY = 0.15  # seconds between connection attempts (ramp-up)
 
@@ -3213,230 +3254,371 @@ class SMTP(BaseModule):
         self.ptdebug("Rate limiting test", title=True)
         self.ptdebug(
             f"Target {self.args.target.ip}:{self.args.target.port} — up to {max_attempts} parallel "
-            f"sessions (ramp {PHASE1_DELAY}s), duration probe max {MAX_RATE_LIMIT_WAIT}s, "
-            f"idle NOOP timeout max {MAX_TIMEOUT}s."
+            f"sessions (ramp {PHASE1_DELAY}s), ban duration probe max {MAX_BAN_WAIT}s, "
+            f"banner/idle timeout cap {MAX_TIMEOUT}s."
         )
 
         def _write_live(label: str, value: str) -> None:
-            line = f"    {label:<{LABEL_W}}{value}"
+            line = f"    {label} {value}"
             with _print_lock:
-                sys.stdout.write(f"\r{line:<79}")
+                sys.stdout.write(f"\r{line:<120}")
                 sys.stdout.flush()
 
         def _finalize_line(label: str, value: str) -> None:
-            line = f"    {label:<{LABEL_W}}{value}"
+            line = f"    {label} {value}"
             with _print_lock:
-                sys.stdout.write(f"\r{line:<79}\n")
+                sys.stdout.write(f"\r{line:<120}\n")
                 sys.stdout.flush()
 
-        # ── Phase 1: Connected ───────────────────────────────────────────────
-        # Sequential ramp-up: open one connection at a time, keep all open.
-        # Firing many threads simultaneously overwhelms the kernel TCP accept
-        # queue before the SMTP daemon (anvil) can count them, causing timeouts
-        # instead of clean 421 rejections. Sequential connections with a short
-        # pause allow the server to respond correctly at its actual limit.
+        def _fmt_mmss(seconds: float) -> str:
+            return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+
+        def _print_verdict(is_vuln: bool, text: str) -> None:
+            if is_vuln:
+                icon = get_colored_text("[✗]", color="VULN")
+            else:
+                icon = get_colored_text("[OK]", color="NOTVULN")
+            self.ptprint(f"        {icon} {text}", Out.TEXT)
+
+        def _print_info(text: str) -> None:
+            icon = get_colored_text("[*]", color="INFO")
+            self.ptprint(f"        {icon} {text}", Out.TEXT)
+
+        # ── Background watcher: blocks on socket.recv() until the server
+        # closes / replies (or the cap is reached) and records the elapsed time.
+        def _watch_disconnect(
+            smtp,
+            start_time: float,
+            cap_seconds: float,
+            result_cell: list,
+            stop_event: threading.Event,
+        ) -> None:
+            sock = getattr(smtp, "sock", None)
+            if sock is None:
+                return
+            try:
+                sock.settimeout(1.0)
+            except Exception:
+                pass
+            while not stop_event.is_set():
+                elapsed = time.perf_counter() - start_time
+                if elapsed >= cap_seconds:
+                    if not result_cell:
+                        result_cell.append((cap_seconds, True))
+                    return
+                try:
+                    data = sock.recv(4096)
+                except socket.timeout:
+                    continue
+                except Exception:
+                    if not result_cell and not stop_event.is_set():
+                        result_cell.append((time.perf_counter() - start_time, False))
+                    return
+                # recv returned: either 0 bytes (clean close) or some data (server
+                # sent e.g. 421 before closing). In both cases the session is
+                # effectively over → record elapsed time and exit.
+                if not result_cell and not stop_event.is_set():
+                    result_cell.append((time.perf_counter() - start_time, False))
+                return
+
+        # ── Phase 1: open A (banner-only), B (after EHLO), then ramp-up
+        # Sequential ramp-up: opening many connections in parallel overwhelms the
+        # kernel accept queue before the SMTP daemon (anvil) can count them, so a
+        # small delay between attempts produces cleaner 421 rejections at the real
+        # server limit.
         connections: list = []
         _first_error: list[str | None] = [None]
+        watcher_stop = threading.Event()
+
+        a_start_time: float | None = None
+        b_start_time: float | None = None
+        a_result: list = []
+        b_result: list = []
 
         if _show_progress:
             _write_live("Connected:", "0")
 
-        for _ in range(max_attempts):
-            # Open one new connection in a thread so the timeout doesn't stall
-            # the main loop while existing connections stay alive.
-            _result: list = [None]
-            _err: list[str | None] = [None]
-            _done = threading.Event()
-
-            def _worker(_r=_result, _e=_err, _d=_done) -> None:
-                try:
-                    _r[0] = self._connect_silent()
-                except Exception as exc:
-                    _e[0] = str(exc)
-                finally:
-                    _d.set()
-
-            threading.Thread(target=_worker, daemon=True).start()
-            _done.wait()
-
-            if _err[0] is not None:
-                if _first_error[0] is None:
-                    _first_error[0] = _err[0]
-                break  # server rejected – we reached the limit
-
-            connections.append(_result[0])
+        # Connection A: banner only (no EHLO)
+        try:
+            smtp_a = self._connect_silent(send_ehlo=False)
+            a_start_time = time.perf_counter()
+            connections.append(smtp_a)
+            threading.Thread(
+                target=_watch_disconnect,
+                args=(smtp_a, a_start_time, MAX_TIMEOUT, a_result, watcher_stop),
+                daemon=True,
+            ).start()
+            self.ptdebug(
+                "Session A (banner-only, no EHLO): TCP open after 220; watcher thread measures "
+                "idle disconnect / initial-response timeout.",
+                Out.INFO,
+            )
             if _show_progress:
                 _write_live("Connected:", str(len(connections)))
+        except Exception as exc:
+            self.ptdebug(f"Session A (banner-only): connect failed — {exc}", Out.INFO)
+            _first_error[0] = str(exc)
+
+        time.sleep(PHASE1_DELAY)
+
+        # Connection B: banner + EHLO
+        try:
+            smtp_b = self._connect_silent(send_ehlo=True)
+            b_start_time = time.perf_counter()
+            connections.append(smtp_b)
+            threading.Thread(
+                target=_watch_disconnect,
+                args=(smtp_b, b_start_time, MAX_TIMEOUT, b_result, watcher_stop),
+                daemon=True,
+            ).start()
+            self.ptdebug(
+                "Session B (banner + EHLO): established; watcher thread measures idle timeout after EHLO.",
+                Out.INFO,
+            )
+            if _show_progress:
+                _write_live("Connected:", str(len(connections)))
+        except Exception as exc:
+            self.ptdebug(f"Session B (EHLO): connect failed — {exc}", Out.INFO)
+            if _first_error[0] is None:
+                _first_error[0] = str(exc)
+
+        # If we failed to set up any connection at all, fail fast.
+        if not connections:
+            raise TestFailedError(_first_error[0] or "Could not establish any connection")
+
+        # Remaining ramp-up attempts (banner-only) until ban or budget exhausted.
+        banned = False
+        remaining = max_attempts - len(connections)
+        for _ in range(max(remaining, 0)):
             time.sleep(PHASE1_DELAY)
+            try:
+                smtp_extra = self._connect_silent(send_ehlo=False)
+            except Exception as exc:
+                self.ptdebug(
+                    f"Ramp-up: next banner-only connection refused or failed — {exc}",
+                    Out.INFO,
+                )
+                if _first_error[0] is None:
+                    _first_error[0] = str(exc)
+                banned = True
+                break
+            connections.append(smtp_extra)
+            self.ptdebug(
+                f"Ramp-up [{len(connections)}/{max_attempts}]: banner-only session established.",
+                Out.INFO,
+            )
+            if _show_progress:
+                _write_live("Connected:", str(len(connections)))
 
         connected = len(connections)
         if _show_progress:
             _finalize_line("Connected:", str(connected))
 
-        self.ptdebug(f"Phase 1 (ramp-up): {connected}/{max_attempts} connections established.")
-        if _first_error[0] is not None and connected < max_attempts:
-            self.ptdebug(f"Ramp-up stopped at limit / error: {_first_error[0]}")
+        self.ptdebug(f"Ramp-up: {connected}/{max_attempts} connections established.")
+        if banned:
+            self.ptdebug(f"Ramp-up stopped: {_first_error[0]}")
 
-        # If no connection succeeded at all, fail with a single error message.
-        if connected == 0:
-            raise TestFailedError(_first_error[0] or "Could not establish any connection")
+        # Verdicts for the "Connected" block.
+        # When banned with >=50 connections: info line [*] plus [✗] threshold line below.
+        # When banned with <50 connections: only [OK] (no redundant [*] line).
+        if banned and connected >= RATE_LIMIT_CONN_VULN_THRESHOLD:
+            _print_info(f"You are banned when {connected} threads was connected")
+        elif not banned:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(
+                f"        {icon} No blocking occurred despite a large number of "
+                f"established connections ({connected} connections are active)",
+                Out.TEXT,
+            )
 
-        # ── Phase 2: Duration rate limiting ──────────────────────────────────
-        if connected < max_attempts:
+        if connected >= RATE_LIMIT_CONN_VULN_THRESHOLD:
+            _print_verdict(
+                True,
+                f"More then {RATE_LIMIT_CONN_VULN_THRESHOLD} simultaneous SMTP connections "
+                "from one IP accepted is too much",
+            )
+        elif banned:
+            _print_verdict(False, f"You are banned when {connected} threads was connected")
+
+        # ── Ban duration probe (only when the server actually banned us) ────
+        ban_duration_seconds: float | None = None
+        ban_duration_exceeded = False
+        ban_duration_probe_ran = False
+
+        if banned:
+            ban_duration_probe_ran = True
             start_rl = time.perf_counter()
             _rl_stop = threading.Event()
+            self.ptdebug(
+                f"Ban duration probe: retry every {RETRY_INTERVAL}s until reconnect or {MAX_BAN_WAIT}s cap.",
+                Out.INFO,
+            )
 
             if _show_progress:
-                _write_live("Duration rate limiting:", "00:00")
+                _write_live("Ban duration:", "00:00")
 
-            def _rl_ticker() -> None:
-                while not _rl_stop.wait(0.5):
-                    elapsed = time.perf_counter() - start_rl
-                    if _show_progress:
-                        _write_live(
-                            "Duration rate limiting:",
-                            f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}",
-                        )
+                def _rl_ticker() -> None:
+                    while not _rl_stop.wait(0.5):
+                        elapsed = time.perf_counter() - start_rl
+                        _write_live("Ban duration:", _fmt_mmss(elapsed))
 
-            if _show_progress:
                 threading.Thread(target=_rl_ticker, daemon=True).start()
 
+            _ban_try = 0
             while True:
                 elapsed = time.perf_counter() - start_rl
-                if elapsed >= MAX_RATE_LIMIT_WAIT:
+                if elapsed >= MAX_BAN_WAIT:
+                    ban_duration_exceeded = True
+                    ban_duration_seconds = elapsed
                     break
                 try:
-                    success_conn = self._connect_silent()
-                    rate_limit_seconds = time.perf_counter() - start_rl
+                    probe = self._connect_silent(send_ehlo=False)
+                    ban_duration_seconds = time.perf_counter() - start_rl
+                    self.ptdebug(
+                        f"Ban probe: reconnect succeeded after {ban_duration_seconds:.2f}s "
+                        f"(attempt #{_ban_try + 1}).",
+                        Out.INFO,
+                    )
+                    try:
+                        probe.close()
+                    except Exception:
+                        pass
                     break
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _ban_try += 1
+                    self.ptdebug(f"Ban probe attempt #{_ban_try}: connect failed — {exc}", Out.INFO)
                 wait_end = time.perf_counter() + RETRY_INTERVAL
                 while time.perf_counter() < wait_end:
                     time.sleep(0.2)
 
             _rl_stop.set()
-            if success_conn is not None:
-                connections.append(success_conn)
 
-            if rate_limit_seconds is not None:
-                self.ptdebug(
-                    f"Phase 2 (duration): new connection accepted after {rate_limit_seconds:.1f}s "
-                    f"({len(connections)} sessions open)."
-                )
-            else:
-                self.ptdebug(
-                    f"Phase 2 (duration): no extra connection within {MAX_RATE_LIMIT_WAIT}s "
-                    f"(server still at cap or refusing)."
-                )
-
+            suffix = " (exceeded 5 min)" if ban_duration_exceeded else ""
             if _show_progress:
-                if rate_limit_seconds is not None:
-                    mm = int(rate_limit_seconds // 60)
-                    ss = int(rate_limit_seconds % 60)
-                    _finalize_line("Duration rate limiting:", f"{mm:02d}:{ss:02d}")
+                _finalize_line("Ban duration:", _fmt_mmss(ban_duration_seconds) + suffix)
+
+            if ban_duration_exceeded:
+                self.ptdebug(
+                    f"Ban duration: no new connection within {MAX_BAN_WAIT}s (cap)."
+                )
+                _print_verdict(False, "Ban is bigger then 30s")
+            else:
+                if ban_duration_seconds is not None:
+                    self.ptdebug(
+                        f"Ban duration summary: reconnect accepted after {ban_duration_seconds:.2f}s.",
+                        Out.INFO,
+                    )
+                if (
+                    ban_duration_seconds is not None
+                    and ban_duration_seconds < RATE_LIMIT_BAN_MIN_SECONDS
+                ):
+                    _print_verdict(True, "Ban duration is too low")
                 else:
-                    _finalize_line("Duration rate limiting:", ">05:00")
-        else:
+                    _print_verdict(False, "Ban is bigger then 30s")
+
+        # ── Wait for A and B watchers, print each as it finishes ───────────
+        def _await_and_report(
+            start_time: float | None,
+            result_cell: list,
+            label: str,
+            cap: float,
+            threshold: float,
+            bad_msg: str,
+            ok_msg: str,
+        ) -> tuple[float | None, bool]:
+            if start_time is None:
+                if _show_progress:
+                    _finalize_line(label, "N/A")
+                return None, False
+
+            deadline = start_time + cap + 2.0  # small grace beyond cap
+
+            # If the watcher already finished during earlier phases, skip the live
+            # ticker entirely and jump straight to the final line below.
+            if _show_progress and not result_cell:
+                _write_live(label, _fmt_mmss(time.perf_counter() - start_time))
+                live_stop = threading.Event()
+
+                def _tick() -> None:
+                    while not live_stop.wait(0.5):
+                        if result_cell:
+                            return
+                        _write_live(label, _fmt_mmss(time.perf_counter() - start_time))
+
+                threading.Thread(target=_tick, daemon=True).start()
+                while not result_cell and time.perf_counter() < deadline:
+                    time.sleep(0.2)
+                live_stop.set()
+            else:
+                while not result_cell and time.perf_counter() < deadline:
+                    time.sleep(0.2)
+
+            if not result_cell:
+                # Watcher is still stuck – force a cap reading.
+                result_cell.append((cap, True))
+
+            elapsed, exceeded = result_cell[0]
+            suffix = " (exceeded 5 min)" if exceeded else ""
             self.ptdebug(
-                f"Phase 2 (duration): skipped — all {max_attempts} ramp-up connections accepted "
-                f"(no connection limit in phase 1)."
+                f"{label.strip()} measured {_fmt_mmss(elapsed)}{suffix}"
+                + (" (hit idle/disconnect cap)" if exceeded else " (peer closed or replied)"),
+                Out.INFO,
             )
             if _show_progress:
-                _finalize_line(
-                    "Duration rate limiting:",
-                    f"(skipped, all {max_attempts} attempts accepted)",
-                )
+                _finalize_line(label, _fmt_mmss(elapsed) + suffix)
 
-        # ── Phase 3: Timeout ─────────────────────────────────────────────────
-        # Use the freshest available connection for accurate idle-timeout measurement:
-        # - success_conn from Phase 2 (just opened, idle time = 0) if it exists
-        # - else try one new _connect_silent() only when connected < N (at N open
-        #   sessions the server often rejects or stalls a 51st connect — avoid that)
-        # - else last Phase-1 connection (connections[-1]) — most recently opened
-        timeout_seconds: float | None = None
-        timeout_exceeded = False
+            if exceeded or elapsed > threshold:
+                _print_verdict(True, bad_msg)
+            else:
+                _print_verdict(False, ok_msg)
+            return elapsed, exceeded
 
-        _timeout_conn: smtplib.SMTP | None = success_conn
-        if _timeout_conn is None and connected < max_attempts:
-            try:
-                _timeout_conn = self._connect_silent()
-            except Exception:
-                _timeout_conn = None
-        if _timeout_conn is None and connections:
-            _timeout_conn = connections[-1]
+        initial_seconds, initial_exceeded = _await_and_report(
+            a_start_time,
+            a_result,
+            "Initial response timeout (without EHLO):",
+            MAX_TIMEOUT,
+            RATE_LIMIT_INITIAL_TIMEOUT_MAX_SECONDS,
+            f"Timeout is too long (more then {RATE_LIMIT_INITIAL_TIMEOUT_MAX_SECONDS}s)",
+            f"Timeout is lower then {RATE_LIMIT_INITIAL_TIMEOUT_MAX_SECONDS}s",
+        )
 
-        if _timeout_conn is None:
-            self.ptdebug("Phase 3 (idle NOOP): skipped (no suitable SMTP session).")
-        else:
-            test_conn = _timeout_conn
-            start_to = time.perf_counter()
-            _to_stop = threading.Event()
+        idle_seconds, idle_exceeded = _await_and_report(
+            b_start_time,
+            b_result,
+            "Idle timeout (after EHLO):",
+            MAX_TIMEOUT,
+            RATE_LIMIT_IDLE_TIMEOUT_MAX_SECONDS,
+            f"Timeout is too long (more then {RATE_LIMIT_IDLE_TIMEOUT_MAX_SECONDS}s)",
+            f"Timeout is lower then {RATE_LIMIT_IDLE_TIMEOUT_MAX_SECONDS}s",
+        )
 
-            if _show_progress:
-                _write_live("Timeout:", "00:00")
-
-            def _to_ticker() -> None:
-                while not _to_stop.wait(0.5):
-                    elapsed = time.perf_counter() - start_to
-                    if _show_progress:
-                        _write_live(
-                            "Timeout:",
-                            f"{int(elapsed // 60):02d}:{int(elapsed % 60):02d}",
-                        )
-
-            if _show_progress:
-                threading.Thread(target=_to_ticker, daemon=True).start()
-
-            while True:
-                elapsed = time.perf_counter() - start_to
-                if elapsed >= MAX_TIMEOUT:
-                    timeout_exceeded = True
-                    timeout_seconds = elapsed
-                    break
-                try:
-                    test_conn.noop()
-                except Exception:
-                    timeout_seconds = time.perf_counter() - start_to
-                    break
-                time.sleep(1)
-
-            _to_stop.set()
-            if _show_progress:
-                if timeout_seconds is not None:
-                    mm = int(timeout_seconds // 60)
-                    ss = int(timeout_seconds % 60)
-                    _finalize_line("Timeout:", f"{mm:02d}:{ss:02d}")
-
-            if timeout_seconds is not None:
-                if timeout_exceeded:
-                    self.ptdebug(
-                        f"Phase 3 (idle NOOP): no idle disconnect within {timeout_seconds:.0f}s (cap)."
-                    )
-                else:
-                    self.ptdebug(
-                        f"Phase 3 (idle NOOP): session ended after {timeout_seconds:.1f}s."
-                    )
-
-        all_conns = list(connections)
-        if _timeout_conn is not None and _timeout_conn not in all_conns:
-            all_conns.append(_timeout_conn)
-        for conn in all_conns:
+        # Signal any remaining watchers (cap-hit A/B) to exit, then close all sockets.
+        watcher_stop.set()
+        for conn in connections:
             try:
                 conn.close()
             except Exception:
                 pass
 
         self.ptdebug(
-            f"Summary: connected={connected}, rate_limit_after_seconds={rate_limit_seconds!s}, "
-            f"idle_timeout_seconds={timeout_seconds!s}, idle_timeout_cap_hit={timeout_exceeded}."
+            f"Summary: connected={connected}, banned={banned}, "
+            f"ban_duration_seconds={ban_duration_seconds!s}, "
+            f"initial_timeout_seconds={initial_seconds!s}, "
+            f"idle_timeout_seconds={idle_seconds!s}."
         )
 
         return RateLimitResult(
             connected=connected,
-            rate_limit_seconds=rate_limit_seconds,
-            timeout_seconds=timeout_seconds,
-            timeout_exceeded=timeout_exceeded,
+            max_attempts=max_attempts,
+            banned=banned,
+            ban_duration_probe_ran=ban_duration_probe_ran,
+            ban_duration_seconds=ban_duration_seconds,
+            ban_duration_exceeded=ban_duration_exceeded,
+            initial_timeout_seconds=initial_seconds,
+            initial_timeout_exceeded=initial_exceeded,
+            idle_timeout_seconds=idle_seconds,
+            idle_timeout_exceeded=idle_exceeded,
         )
 
 
@@ -3508,7 +3690,12 @@ class SMTP(BaseModule):
         return (len(methods) > 0), methods
 
     def _role_port_hint(self) -> str:
-        """Classify port as typical MTA or Submission."""
+        """Classify port as typical MTA or Submission; ``-R`` / ``--role`` overrides port heuristics."""
+        declared = getattr(self.args, "smtp_role", None)
+        if declared == "mta":
+            return "mta"
+        if declared == "submission":
+            return "submission"
         port = self.args.target.port
         if port == 25:
             return "mta"
@@ -3621,6 +3808,13 @@ class SMTP(BaseModule):
           any        | indeterminate   | indeterminate    | Indeterminate
         """
         self.ptdebug("Role identification test", title=True)
+
+        if getattr(self.args, "smtp_role", None):
+            self.ptdebug(
+                f"Declared server role (--role): {self.args.smtp_role} "
+                "(overrides port-based MTA vs Submission classification)",
+                Out.INFO,
+            )
 
         port_hint = self._role_port_hint()
 
@@ -3782,10 +3976,18 @@ class SMTP(BaseModule):
         max_try = max(1, int(max_rcpt_attempts))
         policy_reject_cap = RCPT_LIMIT_POLICY_REJECT_CAP
 
+        def _reply_one_line(raw: str | bytes, limit: int = 160) -> str:
+            if isinstance(raw, str):
+                s = raw.strip().replace("\r\n", " ").replace("\n", " ")
+            else:
+                s = self.bytes_to_str(raw).strip().replace("\r\n", " ").replace("\n", " ")
+            return s if len(s) <= limit else s[: limit - 3] + "..."
+
         try:
             status, reply = smtp.docmd("MAIL FROM:", "<>")
             if status != 250:
                 return RcptLimitResult(0, False, self.bytes_to_str(reply), False)
+            self.ptdebug(f"MAIL FROM:<> → [{status}] {_reply_one_line(reply)}", Out.INFO)
         except (smtplib.SMTPServerDisconnected, ConnectionResetError, BrokenPipeError, EOFError, OSError) as e:
             return RcptLimitResult(0, True, str(e), False)
 
@@ -3802,6 +4004,10 @@ class SMTP(BaseModule):
             try:
                 status, reply = smtp.docmd("RCPT TO:", f"<{i}@{domain}>")
                 reply_str = self.bytes_to_str(reply)
+                self.ptdebug(
+                    f"RCPT [{i}/{max_try}] TO:<{i}@{domain}> → [{status}] {_reply_one_line(reply_str)}",
+                    Out.INFO,
+                )
                 if status == 250:
                     accepted += 1
                     continue
@@ -3860,7 +4066,8 @@ class SMTP(BaseModule):
         retry with parent domain (e.g. calm.festiveloft.net -> festiveloft.net).
         Ticker starts immediately so elapsed time includes connection setup.
         """
-        _show_progress = not self.args.json and not self.args.debug
+        # Live ETA/progress stays on when -vv (--verbose → args.debug); only JSON mode disables it.
+        _show_progress = not self.args.json
         _start_time = time.perf_counter()
         _live_label: list[str] = ["Connecting..."]
         _ticker_stop = threading.Event()
@@ -3936,6 +4143,10 @@ class SMTP(BaseModule):
             smtp = self.get_smtp_handler()
             smtp.docmd("EHLO", self.fqdn)
 
+            self.ptdebug(
+                f"RCPT TO limit probe: domain={domain}, max attempts={max_rcpt_attempts}",
+                Out.INFO,
+            )
             _live_label[0] = "Testing RCPT limit...  attempt 0"
             result = self._run_rcpt_limit_for_domain(
                 smtp, domain, max_rcpt_attempts=max_rcpt_attempts,
@@ -4317,9 +4528,17 @@ class SMTP(BaseModule):
             smtp = self.get_smtp_handler()
             smtp.docmd("EHLO", f"{self.fqdn}")
 
-        self.ptdebug(f"[RCPT] SLOW DOWN TEST {' '*6}", Out.INFO, end="\r")
-        status, reply = smtp.docmd("MAIL FROM:", "<mail@from.me>")
         domain = self._get_rcpt_limit_domain()
+        try:
+            smtp.docmd("RSET")
+        except Exception:
+            pass
+        ok_mail, _ = self._try_mail_from_for_rcpt_probe(smtp, domain)
+        if not ok_mail:
+            self.ptdebug("[RCPT] SLOW DOWN TEST: no MAIL FROM candidate accepted", Out.INFO)
+            return {"rcpt": False}
+
+        self.ptdebug(f"[RCPT] SLOW DOWN TEST {' '*6}", Out.INFO, end="\r")
 
         dummy_data = [
             "".join(random.choices("abcdefghijk", k=random.randint(1, 5))) for i in range(20)
@@ -4497,20 +4716,26 @@ class SMTP(BaseModule):
         args: str,
         on_first_hit=None,
         debug: bool = False,
+        dbg: Callable[[str], None] | None = None,
     ) -> tuple[int, bytes]:
         """Send SMTP command and call on_first_hit(line_bytes) on the very first positive
         (non-5xx) response line – before reading continuation lines.
         Returns (errcode, reply_bytes) identical to smtplib.SMTP.docmd.
         Falls back to smtp.docmd when the underlying file object is not accessible.
 
-        debug=True (-vv) enables timestamped tracing to stderr (fd 2) so the
-        caller can pinpoint whether delays are in readline() or in on_first_hit."""
+        debug=True (-vv) enables timestamped tracing; pass ``dbg`` as ``self.ptdebug``
+        so lines use the same ADDITIONS styling and indent as other verbose output.
+        If ``dbg`` is omitted, falls back to writing raw bytes to stderr (fd 2)."""
         _MAXLINE: int = getattr(smtplib, "_MAXLINE", 8192)
 
         def _dbg(msg: str) -> None:
             if debug:
                 ts = time.perf_counter()
-                os.write(2, f"[DBG enum {ts:.3f}] {msg}\n".encode("utf-8", errors="replace"))
+                text = f"[DBG enum {ts:.3f}] {msg}"
+                if dbg is not None:
+                    dbg(text)
+                else:
+                    os.write(2, (text + "\n").encode("utf-8", errors="replace"))
 
         file = getattr(smtp, "file", None)
         if file is None:
@@ -4710,6 +4935,7 @@ class SMTP(BaseModule):
         )
         line_core = f"{time_part} {pct}% {label}"
         self._raw_write(f"\033[2K\r{line_core}".encode("utf-8", errors="replace"))
+        self._enum_progress_line_dirty = True
 
     def _enum_clock_ensure_started(self) -> None:
         """Single-thread enum: no background ticker — progress updates only from _enum_wait_begin."""
@@ -4747,6 +4973,7 @@ class SMTP(BaseModule):
         if self.use_json or getattr(self.args, "enum_threads", 1) > 1:
             return
         self._raw_write(f"\033[2K\r    {display}\n".encode("utf-8", errors="replace"))
+        self._enum_progress_line_dirty = False
 
     def _enum_wait_end(self) -> None:
         """No-op: clock runs continuously throughout enumeration.
@@ -4781,16 +5008,21 @@ class SMTP(BaseModule):
             return
         with self._enum_progress_print_lock:
             if self._enum_mt_progress_line_active:
-                sys.stdout.write("\n")
+                # Clear live progress line — ``\n`` alone would commit ``100%``; ``\r\n`` would add a blank row.
+                if sys.stdout.isatty():
+                    sys.stdout.write("\033[2K\r")
+                else:
+                    sys.stdout.write("\n")
                 sys.stdout.flush()
                 self._enum_mt_progress_line_active = False
 
     def _enum_progress_newline(self) -> None:
         if self.use_json:
             return
-        # Use _raw_write so we don't touch BufferedWriter while clock may also be
-        # writing to it (avoiding non-thread-safe concurrent BufferedWriter access).
-        self._raw_write(b"\n")
+        # Drop the live ``0:00:00.00 100% …`` line; use ``\r`` only — trailing ``\n`` would leave a blank row before Catch-all.
+        if getattr(self, "_enum_progress_line_dirty", False):
+            self._raw_write(b"\033[2K\r")
+            self._enum_progress_line_dirty = False
 
     def _print_enum_finding(
         self, _idx: int, _total: int, payload: str, *, replace_progress: bool = True
@@ -4812,6 +5044,7 @@ class SMTP(BaseModule):
             return
         elif replace_progress:
             self._raw_write(f"\033[2K\r    {payload}\n".encode("utf-8", errors="replace"))
+            self._enum_progress_line_dirty = False
         else:
             self._raw_write(f"    {payload}\n".encode("utf-8", errors="replace"))
 
@@ -4839,6 +5072,10 @@ class SMTP(BaseModule):
 
                 reconnect_after = getattr(self.args, "enum_reconnect_after", None)
                 consecutive_failures = 0
+                _enum_stream_debug = getattr(self.args, "debug", False)
+                _enum_stream_dbg = (
+                    (lambda m: self.ptdebug(m)) if _enum_stream_debug else None
+                )
 
                 def _do_enum_reconnect() -> None:
                     """Reconnect to reset accumulated teergrube / rate-limit state.
@@ -4883,7 +5120,8 @@ class SMTP(BaseModule):
                         status, reply = self._smtp_command_streaming(
                             smtp, method, user,
                             on_first_hit=None if self.use_json else _on_first_hit,
-                            debug=getattr(self.args, "debug", False),
+                            debug=_enum_stream_debug,
+                            dbg=_enum_stream_dbg,
                         )
                     except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
                         self.ptdebug(
@@ -4904,7 +5142,8 @@ class SMTP(BaseModule):
                             status, reply = self._smtp_command_streaming(
                                 smtp, method, user,
                                 on_first_hit=None if self.use_json else _on_first_hit,
-                                debug=getattr(self.args, "debug", False),
+                                debug=_enum_stream_debug,
+                                dbg=_enum_stream_dbg,
                             )
                             # Retry succeeded: restore 15 s timeout so the rest of
                             # the wordlist is not stuck with the short 10 s window.
@@ -4984,6 +5223,11 @@ class SMTP(BaseModule):
                 if not self.use_json:
                     self._enum_mt_progress_reset()
 
+                _enum_stream_debug = getattr(self.args, "debug", False)
+                _enum_stream_dbg = (
+                    (lambda m: self.ptdebug(m)) if _enum_stream_debug else None
+                )
+
                 def worker() -> None:
                     conn = None
                     while True:
@@ -5014,7 +5258,8 @@ class SMTP(BaseModule):
                                 status, reply = self._smtp_command_streaming(
                                     conn, method, user,
                                     on_first_hit=None if self.use_json else _mt_on_first_hit,
-                                    debug=getattr(self.args, "debug", False),
+                                    debug=_enum_stream_debug,
+                                    dbg=_enum_stream_dbg,
                                 )
                             except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
                                 try:
@@ -5197,6 +5442,85 @@ class SMTP(BaseModule):
         )
         return any(kw in up for kw in RELAY_KEYWORDS)
 
+    _MAIL_RCPT_TRANSACTION_OK = (250, 251, 252)
+
+    def _mail_from_candidates_rcpt(self, domain: str) -> tuple[str, ...]:
+        """Candidates for MAIL FROM before RCPT probes: null sender (RFC 5321), same domain, legacy."""
+        return ("<>", f"<mail@{domain}>", "<mail@from.me>")
+
+    def _try_mail_from_for_rcpt_probe(
+        self, smtp: smtplib.SMTP, domain: str
+    ) -> tuple[bool, str | None]:
+        """Establish MAIL transaction for RCPT enumeration / probes.
+
+        Order: remembered ``_rcpt_enum_mail_from_ok`` first (reconnect / rate-limit fast path),
+        then ``<>``, ``mail@domain``, ``mail@from.me``. Successful candidate is stored on
+        ``self._rcpt_enum_mail_from_ok``. RSET between rejected attempts."""
+        standard = self._mail_from_candidates_rcpt(domain)
+        cached = getattr(self, "_rcpt_enum_mail_from_ok", None)
+        trial_order: list[str] = []
+        seen: set[str] = set()
+        if cached:
+            trial_order.append(cached)
+            seen.add(cached)
+        for c in standard:
+            if c not in seen:
+                trial_order.append(c)
+                seen.add(c)
+        if not trial_order:
+            trial_order = list(standard)
+
+        for i, candidate in enumerate(trial_order):
+            try:
+                status, reply = smtp.docmd("MAIL FROM:", candidate)
+                reply_str = self.bytes_to_str(reply)
+                if status in self._MAIL_RCPT_TRANSACTION_OK:
+                    accept_msg = (
+                        f"MAIL FROM {candidate!r} accepted"
+                        + (" (cached preference)" if cached and candidate == cached else "")
+                        + f": [{status}] {reply_str.strip()[:400]}"
+                    )
+                    self.ptdebug(accept_msg, Out.INFO)
+                    self._rcpt_enum_mail_from_ok = candidate
+                    return True, candidate
+                self.ptdebug(
+                    f"MAIL FROM {candidate!r} rejected: [{status}] {reply_str.strip()[:400]}",
+                    Out.INFO,
+                )
+            except Exception as e:
+                self.ptdebug(f"MAIL FROM {candidate!r} error: {e}", Out.INFO)
+            if i < len(trial_order) - 1:
+                try:
+                    smtp.docmd("RSET")
+                except Exception:
+                    pass
+        return False, None
+
+    @staticmethod
+    def _rcpt_enum_reply_for_display(
+        reply_text: str,
+        domain: str,
+        probes: tuple[str, ...],
+    ) -> str:
+        """Normalize RCPT probe replies for terminal/JSON display: match VRFY/EXPN style (local part only).
+
+        Servers often echo ``<user@domain>`` in RCPT rejects; EXPN/VRFY lines use bare ``user``."""
+        if not reply_text or not domain:
+            return reply_text
+        out = reply_text
+        dom = domain.strip()
+        for p in probes:
+            out = re.sub(re.escape(f"<{p}@{dom}>"), p, out, flags=re.IGNORECASE)
+            out = re.sub(re.escape(f"{p}@{dom}"), p, out, flags=re.IGNORECASE)
+        # Any echoed ``<local@domain>`` for this domain (handles case quirks vs. ``_get_rcpt_limit_domain()``).
+        if dom:
+            out = re.sub(
+                re.compile(rf"<([^\s<>]+)@{re.escape(dom)}>", re.IGNORECASE),
+                lambda m: m.group(1),
+                out,
+            )
+        return out
+
     def rcpt_test(self, smtp) -> bool:
         """RCPT enum vulnerability (OWASP WSTG-IDEN-003).
         Uses full addresses <probe@domain> so the server evaluates them against its
@@ -5218,13 +5542,12 @@ class SMTP(BaseModule):
         except Exception:
             pass
 
-        try:
-            status, reply = smtp.docmd("MAIL FROM:", "<mail@from.me>")
-            if status not in RCPT_ACCEPT:
-                self.ptdebug(f"Testing RCPT method: MAIL FROM rejected [{status}]", Out.INFO)
-                return False
-        except Exception as e:
-            self.ptdebug(f"Testing RCPT method: {e}", Out.INFO)
+        ok_mail, _mail_used = self._try_mail_from_for_rcpt_probe(smtp, domain)
+        if not ok_mail:
+            self.ptdebug(
+                "Testing RCPT method: all MAIL FROM candidates rejected (cannot test RCPT)",
+                Out.INFO,
+            )
             return False
 
         replies: list[tuple[int, str]] = []
@@ -5236,14 +5559,20 @@ class SMTP(BaseModule):
                 if "AUTH" in reply_str.upper():
                     self.ptdebug(f"Testing RCPT method: [{status}] server requires AUTH", Out.INFO)
                     self._enum_test_replies = getattr(self, "_enum_test_replies", {})
-                    self._enum_test_replies["rcpt"] = f"[{status}] {reply_str.strip()} (Relay protection active)"
+                    disp = self._rcpt_enum_reply_for_display(reply_str.strip(), domain, INVALID_PROBES)
+                    self._enum_test_replies["rcpt"] = f"[{status}] {disp} (Relay protection active)"
                     return False
             except Exception as e:
                 self.ptdebug(f"Testing RCPT method: {e}", Out.INFO)
                 return False
 
         first_status, first_reply = replies[0]
-        self.ptdebug(f"Testing RCPT method: [{first_status}] {first_reply}")
+        self.ptdebug(
+            "Testing RCPT method: [{}] {}".format(
+                first_status,
+                self._rcpt_enum_reply_for_display(first_reply.strip(), domain, INVALID_PROBES),
+            ),
+        )
 
         # Uniform 250 for all invalid = cannot enumerate (catch-all or accept-all)
         if all(s in RCPT_ACCEPT for s, _ in replies):
@@ -5267,7 +5596,8 @@ class SMTP(BaseModule):
             return False
 
         rej_status, rej_text = first_reject
-        reject_reply = f"[{rej_status}] {rej_text.strip()}"
+        rej_disp = self._rcpt_enum_reply_for_display(rej_text.strip(), domain, INVALID_PROBES)
+        reject_reply = f"[{rej_status}] {rej_disp}"
 
         # RBL block = server rejected client IP before test could run (not a vulnerability)
         if rej_status in (550, 554) and self._is_rbl_blocked(rej_text):
@@ -5420,7 +5750,7 @@ class SMTP(BaseModule):
                         smtp.docmd("EHLO", self.fqdn)
                         if supports_smtputf8:
                             smtp.command_encoding = "utf-8"
-                        smtp.docmd("MAIL FROM:", "<mail@from.me>")
+                        self._try_mail_from_for_rcpt_probe(smtp, domain)
                     except Exception:
                         pass  # best-effort; next docmd will trigger the existing error handler
 
@@ -5430,7 +5760,8 @@ class SMTP(BaseModule):
                         continue
                     label = f"{local}@{domain}"
                     if not self.use_json:
-                        self._enum_wait_begin(idx, wl_total, label)
+                        # Progress bar: local part only (same style as EXPN/VRFY); findings still use full label.
+                        self._enum_wait_begin(idx, wl_total, local)
                     try:
                         status, reply = smtp.docmd("RCPT TO:", f"<{local}@{domain}>")
                     except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
@@ -5446,7 +5777,7 @@ class SMTP(BaseModule):
                             smtp.docmd("EHLO", f"{self.fqdn}")
                             if supports_smtputf8:
                                 smtp.command_encoding = "utf-8"
-                            smtp.docmd("MAIL FROM:", "<mail@from.me>")
+                            self._try_mail_from_for_rcpt_probe(smtp, domain)
                             status, reply = smtp.docmd("RCPT TO:", f"<{local}@{domain}>")
                             # Retry succeeded: restore 15 s timeout for remaining users.
                             try:
@@ -5460,7 +5791,7 @@ class SMTP(BaseModule):
                                 smtp.docmd("EHLO", f"{self.fqdn}")
                                 if supports_smtputf8:
                                     smtp.command_encoding = "utf-8"
-                                smtp.docmd("MAIL FROM:", "<mail@from.me>")
+                                self._try_mail_from_for_rcpt_probe(smtp, domain)
                             except Exception:
                                 break
                             status, reply = 550, b""
@@ -5471,8 +5802,8 @@ class SMTP(BaseModule):
                         if not self.use_json:
                             self._print_enum_finding(idx, wl_total, label)
                         elif self.use_json:
-                            self.ptdebug(local)
-                        enumerated_users.append(local)
+                            self.ptdebug(label)
+                        enumerated_users.append(label)
                         # Reconnect after a find only when --enum-reconnect-after is set;
                         # resets accumulated teergrube delay on the connection.
                         if reconnect_after is not None and reconnect_after != -1:
@@ -5526,7 +5857,7 @@ class SMTP(BaseModule):
                                     conn.docmd("EHLO", f"{self.fqdn}")
                                     if supports_smtputf8:
                                         conn.command_encoding = "utf-8"
-                                    conn.docmd("MAIL FROM:", "<mail@from.me>")
+                                    self._try_mail_from_for_rcpt_probe(conn, domain)
                                 except Exception:
                                     continue
                             try:
@@ -5537,7 +5868,7 @@ class SMTP(BaseModule):
                                     conn.docmd("EHLO", f"{self.fqdn}")
                                     if supports_smtputf8:
                                         conn.command_encoding = "utf-8"
-                                    conn.docmd("MAIL FROM:", "<mail@from.me>")
+                                    self._try_mail_from_for_rcpt_probe(conn, domain)
                                     status, reply = conn.docmd("RCPT TO:", f"<{local}@{domain}>")
                                 except Exception:
                                     continue
@@ -5545,9 +5876,9 @@ class SMTP(BaseModule):
                                 if not self.use_json:
                                     self._print_enum_finding(cur, work_total, label)
                                 elif self.use_json:
-                                    self.ptdebug(local)
+                                    self.ptdebug(label)
                                 with result_lock:
-                                    enumerated_users.append(local)
+                                    enumerated_users.append(label)
                         finally:
                             p = bump_processed()
                             if not self.use_json:
@@ -7415,8 +7746,9 @@ class SMTP(BaseModule):
                 seen_payloads.add(p)
                 unique_payloads.append(p)
 
-        # Role: port-based hint (MTA vs Submission)
-        port_hint = "submission" if port in (587, 465, 2525) else "mta"
+        # Role: port-based hint or ``-R`` / ``--role`` (same as role identification)
+        ph = self._role_port_hint()
+        port_hint = ph if ph != "unknown" else ("submission" if port in (587, 465, 2525) else "mta")
         rcpt_external = "external-test@gmail.com"
 
         for helo_value in unique_payloads:
@@ -10787,6 +11119,8 @@ class SMTP(BaseModule):
         }
         enumeration_results = None
         self._enum_blocked_by_rbl = set()
+        self._rcpt_enum_mail_from_ok = None  # RCPT MAIL FROM: winner for this run (reconnect reuse)
+        self._enum_progress_line_dirty = False
 
         self.test_enumeration(smtp, enumeration_vulns)
 
@@ -11485,11 +11819,11 @@ class SMTP(BaseModule):
                         self.ptprint(f"    {r}")
         info_icon = get_colored_text("[*]", color="INFO")
         if catch_all == "configured":
-            self.ptprint(f"    {info_icon} Catch All mailbox configured", Out.TEXT)
+            self.ptprint(f"{info_icon} Catch All mailbox configured", Out.TEXT)
         elif catch_all == "not_configured":
-            self.ptprint(f"    {info_icon} Catch All mailbox not configured", Out.TEXT)
+            self.ptprint(f"{info_icon} Catch All mailbox not configured", Out.TEXT)
         elif catch_all == "indeterminate":
-            self.ptprint(f"    {info_icon} Catch All mailbox indeterminate", Out.TEXT)
+            self.ptprint(f"{info_icon} Catch All mailbox indeterminate", Out.TEXT)
 
     def _stream_ntlm_result(self) -> None:
         if (ntlm_error := self.results.ntlm_error) is not None:
@@ -12542,29 +12876,12 @@ class SMTP(BaseModule):
             self.ptprint(f"    {icon} {ad.detail}", Out.TEXT)
 
     def _stream_rate_limit_result(self) -> None:
+        # Per-phase verdicts are emitted inline by the test itself (next to each
+        # measured value). This hook only handles the top-level failure case
+        # (e.g. nothing could be connected at all).
         if (err := self.results.rate_limit_error) is not None:
             icon = get_colored_text("[✗]", color="VULN")
             self.ptprint(f"    {icon} Rate limiting test failed: {err}", Out.TEXT)
-            return
-        rl = self.results.rate_limit
-        if rl is None:
-            return
-        if rl.timeout_exceeded:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(
-                f"    {icon} Server holds connections open for more than 5 minutes",
-                Out.TEXT,
-            )
-        if rl.connected is not None and rl.connected >= 50:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(
-                f"    {icon} Vulnerable: {rl.connected} simultaneous SMTP connections "
-                f"from one IP accepted",
-                Out.TEXT,
-            )
-        elif rl.connected is not None:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} Not vulnerable", Out.TEXT)
 
     def _on_brute_success(self, cred: Creds) -> None:
         """Callback for real-time streaming of found credentials (thread-safe)."""
@@ -12756,6 +13073,9 @@ class SMTP(BaseModule):
             if method_names:
                 parts.append(f"Available methods: {', '.join(method_names)}")
 
+        if getattr(self.args, "smtp_role", None):
+            parts.append(f"Declared server role (--role): {self.args.smtp_role}")
+
         if (role_r := self.results.role) is not None:
             parts.append(f"Identified role: {role_r.role}")
             if role_r.detail:
@@ -12816,23 +13136,31 @@ class SMTP(BaseModule):
         if rl := self.results.rate_limit:
             rl_parts = []
             rl_parts.append(f"Connected: {rl.connected if rl.connected is not None else 'N/A'}")
-            # Phase 2 (Duration) always reflected in JSON description: measured time, skipped at cap,
-            # or full wait window with no new connection (matches console / three-phase test).
-            max_attempts = int(getattr(self.args, "rate_limit", None) or RATE_LIMIT_DEFAULT_ATTEMPTS)
-            if rl.rate_limit_seconds is not None:
-                mm = int(rl.rate_limit_seconds // 60)
-                ss = int(rl.rate_limit_seconds % 60)
-                rl_parts.append(f"Duration rate limiting: {mm:02d}:{ss:02d}")
-            elif rl.connected is not None and rl.connected >= max_attempts:
+            # Ban duration is only meaningful when we ran the ban-duration probe.
+            if rl.ban_duration_probe_ran:
+                if rl.ban_duration_seconds is not None:
+                    mm = int(rl.ban_duration_seconds // 60)
+                    ss = int(rl.ban_duration_seconds % 60)
+                    rl_parts.append(
+                        f"Ban duration: {mm:02d}:{ss:02d}"
+                        + (" (exceeded 5 min)" if rl.ban_duration_exceeded else "")
+                    )
+                else:
+                    rl_parts.append("Ban duration: N/A")
+            if rl.initial_timeout_seconds is not None:
+                mm = int(rl.initial_timeout_seconds // 60)
+                ss = int(rl.initial_timeout_seconds % 60)
                 rl_parts.append(
-                    f"Duration rate limiting: (skipped, all {max_attempts} attempts accepted)"
+                    f"Initial response timeout (without EHLO): {mm:02d}:{ss:02d}"
+                    + (" (exceeded 5 min)" if rl.initial_timeout_exceeded else "")
                 )
-            else:
-                rl_parts.append("Duration rate limiting: >05:00")
-            if rl.timeout_seconds is not None:
-                mm = int(rl.timeout_seconds // 60)
-                ss = int(rl.timeout_seconds % 60)
-                rl_parts.append(f"Timeout: {mm:02d}:{ss:02d}" + (" (exceeded 5 min)" if rl.timeout_exceeded else ""))
+            if rl.idle_timeout_seconds is not None:
+                mm = int(rl.idle_timeout_seconds // 60)
+                ss = int(rl.idle_timeout_seconds % 60)
+                rl_parts.append(
+                    f"Idle timeout (after EHLO): {mm:02d}:{ss:02d}"
+                    + (" (exceeded 5 min)" if rl.idle_timeout_exceeded else "")
+                )
             parts.append("\r\n".join(rl_parts))
         elif (rl_err := self.results.rate_limit_error) is not None:
             parts.append(f"Rate limiting error: {rl_err}")
@@ -12925,8 +13253,28 @@ class SMTP(BaseModule):
                 vulns.append({"vuln_code": VULNS.Blacklist.value})
 
         if rl := self.results.rate_limit:
-            if rl.connected is not None and rl.connected >= 50:
-                vulns.append({"vuln_code": "PTV-SVC-SMTP-CONN"})
+            if rl.connected is not None and rl.connected >= RATE_LIMIT_CONN_VULN_THRESHOLD:
+                vulns.append({"vuln_code": VULNS.ManyConns.value})
+            # Ban was triggered but lifted too quickly — only when ban-duration was measured.
+            if (
+                rl.ban_duration_probe_ran
+                and rl.ban_duration_seconds is not None
+                and not rl.ban_duration_exceeded
+                and rl.ban_duration_seconds < RATE_LIMIT_BAN_MIN_SECONDS
+            ):
+                vulns.append({"vuln_code": VULNS.BanDurationShort.value})
+            # Banner-only (pre-EHLO) idle timeout too long.
+            if rl.initial_timeout_seconds is not None and (
+                rl.initial_timeout_exceeded
+                or rl.initial_timeout_seconds > RATE_LIMIT_INITIAL_TIMEOUT_MAX_SECONDS
+            ):
+                vulns.append({"vuln_code": VULNS.InitialTimeoutLong.value})
+            # Post-EHLO idle timeout too long.
+            if rl.idle_timeout_seconds is not None and (
+                rl.idle_timeout_exceeded
+                or rl.idle_timeout_seconds > RATE_LIMIT_IDLE_TIMEOUT_MAX_SECONDS
+            ):
+                vulns.append({"vuln_code": VULNS.IdleTimeoutLong.value})
 
         if (ntlm := self.results.ntlm) is not None and ntlm.ntlm is not None:
             vulns.append({"vuln_code": VULNS.NTLM.value})
@@ -13440,6 +13788,9 @@ class SMTP(BaseModule):
             "vendor": None,
             "description": None,
         }
+        if getattr(self.args, "smtp_role", None):
+            properties["declaredServerRole"] = self.args.smtp_role
+
         global_vulns: list[dict] = []
 
         if getattr(self, "run_all_mode", False) and (resolved := getattr(self.results, "resolved_domain", None)) is not None:
@@ -14082,9 +14433,15 @@ class SMTP(BaseModule):
         elif rl := self.results.rate_limit:
             properties.update({
                 "connected": rl.connected,
-                "rateLimitSeconds": rl.rate_limit_seconds,
-                "timeoutSeconds": rl.timeout_seconds,
-                "timeoutExceeded": rl.timeout_exceeded,
+                "maxAttempts": rl.max_attempts,
+                "banned": rl.banned,
+                "banDurationProbeRan": rl.ban_duration_probe_ran,
+                "banDurationSeconds": rl.ban_duration_seconds,
+                "banDurationExceeded": rl.ban_duration_exceeded,
+                "initialTimeoutSeconds": rl.initial_timeout_seconds,
+                "initialTimeoutExceeded": rl.initial_timeout_exceeded,
+                "idleTimeoutSeconds": rl.idle_timeout_seconds,
+                "idleTimeoutExceeded": rl.idle_timeout_exceeded,
             })
 
         # Login bruteforce

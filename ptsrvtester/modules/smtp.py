@@ -457,6 +457,92 @@ RATE_LIMIT_INITIAL_TIMEOUT_MAX_SECONDS = 60    # banner-only timeout longer than
 RATE_LIMIT_IDLE_TIMEOUT_MAX_SECONDS = 180      # idle (after EHLO) timeout longer than this → vulnerable
 RATE_LIMIT_TIMEOUT_CAP_SECONDS = 300           # hard cap for any individual timeout / ban measurement
 
+
+def _rate_limit_duration_display(seconds: float | None, exceeded: bool) -> str:
+    """Format -rt durations for console / flat JSON: ``MM:SS``, or ``> MM:SS`` when the hard cap was hit."""
+    if seconds is None:
+        return "N/A"
+    mm = int(seconds // 60)
+    ss = int(seconds % 60)
+    mmss = f"{mm:02d}:{ss:02d}"
+    return f"> {mmss}" if exceeded else mmss
+
+
+# ─── NOOP Flooding (-nf1 / -nf2) ──────────────────────────────────────────────
+# RFC 5321 §4.1.1.9: NOOP must return 250; any other reply (421/4xx/5xx) or a
+# socket-level failure counts as an error for our error-rate metric.
+#
+# Defaults / verdict thresholds are derived from Postfix built-ins:
+#   - smtpd_junk_command_limit = 100 (each further NOOP increments the error
+#     counter; under overload the limit drops to 1).
+#   - smtpd_hard_error_limit = 20 (1 under overload).
+#   - smtpd_soft_error_limit = 10 / smtpd_error_sleep_time = 1s → responses
+#     start to slow down once the error counter is between 10 and the hard
+#     limit.
+# → A well-configured Postfix drops the connection after ~120 NOOPs with a
+# gradual slowdown starting around 110. Sendmail has no equivalent junk limit
+# (relies on Timeout.misc = 2m) and is effectively vulnerable by default.
+
+NOOP_FLOOD1_MAX_COMMANDS = 1000             # per-connection safety cap
+NOOP_FLOOD1_TIMEOUT_SECONDS = 30.0          # recv() timeout for a single NOOP reply
+NOOP_FLOOD1_OVERALL_CAP_SECONDS = 180.0     # never let a single -nf1 run exceed this
+
+NOOP_FLOOD_DISCONNECT_OK_MAX = 120          # ≤ this many NOOPs before disconnect → OK (Postfix default-ish)
+NOOP_FLOOD_SLOWDOWN_MIN_RATIO = 1.5         # last-window avg / baseline avg ≥ this → slowdown configured
+NOOP_FLOOD_SLOWDOWN_MIN_SECONDS = 0.5       # OR last-window avg ≥ this (absolute) → slowdown configured
+NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT = 5.0      # ≤ this % error replies → OK
+
+NOOP_FLOOD2_DEFAULT_CONNECTIONS = 50        # default parallel connections (-nf2 without argument)
+NOOP_FLOOD2_MAX_CONNECTIONS = 1000          # user-specified ceiling (safety)
+NOOP_FLOOD2_RUN_SECONDS = 30.0              # steady-state duration (per thread) after ramp-up
+NOOP_FLOOD2_CONNECT_TIMEOUT = 10.0
+NOOP_FLOOD2_RECV_TIMEOUT = 30.0
+NOOP_FLOOD2_AVG_TIME_OK_MAX_SECONDS = 5.0   # avg time between NOOPs under load ≤ this → OK
+
+
+class NoopFlood1Result(NamedTuple):
+    """Single-connection NOOP flood (-nf1)."""
+    commands_sent: int                 # Total NOOPs issued (ok + error)
+    commands_ok: int                   # 250 OK replies
+    commands_error: int                # 4xx/5xx/timeout/socket reset
+    disconnected: bool                 # True if server closed the connection
+    disconnect_after: int | None       # Number of NOOPs after which server closed (None if never)
+    hit_command_cap: bool              # True when we stopped on NOOP_FLOOD1_MAX_COMMANDS
+    hit_time_cap: bool                 # True when we stopped on NOOP_FLOOD1_OVERALL_CAP_SECONDS
+    min_rt_seconds: float | None       # Fastest per-command round-trip observed
+    max_rt_seconds: float | None       # Slowest (pre-disconnect) per-command round-trip
+    avg_rt_seconds: float | None       # Mean per-command round-trip
+    baseline_avg_seconds: float | None # Mean of the first ≤10 successful replies
+    last_window_avg_seconds: float | None  # Mean of the last ≤10 successful replies
+    slowdown_detected: bool            # True if the last-window avg vs baseline indicates trolling
+    error_rate_pct: float              # 100 * commands_error / commands_sent
+
+
+class NoopFlood2Result(NamedTuple):
+    """Parallel-connection NOOP DoS flood (-nf2)."""
+    requested_connections: int         # What the user asked for
+    established_connections: int       # How many sockets actually got past 220
+    run_duration_seconds: float        # How long we actually hammered the server
+    commands_sent: int                 # Total NOOPs across all threads
+    commands_ok: int                   # 250 OK replies
+    commands_error: int                # Errors (4xx/5xx/timeouts/closed sockets)
+    min_rt_seconds: float | None
+    max_rt_seconds: float | None
+    avg_rt_seconds: float | None       # Mean per-command round-trip across all threads
+    error_rate_pct: float              # 100 * commands_error / commands_sent
+
+
+def _noop_rt_window_display(value: float | None) -> str:
+    """Format a round-trip time as ``Xs`` / ``X.Ys`` for terminal output."""
+    if value is None:
+        return "N/A"
+    if value >= 10:
+        return f"{int(round(value))}s"
+    if value >= 1:
+        return f"{value:.1f}s"
+    return f"{value:.2f}s"
+
+
 # Common MTA / doc placeholder hostnames: -pd may still infer them; flag for analysts
 ACCEPTED_DOMAIN_PLACEHOLDER_DOMAINS: frozenset[str] = frozenset(
     {
@@ -488,6 +574,15 @@ class RcptLimitResult(NamedTuple):
     failed_before_limit: int = 0  # Number of failed RCPTs before 421 or disconnect
     session_limit_triggered: bool = False  # True if server disconnected or returned 421
     no_session_limit: bool = False  # True if server allowed N failed RCPTs without disconnecting
+    # ── Pre-check context (added with --rl smart routing) ───────────────────────
+    role: str | None = None  # mta | submission | hybrid | indeterminate | None when not detected
+    auth_required: bool | None = None  # AUTH required for RCPT TO (per role probe)
+    auth_used: bool = False  # True if --rl performed AUTH LOGIN before probing
+    open_relay: bool | None = None  # Open relay verdict (only meaningful for MTA/hybrid)
+    skipped: bool = False  # True when --rl was not relevant for this server configuration
+    skip_reason: str | None = None  # 'mta_not_relay_no_wordlist' | 'submission_auth_required' | 'auth_failed'
+    skip_message: str | None = None  # Human-readable explanation for output / JSON
+    recipients_source: str | None = None  # 'synthetic' (1@dom, 2@dom) | 'wordlist' (real local users)
 
 
 class AcceptedDomainProbeResult(NamedTuple):
@@ -1051,6 +1146,10 @@ class SMTPResults:
     authentications_requested: bool = False
     rate_limit: RateLimitResult | None = None
     rate_limit_error: str | None = None
+    noop_flood1: NoopFlood1Result | None = None
+    noop_flood1_error: str | None = None
+    noop_flood2: NoopFlood2Result | None = None
+    noop_flood2_error: str | None = None
     ntlm: NTLMResult | None = None
     ntlm_error: str | None = None  # When run-all NTLM test fails
     open_relay: bool | None = None
@@ -1156,6 +1255,12 @@ class VULNS(Enum):
     BanDurationShort = "PTV-SVC-SMTP-BANSHORT"
     InitialTimeoutLong = "PTV-SVC-SMTP-TOUTBANNER"
     IdleTimeoutLong = "PTV-SVC-SMTP-TOUTIDLE"
+    # NOOP Flooding sub-checks (placeholder codes – will be renamed later).
+    NoopFloodNoLimit = "PTV-SVC-SMTP-NOOPFLOOD"
+    NoopFloodNoTrottle = "PTV-SVC-SMTP-NOOPTROT"
+    NoopFloodErrors = "PTV-SVC-SMTP-NOOPERR"
+    NoopFloodDosSlow = "PTV-SVC-SMTP-NOOPDOSSLOW"
+    NoopFloodDosErrors = "PTV-SVC-SMTP-NOOPDOSERR"
 
 
 # endregion
@@ -1175,6 +1280,8 @@ class SMTPArgs(ArgsWithBruteforce):
     enumerate: list[str] | str | None
     blacklist_test: bool
     rate_limit: bool
+    noop_flood1: bool
+    noop_flood2: int | None
     slow_down: bool
     spf_test: bool
     open_relay: bool
@@ -1239,7 +1346,10 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["", "--enum-reconnect-after", "<n>", "Reconnect after n consecutive failures during enum (default: 4)"],
                 ["-sd", "--slow-down", "", "Test slow-down protection (requires -e)"],
                 ["-rt", "--rate-limit", "<n>", f"Rate limiting test (default: {RATE_LIMIT_DEFAULT_ATTEMPTS} attempts)"],
+                ["-nf1", "--noop-flood1", "", "NOOP flooding test (1 connection, rapid NOOP commands)"],
+                ["-nf2", "--noop-flood2", "<n>", f"NOOP flooding DoS test (default: {NOOP_FLOOD2_DEFAULT_CONNECTIONS} parallel connections)"],
                 ["-rl", "--recipient-limit", "<n>", "Test RCPT TO limit (default: 1000 RCPT attempts; aborts after 50 policy rejects if none accepted)"],
+                ["", "--rl-no-precheck", "", "Skip role/open-relay/auth pre-check for -rl (run RCPT TO probe directly)"],
                 ["-d", "--domain", "<domain>", "Recipient domain for RCPT TO limit test"],
                 ["-pd", "--probe-accepted-domain", "", "Probe which recipient domain RCPT treats as local"],
                 ["-or", "--open-relay", "", "Test open relay"],
@@ -1563,6 +1673,30 @@ class SMTPArgs(ArgsWithBruteforce):
             ),
         )
         direct.add_argument(
+            "-nf1", "--noop-flood1",
+            action="store_true",
+            dest="noop_flood1",
+            help=(
+                "NOOP flooding test on a single connection: send NOOPs as fast as possible "
+                "and report how many the server accepts before disconnecting, whether response "
+                "time grows (time-trolling / tarpitting) and the overall error rate."
+            ),
+        )
+        direct.add_argument(
+            "-nf2", "--noop-flood2",
+            nargs="?",
+            type=int,
+            const=NOOP_FLOOD2_DEFAULT_CONNECTIONS,
+            default=None,
+            metavar="N",
+            dest="noop_flood2",
+            help=(
+                "NOOP flooding DoS test across N parallel connections (default: "
+                f"{NOOP_FLOOD2_DEFAULT_CONNECTIONS}). Each thread hammers the server with NOOPs "
+                "for a fixed window; reports per-command reaction time and error rate."
+            ),
+        )
+        direct.add_argument(
             "-rl", "--recipient-limit",
             nargs="?",
             type=int,
@@ -1573,6 +1707,15 @@ class SMTPArgs(ArgsWithBruteforce):
             help=(
                 "Test RCPT TO per-message limit (N = max RCPT TO attempts per session, default: 1000; "
                 f"stops after {RCPT_LIMIT_POLICY_REJECT_CAP} consecutive policy rejections if none accepted)"
+            ),
+        )
+        direct.add_argument(
+            "--rl-no-precheck",
+            action="store_true",
+            dest="rl_no_precheck",
+            help=(
+                "Skip the role/open-relay/AUTH pre-check before -rl and run the RCPT TO probe directly "
+                "(use for regression testing or when the server context is already known)"
             ),
         )
         direct.add_argument(
@@ -1983,6 +2126,8 @@ class SMTP(BaseModule):
             or getattr(self.args, "role_identify", False)
             or self.args.enumerate is not None
             or self.args.rate_limit
+            or getattr(self.args, "noop_flood1", False)
+            or getattr(self.args, "noop_flood2", None) is not None
             or getattr(self.args, "rcpt_limit", False)
             or getattr(self.args, "probe_accepted_domain", False)
             or self.do_brute
@@ -2041,6 +2186,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2067,6 +2214,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2094,6 +2243,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2122,6 +2273,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2152,6 +2305,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2192,6 +2347,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2256,6 +2413,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2292,6 +2451,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2329,6 +2490,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2381,6 +2544,8 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2417,6 +2582,8 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role_identify", False)
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2458,6 +2625,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2490,6 +2659,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2517,6 +2688,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not self.do_brute
         )
@@ -2541,6 +2714,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2564,6 +2739,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2589,6 +2766,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2616,6 +2795,8 @@ class SMTP(BaseModule):
             and not self.args.open_relay
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2628,6 +2809,61 @@ class SMTP(BaseModule):
             except Exception as e:
                 self.results.rate_limit_error = str(e)
                 self._stream_rate_limit_result()
+            return
+
+        # Standalone NOOP flood 1 (-nf1): single-connection NOOP spam.
+        only_noop_flood1 = (
+            getattr(self.args, "noop_flood1", False)
+            and not self.args.banner
+            and not self.args.commands
+            and not self.args.interactive
+            and not self.args.isencrypt
+            and not self.args.ntlm
+            and not self.args.open_relay
+            and not getattr(self.args, "role_identify", False)
+            and self.args.enumerate is None
+            and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood2", None)
+            and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
+            and not self.do_brute
+        )
+        if only_noop_flood1:
+            self.ptprint("NOOP Flooding test (1 connection)", Out.INFO)
+            try:
+                self.results.noop_flood1 = self.noop_flood_test_single()
+                self._stream_noop_flood1_result()
+            except Exception as e:
+                self.results.noop_flood1_error = str(e)
+                self._stream_noop_flood1_result()
+            return
+
+        # Standalone NOOP flood 2 (-nf2): parallel-connection NOOP DoS.
+        only_noop_flood2 = (
+            getattr(self.args, "noop_flood2", None) is not None
+            and not self.args.banner
+            and not self.args.commands
+            and not self.args.interactive
+            and not self.args.isencrypt
+            and not self.args.ntlm
+            and not self.args.open_relay
+            and not getattr(self.args, "role_identify", False)
+            and self.args.enumerate is None
+            and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "rcpt_limit", False)
+            and not getattr(self.args, "probe_accepted_domain", False)
+            and not self.do_brute
+        )
+        if only_noop_flood2:
+            requested = self.args.noop_flood2 or NOOP_FLOOD2_DEFAULT_CONNECTIONS
+            self.ptprint(f"NOOP Flooding DoS test ({requested} connection)", Out.INFO)
+            try:
+                self.results.noop_flood2 = self.noop_flood_test_parallel()
+                self._stream_noop_flood2_result()
+            except Exception as e:
+                self.results.noop_flood2_error = str(e)
+                self._stream_noop_flood2_result()
             return
 
         # Standalone AUTH LOGIN format probe only (PTL-SVC-SMTP-AUTH-FORMAT)
@@ -2643,6 +2879,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2670,6 +2908,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2696,6 +2936,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2722,6 +2964,8 @@ class SMTP(BaseModule):
             and not getattr(self.args, "role_identify", False)
             and self.args.enumerate is None
             and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -3493,9 +3737,11 @@ class SMTP(BaseModule):
 
             _rl_stop.set()
 
-            suffix = " (exceeded 5 min)" if ban_duration_exceeded else ""
             if _show_progress:
-                _finalize_line("Ban duration:", _fmt_mmss(ban_duration_seconds) + suffix)
+                _finalize_line(
+                    "Ban duration:",
+                    _rate_limit_duration_display(ban_duration_seconds, ban_duration_exceeded),
+                )
 
             if ban_duration_exceeded:
                 self.ptdebug(
@@ -3558,14 +3804,14 @@ class SMTP(BaseModule):
                 result_cell.append((cap, True))
 
             elapsed, exceeded = result_cell[0]
-            suffix = " (exceeded 5 min)" if exceeded else ""
+            disp = _rate_limit_duration_display(elapsed, exceeded)
             self.ptdebug(
-                f"{label.strip()} measured {_fmt_mmss(elapsed)}{suffix}"
-                + (" (hit idle/disconnect cap)" if exceeded else " (peer closed or replied)"),
+                f"{label.strip()} measured {disp}"
+                + (" (hit hard cap)" if exceeded else " (peer closed or replied)"),
                 Out.INFO,
             )
             if _show_progress:
-                _finalize_line(label, _fmt_mmss(elapsed) + suffix)
+                _finalize_line(label, disp)
 
             if exceeded or elapsed > threshold:
                 _print_verdict(True, bad_msg)
@@ -3619,6 +3865,375 @@ class SMTP(BaseModule):
             initial_timeout_exceeded=initial_exceeded,
             idle_timeout_seconds=idle_seconds,
             idle_timeout_exceeded=idle_exceeded,
+        )
+
+    # ── NOOP flooding tests ────────────────────────────────────────────────
+    @staticmethod
+    def _noop_read_one_reply(sock: socket.socket) -> tuple[int | None, bytes, bool]:
+        """Read one SMTP reply (multi-line aware) from a raw socket.
+
+        Returns (status, raw, closed): ``status`` is the 3-digit reply code
+        (``None`` on timeout / parse error), ``raw`` is the full reply bytes,
+        ``closed`` is True when the server closed the socket (or reset it)
+        before a complete reply was received.
+        """
+        buf = bytearray()
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                return None, bytes(buf), False
+            except (OSError, ConnectionError):
+                return None, bytes(buf), True
+            if not chunk:
+                return None, bytes(buf), True
+            buf.extend(chunk)
+            # Parse reply line-by-line until we hit the final line ("XYZ ..." or "\r\n").
+            text = buf.decode("latin-1", errors="replace")
+            lines = text.split("\r\n")
+            if len(lines) < 2:
+                continue
+            final_line = None
+            for line in lines[:-1]:
+                if len(line) >= 4 and line[3:4] == " " and line[:3].isdigit():
+                    final_line = line
+                    break
+            if final_line is not None:
+                try:
+                    return int(final_line[:3]), bytes(buf), False
+                except ValueError:
+                    return None, bytes(buf), False
+
+    def noop_flood_test_single(self) -> NoopFlood1Result:
+        """-nf1: rapid NOOP flood in a single connection (RFC 5321 §4.1.1.9 expects 250)."""
+        self.ptdebug("NOOP Flooding test (single connection)", title=True)
+        self.ptdebug(
+            f"Target {self.args.target.ip}:{self.args.target.port} — up to "
+            f"{NOOP_FLOOD1_MAX_COMMANDS} NOOPs (hard cap: {NOOP_FLOOD1_OVERALL_CAP_SECONDS:.0f}s, "
+            f"per-reply timeout: {NOOP_FLOOD1_TIMEOUT_SECONDS:.0f}s)."
+        )
+
+        smtp = self._connect_silent(timeout=NOOP_FLOOD1_TIMEOUT_SECONDS, send_ehlo=True)
+        sock = smtp.sock
+        try:
+            sock.settimeout(NOOP_FLOOD1_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+
+        _show_progress = not self.args.json
+        _print_lock = threading.Lock()
+
+        def _write_live(text: str) -> None:
+            if not _show_progress:
+                return
+            with _print_lock:
+                sys.stdout.write(f"\r    {text:<110}")
+                sys.stdout.flush()
+
+        def _finalize_live() -> None:
+            if not _show_progress:
+                return
+            with _print_lock:
+                sys.stdout.write("\r" + " " * 120 + "\r")
+                sys.stdout.flush()
+
+        commands_sent = 0
+        commands_ok = 0
+        commands_error = 0
+        rtts: list[float] = []     # all successful round-trip times (for baseline/last-window stats)
+        disconnected = False
+        disconnect_after: int | None = None
+        hit_command_cap = False
+        hit_time_cap = False
+        overall_start = time.perf_counter()
+
+        try:
+            while commands_sent < NOOP_FLOOD1_MAX_COMMANDS:
+                elapsed_total = time.perf_counter() - overall_start
+                if elapsed_total >= NOOP_FLOOD1_OVERALL_CAP_SECONDS:
+                    hit_time_cap = True
+                    break
+
+                t0 = time.perf_counter()
+                try:
+                    sock.sendall(b"NOOP\r\n")
+                except (OSError, ConnectionError) as exc:
+                    commands_sent += 1
+                    commands_error += 1
+                    disconnected = True
+                    disconnect_after = commands_sent
+                    self.ptdebug(
+                        f"NOOP #{commands_sent}: send failed — {exc}",
+                        Out.INFO,
+                    )
+                    break
+
+                status, raw, closed = self._noop_read_one_reply(sock)
+                rt = time.perf_counter() - t0
+                commands_sent += 1
+
+                if status == 250:
+                    commands_ok += 1
+                    rtts.append(rt)
+                else:
+                    commands_error += 1
+
+                # Periodic live progress (every 25 commands to keep terminal calm).
+                if _show_progress and (commands_sent % 25 == 0):
+                    _write_live(
+                        f"NOOPs sent: {commands_sent} (ok={commands_ok}, err={commands_error})"
+                    )
+
+                if commands_sent <= 5 or commands_sent % 25 == 0:
+                    if status is None:
+                        self.ptdebug(
+                            f"NOOP #{commands_sent}: no / partial reply "
+                            f"(rt={rt*1000:.0f}ms, closed={closed})",
+                            Out.INFO,
+                        )
+                    else:
+                        reply_text = raw.decode("latin-1", errors="replace").strip()
+                        self.ptdebug(
+                            f"NOOP #{commands_sent}: {status} ({rt*1000:.0f}ms) "
+                            f"— {reply_text[:80]}",
+                            Out.INFO,
+                        )
+
+                if closed:
+                    disconnected = True
+                    disconnect_after = commands_sent
+                    self.ptdebug(
+                        f"NOOP #{commands_sent}: peer closed connection "
+                        f"(after {commands_sent} NOOPs).",
+                        Out.INFO,
+                    )
+                    break
+            else:
+                hit_command_cap = True
+        finally:
+            _finalize_live()
+            try:
+                smtp.close()
+            except Exception:
+                pass
+
+        min_rt = min(rtts) if rtts else None
+        max_rt = max(rtts) if rtts else None
+        avg_rt = (sum(rtts) / len(rtts)) if rtts else None
+
+        # Baseline = mean of the first ≤10 successful NOOPs; last window = last ≤10.
+        window = 10
+        baseline_avg = (sum(rtts[:window]) / min(len(rtts), window)) if rtts else None
+        last_rtts = rtts[-window:] if len(rtts) >= window else rtts
+        last_window_avg = (sum(last_rtts) / len(last_rtts)) if last_rtts else None
+
+        slowdown_detected = False
+        if baseline_avg is not None and last_window_avg is not None and len(rtts) >= window * 2:
+            ratio_ok = last_window_avg >= baseline_avg * NOOP_FLOOD_SLOWDOWN_MIN_RATIO
+            abs_ok = last_window_avg >= NOOP_FLOOD_SLOWDOWN_MIN_SECONDS
+            slowdown_detected = ratio_ok or abs_ok
+
+        error_rate_pct = (100.0 * commands_error / commands_sent) if commands_sent else 0.0
+
+        self.ptdebug(
+            f"Summary: sent={commands_sent}, ok={commands_ok}, error={commands_error} "
+            f"({error_rate_pct:.1f}%), disconnected={disconnected} "
+            f"(after={disconnect_after}), baseline_avg={baseline_avg}, "
+            f"last_window_avg={last_window_avg}, slowdown={slowdown_detected}.",
+            Out.INFO,
+        )
+
+        return NoopFlood1Result(
+            commands_sent=commands_sent,
+            commands_ok=commands_ok,
+            commands_error=commands_error,
+            disconnected=disconnected,
+            disconnect_after=disconnect_after,
+            hit_command_cap=hit_command_cap,
+            hit_time_cap=hit_time_cap,
+            min_rt_seconds=min_rt,
+            max_rt_seconds=max_rt,
+            avg_rt_seconds=avg_rt,
+            baseline_avg_seconds=baseline_avg,
+            last_window_avg_seconds=last_window_avg,
+            slowdown_detected=slowdown_detected,
+            error_rate_pct=error_rate_pct,
+        )
+
+    def noop_flood_test_parallel(self) -> NoopFlood2Result:
+        """-nf2: parallel-connection NOOP DoS. Opens up to N sockets, each sends NOOPs
+        as fast as possible for ``NOOP_FLOOD2_RUN_SECONDS`` seconds; aggregates error
+        rate and average command reaction time across all threads."""
+        requested = getattr(self.args, "noop_flood2", None) or NOOP_FLOOD2_DEFAULT_CONNECTIONS
+        if requested > NOOP_FLOOD2_MAX_CONNECTIONS:
+            self.ptdebug(
+                f"-nf2: requested {requested} capped to {NOOP_FLOOD2_MAX_CONNECTIONS} "
+                "(safety ceiling).",
+                Out.INFO,
+            )
+            requested = NOOP_FLOOD2_MAX_CONNECTIONS
+
+        self.ptdebug("NOOP Flooding DoS test (parallel connections)", title=True)
+        self.ptdebug(
+            f"Target {self.args.target.ip}:{self.args.target.port} — up to {requested} sockets, "
+            f"steady-state duration {NOOP_FLOOD2_RUN_SECONDS:.0f}s, per-reply timeout "
+            f"{NOOP_FLOOD2_RECV_TIMEOUT:.0f}s."
+        )
+
+        _show_progress = not self.args.json
+        _print_lock = threading.Lock()
+
+        def _write_live(text: str) -> None:
+            if not _show_progress:
+                return
+            with _print_lock:
+                sys.stdout.write(f"\r    {text:<110}")
+                sys.stdout.flush()
+
+        def _finalize_live() -> None:
+            if not _show_progress:
+                return
+            with _print_lock:
+                sys.stdout.write("\r" + " " * 120 + "\r")
+                sys.stdout.flush()
+
+        # ── Phase 1: establish sockets ───────────────────────────────────
+        connections: list = []
+        for i in range(requested):
+            try:
+                smtp = self._connect_silent(timeout=NOOP_FLOOD2_CONNECT_TIMEOUT, send_ehlo=True)
+                try:
+                    smtp.sock.settimeout(NOOP_FLOOD2_RECV_TIMEOUT)
+                except Exception:
+                    pass
+                connections.append(smtp)
+                if _show_progress:
+                    _write_live(f"Connecting: {len(connections)}/{requested}")
+            except Exception as exc:
+                self.ptdebug(
+                    f"-nf2: connection #{i + 1} refused/failed — {exc} "
+                    f"(stopping ramp-up, {len(connections)} sockets established).",
+                    Out.INFO,
+                )
+                break
+
+        established = len(connections)
+        _finalize_live()
+        if not connections:
+            raise TestFailedError("Could not establish any connection for -nf2")
+
+        self.ptdebug(
+            f"-nf2: {established}/{requested} sockets established; starting NOOP storm "
+            f"for {NOOP_FLOOD2_RUN_SECONDS:.0f}s.",
+            Out.INFO,
+        )
+
+        # ── Phase 2: each thread hammers its socket with NOOPs ───────────
+        stop_event = threading.Event()
+        results_lock = threading.Lock()
+        agg_commands_sent = 0
+        agg_commands_ok = 0
+        agg_commands_error = 0
+        agg_rtts: list[float] = []
+
+        FLUSH_EVERY = 32  # flush per-thread counters into the shared aggregates this often
+
+        def _flush(local_sent, local_ok, local_err, local_rtts) -> None:
+            nonlocal agg_commands_sent, agg_commands_ok, agg_commands_error
+            with results_lock:
+                agg_commands_sent += local_sent
+                agg_commands_ok += local_ok
+                agg_commands_error += local_err
+                if local_rtts:
+                    agg_rtts.extend(local_rtts)
+
+        def _worker(smtp) -> None:
+            sock = smtp.sock
+            local_sent = 0
+            local_ok = 0
+            local_err = 0
+            local_rtts: list[float] = []
+            while not stop_event.is_set():
+                try:
+                    t0 = time.perf_counter()
+                    sock.sendall(b"NOOP\r\n")
+                    status, _raw, closed = self._noop_read_one_reply(sock)
+                    rt = time.perf_counter() - t0
+                    local_sent += 1
+                    if status == 250:
+                        local_ok += 1
+                        local_rtts.append(rt)
+                    else:
+                        local_err += 1
+                    if local_sent % FLUSH_EVERY == 0:
+                        _flush(local_sent, local_ok, local_err, local_rtts)
+                        local_sent = local_ok = local_err = 0
+                        local_rtts = []
+                    if closed:
+                        break
+                except (OSError, ConnectionError):
+                    local_sent += 1
+                    local_err += 1
+                    break
+            _flush(local_sent, local_ok, local_err, local_rtts)
+
+        threads: list[threading.Thread] = []
+        run_start = time.perf_counter()
+        for smtp in connections:
+            t = threading.Thread(target=_worker, args=(smtp,), daemon=True)
+            threads.append(t)
+            t.start()
+
+        # Live progress ticker while NOOP storm runs.
+        deadline = run_start + NOOP_FLOOD2_RUN_SECONDS
+        while time.perf_counter() < deadline:
+            if _show_progress:
+                remaining = int(deadline - time.perf_counter())
+                with results_lock:
+                    cs, co, ce = agg_commands_sent, agg_commands_ok, agg_commands_error
+                _write_live(
+                    f"NOOP storm ({established} sockets): {cs} sent "
+                    f"(ok={co}, err={ce}) — {remaining:02d}s left"
+                )
+            time.sleep(0.5)
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=NOOP_FLOOD2_RECV_TIMEOUT + 2.0)
+        run_duration = time.perf_counter() - run_start
+        _finalize_live()
+
+        for smtp in connections:
+            try:
+                smtp.close()
+            except Exception:
+                pass
+
+        min_rt = min(agg_rtts) if agg_rtts else None
+        max_rt = max(agg_rtts) if agg_rtts else None
+        avg_rt = (sum(agg_rtts) / len(agg_rtts)) if agg_rtts else None
+        error_rate_pct = (
+            100.0 * agg_commands_error / agg_commands_sent if agg_commands_sent else 0.0
+        )
+
+        self.ptdebug(
+            f"-nf2 summary: established={established}/{requested}, "
+            f"duration={run_duration:.1f}s, sent={agg_commands_sent}, "
+            f"ok={agg_commands_ok}, error={agg_commands_error} ({error_rate_pct:.1f}%), "
+            f"avg_rt={avg_rt}.",
+            Out.INFO,
+        )
+
+        return NoopFlood2Result(
+            requested_connections=requested,
+            established_connections=established,
+            run_duration_seconds=run_duration,
+            commands_sent=agg_commands_sent,
+            commands_ok=agg_commands_ok,
+            commands_error=agg_commands_error,
+            min_rt_seconds=min_rt,
+            max_rt_seconds=max_rt,
+            avg_rt_seconds=avg_rt,
+            error_rate_pct=error_rate_pct,
         )
 
 
@@ -3965,6 +4580,7 @@ class SMTP(BaseModule):
         max_rcpt_attempts: int = RCPT_LIMIT_DEFAULT_ATTEMPTS,
         live_label: list[str] | None = None,
         attempt_hook=None,
+        recipients: list[str] | None = None,
     ) -> RcptLimitResult:
         """Run MAIL FROM + RCPT TO loop for a given domain. Used so we can retry with parent domain.
         Continues on 554/550/553/450 (policy rejection) to probe session error limit (smtpd_hard_error_limit).
@@ -3972,9 +4588,17 @@ class SMTP(BaseModule):
         max_rcpt_attempts caps RCPT iterations when the server keeps accepting (per-message limit probe).
         live_label/attempt_hook are passed from test_rcpt_limit for live progress display.
         attempt_hook(i) is called once per attempt with the current attempt index.
+
+        recipients (optional): explicit list of full RCPT TO addresses (e.g. real local users from -w).
+        When set, the probe iterates this list instead of generating synthetic 1@dom..N@dom; this is
+        required for MTAs without open relay so that we can actually trigger the per-message limit.
         """
         max_try = max(1, int(max_rcpt_attempts))
         policy_reject_cap = RCPT_LIMIT_POLICY_REJECT_CAP
+        explicit_recipients: list[str] = []
+        if recipients:
+            explicit_recipients = list(recipients)
+            max_try = max(1, min(max_try, len(explicit_recipients)))
 
         def _reply_one_line(raw: str | bytes, limit: int = 160) -> str:
             if isinstance(raw, str):
@@ -4001,11 +4625,15 @@ class SMTP(BaseModule):
                 live_label[0] = f"Testing RCPT limit...  attempt {i}"
             if attempt_hook is not None:
                 attempt_hook(i)
+            if explicit_recipients:
+                rcpt_addr = explicit_recipients[i - 1]
+            else:
+                rcpt_addr = f"{i}@{domain}"
             try:
-                status, reply = smtp.docmd("RCPT TO:", f"<{i}@{domain}>")
+                status, reply = smtp.docmd("RCPT TO:", f"<{rcpt_addr}>")
                 reply_str = self.bytes_to_str(reply)
                 self.ptdebug(
-                    f"RCPT [{i}/{max_try}] TO:<{i}@{domain}> → [{status}] {_reply_one_line(reply_str)}",
+                    f"RCPT [{i}/{max_try}] TO:<{rcpt_addr}> → [{status}] {_reply_one_line(reply_str)}",
                     Out.INFO,
                 )
                 if status == 250:
@@ -4058,13 +4686,184 @@ class SMTP(BaseModule):
         self.ptdebug(f"No limit observed up to {accepted} recipients", Out.VULN)
         return RcptLimitResult(accepted, False, None, False)
 
+    # ------------------------------------------------------------------
+    # RCPT TO limit pre-check: role identification, open-relay verdict,
+    # recipient list construction (-w), AUTH for submission servers.
+    # ------------------------------------------------------------------
+
+    def _rl_pick_first(self, value: object) -> str | None:
+        """Pick first non-empty entry from str | list[str] | None."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            v = value.strip()
+            return v or None
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+        return None
+
+    def _rl_first_creds(self) -> tuple[str | None, str | None]:
+        """Return a single (user, password) pair for AUTH LOGIN during -rl on Submission.
+
+        Prefers ``-u/--user`` (first entry) and ``-p/--password``. Falls back to first lines
+        of ``-U/--users`` and ``-P/--passwords`` files when single credentials are absent.
+        """
+        user = self._rl_pick_first(getattr(self.args, "user", None))
+        passwd = self._rl_pick_first(getattr(self.args, "password", None))
+        if user is None and getattr(self.args, "users", None):
+            try:
+                lines = [x for x in text_or_file(None, self.args.users) if x.strip()]
+                if lines:
+                    user = lines[0].strip()
+            except Exception:
+                pass
+        if passwd is None and getattr(self.args, "passwords", None):
+            try:
+                lines = [x for x in text_or_file(None, self.args.passwords) if x.strip()]
+                if lines:
+                    passwd = lines[0].strip()
+            except Exception:
+                pass
+        return user, passwd
+
+    def _rl_build_recipients_from_wordlist(self, domain: str, max_n: int) -> list[str]:
+        """Build full RCPT TO addresses from -w wordlist for MTA-not-relay testing.
+
+        Wordlist entries with ``@`` are kept verbatim (already a full address); bare local parts
+        are completed with ``@<domain>`` (banner/EHLO domain). Output is deduplicated and capped
+        at ``max_n`` entries to respect the user-provided RCPT TO budget.
+        """
+        wl = getattr(self, "wordlist", None) or []
+        if not wl:
+            return []
+        seen: set[str] = set()
+        out: list[str] = []
+        dom = (domain or "").strip().lower().rstrip(".")
+        for entry in wl:
+            if not isinstance(entry, str):
+                continue
+            v = entry.strip()
+            if not v:
+                continue
+            if "@" in v:
+                addr = v
+            else:
+                if not dom:
+                    continue
+                addr = f"{v}@{dom}"
+            key = addr.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(addr)
+            if len(out) >= max(1, int(max_n)):
+                break
+        return out
+
+    def _rl_run_precheck(self) -> dict:
+        """Pre-check before -rl: detect role + (for MTA/hybrid) open-relay verdict.
+
+        Reuses cached ``self.results.role`` / ``self.results.open_relay`` when already populated
+        (e.g. from a prior -ri / -or run inside run-all). Honors ``--role`` override.
+
+        Returns a dict with keys: ``role`` (str|None), ``auth_required`` (bool|None),
+        ``auth_methods`` (list[str]), ``port_hint`` (str), ``open_relay`` (bool|None).
+        """
+        out: dict = {
+            "role": None,
+            "auth_required": None,
+            "auth_methods": [],
+            "port_hint": None,
+            "open_relay": None,
+        }
+
+        forced_role = getattr(self.args, "smtp_role", None)
+
+        # --- Role detection (cached or fresh) ---
+        role_obj = self.results.role
+        if role_obj is None:
+            try:
+                # Ensure self.results.info exists (initial_info populates banner/EHLO)
+                if not getattr(self.results, "info", None):
+                    _, info = self.initial_info(get_commands=True)
+                    self.results.info = InfoResult(
+                        info.banner,
+                        info.ehlo,
+                        getattr(info, "ehlo_starttls", None),
+                    )
+                    self.results.resolved_domain = self._get_domain_from_banner_or_ptr(self.results.info)
+                    self.results.banner_requested = False
+                    self.results.commands_requested = False
+                pre_smtp = self.get_smtp_handler()
+                try:
+                    pre_smtp.docmd("EHLO", self.fqdn)
+                    role_obj = self.test_role(pre_smtp, self.results.info)
+                    self.results.role = role_obj
+                finally:
+                    try:
+                        pre_smtp.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                self.ptdebug(f"Pre-check role detection failed: {e}", Out.INFO)
+
+        if role_obj is not None:
+            out["role"] = forced_role or role_obj.role
+            out["auth_required"] = role_obj.auth_required
+            out["port_hint"] = getattr(role_obj, "port_hint", None)
+        elif forced_role:
+            out["role"] = forced_role
+
+        # --- Open relay probe (only relevant for MTA/hybrid) ---
+        effective_role = out["role"]
+        if effective_role in ("mta", "hybrid"):
+            if self.results.open_relay is not None:
+                out["open_relay"] = self.results.open_relay
+            else:
+                try:
+                    or_smtp = self.get_smtp_handler()
+                    try:
+                        or_smtp.docmd("EHLO", self.fqdn)
+                        open_relay = self.open_relay_test(or_smtp, "TEST", None, None)
+                        self.results.open_relay = open_relay
+                        out["open_relay"] = open_relay
+                    finally:
+                        try:
+                            or_smtp.close()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.ptdebug(f"Pre-check open-relay probe failed: {e}", Out.INFO)
+        return out
+
+    @staticmethod
+    def _rl_role_label(role: str | None, port: int | str, auth_required: bool | None) -> str:
+        """Format `[*] Role: ...` info line for the pre-check verdict."""
+        role_str = (role or "unknown")
+        if auth_required is True:
+            auth_label = "AUTH required"
+        elif auth_required is False:
+            auth_label = "AUTH not required"
+        else:
+            auth_label = "AUTH inconclusive"
+        return f"Role: {role_str} (port {port}, {auth_label})"
+
     def test_rcpt_limit(self) -> RcptLimitResult:
         """
         Test RCPT TO limit per message: send MAIL FROM then many RCPT TO
         until server rejects (452 Too many recipients, 421, 5xx) or closes.
-        When domain is taken from server (banner/EHLO) and server rejects with 550/553,
-        retry with parent domain (e.g. calm.festiveloft.net -> festiveloft.net).
-        Ticker starts immediately so elapsed time includes connection setup.
+
+        When ``--rl-no-precheck`` is not set, the test first detects the server role
+        (and, for MTA/hybrid roles, the open-relay verdict) so it can:
+          • run on Submission only after authentication (``-u``/``-p``);
+          • use real local recipients from ``-w`` for an MTA without open relay
+            (synthetic ``1@dom`` would be rejected as "Relay denied");
+          • fall back to the original behavior for indeterminate / open-relay servers.
+
+        When the server is an MTA-not-relay and no recipient wordlist is provided,
+        the test ends with an explicit "skipped" verdict (no false-positive vuln).
         """
         # Live ETA/progress stays on when -vv (--verbose → args.debug); only JSON mode disables it.
         _show_progress = not self.args.json
@@ -4082,15 +4881,14 @@ class SMTP(BaseModule):
             if attempt > 0 and max_p > 0:
                 pct = min(100, int(attempt * 100 / max_p))
                 if eta is not None and eta >= 0:
-                    eta_m = int(eta // 60)
-                    eta_s = int(eta % 60)
-                    prefix = f"    {eta_m}:{eta_s:02d} {pct}%  "
+                    eta_str = self._format_enum_clock_duration(eta)
+                    prefix = f"    {eta_str} {pct}%  "
                 else:
-                    prefix = f"    --:-- {pct}%  "
+                    prefix = f"    --:--:-- {pct}%  "
             else:
                 prefix = "    "
             line = f"{prefix}{_live_label[0]}"
-            sys.stdout.write(f"\r{line:<79}")
+            sys.stdout.write(f"\r{line:<100}")
             sys.stdout.flush()
 
         def _update_attempt(i: int) -> None:
@@ -4108,43 +4906,196 @@ class SMTP(BaseModule):
 
         def _end_progress() -> None:
             _ticker_stop.set()
-            sys.stdout.write(f"\r{' ' * 79}\r")
+            sys.stdout.write(f"\r{' ' * 100}\r")
             sys.stdout.flush()
+
+        # ── Pre-check phase (no ticker yet, info lines must stay visible) ──
+        no_precheck = bool(getattr(self.args, "rl_no_precheck", False))
+        forced_role = getattr(self.args, "smtp_role", None)
+        info_icon = get_colored_text("[*]", color="INFO")
+
+        self.ptdebug("RCPT TO limit test (per message)", title=True)
+
+        # Always populate self.results.info early so domain resolution + precheck work the same
+        # in standalone (-rl alone) and run-all flows. The transient handler is closed immediately
+        # so the next phase (precheck or probe) opens a fresh connection without leaking sockets
+        # against single-threaded test servers.
+        if not getattr(self.results, "info", None):
+            try:
+                _info_smtp, _info = self.initial_info(get_commands=True)
+                self.results.info = InfoResult(
+                    _info.banner,
+                    _info.ehlo,
+                    getattr(_info, "ehlo_starttls", None),
+                )
+                self.results.resolved_domain = self._get_domain_from_banner_or_ptr(self.results.info)
+                self.results.banner_requested = False
+                self.results.commands_requested = False
+                try:
+                    _info_smtp.quit()
+                except Exception:
+                    try:
+                        _info_smtp.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                self.ptdebug(f"Initial info failed before -rl precheck: {e}", Out.INFO)
+
+        domain = self._get_rcpt_limit_domain()
+        raw_rl = getattr(self.args, "rcpt_limit", None)
+        max_rcpt_attempts = int(raw_rl) if raw_rl is not None else RCPT_LIMIT_DEFAULT_ATTEMPTS
+        if max_rcpt_attempts < 1:
+            max_rcpt_attempts = RCPT_LIMIT_DEFAULT_ATTEMPTS
+        _max_probe_ref[0] = max_rcpt_attempts
+
+        precheck: dict = {}
+        effective_role: str | None = None
+        auth_required: bool | None = None
+        open_relay: bool | None = None
+        recipients: list[str] | None = None
+        recipients_source = "synthetic"
+
+        if no_precheck:
+            self.ptprint(f"    {info_icon} Pre-check skipped (--rl-no-precheck)", Out.TEXT)
+        else:
+            precheck = self._rl_run_precheck()
+            effective_role = precheck.get("role")
+            auth_required = precheck.get("auth_required")
+            open_relay = precheck.get("open_relay")
+
+            if effective_role is not None:
+                self.ptprint(
+                    f"    {info_icon} {self._rl_role_label(effective_role, self.args.target.port, auth_required)}",
+                    Out.TEXT,
+                )
+            else:
+                self.ptprint(
+                    f"    {info_icon} Role: could not be determined (pre-check failed)",
+                    Out.TEXT,
+                )
+
+            if effective_role in ("mta", "hybrid"):
+                if open_relay is True:
+                    self.ptprint(
+                        f"    {info_icon} Open relay: vulnerable (synthetic recipients accepted)",
+                        Out.TEXT,
+                    )
+                elif open_relay is False:
+                    self.ptprint(
+                        f"    {info_icon} Open relay: not vulnerable",
+                        Out.TEXT,
+                    )
+
+            # Decide test path
+            if effective_role in ("mta", "hybrid") and open_relay is False:
+                # MTA not acting as open relay → synthetic 1@dom would always be rejected.
+                # Build recipients from -w; without it, the test is skipped explicitly.
+                recipients = self._rl_build_recipients_from_wordlist(domain, max_rcpt_attempts)
+                if recipients:
+                    recipients_source = "wordlist"
+                    self.ptprint(
+                        f"    {info_icon} Using {len(recipients)} recipient(s) from wordlist (-w) "
+                        f"for MTA-not-relay probe",
+                        Out.TEXT,
+                    )
+                else:
+                    msg = (
+                        "Server is MTA without open relay; per-message RCPT TO limit cannot be tested "
+                        "with synthetic recipients. Pass -w with valid local mailboxes "
+                        "(or --rl-no-precheck to attempt a raw probe)."
+                    )
+                    self.ptprint(f"    {info_icon} Skipping: {msg}", Out.TEXT)
+                    return RcptLimitResult(
+                        max_accepted=0,
+                        limit_triggered=False,
+                        server_response=None,
+                        rejected_addresses=False,
+                        domain_used=domain,
+                        role=effective_role,
+                        auth_required=auth_required,
+                        open_relay=open_relay,
+                        skipped=True,
+                        skip_reason="mta_not_relay_no_wordlist",
+                        skip_message=msg,
+                        recipients_source=None,
+                    )
+
+            elif effective_role == "submission":
+                user, _pw = self._rl_first_creds()
+                if not user or not _pw:
+                    msg = (
+                        "Submission server requires authenticated session for RCPT TO probe. "
+                        "Pass -u/--user and -p/--password (or --rl-no-precheck for an anonymous probe)."
+                    )
+                    self.ptprint(f"    {info_icon} Skipping: {msg}", Out.TEXT)
+                    return RcptLimitResult(
+                        max_accepted=0,
+                        limit_triggered=False,
+                        server_response=None,
+                        rejected_addresses=False,
+                        domain_used=domain,
+                        role=effective_role,
+                        auth_required=auth_required,
+                        open_relay=open_relay,
+                        skipped=True,
+                        skip_reason="submission_auth_required",
+                        skip_message=msg,
+                        recipients_source=None,
+                    )
+
+            elif effective_role == "indeterminate":
+                self.ptprint(
+                    f"    {info_icon} Pre-check inconclusive — falling back to default RCPT TO probe",
+                    Out.TEXT,
+                )
 
         if _show_progress:
             threading.Thread(target=_ticker, daemon=True).start()
 
         smtp: smtplib.SMTP | None = None
+        auth_used = False
         try:
-            self.ptdebug("RCPT TO limit test (per message)", title=True)
-
-            # In standalone mode results.info is not yet set; populate it for domain resolution.
-            if not getattr(self.results, "info", None):
-                _, info = self.initial_info(get_commands=True)
-                self.results.info = InfoResult(
-                    info.banner,
-                    info.ehlo,
-                    getattr(info, "ehlo_starttls", None),
-                )
-                self.results.resolved_domain = self._get_domain_from_banner_or_ptr(self.results.info)
-                self.results.banner_requested = False
-                self.results.commands_requested = False
-
-            domain = self._get_rcpt_limit_domain()
-            raw_rl = getattr(self.args, "rcpt_limit", None)
-            if raw_rl is None:
-                max_rcpt_attempts = RCPT_LIMIT_DEFAULT_ATTEMPTS
-            else:
-                max_rcpt_attempts = int(raw_rl)
-            if max_rcpt_attempts < 1:
-                max_rcpt_attempts = RCPT_LIMIT_DEFAULT_ATTEMPTS
-            _max_probe_ref[0] = max_rcpt_attempts
-
             smtp = self.get_smtp_handler()
             smtp.docmd("EHLO", self.fqdn)
 
+            # Authenticate on the active socket for Submission servers (helper smtp.login)
+            if (not no_precheck) and effective_role == "submission":
+                user, passwd = self._rl_first_creds()
+                if user and passwd:
+                    try:
+                        if _show_progress:
+                            _live_label[0] = f"Authenticating as {user}..."
+                            _render_progress()
+                        smtp.login(user, passwd)
+                        auth_used = True
+                        self.ptdebug(f"AUTH LOGIN succeeded for user {user}", Out.INFO)
+                    except Exception as e:
+                        msg = f"AUTH LOGIN failed for {user}: {e}"
+                        self.ptdebug(msg, Out.INFO)
+                        if _show_progress:
+                            _end_progress()
+                        self.ptprint(
+                            f"    {get_colored_text('[✗]', color='VULN')} {msg}",
+                            Out.TEXT,
+                        )
+                        return RcptLimitResult(
+                            max_accepted=0,
+                            limit_triggered=False,
+                            server_response=str(e),
+                            rejected_addresses=False,
+                            domain_used=domain,
+                            role=effective_role,
+                            auth_required=auth_required,
+                            open_relay=open_relay,
+                            skipped=True,
+                            skip_reason="auth_failed",
+                            skip_message=msg,
+                            recipients_source=None,
+                        )
+
             self.ptdebug(
-                f"RCPT TO limit probe: domain={domain}, max attempts={max_rcpt_attempts}",
+                f"RCPT TO limit probe: domain={domain}, max attempts={max_rcpt_attempts}, "
+                f"recipients_source={recipients_source}, auth_used={auth_used}",
                 Out.INFO,
             )
             _live_label[0] = "Testing RCPT limit...  attempt 0"
@@ -4152,14 +5103,15 @@ class SMTP(BaseModule):
                 smtp, domain, max_rcpt_attempts=max_rcpt_attempts,
                 live_label=_live_label,
                 attempt_hook=_update_attempt if _show_progress else None,
+                recipients=recipients,
             )
             domain_used = domain
 
-            # If server rejected (e.g. "User unknown" for full hostname) and user did not set -d,
-            # retry with parent domain so test can succeed (e.g. festiveloft.net accepts 1@, 2@, ...).
-            # Skip retry when no_session_limit or session_limit_triggered – socket may be dead.
+            # Parent-domain retry only makes sense for synthetic recipients (1@dom). With a wordlist
+            # the addresses are already explicit, so we do not rewrite them.
             if (
-                getattr(result, "rejected_addresses", False)
+                recipients is None
+                and getattr(result, "rejected_addresses", False)
                 and not getattr(result, "no_session_limit", False)
                 and not getattr(result, "session_limit_triggered", False)
                 and not getattr(self.args, "domain", None)
@@ -4191,6 +5143,14 @@ class SMTP(BaseModule):
                 getattr(result, "failed_before_limit", 0),
                 getattr(result, "session_limit_triggered", False),
                 getattr(result, "no_session_limit", False),
+                role=effective_role,
+                auth_required=auth_required,
+                auth_used=auth_used,
+                open_relay=open_relay,
+                skipped=False,
+                skip_reason=None,
+                skip_message=None,
+                recipients_source=recipients_source,
             )
         finally:
             if _show_progress:
@@ -4586,19 +5546,16 @@ class SMTP(BaseModule):
 
     @staticmethod
     def _format_enum_clock_duration(elapsed: float) -> str:
-        """Format a non-negative duration as H:MM:SS.cs (used for elapsed and ETA)."""
+        """Format a non-negative duration as H:MM:SS (enumeration progress ETA / elapsed)."""
         elapsed = max(0.0, float(elapsed))
         total_sec = int(elapsed)
-        cs = int((elapsed - total_sec) * 100)
-        if cs >= 100:
-            cs = 99
         h, rem = divmod(total_sec, 3600)
         m, s = divmod(rem, 60)
-        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+        return f"{h}:{m:02d}:{s:02d}"
 
     @staticmethod
     def _format_enum_elapsed(start: float) -> str:
-        """Elapsed since start with centiseconds (distinct stamps when lines flush together)."""
+        """Elapsed since start (same format as ``_format_enum_clock_duration``)."""
         return SMTP._format_enum_clock_duration(time.time() - start)
 
     @staticmethod
@@ -4931,7 +5888,7 @@ class SMTP(BaseModule):
         time_part = (
             self._format_enum_clock_duration(eta_sec)
             if eta_sec is not None
-            else "--:--:00.00"
+            else "--:--:--"
         )
         line_core = f"{time_part} {pct}% {label}"
         self._raw_write(f"\033[2K\r{line_core}".encode("utf-8", errors="replace"))
@@ -4994,7 +5951,7 @@ class SMTP(BaseModule):
         time_part = (
             self._format_enum_clock_duration(eta_sec)
             if eta_sec is not None
-            else "--:--:00.00"
+            else "--:--:--"
         )
         line_core = f"{time_part} {pct}%"
         with self._enum_progress_print_lock:
@@ -5019,7 +5976,7 @@ class SMTP(BaseModule):
     def _enum_progress_newline(self) -> None:
         if self.use_json:
             return
-        # Drop the live ``0:00:00.00 100% …`` line; use ``\r`` only — trailing ``\n`` would leave a blank row before Catch-all.
+        # Drop the live ``0:00:00 100% …`` line; use ``\r`` only — trailing ``\n`` would leave a blank row before Catch-all.
         if getattr(self, "_enum_progress_line_dirty", False):
             self._raw_write(b"\033[2K\r")
             self._enum_progress_line_dirty = False
@@ -11644,6 +12601,15 @@ class SMTP(BaseModule):
         if rlim is None:
             return
         info_icon = get_colored_text("[*]", color="INFO")
+        # Pre-check verdict / skip path (printed live by test_rcpt_limit; nothing more to do
+        # here except announce the per-message verdict, which is already absent for skip cases).
+        if getattr(rlim, "skipped", False):
+            return
+        if getattr(rlim, "auth_used", False):
+            self.ptprint(
+                f"    {info_icon} Authenticated session used for RCPT TO probe",
+                Out.TEXT,
+            )
         if rcptmax_advertised is not None:
             self.ptprint(
                 f"    {info_icon} Advertised in EHLO (RFC 9422): RCPTMAX={rcptmax_advertised}",
@@ -12883,6 +13849,136 @@ class SMTP(BaseModule):
             icon = get_colored_text("[✗]", color="VULN")
             self.ptprint(f"    {icon} Rate limiting test failed: {err}", Out.TEXT)
 
+    def _stream_noop_flood1_result(self) -> None:
+        """Render verdicts for -nf1 (NOOP Flooding, single connection)."""
+        if (err := self.results.noop_flood1_error) is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} NOOP flood test failed: {err}", Out.TEXT)
+            return
+
+        r = self.results.noop_flood1
+        if r is None:
+            return
+
+        vuln_icon = get_colored_text("[✗]", color="VULN")
+        ok_icon = get_colored_text("[OK]", color="NOTVULN")
+
+        # 1) Disconnect behaviour.
+        if r.disconnected and r.disconnect_after is not None:
+            if r.disconnect_after <= NOOP_FLOOD_DISCONNECT_OK_MAX:
+                self.ptprint(
+                    f"    {ok_icon} Server disconnect after {r.disconnect_after} NOOP commands",
+                    Out.TEXT,
+                )
+            else:
+                self.ptprint(
+                    f"    {vuln_icon} Server disconnects only after {r.disconnect_after} "
+                    f"NOOP commands (more than {NOOP_FLOOD_DISCONNECT_OK_MAX} accepted)",
+                    Out.TEXT,
+                )
+        else:
+            suffix = " (hit time cap)" if r.hit_time_cap else " (hit command cap)"
+            self.ptprint(
+                f"    {vuln_icon} No disconnect after {r.commands_sent} NOOP commands{suffix}",
+                Out.TEXT,
+            )
+
+        # 2) Time-trolling / tarpitting.
+        if r.baseline_avg_seconds is not None and r.last_window_avg_seconds is not None:
+            min_d = _noop_rt_window_display(r.min_rt_seconds)
+            max_d = _noop_rt_window_display(r.max_rt_seconds)
+            avg_d = _noop_rt_window_display(r.avg_rt_seconds)
+            if r.slowdown_detected:
+                self.ptprint(
+                    f"    {ok_icon} Time between two commands ({min_d} - {max_d}, avg {avg_d})",
+                    Out.TEXT,
+                )
+                self.ptprint(
+                    f"    {ok_icon} Time trolting is configured "
+                    f"(baseline {_noop_rt_window_display(r.baseline_avg_seconds)} → "
+                    f"last {_noop_rt_window_display(r.last_window_avg_seconds)})",
+                    Out.TEXT,
+                )
+            else:
+                self.ptprint(
+                    f"    {ok_icon} Time between two commands ({min_d} - {max_d}, avg {avg_d})",
+                    Out.TEXT,
+                )
+                self.ptprint(
+                    f"    {vuln_icon} No time trolting is configured",
+                    Out.TEXT,
+                )
+        else:
+            self.ptprint(
+                f"    {vuln_icon} No time trolting is configured (not enough samples)",
+                Out.TEXT,
+            )
+
+        # 3) Error rate.
+        err_rate = r.error_rate_pct
+        if err_rate <= NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:
+            self.ptprint(
+                f"    {ok_icon} Error rate: {err_rate:.0f}%",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"    {vuln_icon} Error rate: {err_rate:.0f}% "
+                f"(over {NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:.0f}%)",
+                Out.TEXT,
+            )
+
+    def _stream_noop_flood2_result(self) -> None:
+        """Render verdicts for -nf2 (NOOP Flooding DoS test, parallel connections)."""
+        if (err := self.results.noop_flood2_error) is not None:
+            icon = get_colored_text("[✗]", color="VULN")
+            self.ptprint(f"    {icon} NOOP DoS flood test failed: {err}", Out.TEXT)
+            return
+
+        r = self.results.noop_flood2
+        if r is None:
+            return
+
+        vuln_icon = get_colored_text("[✗]", color="VULN")
+        ok_icon = get_colored_text("[OK]", color="NOTVULN")
+
+        # 1) Time between two commands (average reaction time under load).
+        if r.avg_rt_seconds is not None:
+            min_d = _noop_rt_window_display(r.min_rt_seconds)
+            max_d = _noop_rt_window_display(r.max_rt_seconds)
+            avg_d = _noop_rt_window_display(r.avg_rt_seconds)
+            if r.avg_rt_seconds > NOOP_FLOOD2_AVG_TIME_OK_MAX_SECONDS:
+                self.ptprint(
+                    f"    {vuln_icon} Time between two commands ({min_d} - {max_d}, avg {avg_d}) "
+                    f"— over {NOOP_FLOOD2_AVG_TIME_OK_MAX_SECONDS:.0f}s avg under load",
+                    Out.TEXT,
+                )
+            else:
+                self.ptprint(
+                    f"    {ok_icon} Time between two commands ({min_d} - {max_d}, avg {avg_d})",
+                    Out.TEXT,
+                )
+        else:
+            self.ptprint(
+                f"    {vuln_icon} Time between two commands: no successful replies "
+                f"({r.commands_sent} sent)",
+                Out.TEXT,
+            )
+
+        # 2) Error rate under load.
+        err_rate = r.error_rate_pct
+        if err_rate <= NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:
+            self.ptprint(
+                f"    {ok_icon} Error rate: {err_rate:.0f}%",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"    {vuln_icon} Error rate: {err_rate:.0f}% "
+                f"(over {NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:.0f}%)",
+                Out.TEXT,
+            )
+
     def _on_brute_success(self, cred: Creds) -> None:
         """Callback for real-time streaming of found credentials (thread-safe)."""
         with self._brute_stream_lock:
@@ -13084,7 +14180,27 @@ class SMTP(BaseModule):
             parts.append(f"Role error: {role_err}")
 
         if (rlim := self.results.rcpt_limit) is not None:
-            if getattr(rlim, "session_limit_triggered", False):
+            # Pre-check context (role / open relay) — visible in JSON description for analysts.
+            if getattr(rlim, "role", None):
+                role_bits = [f"Role: {rlim.role}"]
+                ar = getattr(rlim, "auth_required", None)
+                if ar is True:
+                    role_bits.append("AUTH required")
+                elif ar is False:
+                    role_bits.append("AUTH not required")
+                if getattr(rlim, "auth_used", False):
+                    role_bits.append("authenticated probe")
+                _or = getattr(rlim, "open_relay", None)
+                if _or is True:
+                    role_bits.append("open relay")
+                elif _or is False:
+                    role_bits.append("not open relay")
+                parts.append(", ".join(role_bits))
+            if getattr(rlim, "skipped", False):
+                parts.append(
+                    f"RCPT TO limit test skipped: {getattr(rlim, 'skip_message', None) or rlim.skip_reason}"
+                )
+            elif getattr(rlim, "session_limit_triggered", False):
                 failed = getattr(rlim, "failed_before_limit", 0)
                 parts.append(f"Session limit enforced after {failed} failed RCPTs")
             elif getattr(rlim, "rejected_addresses", False) and getattr(rlim, "no_session_limit", False):
@@ -13133,33 +14249,76 @@ class SMTP(BaseModule):
         elif self.results.blacklist_private_ip_skipped:
             parts.append("Blacklist check skipped (private IP)")
 
+        if (nf1 := self.results.noop_flood1) is not None:
+            nf1_parts = [
+                f"Commands sent: {nf1.commands_sent} (ok={nf1.commands_ok}, err={nf1.commands_error})",
+            ]
+            if nf1.disconnected and nf1.disconnect_after is not None:
+                nf1_parts.append(f"Disconnect after: {nf1.disconnect_after} NOOP commands")
+            else:
+                nf1_parts.append("Disconnect: none observed")
+            if nf1.avg_rt_seconds is not None:
+                nf1_parts.append(
+                    "Time between commands: "
+                    f"{_noop_rt_window_display(nf1.min_rt_seconds)} - "
+                    f"{_noop_rt_window_display(nf1.max_rt_seconds)} "
+                    f"(avg {_noop_rt_window_display(nf1.avg_rt_seconds)})"
+                )
+            nf1_parts.append(f"Slowdown detected: {'yes' if nf1.slowdown_detected else 'no'}")
+            nf1_parts.append(f"Error rate: {nf1.error_rate_pct:.0f}%")
+            parts.append("\r\n".join(nf1_parts))
+        elif (nf1_err := self.results.noop_flood1_error) is not None:
+            parts.append(f"NOOP flood (1 connection) error: {nf1_err}")
+
+        if (nf2 := self.results.noop_flood2) is not None:
+            nf2_parts = [
+                f"Connections: {nf2.established_connections}/{nf2.requested_connections}",
+                f"Duration: {nf2.run_duration_seconds:.0f}s",
+                f"Commands sent: {nf2.commands_sent} "
+                f"(ok={nf2.commands_ok}, err={nf2.commands_error})",
+            ]
+            if nf2.avg_rt_seconds is not None:
+                nf2_parts.append(
+                    "Time between commands: "
+                    f"{_noop_rt_window_display(nf2.min_rt_seconds)} - "
+                    f"{_noop_rt_window_display(nf2.max_rt_seconds)} "
+                    f"(avg {_noop_rt_window_display(nf2.avg_rt_seconds)})"
+                )
+            nf2_parts.append(f"Error rate: {nf2.error_rate_pct:.0f}%")
+            parts.append("\r\n".join(nf2_parts))
+        elif (nf2_err := self.results.noop_flood2_error) is not None:
+            parts.append(f"NOOP flood DoS error: {nf2_err}")
+
         if rl := self.results.rate_limit:
             rl_parts = []
             rl_parts.append(f"Connected: {rl.connected if rl.connected is not None else 'N/A'}")
             # Ban duration is only meaningful when we ran the ban-duration probe.
             if rl.ban_duration_probe_ran:
                 if rl.ban_duration_seconds is not None:
-                    mm = int(rl.ban_duration_seconds // 60)
-                    ss = int(rl.ban_duration_seconds % 60)
                     rl_parts.append(
-                        f"Ban duration: {mm:02d}:{ss:02d}"
-                        + (" (exceeded 5 min)" if rl.ban_duration_exceeded else "")
+                        "Ban duration: "
+                        + _rate_limit_duration_display(
+                            rl.ban_duration_seconds,
+                            rl.ban_duration_exceeded,
+                        )
                     )
                 else:
                     rl_parts.append("Ban duration: N/A")
             if rl.initial_timeout_seconds is not None:
-                mm = int(rl.initial_timeout_seconds // 60)
-                ss = int(rl.initial_timeout_seconds % 60)
                 rl_parts.append(
-                    f"Initial response timeout (without EHLO): {mm:02d}:{ss:02d}"
-                    + (" (exceeded 5 min)" if rl.initial_timeout_exceeded else "")
+                    "Initial response timeout (without EHLO): "
+                    + _rate_limit_duration_display(
+                        rl.initial_timeout_seconds,
+                        rl.initial_timeout_exceeded,
+                    )
                 )
             if rl.idle_timeout_seconds is not None:
-                mm = int(rl.idle_timeout_seconds // 60)
-                ss = int(rl.idle_timeout_seconds % 60)
                 rl_parts.append(
-                    f"Idle timeout (after EHLO): {mm:02d}:{ss:02d}"
-                    + (" (exceeded 5 min)" if rl.idle_timeout_exceeded else "")
+                    "Idle timeout (after EHLO): "
+                    + _rate_limit_duration_display(
+                        rl.idle_timeout_seconds,
+                        rl.idle_timeout_exceeded,
+                    )
                 )
             parts.append("\r\n".join(rl_parts))
         elif (rl_err := self.results.rate_limit_error) is not None:
@@ -13251,6 +14410,33 @@ class SMTP(BaseModule):
         if (blacklist := self.results.blacklist) is not None:
             if blacklist.listed:
                 vulns.append({"vuln_code": VULNS.Blacklist.value})
+
+        if (nf1 := self.results.noop_flood1) is not None:
+            # No disconnect, or disconnect only after far too many NOOPs.
+            if not nf1.disconnected or (
+                nf1.disconnect_after is not None
+                and nf1.disconnect_after > NOOP_FLOOD_DISCONNECT_OK_MAX
+            ):
+                vulns.append({"vuln_code": VULNS.NoopFloodNoLimit.value})
+            # Enough samples to judge time-trolling and we did not see it.
+            if (
+                nf1.baseline_avg_seconds is not None
+                and nf1.last_window_avg_seconds is not None
+                and nf1.commands_ok >= 20
+                and not nf1.slowdown_detected
+            ):
+                vulns.append({"vuln_code": VULNS.NoopFloodNoTrottle.value})
+            if nf1.error_rate_pct > NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:
+                vulns.append({"vuln_code": VULNS.NoopFloodErrors.value})
+
+        if (nf2 := self.results.noop_flood2) is not None:
+            if (
+                nf2.avg_rt_seconds is not None
+                and nf2.avg_rt_seconds > NOOP_FLOOD2_AVG_TIME_OK_MAX_SECONDS
+            ):
+                vulns.append({"vuln_code": VULNS.NoopFloodDosSlow.value})
+            if nf2.error_rate_pct > NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:
+                vulns.append({"vuln_code": VULNS.NoopFloodDosErrors.value})
 
         if rl := self.results.rate_limit:
             if rl.connected is not None and rl.connected >= RATE_LIMIT_CONN_VULN_THRESHOLD:
@@ -13362,12 +14548,41 @@ class SMTP(BaseModule):
             return props, vulns
         if rcptmax_advertised is not None:
             props["rcptLimitAdvertised"] = rcptmax_advertised
+
+        # Pre-check context (role + open-relay verdict + auth) is recorded for *every* outcome so
+        # the JSON consumer always knows in which configuration the result was produced.
+        precheck_obj: dict = {}
+        if getattr(rlim, "role", None):
+            precheck_obj["role"] = rlim.role
+        ar = getattr(rlim, "auth_required", None)
+        if ar is not None:
+            precheck_obj["authRequired"] = bool(ar)
+        if getattr(rlim, "auth_used", False):
+            precheck_obj["authUsed"] = True
+        if getattr(rlim, "open_relay", None) is not None:
+            precheck_obj["openRelay"] = bool(rlim.open_relay)
+        if getattr(rlim, "recipients_source", None):
+            precheck_obj["recipientsSource"] = rlim.recipients_source
+
+        # Skipped: emit a structured record but no vulnerability code.
+        if getattr(rlim, "skipped", False):
+            skip_obj: dict = {
+                "skipped": True,
+                "skipReason": getattr(rlim, "skip_reason", None),
+                "skipMessage": getattr(rlim, "skip_message", None),
+            }
+            if precheck_obj:
+                skip_obj["precheck"] = precheck_obj
+            props["rcptLimit"] = skip_obj
+            return props, vulns
+
         if getattr(rlim, "session_limit_triggered", False):
             props["rcptLimit"] = {
                 "sessionLimitTriggered": True,
                 "failedBeforeLimit": getattr(rlim, "failed_before_limit", 0),
                 "maxAccepted": rlim.max_accepted,
                 "serverResponse": rlim.server_response,
+                **({"precheck": precheck_obj} if precheck_obj else {}),
             }
             return props, vulns
         if getattr(rlim, "rejected_addresses", False):
@@ -13389,21 +14604,29 @@ class SMTP(BaseModule):
                     )
                 else:
                     vulns.append({"vuln_code": VULNS.ManyRcptReject.value})
+            if precheck_obj:
+                rcpt_obj["precheck"] = precheck_obj
             props["rcptLimit"] = rcpt_obj
             return props, vulns
         if rlim.limit_triggered:
-            props["rcptLimit"] = {"maxAccepted": rlim.max_accepted, "limitTriggered": True}
+            obj: dict = {"maxAccepted": rlim.max_accepted, "limitTriggered": True}
+            if precheck_obj:
+                obj["precheck"] = precheck_obj
+            props["rcptLimit"] = obj
             ma = rlim.max_accepted if rlim.max_accepted is not None else 0
             if ma > RCPT_LIMIT_VERDICT_WARN_MAX:
                 vulns.append({"vuln_code": VULNS.ManyRcpt.value})
             return props, vulns
         if rlim.max_accepted == 0:
-            props["rcptLimit"] = {"maxAccepted": 0, "limitTriggered": False, "couldNotTest": True}
+            obj = {"maxAccepted": 0, "limitTriggered": False, "couldNotTest": True}
         else:
-            props["rcptLimit"] = {"maxAccepted": rlim.max_accepted, "limitTriggered": False}
+            obj = {"maxAccepted": rlim.max_accepted, "limitTriggered": False}
             ma = rlim.max_accepted if rlim.max_accepted is not None else 0
             if ma > RCPT_LIMIT_VERDICT_WARN_MAX:
                 vulns.append({"vuln_code": VULNS.ManyRcpt.value})
+        if precheck_obj:
+            obj["precheck"] = precheck_obj
+        props["rcptLimit"] = obj
         return props, vulns
 
     def output(self) -> None:
@@ -14442,6 +15665,48 @@ class SMTP(BaseModule):
                 "initialTimeoutExceeded": rl.initial_timeout_exceeded,
                 "idleTimeoutSeconds": rl.idle_timeout_seconds,
                 "idleTimeoutExceeded": rl.idle_timeout_exceeded,
+            })
+
+        # NOOP flood 1 (-nf1)
+        if (nf1_err := self.results.noop_flood1_error) is not None:
+            properties.update({"noopFlood1Error": nf1_err})
+        elif (nf1 := self.results.noop_flood1) is not None:
+            properties.update({
+                "noopFlood1": {
+                    "commandsSent": nf1.commands_sent,
+                    "commandsOk": nf1.commands_ok,
+                    "commandsError": nf1.commands_error,
+                    "disconnected": nf1.disconnected,
+                    "disconnectAfter": nf1.disconnect_after,
+                    "hitCommandCap": nf1.hit_command_cap,
+                    "hitTimeCap": nf1.hit_time_cap,
+                    "minRtSeconds": nf1.min_rt_seconds,
+                    "maxRtSeconds": nf1.max_rt_seconds,
+                    "avgRtSeconds": nf1.avg_rt_seconds,
+                    "baselineAvgSeconds": nf1.baseline_avg_seconds,
+                    "lastWindowAvgSeconds": nf1.last_window_avg_seconds,
+                    "slowdownDetected": nf1.slowdown_detected,
+                    "errorRatePct": nf1.error_rate_pct,
+                }
+            })
+
+        # NOOP flood 2 (-nf2)
+        if (nf2_err := self.results.noop_flood2_error) is not None:
+            properties.update({"noopFlood2Error": nf2_err})
+        elif (nf2 := self.results.noop_flood2) is not None:
+            properties.update({
+                "noopFlood2": {
+                    "requestedConnections": nf2.requested_connections,
+                    "establishedConnections": nf2.established_connections,
+                    "runDurationSeconds": nf2.run_duration_seconds,
+                    "commandsSent": nf2.commands_sent,
+                    "commandsOk": nf2.commands_ok,
+                    "commandsError": nf2.commands_error,
+                    "minRtSeconds": nf2.min_rt_seconds,
+                    "maxRtSeconds": nf2.max_rt_seconds,
+                    "avgRtSeconds": nf2.avg_rt_seconds,
+                    "errorRatePct": nf2.error_rate_pct,
+                }
             })
 
         # Login bruteforce

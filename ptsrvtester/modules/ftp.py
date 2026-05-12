@@ -27,9 +27,20 @@ from .utils.helpers import (
     text_or_file,
 )
 from .utils.service_identification import identify_service
+from .decompression_payloads import BILLION_LAUGHS_XML, build_full_zip_bomb, build_minimal_zip_bomb
 
 
 # region helper methods
+
+# Canonical EICAR test file payload (68 bytes; harmless, universally recognized AV test pattern).
+EICAR_STANDARD_TEST_FILE = (
+    b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+)
+
+# FTP processing-resilience: warn if control channel stays quiet too long after last data byte → 226, or NOOP is slow.
+FTP_DOS_DELTA_WARN_SEC = 2.0
+FTP_DOS_NOOP_WARN_SEC = 3.0
+FTP_DOS_POLICY_BLOCK_CODES = frozenset({450, 451, 452, 550, 551, 552, 553, 554})
 
 
 class TestFailedError(Exception):
@@ -65,6 +76,38 @@ def valid_target_bounce(target: str) -> Target:
 def nop_callback(_: str):
     """RETR callback helper"""
     pass
+
+
+def _ftp_list_line_directory_rel_name(line: str) -> str | None:
+    """
+    Relative directory name from a Unix-style FTP LIST row (drwx…).
+    Supports:
+      - "... Mon DD  YYYY name" / "... Mon DD YYYY name" (year = 4 digits)
+      - "... Mon DD HH:MM name" (time contains ':')
+      - legacy "... timestamp with single ':' ... name" heuristic (narrow case)
+    """
+    stripped = (line or "").rstrip("\r\n")
+    if len(stripped) < 11 or stripped[0] != "d":
+        return None
+    parts = stripped.split()
+    if len(parts) >= 9:
+        tok7 = parts[7]
+        if len(tok7) == 4 and tok7.isdigit():
+            cand = " ".join(parts[8:]).strip()
+            return cand or None
+        if ":" in tok7:
+            cand = " ".join(parts[8:]).strip()
+            return cand or None
+    if ":" not in stripped:
+        return None
+    try:
+        after_colon = stripped.split(":", 1)[1]
+        remainder = after_colon.split(None, 1)
+        if len(remainder) < 2:
+            return None
+        return remainder[1].strip() or None
+    except Exception:
+        return None
 
 
 # endregion
@@ -136,6 +179,82 @@ class AccessPermissions:
 class AccessCheckResult(NamedTuple):
     errors: list[str] | None
     results: list[AccessPermissions] | None
+
+
+class FtpEicarRow(NamedTuple):
+    """One account’s EICAR upload / post-upload verification (PTL-SVC-FTP-ANTIVIRUS)."""
+
+    creds: Creds
+    remote_path: str
+    stor_ok: bool
+    stor_error: str | None
+    post_stor_delay_seconds: float
+    size_bytes: int | None
+    size_error: str | None
+    retr_ok: bool
+    retr_payload_match: bool | None
+    retr_error: str | None
+    vanished_after_stor_suspected: bool
+    on_access_scan_suspected: bool
+    delete_ok: bool
+    delete_error: str | None
+    delete_note: str | None
+
+
+class FtpEicarAuditResult(NamedTuple):
+    """Aggregate EICAR / on-access probe result."""
+
+    post_stor_delay_seconds: float
+    rows: tuple[FtpEicarRow, ...]
+    detail: str
+    risky_content_reachable: bool
+    upload_blocked_all: bool
+
+
+class FtpStorTimingOutcome(NamedTuple):
+    """STOR timing slice: totals and delay from last client data byte to final control reply (usually 226)."""
+
+    ok: bool
+    error: str | None
+    reply_code: int | None
+    reply_line: str | None
+    total_seconds: float | None
+    delta_last_byte_to_226_seconds: float | None
+    timed_out: bool
+
+
+class FtpDosProbeRow(NamedTuple):
+    """One payload in the FTP processing-resilience session (PTL-SVC-FTP-PROC-DOS)."""
+
+    probe_label: str
+    remote_filename: str
+    payload_bytes: int
+    stor_ok: bool
+    stor_error: str | None
+    stor_reply_snippet: str | None
+    reply_code: int | None
+    total_transfer_seconds: float | None
+    delta_last_byte_to_226_seconds: float | None
+    noop_ok: bool | None
+    noop_error: str | None
+    noop_elapsed_seconds: float | None
+    blocked_by_policy: bool
+    background_processing_suspected: bool
+    timed_out: bool
+    delete_ok: bool
+    delete_error: str | None
+
+
+class FtpDosAuditResult(NamedTuple):
+    """Single-session XML + ZIP processing stress (default minimal zip; optional full bomb)."""
+
+    timeout_seconds: float
+    zip_mode: str
+    creds_user: str
+    probes: tuple[FtpDosProbeRow, ...]
+    detail: str
+    post_processing_dos_suspected: bool
+    all_blocked_by_policy: bool
 
 
 class InfoResult(NamedTuple):
@@ -533,6 +652,10 @@ class FTPResults:
     conn_limits_error: str | None = None
     chroot_audit: ChrootAuditResult | None = None
     chroot_audit_error: str | None = None
+    eicar_audit: FtpEicarAuditResult | None = None
+    eicar_audit_error: str | None = None
+    dos_audit: FtpDosAuditResult | None = None
+    dos_audit_error: str | None = None
 
 
 class VULNS(Enum):
@@ -547,6 +670,8 @@ class VULNS(Enum):
     FtpPassivePortRange = "PTL-SVC-FTP-PASIVE"
     FtpConnectionLimits = "PTL-SVC-FTP-CONN"
     FtpChrootIsolation = "PTL-SVC-FTP-CHROOT"
+    FtpAntivirusEicar = "PTL-SVC-FTP-ANTIVIRUS"
+    FtpProcessingResilience = "PTL-SVC-FTP-PROC-DOS"
 
 
 # endregion
@@ -566,6 +691,11 @@ class FTPArgs(ArgsWithBruteforce):
     bounce: Target | None
     bounce_file: str | None
     isencrypt: bool
+    eicar_probe: bool
+    eicar_post_stor_delay: float
+    ftp_dos_probes: bool
+    ftp_dos_timeout: float
+    ftp_dos_force_large: bool
 
     @staticmethod
     def get_help():
@@ -585,6 +715,10 @@ class FTPArgs(ArgsWithBruteforce):
                 "ptsrvtester ftp -AR 127.0.0.1",
                 "ptsrvtester ftp -L 127.0.0.1",
                 "ptsrvtester ftp -u user -p pass -J 127.0.0.1",
+                "ptsrvtester ftp -A --eicar 127.0.0.1",
+                "ptsrvtester ftp -u user -p pass --eicar --eicar-post-stor-delay 0.5 127.0.0.1",
+                "ptsrvtester ftp -A --ftp-dos-probes 127.0.0.1",
+                "ptsrvtester ftp -u user -p pass --ftp-dos-probes --ftp-dos-timeout 45 127.0.0.1",
             ]},
             {"options": [
                 ["-i", "--info", "", "Grab banner and inspect HELP, SYST, STAT commands"],
@@ -635,6 +769,11 @@ class FTPArgs(ArgsWithBruteforce):
                 ["", "--base-path", "<path>", "Start directory for enumeration"],
                 ["-h", "--help", "", "Show this help message and exit"],
                 ["-vv", "--verbose", "", "Enable verbose mode"],
+                ["", "--eicar", "", "EICAR upload + delayed SIZE/RETR probe (on-access AV); needs -A or -u/-p / wordlists"],
+                ["", "--eicar-post-stor-delay", "<sec>", "Seconds to wait after STOR before verify (default 0.5)"],
+                ["", "--ftp-dos-probes", "", "XML + ZIP processing-resilience probes (off by default; needs -A or -u/-p / wordlists)"],
+                ["", "--ftp-dos-timeout", "<sec>", "Per-operation socket timeout for DoS probes (default 30)"],
+                ["", "--ftp-dos-force-large", "", "Use full zip bomb instead of minimal (isolated labs only)"],
             ]}
         ]
 
@@ -654,6 +793,9 @@ class FTPArgs(ArgsWithBruteforce):
   ptsrvtester ftp -AR 127.0.0.1
   ptsrvtester ftp -L 127.0.0.1
   ptsrvtester ftp -u user -p pass -J 127.0.0.1
+  ptsrvtester ftp -A --eicar 127.0.0.1
+  ptsrvtester ftp -u user -p pass --eicar --eicar-post-stor-delay 0.5 127.0.0.1
+  ptsrvtester ftp -A --ftp-dos-probes --ftp-dos-timeout 30 127.0.0.1
   ptsrvtester ftp -AL --conn-limits-idle-pre-auth 120 127.0.0.1
   ptsrvtester -j ftp -u admin -P passwords.txt --brute-threads 20 127.0.0.1:21
 
@@ -986,6 +1128,50 @@ Credentials:
             help="max usernames taken from wordlist after comments/blank skip (0 = no limit)",
         )
 
+        eic_grp = parser.add_argument_group(
+            "ANTIVIRUS / EICAR",
+            "Standard EICAR test string over FTP (harmless; authorized targets only).",
+        )
+        eic_grp.add_argument(
+            "--eicar",
+            action="store_true",
+            dest="eicar_probe",
+            help="upload EICAR .com test file, delay, SIZE+RETR verification, DELE cleanup (needs -A or -u/-p or wordlists)",
+        )
+        eic_grp.add_argument(
+            "--eicar-post-stor-delay",
+            type=float,
+            default=0.5,
+            dest="eicar_post_stor_delay",
+            metavar="<sec>",
+            help="wait after successful STOR before SIZE/RETR (default 0.5) so on-access scanners can act",
+        )
+
+        dos_grp = parser.add_argument_group(
+            "FTP PROCESSING RESILIENCE (DoS probes)",
+            "Off by default: small XML/ZIP payloads that may stress scanners or indexers post-STOR. Authorized targets only.",
+        )
+        dos_grp.add_argument(
+            "--ftp-dos-probes",
+            action="store_true",
+            dest="ftp_dos_probes",
+            help="single-session STOR probes (Billion Laughs XML + zip bomb); requires -A or -u/-p / wordlists",
+        )
+        dos_grp.add_argument(
+            "--ftp-dos-timeout",
+            type=float,
+            default=30.0,
+            dest="ftp_dos_timeout",
+            metavar="<sec>",
+            help="socket timeout for STOR/NOOP in processing probes (default 30)",
+        )
+        dos_grp.add_argument(
+            "--ftp-dos-force-large",
+            action="store_true",
+            dest="ftp_dos_force_large",
+            help="replace minimal zip with large expansion payload (isolated lab only)",
+        )
+
         add_bruteforce_args(parser)
 
 
@@ -1012,6 +1198,38 @@ class FTP(BaseModule):
                 raise argparse.ArgumentError(None, "--bounce-file requires also --access")
             if args.access_list:
                 raise argparse.ArgumentError(None, "--access-list requires also --access")
+
+        if getattr(args, "eicar_probe", False):
+            if not args.anonymous and not check_if_brute(args):
+                raise argparse.ArgumentError(
+                    None,
+                    "--eicar requires --anonymous (-A) or credentials (-u/-p or -U/-P wordlists)",
+                )
+            d = float(getattr(args, "eicar_post_stor_delay", 0.5) or 0.0)
+            if d < 0 or d > 300:
+                raise argparse.ArgumentError(
+                    None,
+                    "--eicar-post-stor-delay must be between 0 and 300 seconds",
+                )
+
+        if getattr(args, "ftp_dos_probes", False):
+            if not args.anonymous and not check_if_brute(args):
+                raise argparse.ArgumentError(
+                    None,
+                    "--ftp-dos-probes requires --anonymous (-A) or credentials (-u/-p or -U/-P wordlists)",
+                )
+            dto = float(getattr(args, "ftp_dos_timeout", 30.0) or 30.0)
+            if dto < 5.0 or dto > 600.0:
+                raise argparse.ArgumentError(
+                    None,
+                    "--ftp-dos-timeout must be between 5 and 600 seconds",
+                )
+
+        if getattr(args, "ftp_dos_force_large", False) and not getattr(args, "ftp_dos_probes", False):
+            raise argparse.ArgumentError(
+                None,
+                "--ftp-dos-force-large requires --ftp-dos-probes",
+            )
 
         enum_paths = getattr(args, "enum_paths", False)
         if enum_paths:
@@ -1120,6 +1338,7 @@ class FTP(BaseModule):
         self._streamed_encryption = False
         self._streamed_anonymous = False
         self._streamed_brute = False
+        self._streamed_access = False
 
     def _is_run_all_mode(self) -> bool:
         """True when only target is given (no test switches). Run all tests in sequence."""
@@ -1144,7 +1363,16 @@ class FTP(BaseModule):
             or getattr(self.args, "cmd_audit_active", False)
             or getattr(self.args, "invalid_cmd_audit", False)
             or getattr(self.args, "user_enum", False)
+            or getattr(self.args, "eicar_probe", False)
+            or getattr(self.args, "ftp_dos_probes", False)
         )
+
+    def _emit_section_heading(self, title: str) -> None:
+        """Print section title before work starts (align with SMTP progressive terminal UX)."""
+        if self.use_json:
+            return
+        with self._output_lock:
+            self.ptprint(title, Out.INFO)
 
     def _ftp_any_primary_action(self) -> bool:
         """True if any test flag is set other than standalone -eu (used for user-enum-only fast path)."""
@@ -1169,6 +1397,8 @@ class FTP(BaseModule):
             or getattr(a, "cmd_audit", False)
             or getattr(a, "cmd_audit_active", False)
             or getattr(a, "invalid_cmd_audit", False)
+            or getattr(a, "eicar_probe", False)
+            or getattr(a, "ftp_dos_probes", False)
         )
 
     def _fail(self, msg: str) -> None:
@@ -1205,7 +1435,10 @@ class FTP(BaseModule):
             and not self.args.bounce
             and not self.do_brute
             and not getattr(self.args, "user_enum", False)
+            and not getattr(self.args, "eicar_probe", False)
+            and not getattr(self.args, "ftp_dos_probes", False)
         ):
+            self._emit_section_heading("Encryption")
             try:
                 self.results.encryption = self.test_encryption()
             except Exception as e:
@@ -1226,10 +1459,12 @@ class FTP(BaseModule):
             self.results.info_error = str(e)
             return
 
-        # Anonymous (info/STAT may need login; run before info when both requested)
+        # Anonymous (stream immediately; --access details live under [+] Access check after access_check)
         if self.args.anonymous:
+            self._emit_section_heading("Anonymous authentication")
             self.results.anonymous = self.anonymous()
-            self._stream_anonymous_result()
+            if not self.use_json:
+                self._stream_anonymous_result()
 
         # Bruteforce (info/STAT may need creds for STAT when anonymous disabled)
         if self.do_brute:
@@ -1257,6 +1492,7 @@ class FTP(BaseModule):
             self.results.banner_requested = do_banner
             self.results.commands_requested = do_commands
             try:
+                self._emit_section_heading("Banner")
                 info = self.info(get_commands=do_commands)
                 self.results.info = InfoResult(
                     info.banner if do_banner else None,
@@ -1270,6 +1506,7 @@ class FTP(BaseModule):
 
         # Encryption test (-ie)
         if isencrypt:
+            self._emit_section_heading("Encryption")
             try:
                 self.results.encryption = self.test_encryption()
             except Exception as e:
@@ -1278,9 +1515,13 @@ class FTP(BaseModule):
 
         # Access check
         if self.args.access:
+            self._emit_section_heading("Access check")
             self.results.access = self.access_check()
             if self.args.bounce:
                 self.results.bounce = self.bounce()
+
+        if self.args.access and not self.use_json:
+            self._stream_access_check_terminal()
 
         # Path enumeration (dictionary attack)
         if getattr(self.args, "enum_paths", False):
@@ -1289,8 +1530,7 @@ class FTP(BaseModule):
                 try:
                     paths_raw = text_or_file(None, self.args.paths_wordlist)
                     paths = [p.strip() for p in paths_raw if p.strip() and not p.strip().startswith("#")]
-                    if not self.use_json:
-                        self.ptprint("Path enumeration", Out.INFO)
+                    self._emit_section_heading("Path enumeration")
                     self.results.path_enum = self.path_enumeration(creds, paths)
                 except Exception as e:
                     self.results.path_enum_error = str(e)
@@ -1302,6 +1542,7 @@ class FTP(BaseModule):
             creds = self._get_path_enum_creds()
             if creds is not None:
                 try:
+                    self._emit_section_heading("Data mode")
                     self.results.modes = self.test_modes(creds)
                 except Exception as e:
                     self.results.modes_error = str(e)
@@ -1395,6 +1636,18 @@ class FTP(BaseModule):
             except Exception as e:
                 self.results.user_enum_error = str(e)
 
+        if getattr(self.args, "eicar_probe", False):
+            try:
+                self.results.eicar_audit = self.test_eicar_antivirus_probe()
+            except Exception as e:
+                self.results.eicar_audit_error = str(e)
+
+        if getattr(self.args, "ftp_dos_probes", False):
+            try:
+                self.results.dos_audit = self.test_ftp_processing_resilience_probes()
+            except Exception as e:
+                self.results.dos_audit_error = str(e)
+
     def _ftp_is_single_known_login(self) -> bool:
         """True when CLI supplies one username and one password (no -U/-P wordlists)."""
         u = getattr(self.args, "user", None)
@@ -1418,6 +1671,7 @@ class FTP(BaseModule):
         self.results.commands_requested = True
         try:
             self.ftp = self.connect()
+            self._emit_section_heading("Banner")
             self.results.info = self.info(get_commands=True)
             self._stream_banner_result()
         except TestFailedError as e:
@@ -1429,15 +1683,19 @@ class FTP(BaseModule):
 
         # 2. Anonymous authentication
         try:
+            self._emit_section_heading("Anonymous authentication")
             self.results.anonymous = self.anonymous()
-            self._stream_anonymous_result()
         except TestFailedError as e:
             self.results.anonymous_error = str(e)
         except Exception as e:
             self.results.anonymous_error = str(e)
+        else:
+            if not self.use_json:
+                self._stream_anonymous_result()
 
         # 3. Access check (only if anonymous is enabled)
         if self.results.anonymous:
+            self._emit_section_heading("Access check")
             try:
                 self.results.access = self.access_check()
             except TestFailedError as e:
@@ -1445,10 +1703,14 @@ class FTP(BaseModule):
             except Exception as e:
                 self.results.access_error = str(e)
 
+        if self.results.access is not None and not self.use_json:
+            self._stream_access_check_terminal()
+
         # 4. Data mode test (passive/active + PASV IP leakage; requires creds)
         creds = self._get_path_enum_creds()
         if creds is not None:
             try:
+                self._emit_section_heading("Data mode")
                 self.results.modes = self.test_modes(creds)
             except TestFailedError:
                 raise
@@ -1589,29 +1851,15 @@ class FTP(BaseModule):
                 access_permissions.append(AccessPermissions(creds, None, None, None, None))
                 continue
 
-            # Root and top-level directories
+            # Root and top-level directories from LIST (format varies by server/OS)
             directories: list[str] = [""]
             if ach.lines_read is not None:
                 for l in ach.lines_read:
-                    # LIST response format is not standardised
-                    # expecting and trying to parse the following format:
-                    # drwxr-xr-x  2 root   root    4096 May  3 13:57 spaces in name
-
-                    # Not a directory
-                    if l[0] != "d":
+                    if not l or l[0] != "d":
                         continue
-
-                    # Directory
-                    try:
-                        after_colon = l.split(":")[1:][0]
-                        after_space = after_colon.split(" ")[1:]
-                        dir_name = " ".join(after_space)
+                    dir_name = _ftp_list_line_directory_rel_name(l)
+                    if dir_name:
                         directories.append(dir_name)
-                    except:
-                        errors.append(f"Unknown response format: {l}")
-                        access_permissions.append(
-                            AccessPermissions(creds, ach.lines_read, None, None, None)
-                        )
 
             text = BytesIO(b"FILE WRITE TEST")
             filename = "".join(random.choices(ascii_uppercase, k=15)) + ".txt"
@@ -1662,6 +1910,502 @@ class FTP(BaseModule):
             return AccessCheckResult(None, access_permissions)
         else:
             return AccessCheckResult(errors, access_permissions)
+
+    @staticmethod
+    def _eicar_reply_suggests_missing(msg: str) -> bool:
+        """Heuristic for SIZE/RETR/DELE failures that imply the uploaded object is absent."""
+        lower = msg.lower()
+        needles = (
+            "not found",
+            "no such file",
+            "couldn't open",
+            "could not open",
+            "can't open",
+            "cannot open",
+            "failed to open",
+            "does not exist",
+            "unknown file",
+            "file unavailable",
+        )
+        return any(n in lower for n in needles)
+
+    @staticmethod
+    def _eicar_size_unsupported(msg: str) -> bool:
+        m = msg.lower()
+        return (
+            "502" in msg
+            or "504" in msg
+            or "command not implemented" in m
+            or "not implemented" in m
+            or "unsupported" in m and "size" in m
+        )
+
+    def _eicar_probe_one_account(self, creds: Creds, delay: float) -> FtpEicarRow:
+        """Upload EICAR, wait, verify presence via SIZE/RETR, DELE cleanup."""
+        ftp = self.connect()
+
+        def _fail_early(stor_error: str | None) -> FtpEicarRow:
+            try:
+                ftp.quit()
+            except Exception:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+            return FtpEicarRow(
+                creds,
+                "",
+                False,
+                stor_error,
+                delay,
+                None,
+                None,
+                False,
+                None,
+                None,
+                False,
+                False,
+                False,
+                None,
+                None,
+            )
+
+        try:
+            ftp.login(creds.user, creds.passw)
+        except Exception as e:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+            return FtpEicarRow(
+                creds,
+                "",
+                False,
+                str(e),
+                delay,
+                None,
+                None,
+                False,
+                None,
+                None,
+                False,
+                False,
+                False,
+                None,
+                None,
+            )
+
+        ach = AccessCheckHelper()
+        directories: list[str] = [""]
+        try:
+            ftp.dir(ach.read_callback)
+            if ach.lines_read is not None:
+                for l in ach.lines_read:
+                    if not l or l[0] != "d":
+                        continue
+                    dn = _ftp_list_line_directory_rel_name(l)
+                    if dn:
+                        directories.append(dn)
+        except Exception:
+            directories = [""]
+
+        filename = "EICAR_" + "".join(random.choices(ascii_uppercase, k=8)) + ".com"
+        stor_ok = False
+        stor_err: str | None = None
+        used_path = ""
+
+        for dir in directories:
+            if stor_ok:
+                break
+            filepath = dir + "/" + filename
+            bio = BytesIO(EICAR_STANDARD_TEST_FILE)
+            try:
+                ftp.storbinary("STOR " + filepath, bio)
+                stor_ok = True
+                used_path = filepath
+            except ftplib.Error as e:
+                stor_err = str(e)
+
+        if not stor_ok:
+            return _fail_early(stor_err)
+
+        try:
+            time.sleep(max(0.0, delay))
+        except Exception:
+            pass
+
+        size_bytes: int | None = None
+        size_err: str | None = None
+        try:
+            size_bytes = ftp.size(used_path)
+        except ftplib.error_perm as e:
+            size_err = str(e)
+        except ftplib.Error as e:
+            size_err = str(e)
+
+        buf = BytesIO()
+        retr_ok = False
+        retr_match: bool | None = None
+        retr_err: str | None = None
+        try:
+            ftp.retrbinary("RETR " + used_path, buf.write)
+            retr_ok = True
+            retr_match = buf.getvalue() == EICAR_STANDARD_TEST_FILE
+        except ftplib.Error as e:
+            retr_err = str(e)
+
+        size_vanished = (
+            bool(size_err)
+            and not self._eicar_size_unsupported(size_err)
+            and self._eicar_reply_suggests_missing(size_err)
+        )
+        size_wrong = size_bytes is not None and size_bytes != len(EICAR_STANDARD_TEST_FILE)
+        retr_missing = retr_err is not None and self._eicar_reply_suggests_missing(retr_err)
+        retr_bad = bool(retr_ok and retr_match is False)
+        vanished = size_vanished or size_wrong or retr_missing or retr_bad
+
+        delete_ok = False
+        delete_err: str | None = None
+        delete_note: str | None = None
+        try:
+            ftp.delete(used_path)
+            delete_ok = True
+        except ftplib.error_perm as e:
+            delete_err = str(e)
+            if self._eicar_reply_suggests_missing(str(e)):
+                delete_note = (
+                    "DELE failed with missing-file style reply — file likely already removed "
+                    "(on-access AV / quarantine); treated as protection signal, not test failure."
+                )
+        except ftplib.Error as e:
+            delete_err = str(e)
+            if self._eicar_reply_suggests_missing(str(e)):
+                delete_note = (
+                    "DELE failed with missing-file style reply — file likely already removed "
+                    "(on-access AV / quarantine); treated as protection signal, not test failure."
+                )
+
+        on_access = vanished or (delete_note is not None)
+
+        try:
+            ftp.quit()
+        except Exception:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+        return FtpEicarRow(
+            creds,
+            used_path,
+            True,
+            None,
+            delay,
+            size_bytes,
+            size_err,
+            retr_ok,
+            retr_match,
+            retr_err,
+            vanished,
+            on_access,
+            delete_ok,
+            delete_err,
+            delete_note,
+        )
+
+    def test_eicar_antivirus_probe(self) -> FtpEicarAuditResult:
+        """EICAR upload audit (PTL-SVC-FTP-ANTIVIRUS): delayed verify for on-access scanners."""
+        delay = max(0.0, float(getattr(self.args, "eicar_post_stor_delay", 0.5) or 0.0))
+        all_creds: list[Creds] = []
+        if self.results.anonymous:
+            all_creds.append(Creds("anonymous", ""))
+        if self.results.creds is not None:
+            all_creds.extend(self.results.creds)
+        if not all_creds:
+            return FtpEicarAuditResult(
+                delay,
+                tuple(),
+                "No credentials for EICAR probe (enable anonymous or provide -u/-p / wordlists).",
+                False,
+                True,
+            )
+        rows = tuple(self._eicar_probe_one_account(c, delay) for c in all_creds)
+        risky = any(
+            r.stor_ok and r.retr_payload_match is True and not r.vanished_after_stor_suspected
+            for r in rows
+        )
+        blocked_all = bool(rows) and all(not r.stor_ok for r in rows)
+        n_stor = sum(1 for r in rows if r.stor_ok)
+        n_van = sum(1 for r in rows if r.vanished_after_stor_suspected)
+        n_onacc = sum(1 for r in rows if r.on_access_scan_suspected)
+        detail = (
+            f"Accounts tested: {len(rows)}; STOR ok: {n_stor}; "
+            f"vanished_after_stor_suspected: {n_van}; on_access_signals: {n_onacc}; "
+            f"EICAR still retrievable unchanged after delay: {'yes' if risky else 'no'}."
+        )
+        return FtpEicarAuditResult(delay, rows, detail, risky, blocked_all)
+
+    def _ftp_stor_binary_timed(
+        self,
+        ftp: ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit,
+        cmd: str,
+        data: bytes,
+    ) -> FtpStorTimingOutcome:
+        """Mirror ftplib.storbinary but measure time from last payload byte sent to final voidresp() (typically 226)."""
+        if not data:
+            return FtpStorTimingOutcome(False, "empty payload", None, None, None, None, False)
+        blocksize = 8192
+        t_last_byte_sent: float | None = None
+        t_start = time.perf_counter()
+        try:
+            ftp.voidcmd("TYPE I")
+            with ftp.transfercmd(cmd) as conn:
+                bio = BytesIO(data)
+                while True:
+                    buf = bio.read(blocksize)
+                    if not buf:
+                        break
+                    conn.sendall(buf)
+                    t_last_byte_sent = time.perf_counter()
+                try:
+                    conn.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+            reply = ftp.voidresp()
+            t_done = time.perf_counter()
+            code, line = self._ftp_parse_reply_line(reply)
+            total = t_done - t_start
+            delta = (t_done - t_last_byte_sent) if t_last_byte_sent is not None else total
+            return FtpStorTimingOutcome(True, None, code, line, total, delta, False)
+        except socket.timeout:
+            t_done = time.perf_counter()
+            total = t_done - t_start
+            delta = (
+                (t_done - t_last_byte_sent)
+                if t_last_byte_sent is not None
+                else None
+            )
+            try:
+                ftp.abort()
+            except Exception:
+                pass
+            return FtpStorTimingOutcome(
+                False,
+                "socket.timeout waiting for STOR / control completion",
+                None,
+                None,
+                total,
+                delta,
+                True,
+            )
+        except (ftplib.error_reply, ftplib.error_temp, ftplib.error_perm) as e:
+            t_done = time.perf_counter()
+            total = t_done - t_start
+            raw = e.args[0] if e.args else str(e)
+            rs = raw if isinstance(raw, str) else str(raw)
+            code, line = self._ftp_parse_reply_line(rs)
+            delta = (
+                (t_done - t_last_byte_sent)
+                if t_last_byte_sent is not None
+                else total
+            )
+            return FtpStorTimingOutcome(False, rs, code, line, total, delta, False)
+        except OSError as e:
+            t_done = time.perf_counter()
+            total = t_done - t_start
+            delta = (
+                (t_done - t_last_byte_sent)
+                if t_last_byte_sent is not None
+                else total
+            )
+            return FtpStorTimingOutcome(False, str(e), None, None, total, delta, False)
+
+    def _ftp_dos_policy_block_hit(self, code: int | None, text: str | None) -> bool:
+        """550/451-style denials counted as protective (content/type policy or quota)."""
+        if code is not None and code in FTP_DOS_POLICY_BLOCK_CODES:
+            return True
+        low = (text or "").lower()
+        phrases = (
+            "access denied",
+            "permission denied",
+            "not allowed",
+            "prohibited",
+        )
+        # Avoid flagging benign "transfer complete" / "opening" replies
+        if code is not None and 200 <= code < 300:
+            return False
+        if any(p in low for p in phrases):
+            return True
+        if ("virus" in low or "infected" in low) and code is not None and code >= 400:
+            return True
+        return False
+
+    def _ftp_dos_probe_row(
+        self,
+        ftp: ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit,
+        *,
+        probe_label: str,
+        remote_filename: str,
+        payload: bytes,
+    ) -> FtpDosProbeRow:
+        o = self._ftp_stor_binary_timed(ftp, "STOR " + remote_filename, payload)
+        stor_line = (o.reply_line or o.error or "").strip() or None
+        blocked = False
+        if o.ok:
+            blocked = self._ftp_dos_policy_block_hit(o.reply_code, o.reply_line)
+        else:
+            blocked = self._ftp_dos_policy_block_hit(o.reply_code, o.error)
+
+        noop_ok: bool | None = None
+        noop_err: str | None = None
+        noop_elapsed: float | None = None
+        if o.ok and not blocked:
+            t_n0 = time.perf_counter()
+            try:
+                ftp.voidcmd("NOOP")
+                noop_ok = True
+            except Exception as e_noop:
+                try:
+                    _ = ftp.pwd()
+                    noop_ok = True
+                    noop_err = None
+                except Exception as e_pwd:
+                    noop_ok = False
+                    noop_err = f"{e_noop}; PWD fallback: {e_pwd}"
+            noop_elapsed = time.perf_counter() - t_n0
+
+        delete_ok = False
+        delete_err: str | None = None
+        if o.ok:
+            try:
+                ftp.delete(remote_filename)
+                delete_ok = True
+            except ftplib.Error as e:
+                delete_err = str(e)
+
+        delta = o.delta_last_byte_to_226_seconds
+        suspected = False
+        if o.timed_out:
+            suspected = True
+        elif o.ok and not blocked:
+            if delta is not None and delta >= FTP_DOS_DELTA_WARN_SEC:
+                suspected = True
+            if noop_elapsed is not None and noop_elapsed >= FTP_DOS_NOOP_WARN_SEC:
+                suspected = True
+            if noop_ok is False:
+                suspected = True
+
+        return FtpDosProbeRow(
+            probe_label,
+            remote_filename,
+            len(payload),
+            o.ok,
+            o.error,
+            stor_line,
+            o.reply_code,
+            o.total_seconds,
+            delta,
+            noop_ok,
+            noop_err,
+            noop_elapsed,
+            blocked,
+            suspected,
+            o.timed_out,
+            delete_ok,
+            delete_err,
+        )
+
+    def test_ftp_processing_resilience_probes(self) -> FtpDosAuditResult:
+        """PTL-SVC-FTP-PROC-DOS: one login, sequential STOR probes, timing + NOOP stability."""
+        tmo = float(getattr(self.args, "ftp_dos_timeout", 30.0) or 30.0)
+        force_large = bool(getattr(self.args, "ftp_dos_force_large", False))
+        zip_mode = "full" if force_large else "minimal"
+        creds = self._get_path_enum_creds()
+        if creds is None:
+            return FtpDosAuditResult(
+                tmo,
+                zip_mode,
+                "",
+                tuple(),
+                "No credentials for processing probes (--anonymous successful login or -u/-p / wordlists required).",
+                False,
+                False,
+            )
+
+        ftp = self.connect()
+
+        try:
+            ftp.login(creds.user, creds.passw)
+        except Exception as e:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+            return FtpDosAuditResult(
+                tmo,
+                zip_mode,
+                creds.user,
+                tuple(),
+                f"LOGIN failed: {e}",
+                False,
+                False,
+            )
+
+        if getattr(ftp, "sock", None) is not None:
+            ftp.sock.settimeout(tmo)
+
+        rows: list[FtpDosProbeRow] = []
+        rows.append(
+            self._ftp_dos_probe_row(
+                ftp,
+                probe_label="billion_laughs.xml (XML DoS)",
+                remote_filename="billion_laughs.xml",
+                payload=BILLION_LAUGHS_XML.encode("utf-8"),
+            )
+        )
+        rows.append(
+            self._ftp_dos_probe_row(
+                ftp,
+                probe_label=(
+                    "recursive_zip_bomb.zip (Decompression DoS — "
+                    + ("full" if force_large else "minimal")
+                    + ")"
+                ),
+                remote_filename="recursive_zip_bomb.zip",
+                payload=build_full_zip_bomb() if force_large else build_minimal_zip_bomb(),
+            )
+        )
+
+        try:
+            ftp.quit()
+        except Exception:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+        probes_t = tuple(rows)
+        all_blocked = bool(probes_t) and all(r.blocked_by_policy for r in probes_t)
+        suspected = any(r.background_processing_suspected for r in probes_t)
+        if all_blocked:
+            suspected = False
+
+        nb = sum(1 for r in probes_t if r.blocked_by_policy)
+        nsus = sum(1 for r in probes_t if r.background_processing_suspected)
+        ntimeout = sum(1 for r in probes_t if r.timed_out)
+        detail = (
+            f"{tmo}s cap per socket op; ZIP={zip_mode}; probes={len(probes_t)}; "
+            f"policy_blocked={nb}; post_processing_signals={nsus}; STOR_timeouts={ntimeout}."
+        )
+        return FtpDosAuditResult(
+            tmo,
+            zip_mode,
+            creds.user,
+            probes_t,
+            detail,
+            suspected,
+            all_blocked,
+        )
 
     def _on_brute_success(self, cred: Creds) -> None:
         """Callback for real-time streaming of found credentials (thread-safe).
@@ -5333,7 +6077,6 @@ class FTP(BaseModule):
         if self.use_json or not (info := self.results.info) or info.banner is None:
             return
         with self._output_lock:
-            self.ptprint("Banner", Out.INFO)
             sid = identify_service(info.banner)
             if sid is None:
                 icon = get_colored_text("[✓]", color="NOTVULN")
@@ -5356,7 +6099,6 @@ class FTP(BaseModule):
         if self.use_json:
             return
         with self._output_lock:
-            self.ptprint("Encryption", Out.INFO)
             if (err := self.results.encryption_error) is not None:
                 icon = get_colored_text("[✗]", color="VULN")
                 self.ptprint(f"    {icon} Encryption test failed: {err}", Out.TEXT)
@@ -5364,6 +6106,7 @@ class FTP(BaseModule):
                 return
             enc = self.results.encryption
             if enc is None:
+                self._streamed_encryption = True
                 return
             plaintext_only = enc.plaintext_ok and not enc.auth_tls_ok and not enc.tls_ok
             any_ok = enc.plaintext_ok or enc.auth_tls_ok or enc.tls_ok
@@ -5396,25 +6139,40 @@ class FTP(BaseModule):
         if self.use_json or (anonymous := self.results.anonymous) is None:
             return
         with self._output_lock:
-            self.ptprint("Anonymous authentication", Out.INFO)
             if anonymous:
                 icon = get_colored_text("[✗]", color="VULN")
                 self.ptprint(f"    {icon} Enabled", Out.TEXT)
-                # Basic permissions from access if available (anon + access in run-all)
-                if (access := self.results.access) and access.results:
-                    try:
-                        anon_p = next(p for p in access.results if p.creds.user == "anonymous")
-                        perm_str = (
-                            f"    (Directory listing: {anon_p.dirlist is not None}, "
-                            + f"Write: {anon_p.write}, Read: {anon_p.read}, Delete: {anon_p.delete})"
-                        )
-                        self.ptprint(perm_str, Out.TEXT)
-                    except StopIteration:
-                        pass
             else:
                 icon = get_colored_text("[✓]", color="NOTVULN")
                 self.ptprint(f"    {icon} Disabled", Out.TEXT)
         self._streamed_anonymous = True
+
+    def _stream_access_check_terminal(self) -> None:
+        """Print --access results under [+] Access check. Avoid duplicating in output() brute lines."""
+        if self.use_json:
+            return
+        access = self.results.access
+        if access is None:
+            return
+        with self._output_lock:
+            warn = get_colored_text("[!]", color="WARNING")
+            if access.errors:
+                for e in access.errors:
+                    self.ptprint(f"    {warn} {e}", Out.TEXT)
+            if access.results:
+                for p in access.results:
+                    cred_str = f"user: {p.creds.user}, password: {p.creds.passw}"
+                    perm_str = (
+                        f" (Directory listing: {p.dirlist is not None}, "
+                        f"Write: {p.write}, Read: {p.read}, Delete: {p.delete})"
+                    )
+                    self.ptprint(f"    {cred_str + perm_str}", Out.TEXT)
+            if access.errors and self.results.anonymous is not True:
+                self.ptprint(
+                    f"    {warn} Use --anonymous (-A), or -u USER -p PASS, or wordlists (-U/-P).",
+                    Out.TEXT,
+                )
+        self._streamed_access = True
 
     def _stream_brute_result(self) -> None:
         creds = self.results.creds
@@ -6260,6 +7018,214 @@ class FTP(BaseModule):
         if ue.enumeration_suspected or ue.timing_anomaly_suspected:
             self.ptprint(f"{d2}{info_i} Note: {ue.detail}", Out.TEXT)
 
+    def _print_ftp_dos_audit_terminal(self, da: FtpDosAuditResult) -> None:
+        fk = get_colored_text
+        d1 = "    "
+        d2 = "        "
+        plus = fk("[+]", color="NOTVULN")
+        star = fk("[*]", color="INFO")
+        info_i = fk("[i]", color="INFO")
+        tick = fk("[✓]", color="NOTVULN")
+        cross = fk("[✗]", color="VULN")
+        warn_bang = fk("[!]", color="WARNING")
+
+        self.ptprint(f"{plus} FTP Processing Resilience (DoS Probes)", Out.INFO)
+        self.ptprint(f"{d1}{star} Methodology & Safety", Out.TEXT)
+        self.ptprint(
+            f"{d2}{info_i} Targets: XML Entity Expansion & Decompression Bombs.",
+            Out.TEXT,
+        )
+        self.ptprint(
+            f"{d2}{info_i} Goal: Detect if backend processing (AV/Indexer) delays or stalls after file storage.",
+            Out.TEXT,
+        )
+        self.ptprint(
+            f"{d2}{info_i} ZIP payload mode: {da.zip_mode} (--ftp-dos-force-large swaps minimal → full bomb).",
+            Out.TEXT,
+        )
+        if da.zip_mode == "full":
+            self.ptprint(
+                f"{d2}{warn_bang} Large zip bomb mode ENABLED — isolate the target; heavy expansion if extracted server-side.",
+                Out.TEXT,
+            )
+
+        for r in da.probes:
+            self.ptprint(f"{d1}{star} Probe: {r.probe_label}", Out.TEXT)
+            if r.timed_out:
+                self.ptprint(
+                    f"{d2}{cross} STOR did not finish within socket timeout "
+                    f"({da.timeout_seconds}s) — control or data hung (high risk synchronous scanner).",
+                    Out.TEXT,
+                )
+                continue
+            if not r.stor_ok:
+                if r.blocked_by_policy:
+                    self.ptprint(
+                        f"{d2}{tick} STOR denied / rejected (protection signal): "
+                        f"{r.stor_error or r.stor_reply_snippet or 'n/a'}",
+                        Out.TEXT,
+                    )
+                else:
+                    self.ptprint(
+                        f"{d2}{cross} STOR failed: {r.stor_error or 'unknown'}",
+                        Out.TEXT,
+                    )
+                continue
+
+            stor_show = warn_bang if r.background_processing_suspected else tick
+            line_m = r.stor_reply_snippet or "226 Transfer complete"
+            self.ptprint(
+                f"{d2}{stor_show} STOR command accepted ({line_m})",
+                Out.TEXT,
+            )
+
+            if r.total_transfer_seconds is not None:
+                tot = r.total_transfer_seconds
+                speed = "Normal" if tot < 5.0 else "Slow"
+                self.ptprint(
+                    f"{d2}{info_i} Transfer time: {tot:.2f}s ({speed})",
+                    Out.TEXT,
+                )
+            if r.delta_last_byte_to_226_seconds is not None:
+                d226 = r.delta_last_byte_to_226_seconds
+                self.ptprint(
+                    f"{d2}{info_i} Control reply delay after last byte: {d226:.2f}s",
+                    Out.TEXT,
+                )
+                if d226 >= FTP_DOS_DELTA_WARN_SEC:
+                    self.ptprint(
+                        f"{d2}{warn_bang} Warning: server response delayed by {d226:.1f}s after upload "
+                        f"(possible background parsing / decompression).",
+                        Out.TEXT,
+                    )
+
+            if r.noop_ok is True:
+                self.ptprint(
+                    f"{d2}{info_i} Post-transfer stability: Server responding (OK)",
+                    Out.TEXT,
+                )
+            elif r.noop_ok is False:
+                self.ptprint(
+                    f"{d2}{warn_bang} Post-transfer stability: control channel unhealthy after STOR "
+                    f"({r.noop_error or 'NOOP/PWD failed'})",
+                    Out.TEXT,
+                )
+
+            if r.delete_ok:
+                self.ptprint(f"{d2}{tick} DELE cleanup attempted: OK", Out.TEXT)
+            elif r.delete_error:
+                self.ptprint(f"{d2}{info_i} DELE: {r.delete_error}", Out.TEXT)
+
+        self.ptprint(f"{d1}{star} Summary", Out.TEXT)
+        any_accepted = any(p.stor_ok and not p.blocked_by_policy for p in da.probes)
+        if da.all_blocked_by_policy:
+            self.ptprint(
+                f"{d2}{tick} Uploads rejected by policy — positive signal if denials map to content/type inspection.",
+                Out.TEXT,
+            )
+        elif da.post_processing_dos_suspected:
+            self.ptprint(
+                f"{d2}{warn_bang} Delay, timeout, or post-STOR instability observed — treat as post-processing DoS risk "
+                f"if AV/EDR or indexers touch uploads asynchronously.",
+                Out.TEXT,
+            )
+        elif any_accepted:
+            self.ptprint(
+                f"{d2}{info_i} Files accepted without obvious delay in this black-box view; "
+                f"still monitor CPU/RAM/disk for asynchronous backend work.",
+                Out.TEXT,
+            )
+        self.ptprint(f"{d2}{info_i} {da.detail}", Out.TEXT)
+
+    def _print_eicar_audit_terminal(self, ea: FtpEicarAuditResult) -> None:
+        fk = get_colored_text
+        d1 = "    "
+        d2 = "        "
+        star = fk("[*]", color="INFO")
+        info_i = fk("[i]", color="INFO")
+        tick = fk("[✓]", color="NOTVULN")
+        cross = fk("[✗]", color="VULN")
+        warn = fk("[!]", color="WARNING")
+
+        self.ptprint("Antivirus probe (EICAR)", Out.INFO)
+        self.ptprint(f"{d1}{star} Setup & methodology", Out.TEXT)
+        self.ptprint(
+            f"{d2}{info_i} Post-STOR delay before SIZE/RETR: {ea.post_stor_delay_seconds}s "
+            f"(allows on-access scanners to react after transfer complete).",
+            Out.TEXT,
+        )
+        self.ptprint(
+            f"{d2}{info_i} Default filename uses .com (classic EICAR); if upload succeeds unchanged, "
+            f"policy may still be extension-driven — interpret with care.",
+            Out.TEXT,
+        )
+
+        for i, r in enumerate(ea.rows, 1):
+            self.ptprint(f"{d1}{star} Account {i}: {r.creds.user!r}", Out.TEXT)
+            self.ptprint(f"{d2}{info_i} Credentials: {r.creds.user!r} / {r.creds.passw!r}", Out.TEXT)
+            if not r.stor_ok:
+                self.ptprint(f"{d2}{cross} STOR failed: {r.stor_error or 'unknown'}", Out.TEXT)
+                continue
+            self.ptprint(f"{d2}{tick} STOR completed: {r.remote_path}", Out.TEXT)
+            if r.size_error:
+                su = self._eicar_size_unsupported(r.size_error)
+                hint = " (SIZE unsupported — relied on RETR)" if su else ""
+                self.ptprint(
+                    f"{d2}{info_i} SIZE: "
+                    f"{r.size_bytes if r.size_bytes is not None else 'n/a'} — {r.size_error}{hint}",
+                    Out.TEXT,
+                )
+            elif r.size_bytes is not None:
+                self.ptprint(
+                    f"{d2}{info_i} SIZE: {r.size_bytes} bytes (expected {len(EICAR_STANDARD_TEST_FILE)})",
+                    Out.TEXT,
+                )
+
+            if r.retr_ok:
+                icon = tick if r.retr_payload_match else cross
+                self.ptprint(
+                    f"{d2}{icon} RETR payload matches EICAR: {r.retr_payload_match}",
+                    Out.TEXT,
+                )
+            elif r.retr_error:
+                missing = self._eicar_reply_suggests_missing(r.retr_error)
+                icon = warn if missing else cross
+                tag = " — file likely gone (on-access AV?)" if missing else ""
+                self.ptprint(f"{d2}{icon} RETR failed: {r.retr_error}{tag}", Out.TEXT)
+
+            if r.vanished_after_stor_suspected:
+                self.ptprint(
+                    f"{d2}{warn} Signal: file missing or altered after STOR + delay — "
+                    f"hints at on-access scanning or quarantine.",
+                    Out.TEXT,
+                )
+
+            if r.delete_ok:
+                self.ptprint(f"{d2}{tick} DELE cleanup succeeded.", Out.TEXT)
+            elif r.delete_note:
+                self.ptprint(f"{d2}{info_i} DELE: {r.delete_note}", Out.TEXT)
+            elif r.delete_error:
+                self.ptprint(f"{d2}{warn} DELE failed: {r.delete_error}", Out.TEXT)
+
+        self.ptprint(f"{d1}{star} Summary", Out.TEXT)
+        self.ptprint(f"{d2}{info_i} {ea.detail}", Out.TEXT)
+        if ea.risky_content_reachable:
+            self.ptprint(
+                f"{d2}{cross} Verdict: EICAR stayed retrievable after the delay — no on-access removal "
+                f"observed on this path (policy / AV gap possible).",
+                Out.TEXT,
+            )
+        elif ea.upload_blocked_all:
+            self.ptprint(
+                f"{d2}{tick} Verdict: STOR failed for every tested account.",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"{d2}{tick} Verdict: No account left unchanged EICAR downloadable after the window.",
+                Out.TEXT,
+            )
+
     # region output
 
     def output(self) -> None:
@@ -6389,19 +7355,19 @@ class FTP(BaseModule):
         if (anonymous_error := self.results.anonymous_error) is not None:
             properties.update({"anonymousError": anonymous_error})
             if not self.use_json and not self._streamed_anonymous:
-                self.ptprint("Authentication", Out.INFO)
+                self.ptprint("Anonymous authentication", Out.INFO)
                 icon = get_colored_text("[✗]", color="VULN")
                 self.ptprint(f"    {icon} Anonymous test failed: {anonymous_error}", Out.TEXT)
         elif (access_error := self.results.access_error) is not None:
             properties.update({"accessError": access_error})
             if not self.use_json and not self._streamed_anonymous:
-                self.ptprint("Authentication", Out.INFO)
+                self.ptprint("Anonymous authentication", Out.INFO)
                 icon = get_colored_text("[✗]", color="VULN")
                 self.ptprint(f"    {icon} Anonymous authentication is enabled", Out.TEXT)
                 self.ptprint(f"    {icon} Access check failed: {access_error}", Out.TEXT)
         elif (anon := self.results.anonymous) is not None:
             if not self.use_json and not self._streamed_anonymous:
-                self.ptprint("Authentication", Out.INFO)
+                self.ptprint("Anonymous authentication", Out.INFO)
                 if anon:
                     icon = get_colored_text("[✗]", color="VULN")
                     self.ptprint(f"    {icon} Anonymous authentication is enabled", Out.TEXT)
@@ -6444,6 +7410,7 @@ class FTP(BaseModule):
         # --access without working anonymous: access_check still ran but UI above skipped (anonymous unset or False)
         if (
             self.args.access
+            and not self._streamed_access
             and (access := self.results.access) is not None
             and access.errors
             and self.results.anonymous is not True
@@ -6497,8 +7464,10 @@ class FTP(BaseModule):
                     else:
                         perm_str = ""
 
+                    show_perm_terminal = perm_str if not self._streamed_access else ""
+
                     if not self.use_json and not self._streamed_brute:
-                        self.ptprint(f"    {cred_str + perm_str}", Out.TEXT)
+                        self.ptprint(f"    {cred_str + show_perm_terminal}", Out.TEXT)
                     json_lines.append(cred_str + perm_str)
 
                 if self.args.user is not None:
@@ -7059,6 +8028,112 @@ class FTP(BaseModule):
                             ue.detail
                             + " See ftpUserEnumeration in JSON (per-probe codes, lines, passElapsedMs, connectionOkAfter)."
                         ),
+                    }
+                )
+
+        # EICAR / on-access antivirus probe (PTL-SVC-FTP-ANTIVIRUS)
+        if ea_err := getattr(self.results, "eicar_audit_error", None):
+            properties.update({"ftpEicarError": ea_err})
+            if not self.use_json:
+                self.ptprint("Antivirus probe (EICAR)", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {ea_err}", Out.TEXT)
+        elif (ea := getattr(self.results, "eicar_audit", None)) is not None:
+            ea_json = {
+                "postStorDelaySeconds": ea.post_stor_delay_seconds,
+                "detail": ea.detail,
+                "riskyContentReachable": ea.risky_content_reachable,
+                "uploadBlockedAllAccounts": ea.upload_blocked_all,
+                "rows": [
+                    {
+                        "username": r.creds.user,
+                        "password": r.creds.passw,
+                        "remotePath": r.remote_path,
+                        "storOk": r.stor_ok,
+                        "storError": r.stor_error,
+                        "sizeBytes": r.size_bytes,
+                        "sizeError": r.size_error,
+                        "retrOk": r.retr_ok,
+                        "retrPayloadMatch": r.retr_payload_match,
+                        "retrError": r.retr_error,
+                        "vanishedAfterStorSuspected": r.vanished_after_stor_suspected,
+                        "onAccessScanSuspected": r.on_access_scan_suspected,
+                        "deleteOk": r.delete_ok,
+                        "deleteError": r.delete_error,
+                        "deleteNote": r.delete_note,
+                    }
+                    for r in ea.rows
+                ],
+            }
+            properties.update({"ftpEicar": ea_json})
+            if not self.use_json:
+                self._print_eicar_audit_terminal(ea)
+            if ea.risky_content_reachable:
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.FtpAntivirusEicar.value,
+                        "vuln_request": "FTP STOR of EICAR test file + delayed SIZE/RETR (--eicar)",
+                        "vuln_response": (
+                            ea.detail
+                            + " EICAR remained retrievable after post-STOR delay — treat as missing or weak "
+                            "on-access/content filtering on the FTP storage path unless policy explicitly allows."
+                        ),
+                    }
+                )
+
+        # FTP processing resilience / STOR timing (PTL-SVC-FTP-PROC-DOS)
+        if d_err := getattr(self.results, "dos_audit_error", None):
+            properties.update({"ftpProcessingResilienceError": d_err})
+            if not self.use_json:
+                self.ptprint("FTP Processing Resilience (DoS Probes)", Out.INFO)
+                icon = get_colored_text("[✗]", color="VULN")
+                self.ptprint(f"    {icon} {d_err}", Out.TEXT)
+        elif (dos := getattr(self.results, "dos_audit", None)) is not None:
+            dos_json = {
+                "timeoutSeconds": dos.timeout_seconds,
+                "zipMode": dos.zip_mode,
+                "credsUser": dos.creds_user,
+                "detail": dos.detail,
+                "postProcessingDosSuspected": dos.post_processing_dos_suspected,
+                "allBlockedByPolicy": dos.all_blocked_by_policy,
+                "probes": [
+                    {
+                        "probeLabel": p.probe_label,
+                        "remoteFilename": p.remote_filename,
+                        "payloadBytes": p.payload_bytes,
+                        "storOk": p.stor_ok,
+                        "storError": p.stor_error,
+                        "storReplySnippet": p.stor_reply_snippet,
+                        "replyCode": p.reply_code,
+                        "totalTransferSeconds": p.total_transfer_seconds,
+                        "deltaLastByteTo226Seconds": p.delta_last_byte_to_226_seconds,
+                        "noopOk": p.noop_ok,
+                        "noopError": p.noop_error,
+                        "noopElapsedSeconds": p.noop_elapsed_seconds,
+                        "blockedByPolicy": p.blocked_by_policy,
+                        "backgroundProcessingSuspected": p.background_processing_suspected,
+                        "timedOut": p.timed_out,
+                        "deleteOk": p.delete_ok,
+                        "deleteError": p.delete_error,
+                    }
+                    for p in dos.probes
+                ],
+            }
+            properties.update({"ftpProcessingResilience": dos_json})
+            if not self.use_json:
+                self._print_ftp_dos_audit_terminal(dos)
+            if dos.post_processing_dos_suspected:
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.FtpProcessingResilience.value,
+                        "vuln_request": (
+                            "FTP STOR of billion-laughs XML + ZIP bomb in one session (--ftp-dos-probes); "
+                            "timing last-byte→226 + NOOP/PWD stability"
+                        ),
+                        "vuln_response": dos.detail
+                        + " Elevated control latency, timeout, or unstable session after STOR hints at synchronous "
+                        "or heavyweight backend processing (AV/EDR decompression, XML parse, indexer). "
+                        "See ftpProcessingResilience JSON for per-probe deltas.",
                     }
                 )
 

@@ -106,6 +106,7 @@ _SMTP_UNKNOWN_CMD: Final[list[tuple[re.Pattern[str], str]]] = [
 _SMTP_TLS_CERT_FINGERPRINTS: Final[list[tuple[re.Pattern[str], re.Pattern[str], str, str]]] = [
     (re.compile(r".*"), re.compile(r"exchange|outlook|microsoft|exch[0-9]+", re.I), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*"),
     (re.compile(r".*"), re.compile(r"barracuda", re.I), "Barracuda Email Security Gateway", "cpe:2.3:h:barracuda:email_security_gateway:*:*:*:*:*:*:*:*"),
+    (re.compile(r".*"), re.compile(r"mailmarshal|trustwave", re.I), "Trustwave MailMarshal", "cpe:2.3:a:trustwave:mailmarshal:*:*:*:*:*:*:*:*"),
     (re.compile(r".*"), re.compile(r"ironport|cisco\.com", re.I), "Cisco Secure Email (IronPort)", "cpe:2.3:h:cisco:secure_email_gateway:*:*:*:*:*:*:*:*"),
     (re.compile(r".*"), re.compile(r"postfix|mailcow|postfix-vm", re.I), "Postfix", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
     (re.compile(r".*"), re.compile(r"exim|exim[0-9]", re.I), "Exim", "cpe:2.3:a:exim:exim:*:*:*:*:*:*:*:*"),
@@ -148,6 +149,7 @@ _BANNER_CERT_CONSISTENCY: Final[dict[str, list[re.Pattern[str]]]] = {
     "Proofpoint Email Protection": [re.compile(r"proofpoint", re.I)],
     "Mimecast": [re.compile(r"mimecast", re.I)],
     "FortiMail": [re.compile(r"fortinet|fortimail", re.I)],
+    "Trustwave MailMarshal": [re.compile(r"trustwave|mailmarshal|focusmarshal", re.I)],
     "Oracle Communications Messaging Server": [re.compile(r"oracle", re.I)],
     "MailStore Gateway": [re.compile(r"mailstore|maxkon", re.I)],  # MailStore often uses customer domain in cert
     # Hosting providers: cert holds hostname (e.g. dc80.etius.jp), not product name – match provider domain
@@ -745,6 +747,10 @@ class ServerIdentifyResult:
     latency_avg_ms: float | None = None  # RSET/NOOP avg RTT
     latency_jitter_ms: float | None = None  # Stddev of RTT
     cert_domain_match: bool = False  # SAN/Subject domain aligns with target
+    mx_cert_ok: bool | None = None  # True/False when MX↔cert checked; None = skipped
+    mx_cert_message: str | None = None
+    mx_queried_domain: str | None = None
+    mx_peer_hostname: str | None = None
     cert_software_context: str | None = None  # "HestiaCP → Exim" etc.
     behavioral_matched_verbs: tuple[str, ...] = ()  # EHLO verbs that matched profile (evidence-based)
     behavioral_missing_verbs: tuple[str, ...] = ()  # EHLO verbs expected but missing (evidence-based)
@@ -1000,6 +1006,32 @@ def _cert_domain_matches_target(cert_text: str, target_host: str | None) -> bool
     return False
 
 
+def _cert_covers_dname(cert_text: str, dns_name: str) -> bool:
+    """True if TLS names (Subject/SAN text blob) cover ``dns_name``.
+
+    Uses strict hostname / ``*.label.example`` rules only (no parent-domain walk),
+    so MX hostnames are not accepted solely because a registrable parent appears in the cert.
+    """
+    if not cert_text or not dns_name or "." not in dns_name:
+        return False
+    host = dns_name.rstrip(".").lower()
+    cert_lower = cert_text.lower()
+    if host in cert_lower:
+        return True
+    for m in re.finditer(r"\*\.([a-z0-9][a-z0-9.-]*)", cert_lower):
+        base = m.group(1).rstrip(".").lower()
+        if not base:
+            continue
+        if host == base:
+            return True
+        if not host.endswith("." + base):
+            continue
+        prefix = host[: -(len(base) + 1)]
+        if prefix and "." not in prefix:
+            return True
+    return False
+
+
 def _hostname_from_banner(banner: str | None) -> str | None:
     """Extract hostname from banner first line (e.g. 'dc80.etius.jp ESMTP' -> dc80.etius.jp)."""
     if not banner or not banner.strip():
@@ -1038,6 +1070,10 @@ def identify_smtp_server(
     target_host: str | None = None,  # For cert_domain_match (hostname or PTR)
     latency_avg_ms: float | None = None,
     latency_jitter_ms: float | None = None,
+    mx_cert_ok: bool | None = None,
+    mx_cert_message: str | None = None,
+    mx_queried_domain: str | None = None,
+    mx_peer_hostname: str | None = None,
 ) -> ServerIdentifyResult:
     """
     Perform SMTP server identification from collected responses.
@@ -1756,4 +1792,8 @@ def identify_smtp_server(
         discrepancy_banner_product=discrepancy_banner_product,
         discrepancy_behavior_product=discrepancy_behavior_product,
         behavioral_hint=behavioral_hint,
+        mx_cert_ok=mx_cert_ok,
+        mx_cert_message=mx_cert_message,
+        mx_queried_domain=mx_queried_domain,
+        mx_peer_hostname=mx_peer_hostname,
     )

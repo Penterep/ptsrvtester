@@ -115,6 +115,10 @@ _BANNER_PATTERNS: Final[list[tuple[re.Pattern[str], str, str]]] = [
     (re.compile(r"\bSophos\b", re.I), "Sophos Email Appliance", "cpe:2.3:a:sophos:email_appliance:*:*:*:*:*:*:*:*"),
     (re.compile(r"ESMTP\s+\(Mimecast\)", re.I), "Mimecast", "cpe:2.3:a:mimecast:email_security_gateway:*:*:*:*:*:*:*:*"),
     (re.compile(r"\bMimecast\b", re.I), "Mimecast", "cpe:2.3:a:mimecast:email_security_gateway:*:*:*:*:*:*:*:*"),
+    # Trustwave MailMarshal (MX/security gateway); banner often "Trustwave MailMarshal (vX.Y.Z.W) Ready"
+    (re.compile(r"Trustwave\s+MailMarshal\s+\(v?([\d.]+)\)", re.I), "Trustwave MailMarshal", "cpe:2.3:a:trustwave:mailmarshal:*:*:*:*:*:*:*:*"),
+    (re.compile(r"\bTrustwave\s+MailMarshal\b", re.I), "Trustwave MailMarshal", "cpe:2.3:a:trustwave:mailmarshal:*:*:*:*:*:*:*:*"),
+    (re.compile(r"\bMailMarshal\b", re.I), "Trustwave MailMarshal", "cpe:2.3:a:trustwave:mailmarshal:*:*:*:*:*:*:*:*"),
     (re.compile(r"ESMTP\s+Trend\s+Micro\s+Email\s+Security\s+Service\s+ready", re.I), "Trend Micro Email Security", "cpe:2.3:a:trendmicro:email_security:*:*:*:*:*:*:*:*"),
     (re.compile(r"Trend\s+Micro\s+Email\s+Security", re.I), "Trend Micro Email Security", "cpe:2.3:a:trendmicro:email_security:*:*:*:*:*:*:*:*"),
     (re.compile(r"\bDovecot\b", re.I), "Dovecot", "cpe:2.3:a:dovecot:dovecot:*:*:*:*:*:*:*:*"),
@@ -231,7 +235,8 @@ _BANNER_MTA_VENDOR_TOKEN: Final[re.Pattern[str]] = re.compile(
     r"mailenable|axigen|courier|qmail|dovecot|kerio|fortimail|cisco|barracuda|mimecast|"
     r"proofpoint|mailgun|sendgrid|mandrill|amazon|ses|gsmtp|zoho|proton|yandex|fastmail|"
     r"outlook|office365|mailstore|trend\s+micro|sophos|power\s*mta|postcow|mailcow|"
-    r"communigate|smartermail|hmailserver|oracle\s+communications|asyncos|ironport"
+    r"communigate|smartermail|hmailserver|oracle\s+communications|asyncos|ironport|"
+    r"trustwave|mailmarshal"
     r")\b",
     re.I,
 )

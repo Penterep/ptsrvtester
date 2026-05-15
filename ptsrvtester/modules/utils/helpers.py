@@ -43,6 +43,7 @@ def add_bruteforce_args(
     *,
     user_nargs: str | None = None,
     user_help: str | None = None,
+    mutually_exclusive_user_and_users: bool = True,
 ):
     """
     Adds bruteforce arguments to ArgumentParser
@@ -55,31 +56,50 @@ def add_bruteforce_args(
         parser (argparse.ArgumentParser)
         user_nargs: if "+", -u accepts one or more usernames (list); else single string.
         user_help: override help for -u (default: "username" or "username(s)" when user_nargs="+").
+        mutually_exclusive_user_and_users: if False, -u and -U may both be set (e.g. SMTP -e + file).
     """
     bruteforce = parser.add_argument_group(
         "LOGIN / BRUTEFORCE",
         "user/users + password/passwords",
     )
 
-    # username / users file
-    bruteuser = bruteforce.add_mutually_exclusive_group()
-    bruteuser.title = "bruteuser"
     _u_help = user_help or (
-        "username(s); with -e, names are used for VRFY/EXPN/RCPT enumeration (combine with -w)"
+        "username(s); with -e, merged with lines from -U (optional username file)"
         if user_nargs == "+"
         else "username"
     )
-    if user_nargs == "+":
-        bruteuser.add_argument(
-            "-u",
-            "--user",
-            nargs="+",
-            metavar="NAME",
-            help=_u_help,
-        )
+    _users_help = (
+        "file with usernames (bruteforce with -p/-P; also name list for -e, -ae, -rl)"
+        if not mutually_exclusive_user_and_users
+        else "file containing usernames"
+    )
+
+    if mutually_exclusive_user_and_users:
+        bruteuser = bruteforce.add_mutually_exclusive_group()
+        bruteuser.title = "bruteuser"
+        if user_nargs == "+":
+            bruteuser.add_argument(
+                "-u",
+                "--user",
+                nargs="+",
+                metavar="NAME",
+                help=_u_help,
+            )
+        else:
+            bruteuser.add_argument("-u", "--user", type=str, help=_u_help)
+        bruteuser.add_argument("-U", "--users", type=str, help=_users_help)
     else:
-        bruteuser.add_argument("-u", "--user", type=str, help=_u_help)
-    bruteuser.add_argument("-U", "--users", type=str, help="file containing usernames")
+        if user_nargs == "+":
+            bruteforce.add_argument(
+                "-u",
+                "--user",
+                nargs="+",
+                metavar="NAME",
+                help=_u_help,
+            )
+        else:
+            bruteforce.add_argument("-u", "--user", type=str, help=_u_help)
+        bruteforce.add_argument("-U", "--users", type=str, help=_users_help)
 
     # password / passwords file
     brutepass = bruteforce.add_mutually_exclusive_group()

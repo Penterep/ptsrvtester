@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os, ipaddress, socket, argparse
 from dataclasses import dataclass
 from typing import Callable
@@ -5,6 +7,63 @@ from typing import Callable
 from ptlibs.threads import ptthreads
 
 from .._base import BaseArgs
+
+# Probable mailbox names for AUTH user-enum when the operator does not pass -u/-U (SMTP -ae, etc.).
+default_logins: tuple[str, ...] = (
+    "admin",
+    "administrator",
+    "root",
+    "postmaster",
+    "webmaster",
+    "support",
+)
+
+# Synthetic non-existent identities used as invalid baseline alongside candidate names (-ae).
+AUTH_ENUM_SYNTHETIC_INVALID_COUNT = 2
+
+
+def auth_enum_candidate_names(
+    args: ArgsWithBruteforce,
+    *,
+    wordlist: list[str] | None = None,
+) -> tuple[list[str], bool]:
+    """
+    Resolve AUTH enumeration candidate logins.
+
+    Returns ``(names, used_default_logins)``. With ``-u`` or a populated *wordlist*
+    (from ``-U``), only those names are used; otherwise ``default_logins``.
+    """
+    if args.user:
+        names = [x.strip() for x in text_or_file(args.user, None) if x.strip()]
+        return names, False
+    wl = wordlist or []
+    if wl:
+        return [u.strip() for u in wl if u.strip()], False
+    return list(default_logins), True
+
+
+def auth_enum_ntlm_identity_note(
+    used_default_logins: bool,
+    candidates: list[str] | tuple[str, ...],
+) -> str | None:
+    """
+    Operator hint for SMTP AUTH NTLM enumeration when identity shape may skew results.
+
+    Shown when built-in ``default_logins`` are used, or when ``-u``/``-U`` names lack
+    ``\\`` (NetBIOS) and ``@`` (UPN).
+    """
+    if used_default_logins:
+        return (
+            "Note: NTLM is tested with built-in default names (admin, root, …). "
+            "For reliable results on Windows/AD, pass -u or -U using DOMAIN\\user (legacy) "
+            "or user@domain (UPN)."
+        )
+    if candidates and not any("\\" in name or "@" in name for name in candidates):
+        return (
+            "Note: NTLM identity format may affect results; "
+            "consider DOMAIN\\user or user@domain in -u/-U."
+        )
+    return None
 
 
 def vendor_from_cpe(cpe: str | None) -> str | None:

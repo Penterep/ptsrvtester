@@ -123,7 +123,7 @@ ptsrvtester <module> -h     for help for module use
 - Server information gathering
 - Encryption testing (plaintext, STARTTLS, TLS); port 465 implicit TLS
 - User enumeration (VRFY, EXPN, RCPT)
-- AUTH user enumeration (LOGIN / PLAIN / NTLM from EHLO; optional `-u`/`-U` — NTLM needs names, LOGIN/PLAIN can run baseline-only)
+- AUTH user enumeration (each advertised LOGIN / PLAIN / NTLM; 2 synthetic baselines + `-u`/`-U` or default_logins)
 - HELO/EHLO hostname validation
 - AUTH downgrade test
 - Invalid/non-standard SMTP commands

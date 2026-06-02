@@ -25,6 +25,9 @@ from .utils.helpers import (
     Target,
     Creds,
     ArgsWithBruteforce,
+    AUTH_ENUM_SYNTHETIC_INVALID_COUNT,
+    auth_enum_candidate_names,
+    auth_enum_ntlm_identity_note,
     check_if_brute,
     get_mode,
     valid_target,
@@ -33,6 +36,7 @@ from .utils.helpers import (
     text_or_file,
 )
 from .utils.blacklist_parser import BlacklistParser
+from .utils.progress import ThreadedProgress
 from .utils.service_identification import identify_service
 from .utils.smtp_fingerprints import (
     ServerIdentifyResult,
@@ -483,6 +487,8 @@ RCPT_LIMIT_VERDICT_WARN_MAX = 500
 # Post-hit disconnect probe: how many extra RCPT TO are sent after the per-message
 # limit is detected to determine whether the server eventually closes the session.
 RCPT_LIMIT_POSTHIT_PROBE_COUNT = 20
+# MTA-not-relay: recommend at least this many local names in -u / -U for a meaningful limit probe.
+RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT = 50
 
 # Duplicate RCPT TO (-rdd): same envelope recipient repeated N times in one MAIL transaction.
 # RFC 5321 does not forbid this; delivery fan-out is implementation-defined (dedupe vs N copies).
@@ -1240,6 +1246,8 @@ class SMTPResults:
     role: RoleResult | None = None
     role_error: str | None = None  # When role identification test fails
     auth_enum: AuthEnumResult | None = None
+    auth_enum_methods: tuple[AuthEnumResult, ...] | None = None
+    auth_enum_ntlm_note: str | None = None
     auth_enum_error: str | None = None
     auth_format: AuthFormatProbeResult | None = None
     auth_format_error: str | None = None
@@ -1414,7 +1422,7 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-c", "--commands", "", "Grab EHLO (alias for -A, different JSON)"],
                 ["-A", "--authentications", "", "Grab EHLO (alias for -c, different JSON)"],
                 ["-af", "--auth-format", "", "AUTH LOGIN identity shape probe (username vs e-mail vs NetBIOS)"],
-                ["-ae", "--auth-enum", "", "AUTH enumeration: optional -u/-U; baseline-only uses 5 synthetic names (LOGIN/PLAIN)"],
+                ["-ae", "--auth-enum", "", "AUTH enumeration: 2 synthetic baselines + -u/-U or default_logins"],
                 ["-ad", "--auth-downgrade", "", "Test AUTH downgrade after failed authentication"],
                 ["-he", "--helo-validation", "", "Test HELO/EHLO hostname validation"],
                 ["-iv", "--invalid-commands", "", "Test invalid/non-standard SMTP commands"],
@@ -1579,8 +1587,8 @@ class SMTPArgs(ArgsWithBruteforce):
             "--auth-enum",
             action="store_true",
             help=(
-                "AUTH user enumeration from EHLO (LOGIN / PLAIN / NTLM). Without -u/-U: LOGIN/PLAIN baseline-only "
-                "using 5 synthetic invalid identities; NTLM needs -u/-U to probe candidates"
+                "AUTH user enumeration: test each advertised LOGIN / PLAIN / NTLM; "
+                "2 synthetic invalid baselines plus -u/-U or built-in default_logins when no names are given"
             ),
         )
         direct.add_argument(
@@ -2165,7 +2173,6 @@ class SMTP(BaseModule):
         self.ptjsonlib = ptjsonlib
         self.already_enumerated = None
         self._enum_progress_print_lock = threading.Lock()
-        self._enum_mt_progress_line_active = False
         self._enum_clock_thread: threading.Thread | None = None
         self._enum_clock_stop = threading.Event()
         self._enum_clock_state: dict[str, int | str] | None = None
@@ -2180,12 +2187,15 @@ class SMTP(BaseModule):
         self.is_slow_down = None
         self.fqdn = "example.com" if not args.fqdn else args.fqdn
 
-        # Enumeration / -rl recipient names: lines from -U when used as name list (not bruteforce-only);
-        # optional extra names from -u when -e is active.
+        # Enumeration / -rl / -ae recipient or candidate names: -U file and/or -u list.
         raw: list[str] = []
         if _smtp_users_file_supplies_name_list(args):
             raw = list(filter(lambda x: x != "", text_or_file(None, args.users)))
-        if args.enumerate is not None and args.user is not None:
+        if args.user is not None and (
+            args.enumerate is not None
+            or getattr(args, "auth_enum", False)
+            or getattr(args, "rcpt_limit", None) is not None
+        ):
             raw.extend(x for x in text_or_file(args.user, None) if x != "")
         if raw:
             self.wordlist = [u for u in raw if self._is_valid_local_part(u.split("@")[0].strip())]
@@ -5052,8 +5062,20 @@ class SMTP(BaseModule):
                 pass
         return user, passwd
 
+    def _rl_name_list_source_phrase(self) -> str:
+        """Human label for where -rl recipient names came from (-u vs -U)."""
+        has_file = bool(getattr(self.args, "users", None))
+        has_cli = bool(self.args.user)
+        if has_file and has_cli:
+            return "from -u and username file (-U)"
+        if has_file:
+            return "from username file (-U)"
+        if has_cli:
+            return "from command line (-u)"
+        return "from name list"
+
     def _rl_build_recipients_from_wordlist(self, domain: str, max_n: int) -> list[str]:
-        """Build full RCPT TO addresses from in-memory name list (-U) for MTA-not-relay testing.
+        """Build full RCPT TO addresses from in-memory name list (-u / -U) for MTA-not-relay testing.
 
         Wordlist entries with ``@`` are kept verbatim (already a full address); bare local parts
         are completed with ``@<domain>`` (banner/EHLO domain). Output is deduplicated and capped
@@ -5326,15 +5348,22 @@ class SMTP(BaseModule):
             # Decide test path
             if effective_role in ("mta", "hybrid") and open_relay is False:
                 # MTA not acting as open relay → synthetic 1@dom would always be rejected.
-                # Build recipients from -U name list; without it, the test is skipped explicitly.
+                # Build recipients from -u / -U name list; without it, the test is skipped explicitly.
                 recipients = self._rl_build_recipients_from_wordlist(domain, max_rcpt_attempts)
                 if recipients:
                     recipients_source = "wordlist"
                     self.ptprint(
-                        f"    {info_icon} Using {len(recipients)} recipient(s) from username file (-U) "
-                        f"for MTA-not-relay probe",
+                        f"    {info_icon} Using {len(recipients)} recipient(s) "
+                        f"{self._rl_name_list_source_phrase()} for MTA-not-relay probe",
                         Out.TEXT,
                     )
+                    wl_n = len(getattr(self, "wordlist", None) or [])
+                    if wl_n < RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT:
+                        self.ptprint(
+                            f"    {info_icon} For a valid test, a username list with more than "
+                            f"{RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT} valid recipients is required",
+                            Out.TEXT,
+                        )
                 else:
                     msg = (
                         "Server is not an open relay; the test cannot run with synthetic recipients. "
@@ -6375,42 +6404,6 @@ class SMTP(BaseModule):
         State is updated per-user by _enum_wait_begin(); stopped only once
         at the very end by _enum_clock_shutdown()."""
 
-    def _enum_mt_progress_reset(self) -> None:
-        self._enum_mt_progress_line_active = False
-
-    def _enum_mt_progress_update(self, done: int, total: int) -> None:
-        """One-line progress for multi-thread enum (TTY): ETA and % vs wordlist."""
-        if self.use_json or getattr(self.args, "enum_threads", 1) <= 1 or total <= 0:
-            return
-        start = getattr(self, "_enum_progress_start", None) or time.time()
-        elapsed = max(0.0, time.time() - start)
-        pct = min(100, max(0, int(100 * done / total)))
-        eta_sec = self._enum_eta_remaining_seconds(done, total, elapsed)
-        time_part = (
-            self._format_enum_clock_duration(eta_sec)
-            if eta_sec is not None
-            else "--:--:--"
-        )
-        line_core = f"{time_part} {pct}%"
-        with self._enum_progress_print_lock:
-            self._enum_mt_progress_line_active = True
-            if sys.stdout.isatty():
-                sys.stdout.write(f"\033[2K\r{line_core}")
-                sys.stdout.flush()
-
-    def _enum_mt_progress_finalize(self) -> None:
-        if self.use_json or getattr(self.args, "enum_threads", 1) <= 1:
-            return
-        with self._enum_progress_print_lock:
-            if self._enum_mt_progress_line_active:
-                # Clear live progress line — ``\n`` alone would commit ``100%``; ``\r\n`` would add a blank row.
-                if sys.stdout.isatty():
-                    sys.stdout.write("\033[2K\r")
-                else:
-                    sys.stdout.write("\n")
-                sys.stdout.flush()
-                self._enum_mt_progress_line_active = False
-
     def _enum_progress_newline(self) -> None:
         if self.use_json:
             return
@@ -6422,22 +6415,14 @@ class SMTP(BaseModule):
     def _print_enum_finding(
         self, _idx: int, _total: int, payload: str, *, replace_progress: bool = True
     ) -> None:
-        """Print one enumerated value; clear the live progress line when replace_progress (ST + MT)."""
+        """Print one enumerated value (single-thread); clear the live progress line when replace_progress.
+
+        Multi-thread enumeration prints findings via ``ThreadedProgress`` + ``PrintLock``
+        (see ``utils/progress.py``); this path is single-thread only.
+        """
         if self.use_json:
             return
-        if getattr(self.args, "enum_threads", 1) > 1:
-            with self._enum_progress_print_lock:
-                if replace_progress:
-                    self._enum_mt_progress_line_active = False
-                    self._raw_write(
-                        f"\033[2K\r    {payload}\n".encode("utf-8", errors="replace")
-                    )
-                else:
-                    self._raw_write(
-                        f"    {payload}\n".encode("utf-8", errors="replace")
-                    )
-            return
-        elif replace_progress:
+        if replace_progress:
             self._raw_write(f"\033[2K\r    {payload}\n".encode("utf-8", errors="replace"))
             self._enum_progress_line_dirty = False
         else:
@@ -6592,31 +6577,16 @@ class SMTP(BaseModule):
                 if not self.use_json and enum_threads <= 1:
                     self._enum_progress_newline()
             else:
+                valid_users = [u for u in self.wordlist if not _skip_non_ascii_no_utf8(u)]
+                work_total = len(valid_users)
                 user_queue: queue.Queue[str | None] = queue.Queue()
-                work_total = 0
-                for u in self.wordlist:
-                    if not _skip_non_ascii_no_utf8(u):
-                        user_queue.put(u)
-                        work_total += 1
+                for u in valid_users:
+                    user_queue.put(u)
                 for _ in range(enum_threads):
                     user_queue.put(None)
                 result_lock = threading.Lock()
-                progress_lock = threading.Lock()
-                completed = [0]
-                processed = [0]
-
-                def bump_completed() -> int:
-                    with progress_lock:
-                        completed[0] += 1
-                        return completed[0]
-
-                def bump_processed() -> int:
-                    with progress_lock:
-                        processed[0] += 1
-                        return processed[0]
-
-                if not self.use_json:
-                    self._enum_mt_progress_reset()
+                # ptlibs-style live progress + PrintLock per-item output (utils/progress.py).
+                progress = ThreadedProgress(work_total, enabled=not self.use_json)
 
                 _enum_stream_debug = getattr(self.args, "debug", False)
                 _enum_stream_dbg = (
@@ -6630,7 +6600,7 @@ class SMTP(BaseModule):
                         if user is None:
                             user_queue.task_done()
                             break
-                        cur = bump_completed()
+                        out = progress.new_output()
                         try:
                             if conn is None:
                                 try:
@@ -6641,18 +6611,10 @@ class SMTP(BaseModule):
                                 except Exception:
                                     continue
 
-                            _mt_preview: list[str] = []
-
-                            def _mt_on_first_hit(line_bytes, _u=user, _c=cur):
-                                display = self._expn_vrfy_quick_display(line_bytes, _u)
-                                _mt_preview.append(display)
-                                if not self.use_json:
-                                    self._print_enum_finding(_c, work_total, display)
-
                             try:
                                 status, reply = self._smtp_command_streaming(
                                     conn, method, user,
-                                    on_first_hit=None if self.use_json else _mt_on_first_hit,
+                                    on_first_hit=None,
                                     debug=_enum_stream_debug,
                                     dbg=_enum_stream_dbg,
                                 )
@@ -6666,27 +6628,22 @@ class SMTP(BaseModule):
                                 except Exception:
                                     continue
                             if status != 550:
-                                preview = _mt_preview[0] if _mt_preview else self._expn_vrfy_quick_display(reply, user)
-                                if not _mt_preview and not self.use_json:
-                                    self._print_enum_finding(cur, work_total, preview)
+                                preview = self._expn_vrfy_quick_display(reply, user)
                                 reply_str = self.bytes_to_str(reply)
                                 user_email = self._expn_vrfy_result_strings(reply_str)
                                 if not user_email:
                                     user_email = [preview]
                                 with result_lock:
                                     enumerated_users.extend(user_email)
-                                if not self.use_json:
-                                    for em in user_email:
-                                        if em != preview:
-                                            self._print_enum_finding(
-                                                cur, work_total, em, replace_progress=False
-                                            )
-                                elif self.use_json:
+                                if self.use_json:
                                     self.ptdebug(user_email[0])
+                                else:
+                                    for em in user_email:
+                                        out.add_string_to_output(em)
                         finally:
-                            p = bump_processed()
                             if not self.use_json:
-                                self._enum_mt_progress_update(p, work_total)
+                                progress.flush(out, repaint=False)
+                                progress.advance(label=user)
                             user_queue.task_done()
 
                 threads_list = [threading.Thread(target=worker) for _ in range(enum_threads)]
@@ -6695,7 +6652,7 @@ class SMTP(BaseModule):
                 for t in threads_list:
                     t.join()
                 if not self.use_json:
-                    self._enum_mt_progress_finalize()
+                    progress.finalize()
                 total_aliases = 0
 
             additional_message = (
@@ -7219,22 +7176,8 @@ class SMTP(BaseModule):
                 for _ in range(enum_threads):
                     user_queue.put(None)
                 result_lock = threading.Lock()
-                progress_lock = threading.Lock()
-                completed = [0]
-                processed = [0]
-
-                def bump_completed() -> int:
-                    with progress_lock:
-                        completed[0] += 1
-                        return completed[0]
-
-                def bump_processed() -> int:
-                    with progress_lock:
-                        processed[0] += 1
-                        return processed[0]
-
-                if not self.use_json:
-                    self._enum_mt_progress_reset()
+                # ptlibs-style live progress + PrintLock per-item output (utils/progress.py).
+                progress = ThreadedProgress(work_total, enabled=not self.use_json)
 
                 def rcpt_worker() -> None:
                     conn = None
@@ -7243,8 +7186,8 @@ class SMTP(BaseModule):
                         if local is None:
                             user_queue.task_done()
                             break
-                        cur = bump_completed()
                         label = f"{local}@{domain}"
+                        out = progress.new_output()
                         try:
                             if conn is None:
                                 try:
@@ -7268,16 +7211,16 @@ class SMTP(BaseModule):
                                 except Exception:
                                     continue
                             if status != 550 and not self._rcpt_reply_has_unknown(reply):
-                                if not self.use_json:
-                                    self._print_enum_finding(cur, work_total, label)
-                                elif self.use_json:
+                                if self.use_json:
                                     self.ptdebug(label)
+                                else:
+                                    out.add_string_to_output(label)
                                 with result_lock:
                                     enumerated_users.append(label)
                         finally:
-                            p = bump_processed()
                             if not self.use_json:
-                                self._enum_mt_progress_update(p, work_total)
+                                progress.flush(out, repaint=False)
+                                progress.advance(label=local)
                             user_queue.task_done()
 
                 threads_list = [threading.Thread(target=rcpt_worker) for _ in range(enum_threads)]
@@ -7286,7 +7229,7 @@ class SMTP(BaseModule):
                 for t in threads_list:
                     t.join()
                 if not self.use_json:
-                    self._enum_mt_progress_finalize()
+                    progress.finalize()
 
             self.ptdebug(f" ")
             self.ptdebug(f"-- Enumerated {len(enumerated_users)} users --")
@@ -7528,9 +7471,7 @@ class SMTP(BaseModule):
         return NTLMResult(True, ntlm)
 
     AUTH_ENUM_PASSWORD = "PtSrv_Test_!@#_2026"
-    #: Standalone ``-ae`` without ``-u``/``-U``: probe this many random non-existent identities (LOGIN/PLAIN).
-    #: OWASP-style differential checks compare multiple invalid probes; a small N>2 reduces single-shot noise.
-    AUTH_ENUM_BASELINE_ONLY_INVALID_COUNT = 5
+    AUTH_ENUM_METHOD_PROBE_ORDER = ("LOGIN", "PLAIN", "NTLM")
 
     def _get_smtp_for_auth_enum(self) -> tuple[smtplib.SMTP, str]:
         """
@@ -7729,175 +7670,109 @@ class SMTP(BaseModule):
                 except Exception:
                     pass
 
-    def _auth_enum_result_baseline_only_login(self, invalid_users: Sequence[str]) -> AuthEnumResult:
-        """
-        Baseline-only probe (no -u/-U): several synthetic invalid users over AUTH LOGIN.
-        Identical failure signatures across probes → likely masked; any mismatch or 5xx after username only → oracle.
-        (OWASP-style differential testing: compare multiple invalid requests, not a single pair.)
-        """
-        n = len(invalid_users)
-        self._auth_enum_progress_session_begin()
-        try:
-            sigs: list[str | None] = []
-            protocol_flow_vuln = False
-            for i, u in enumerate(invalid_users, start=1):
-                self._auth_enum_progress_step(i, n, self._auth_enum_progress_label(u))
-                try:
-                    s = self._auth_enum_probe_login_user(u)
-                    sigs.append(s)
-                    self.ptdebug(f"AUTH-ENUM baseline-only LOGIN: probe {u!r} → {s!r}")
-                    if s and s.startswith("LOGIN:u:"):
-                        protocol_flow_vuln = True
-                finally:
-                    self._auth_enum_progress_step_done()
-            inv_list = [x for x in sigs if x]
-            if protocol_flow_vuln:
-                return AuthEnumResult(
-                    vulnerable=True,
-                    indeterminate=False,
-                    method_tested="LOGIN",
-                    protocol_flow_vuln=True,
-                    invalid_user_responses=inv_list,
-                    valid_user_response=None,
-                    enumerated_users=(),
-                    detail="Server responds 5xx after username (before password challenge)",
-                )
-            if any(s is None for s in sigs):
-                return AuthEnumResult(
-                    vulnerable=False,
-                    indeterminate=True,
-                    method_tested="LOGIN",
-                    protocol_flow_vuln=False,
-                    invalid_user_responses=inv_list,
-                    valid_user_response=None,
-                    enumerated_users=(),
-                    detail=(
-                        f"Baseline-only: could not obtain comparable AUTH LOGIN failure signatures for all {n} "
-                        "synthetic invalid users (unexpected replies or disconnect)"
-                    ),
-                )
-            uniq = set(sigs)
-            if len(uniq) == 1:
-                one = next(iter(uniq))
-                return AuthEnumResult(
-                    vulnerable=False,
-                    indeterminate=False,
-                    method_tested="LOGIN",
-                    protocol_flow_vuln=False,
-                    invalid_user_responses=list(sigs),
-                    valid_user_response=None,
-                    enumerated_users=(),
-                    detail=(
-                        f"Baseline-only: identical AUTH failure signatures across {n} synthetic invalid users "
-                        "(unknown identities appear consistently rejected)"
-                    ),
-                )
-            return AuthEnumResult(
-                vulnerable=True,
-                indeterminate=False,
-                method_tested="LOGIN",
-                protocol_flow_vuln=False,
-                invalid_user_responses=inv_list,
-                valid_user_response=None,
-                enumerated_users=(),
-                detail=(
-                    f"Baseline-only: differing AUTH failure signatures among {n} synthetic invalid users; "
-                    "errors may leak state — probe candidate names with -u / -U"
-                ),
-            )
-        finally:
-            self._auth_enum_progress_session_end()
-
-    def _auth_enum_result_baseline_only_plain(self, invalid_users: Sequence[str]) -> AuthEnumResult:
-        """
-        Baseline-only AUTH PLAIN (RFC 4616): compare final failure across several synthetic invalid identities.
-        Same rationale as LOGIN baseline-only (multiple invalid probes).
-        """
-        n = len(invalid_users)
-        self._auth_enum_progress_session_begin()
-        try:
-            rows: list[str | None] = []
-            for i, u in enumerate(invalid_users, start=1):
-                self._auth_enum_progress_step(i, n, self._auth_enum_progress_label(u))
-                try:
-                    r = self._auth_enum_probe_plain_user(u)
-                    rows.append(r)
-                    self.ptdebug(f"AUTH-ENUM baseline-only PLAIN: probe {u!r} → {r!r}")
-                finally:
-                    self._auth_enum_progress_step_done()
-            inv_list = [x for x in rows if x]
-            if any(r is None for r in rows):
-                return AuthEnumResult(
-                    vulnerable=False,
-                    indeterminate=True,
-                    method_tested="PLAIN",
-                    protocol_flow_vuln=False,
-                    invalid_user_responses=inv_list,
-                    valid_user_response=None,
-                    enumerated_users=(),
-                    detail=(
-                        f"Baseline-only: could not obtain comparable AUTH PLAIN failure responses for all {n} "
-                        "synthetic invalid users (unexpected replies or disconnect)"
-                    ),
-                )
-            norms = [_normalize_auth_response_for_comparison(r) for r in rows if r]
-            if len(set(norms)) == 1:
-                return AuthEnumResult(
-                    vulnerable=False,
-                    indeterminate=False,
-                    method_tested="PLAIN",
-                    protocol_flow_vuln=False,
-                    invalid_user_responses=[r for r in rows if r],
-                    valid_user_response=None,
-                    enumerated_users=(),
-                    detail=(
-                        f"Baseline-only: identical AUTH PLAIN failure responses across {n} synthetic invalid users "
-                        "(unknown identities appear consistently rejected)"
-                    ),
-                )
-            return AuthEnumResult(
-                vulnerable=True,
-                indeterminate=False,
-                method_tested="PLAIN",
-                protocol_flow_vuln=False,
-                invalid_user_responses=[r for r in rows if r],
-                valid_user_response=None,
-                enumerated_users=(),
-                detail=(
-                    f"Baseline-only: differing AUTH PLAIN failure responses among {n} synthetic invalid users; "
-                    "errors may leak state — probe candidate names with -u / -U"
-                ),
-            )
-        finally:
-            self._auth_enum_progress_session_end()
-
-    def test_auth_enum(self) -> AuthEnumResult:
-        """
-        AUTH user enumeration: with -u/-U, compare candidate probes to an invalid baseline.
-        Without -u/-U (baseline-only): LOGIN/PLAIN — several synthetic invalid identities (see
-        ``AUTH_ENUM_BASELINE_ONLY_INVALID_COUNT``); stable identical failures suggest masking, divergence
-        suggests a response oracle. NTLM without candidates is indeterminate (no reliable invalid-only oracle).
-        """
-        self._auth_enum_dbg_logged_starttls = False
-        if self.args.user:
-            candidates = text_or_file(self.args.user, None)
-        else:
-            candidates = [u.strip() for u in (self.wordlist or []) if u.strip()]
-        baseline_only = len(candidates) == 0
-        invalid_users = [
-            f"enumtest_invalid_{random.getrandbits(32):08x}",
-            f"enumtest_invalid_{random.getrandbits(32):08x}",
+    @staticmethod
+    def _auth_enum_synthetic_invalid_names() -> list[str]:
+        return [
+            f"enumtest_invalid_{random.getrandbits(32):08x}"
+            for _ in range(AUTH_ENUM_SYNTHETIC_INVALID_COUNT)
         ]
+
+    def _auth_enum_methods_to_test(self, auth_methods: set[str]) -> list[str]:
+        return [m for m in self.AUTH_ENUM_METHOD_PROBE_ORDER if m in auth_methods]
+
+    @staticmethod
+    def _auth_enum_login_postprocess(
+        invalid_responses: list[str],
+        candidate_sigs: list[str | None],
+        candidates: list[str],
+    ) -> tuple[bool, list[str]]:
+        """Compute LOGIN enumeration result from collected signatures.
+
+        Returns ``(effective_protocol_flow_vuln, enumerated_list)``:
+
+        * baseline (invalid) users rejected with 5xx at the username stage
+          (``LOGIN:u:``) is only a real oracle if at least one candidate is NOT
+          rejected there (i.e. passes to the password stage → likely valid).
+        * a candidate is enumerated when its signature differs from the invalid
+          baseline OR it passed the username gate while invalid users did not.
+        """
+        inv_set = set(invalid_responses)
+        baseline_gate_reject = any(s and s.startswith("LOGIN:u:") for s in invalid_responses)
+        enumerated: list[str] = []
+        gate_passed_count = 0
+        for cand, sig in zip(candidates, candidate_sigs):
+            differs = bool(sig and inv_set and sig not in inv_set)
+            passed_gate = bool(baseline_gate_reject and sig and not sig.startswith("LOGIN:u:"))
+            if passed_gate:
+                gate_passed_count += 1
+            if differs or passed_gate:
+                enumerated.append(cand)
+        effective_proto = baseline_gate_reject and gate_passed_count > 0
+        return effective_proto, enumerated
+
+    def _auth_enum_finalize_method_result(
+        self,
+        method: str,
+        *,
+        invalid_responses: list[str],
+        protocol_flow_vuln: bool,
+        enumerated_list: list[str],
+        candidates: list[str],
+        any_candidate_sig: bool,
+        valid_response: str | None,
+    ) -> AuthEnumResult:
+        response_differs = len(enumerated_list) > 0
+        vulnerable = protocol_flow_vuln or response_differs
+        detail: str | None = None
+        if protocol_flow_vuln:
+            detail = "Server responds 5xx after username (before password challenge)"
+        elif response_differs:
+            detail = (
+                f"Different responses vs synthetic invalid baseline; "
+                f"examples: {invalid_responses[:1]} vs {valid_response}"
+            )
+
+        if not invalid_responses and not protocol_flow_vuln:
+            return AuthEnumResult(
+                vulnerable=False,
+                indeterminate=True,
+                method_tested=method,
+                protocol_flow_vuln=False,
+                invalid_user_responses=[],
+                valid_user_response=None,
+                enumerated_users=(),
+                detail="Could not obtain AUTH baseline from two synthetic invalid users",
+            )
+        if not vulnerable and candidates and not any_candidate_sig:
+            return AuthEnumResult(
+                vulnerable=False,
+                indeterminate=True,
+                method_tested=method,
+                protocol_flow_vuln=False,
+                invalid_user_responses=invalid_responses,
+                valid_user_response=valid_response,
+                enumerated_users=(),
+                detail="No comparable AUTH responses for candidate names",
+            )
+
         self.ptdebug(
-            f"AUTH-ENUM: mode={'baseline-only (no -u/-U)' if baseline_only else 'with candidates'}; "
-            f"{len(candidates)} candidate(s): "
-            f"{candidates if len(candidates) <= 12 else candidates[:12] + ['…']}",
+            f"AUTH-ENUM {method}: summary vulnerable={vulnerable} "
+            f"protocol_flow_vuln={protocol_flow_vuln} response_differs={response_differs} "
+            f"enumerated={list(enumerated_list)!r} first_candidate_signature={valid_response!r}",
+        )
+        return AuthEnumResult(
+            vulnerable=vulnerable,
+            indeterminate=False,
+            method_tested=method,
+            protocol_flow_vuln=protocol_flow_vuln,
+            invalid_user_responses=invalid_responses,
+            valid_user_response=valid_response,
+            enumerated_users=tuple(enumerated_list),
+            detail=detail,
         )
 
-        try:
-            _, ehlo = self._get_smtp_for_auth_enum()
-        except Exception as e:
-            self.ptdebug(f"AUTH-ENUM: aborted — initial connect/EHLO failed: {e!r}")
+    def _auth_enum_aggregate_results(self, method_results: list[AuthEnumResult]) -> AuthEnumResult:
+        if not method_results:
             return AuthEnumResult(
                 vulnerable=False,
                 indeterminate=True,
@@ -7906,359 +7781,196 @@ class SMTP(BaseModule):
                 invalid_user_responses=[],
                 valid_user_response=None,
                 enumerated_users=(),
-                detail=str(e),
+                detail="No AUTH enumeration probes were run",
+            )
+        if len(method_results) == 1:
+            return method_results[0]
+
+        methods_tested = ",".join(r.method_tested for r in method_results if r.method_tested)
+        enumerated: list[str] = []
+        seen_enum: set[str] = set()
+        for r in method_results:
+            for u in r.enumerated_users:
+                if u not in seen_enum:
+                    seen_enum.add(u)
+                    enumerated.append(u)
+
+        if any(r.vulnerable for r in method_results):
+            detail_parts = [
+                f"{r.method_tested}: {r.detail}"
+                for r in method_results
+                if r.vulnerable and r.detail
+            ]
+            return AuthEnumResult(
+                vulnerable=True,
+                indeterminate=False,
+                method_tested=methods_tested,
+                protocol_flow_vuln=any(r.protocol_flow_vuln for r in method_results),
+                invalid_user_responses=[],
+                valid_user_response=None,
+                enumerated_users=tuple(enumerated),
+                detail="; ".join(detail_parts) if detail_parts else "User enumeration via one or more AUTH mechanisms",
             )
 
-        auth_methods = _get_auth_methods_from_ehlo(ehlo)
-        self.ptdebug(
-            f"AUTH-ENUM: target {self.args.target.ip}:{self.args.target.port} fqdn={self.fqdn!r}; "
-            f"AUTH from EHLO → {sorted(auth_methods)!r}",
+        if all(r.indeterminate for r in method_results):
+            detail_parts = [r.detail for r in method_results if r.detail]
+            return AuthEnumResult(
+                vulnerable=False,
+                indeterminate=True,
+                method_tested=methods_tested,
+                protocol_flow_vuln=False,
+                invalid_user_responses=[],
+                valid_user_response=None,
+                enumerated_users=(),
+                detail="; ".join(detail_parts) if detail_parts else "Indeterminate",
+            )
+
+        return AuthEnumResult(
+            vulnerable=False,
+            indeterminate=False,
+            method_tested=methods_tested,
+            protocol_flow_vuln=False,
+            invalid_user_responses=[],
+            valid_user_response=None,
+            enumerated_users=(),
+            detail=None,
         )
-        method_to_test: str | None = None
-        if "LOGIN" in auth_methods:
-            method_to_test = "LOGIN"
-        elif "PLAIN" in auth_methods:
-            method_to_test = "PLAIN"
-        elif "NTLM" in auth_methods:
-            method_to_test = "NTLM"
-        if not method_to_test:
-            self.ptdebug(
-                "AUTH-ENUM: aborted — EHLO has no AUTH mechanism LOGIN, PLAIN, or NTLM "
-                "(after any STARTTLS upgrade inside probe)",
-            )
-            return AuthEnumResult(
-                vulnerable=False,
-                indeterminate=True,
-                method_tested="",
-                protocol_flow_vuln=False,
-                invalid_user_responses=[],
-                valid_user_response=None,
-                enumerated_users=(),
-                detail="Server does not advertise AUTH LOGIN, PLAIN, or NTLM",
-            )
 
-        if baseline_only and method_to_test == "NTLM":
-            if NtlmContext is None:
-                self.ptdebug("AUTH-ENUM: baseline-only + NTLM — ntlm-auth not installed")
-                return AuthEnumResult(
-                    vulnerable=False,
-                    indeterminate=True,
-                    method_tested="NTLM",
-                    protocol_flow_vuln=False,
-                    invalid_user_responses=[],
-                    valid_user_response=None,
-                    enumerated_users=(),
-                    detail="NTLM test requires ntlm-auth package",
-                )
-            self.ptdebug(
-                "AUTH-ENUM: baseline-only + NTLM — skipping invalid-only oracle (use -u / -U for probes)",
-            )
-            return AuthEnumResult(
-                vulnerable=False,
-                indeterminate=True,
-                method_tested="NTLM",
-                protocol_flow_vuln=False,
-                invalid_user_responses=[],
-                valid_user_response=None,
-                enumerated_users=(),
-                detail=(
-                    "AUTH NTLM enumeration requires candidate names (-u / -U); "
-                    "a two-user baseline without known accounts is not a reliable oracle (multi-step handshake)."
-                ),
-            )
+    def _auth_enum_progress_run_step(self, total: int, label: str) -> None:
+        counter = getattr(self, "_auth_enum_progress_counter", 0) + 1
+        self._auth_enum_progress_counter = counter
+        self._auth_enum_progress_step(counter, total, label)
 
+    def _auth_enum_test_login_method(
+        self,
+        candidates: list[str],
+        invalid_users: list[str],
+        *,
+        progress_total: int,
+    ) -> AuthEnumResult:
         invalid_responses: list[str] = []
         protocol_flow_vuln = False
         enumerated_list: list[str] = []
         valid_response: str | None = None
+        any_candidate_sig = False
 
-        def _norm_line(code: int, resp: bytes) -> str:
-            txt = self.bytes_to_str(resp).strip()
-            return f"{code} {txt}" if txt else str(code)
-
-        if method_to_test == "LOGIN":
-            if baseline_only:
-                synth = [
-                    f"enumtest_invalid_{random.getrandbits(32):08x}"
-                    for _ in range(self.AUTH_ENUM_BASELINE_ONLY_INVALID_COUNT)
-                ]
-                return self._auth_enum_result_baseline_only_login(synth)
-            total_steps = len(invalid_users) + len(candidates)
-            self._auth_enum_progress_session_begin()
+        self.ptdebug(f"AUTH-ENUM: LOGIN — synthetic baseline: {invalid_users!r}")
+        for inv_user in invalid_users:
+            self._auth_enum_progress_run_step(progress_total, self._auth_enum_progress_label(inv_user))
             try:
-                self.ptdebug(f"AUTH-ENUM: LOGIN — invalid baseline identities: {invalid_users!r}")
-                for bi, inv_user in enumerate(invalid_users, start=1):
-                    self._auth_enum_progress_step(bi, total_steps, self._auth_enum_progress_label(inv_user))
-                    try:
-                        try:
-                            conn, _ = self._get_smtp_for_auth_enum()
-                            code, resp = conn.docmd("AUTH", "LOGIN")
-                            if code != 334:
-                                self.ptdebug(
-                                    f"AUTH-ENUM baseline {inv_user!r}: AUTH LOGIN → {code} "
-                                    f"{self._auth_enum_reply_snip(resp)!r} (skip)",
-                                )
-                                try:
-                                    conn.close()
-                                except Exception:
-                                    pass
-                                continue
-                            code, resp = conn.docmd(b64encode(inv_user.encode()).decode())
-                            if code >= 500:
-                                protocol_flow_vuln = True
-                                invalid_responses.append(
-                                    _auth_enum_login_stage_signature("u", code, resp, self.bytes_to_str)
-                                )
-                                self.ptdebug(
-                                    f"AUTH-ENUM baseline {inv_user!r}: after username → {code} "
-                                    f"{self._auth_enum_reply_snip(resp)!r} (stage=u, 5xx before password)",
-                                )
-                            elif code == 334:
-                                code, resp = conn.docmd(b64encode(self.AUTH_ENUM_PASSWORD.encode()).decode())
-                                if code >= 500:
-                                    invalid_responses.append(
-                                        _auth_enum_login_stage_signature("p", code, resp, self.bytes_to_str)
-                                    )
-                                    self.ptdebug(
-                                        f"AUTH-ENUM baseline {inv_user!r}: after password (fixed wrong) → {code} "
-                                        f"{self._auth_enum_reply_snip(resp)!r} (stage=p)",
-                                    )
-                                else:
-                                    self.ptdebug(
-                                        f"AUTH-ENUM baseline {inv_user!r}: after password → {code} "
-                                        f"{self._auth_enum_reply_snip(resp)!r} (unexpected, not 5xx)",
-                                    )
-                            else:
-                                self.ptdebug(
-                                    f"AUTH-ENUM baseline {inv_user!r}: after username → {code} "
-                                    f"{self._auth_enum_reply_snip(resp)!r} (not 334/5xx, unexpected)",
-                                )
-                            try:
-                                conn.close()
-                            except Exception:
-                                pass
-                        except Exception as ex:
-                            self.ptdebug(f"AUTH-ENUM baseline {inv_user!r}: exception {type(ex).__name__}: {ex}")
-                    finally:
-                        self._auth_enum_progress_step_done()
-
-                inv_normalized = set(invalid_responses) if invalid_responses else set()
-                self.ptdebug(
-                    f"AUTH-ENUM: baseline comparison set ({len(inv_normalized)}): {sorted(inv_normalized)!r}",
-                )
-                self.ptdebug(
-                    f"AUTH-ENUM: protocol_flow_vuln (5xx immediately after username for invalid) = {protocol_flow_vuln}",
-                )
-                for i, cand in enumerate(candidates):
-                    self._auth_enum_progress_step(
-                        len(invalid_users) + i + 1,
-                        total_steps,
-                        self._auth_enum_progress_label(cand),
-                    )
-                    try:
-                        r = self._auth_enum_probe_login_user(cand)
-                        differs = bool(r and inv_normalized and r not in inv_normalized)
-                        self.ptdebug(
-                            f"AUTH-ENUM candidate[{i}] {cand!r}: signature={r!r}; differs_from_baseline={differs}",
-                        )
-                        if i == 0:
-                            valid_response = r
-                        if i == 0 and r is None:
-                            return AuthEnumResult(
-                                vulnerable=protocol_flow_vuln,
-                                indeterminate=not protocol_flow_vuln and not invalid_responses,
-                                method_tested="LOGIN",
-                                protocol_flow_vuln=protocol_flow_vuln,
-                                invalid_user_responses=invalid_responses,
-                                valid_user_response=None,
-                                enumerated_users=(),
-                                detail=None,
-                            )
-                        if r and inv_normalized and r not in inv_normalized:
-                            enumerated_list.append(cand)
-                    finally:
-                        self._auth_enum_progress_step_done()
+                r = self._auth_enum_probe_login_user(inv_user)
+                self.ptdebug(f"AUTH-ENUM baseline {inv_user!r}: signature={r!r}")
+                if r:
+                    invalid_responses.append(r)
             finally:
-                self._auth_enum_progress_session_end()
+                self._auth_enum_progress_step_done()
 
-        elif method_to_test == "PLAIN":
-            if baseline_only:
-                synth = [
-                    f"enumtest_invalid_{random.getrandbits(32):08x}"
-                    for _ in range(self.AUTH_ENUM_BASELINE_ONLY_INVALID_COUNT)
-                ]
-                return self._auth_enum_result_baseline_only_plain(synth)
-            total_steps = len(invalid_users) + len(candidates)
-            self._auth_enum_progress_session_begin()
+        inv_normalized = set(invalid_responses) if invalid_responses else set()
+        self.ptdebug(
+            f"AUTH-ENUM: baseline comparison set ({len(inv_normalized)}): {sorted(inv_normalized)!r}",
+        )
+        candidate_sigs: list[str | None] = []
+        for i, cand in enumerate(candidates):
+            self._auth_enum_progress_run_step(progress_total, self._auth_enum_progress_label(cand))
             try:
-                self.ptdebug(f"AUTH-ENUM: PLAIN (RFC 4616) — invalid baseline identities: {invalid_users!r}")
-                for bi, inv_user in enumerate(invalid_users, start=1):
-                    self._auth_enum_progress_step(bi, total_steps, self._auth_enum_progress_label(inv_user))
-                    try:
-                        try:
-                            conn, _ = self._get_smtp_for_auth_enum()
-                            code, resp = self._auth_enum_plain_exchange(conn, inv_user, self.AUTH_ENUM_PASSWORD)
-                            if code >= 500:
-                                invalid_responses.append(_norm_line(code, resp))
-                                self.ptdebug(
-                                    f"AUTH-ENUM PLAIN baseline {inv_user!r}: after PLAIN → {code} "
-                                    f"{self._auth_enum_reply_snip(resp)!r}",
-                                )
-                            else:
-                                self.ptdebug(
-                                    f"AUTH-ENUM PLAIN baseline {inv_user!r}: after PLAIN → {code} "
-                                    f"{self._auth_enum_reply_snip(resp)!r} (not 5xx, skip)",
-                                )
-                            try:
-                                conn.close()
-                            except Exception:
-                                pass
-                        except Exception as ex:
-                            self.ptdebug(f"AUTH-ENUM PLAIN baseline {inv_user!r}: exception {type(ex).__name__}: {ex}")
-                    finally:
-                        self._auth_enum_progress_step_done()
-
-                inv_normalized = (
-                    {_normalize_auth_response_for_comparison(r) for r in invalid_responses}
-                    if invalid_responses
-                    else set()
-                )
-                self.ptdebug(
-                    f"AUTH-ENUM: PLAIN baseline normalized set ({len(inv_normalized)}): {sorted(inv_normalized)!r}",
-                )
-                for i, cand in enumerate(candidates):
-                    self._auth_enum_progress_step(
-                        len(invalid_users) + i + 1,
-                        total_steps,
-                        self._auth_enum_progress_label(cand),
-                    )
-                    try:
-                        r = self._auth_enum_probe_plain_user(cand)
-                        differs = bool(
-                            r
-                            and inv_normalized
-                            and _normalize_auth_response_for_comparison(r) not in inv_normalized
-                        )
-                        self.ptdebug(
-                            f"AUTH-ENUM PLAIN candidate[{i}] {cand!r}: line={r!r}; differs_from_baseline={differs}",
-                        )
-                        if i == 0:
-                            valid_response = r
-                        if i == 0 and r is None:
-                            return AuthEnumResult(
-                                vulnerable=False,
-                                indeterminate=not invalid_responses,
-                                method_tested="PLAIN",
-                                protocol_flow_vuln=False,
-                                invalid_user_responses=invalid_responses,
-                                valid_user_response=None,
-                                enumerated_users=(),
-                                detail=None,
-                            )
-                        if r and inv_normalized and _normalize_auth_response_for_comparison(r) not in inv_normalized:
-                            enumerated_list.append(cand)
-                    finally:
-                        self._auth_enum_progress_step_done()
+                r = self._auth_enum_probe_login_user(cand)
+                candidate_sigs.append(r)
+                self.ptdebug(f"AUTH-ENUM candidate[{i}] {cand!r}: signature={r!r}")
+                if i == 0:
+                    valid_response = r
+                if r is not None:
+                    any_candidate_sig = True
             finally:
-                self._auth_enum_progress_session_end()
+                self._auth_enum_progress_step_done()
 
-        elif method_to_test == "NTLM" and NtlmContext is not None:
-            total_steps = len(invalid_users) + len(candidates)
-            self._auth_enum_progress_session_begin()
+        protocol_flow_vuln, enumerated_list = self._auth_enum_login_postprocess(
+            invalid_responses, candidate_sigs, candidates,
+        )
+        self.ptdebug(
+            f"AUTH-ENUM: LOGIN effective protocol_flow_vuln={protocol_flow_vuln}; "
+            f"enumerated={enumerated_list!r}",
+        )
+
+        return self._auth_enum_finalize_method_result(
+            "LOGIN",
+            invalid_responses=invalid_responses,
+            protocol_flow_vuln=protocol_flow_vuln,
+            enumerated_list=enumerated_list,
+            candidates=candidates,
+            any_candidate_sig=any_candidate_sig,
+            valid_response=valid_response,
+        )
+
+    def _auth_enum_test_plain_method(
+        self,
+        candidates: list[str],
+        invalid_users: list[str],
+        *,
+        progress_total: int,
+    ) -> AuthEnumResult:
+        invalid_responses: list[str] = []
+        enumerated_list: list[str] = []
+        valid_response: str | None = None
+        any_candidate_sig = False
+
+        self.ptdebug(f"AUTH-ENUM: PLAIN (RFC 4616) — synthetic baseline: {invalid_users!r}")
+        for inv_user in invalid_users:
+            self._auth_enum_progress_run_step(progress_total, self._auth_enum_progress_label(inv_user))
             try:
-                self.ptdebug(f"AUTH-ENUM: NTLM — invalid baseline identities: {invalid_users!r}")
-                for bi, inv_user in enumerate(invalid_users, start=1):
-                    self._auth_enum_progress_step(bi, total_steps, self._auth_enum_progress_label(inv_user))
-                    try:
-                        try:
-                            conn, _ = self._get_smtp_for_auth_enum()
-                            code, resp = conn.docmd("AUTH", "NTLM")
-                            if code != 334:
-                                self.ptdebug(
-                                    f"AUTH-ENUM NTLM baseline {inv_user!r}: AUTH NTLM → {code} "
-                                    f"{self._auth_enum_reply_snip(resp)!r} (skip)",
-                                )
-                                try:
-                                    conn.close()
-                                except Exception:
-                                    pass
-                                continue
-                            conn.send(b64encode(get_NegotiateMessage_data()) + smtplib.bCRLF)
-                            code, resp = conn.getreply()
-                            if code != 334:
-                                self.ptdebug(
-                                    f"AUTH-ENUM NTLM baseline {inv_user!r}: after negotiate → {code} "
-                                    f"{self._auth_enum_reply_snip(resp)!r} (skip)",
-                                )
-                                try:
-                                    conn.close()
-                                except Exception:
-                                    pass
-                                continue
-                            ctx = NtlmContext(inv_user, self.AUTH_ENUM_PASSWORD)
-                            type3 = ctx.step(b64decode(resp))
-                            conn.send(b64encode(type3) + smtplib.bCRLF)
-                            code, resp = conn.getreply()
-                            if code >= 500:
-                                invalid_responses.append(_norm_line(code, resp))
-                                self.ptdebug(
-                                    f"AUTH-ENUM NTLM baseline {inv_user!r}: after Type 3 → {code} "
-                                    f"{self._auth_enum_reply_snip(resp)!r}",
-                                )
-                            try:
-                                conn.close()
-                            except Exception:
-                                pass
-                        except Exception as ex:
-                            self.ptdebug(f"AUTH-ENUM NTLM baseline {inv_user!r}: exception {type(ex).__name__}: {ex}")
-                    finally:
-                        self._auth_enum_progress_step_done()
+                r = self._auth_enum_probe_plain_user(inv_user)
+                self.ptdebug(f"AUTH-ENUM PLAIN baseline {inv_user!r}: line={r!r}")
+                if r:
+                    invalid_responses.append(r)
+            finally:
+                self._auth_enum_progress_step_done()
 
-                inv_normalized = (
-                    {_normalize_auth_response_for_comparison(r) for r in invalid_responses}
-                    if invalid_responses
-                    else set()
+        inv_normalized = (
+            {_normalize_auth_response_for_comparison(r) for r in invalid_responses}
+            if invalid_responses
+            else set()
+        )
+        self.ptdebug(
+            f"AUTH-ENUM: PLAIN baseline normalized set ({len(inv_normalized)}): {sorted(inv_normalized)!r}",
+        )
+        for i, cand in enumerate(candidates):
+            self._auth_enum_progress_run_step(progress_total, self._auth_enum_progress_label(cand))
+            try:
+                r = self._auth_enum_probe_plain_user(cand)
+                differs = bool(
+                    r
+                    and inv_normalized
+                    and _normalize_auth_response_for_comparison(r) not in inv_normalized
                 )
                 self.ptdebug(
-                    f"AUTH-ENUM: NTLM baseline normalized set ({len(inv_normalized)}): {sorted(inv_normalized)!r}",
+                    f"AUTH-ENUM PLAIN candidate[{i}] {cand!r}: line={r!r}; differs_from_baseline={differs}",
                 )
-                for i, cand in enumerate(candidates):
-                    self._auth_enum_progress_step(
-                        len(invalid_users) + i + 1,
-                        total_steps,
-                        self._auth_enum_progress_label(cand),
-                    )
-                    try:
-                        r = self._auth_enum_probe_ntlm_user(cand)
-                        differs = bool(
-                            r
-                            and inv_normalized
-                            and _normalize_auth_response_for_comparison(r) not in inv_normalized
-                        )
-                        self.ptdebug(
-                            f"AUTH-ENUM NTLM candidate[{i}] {cand!r}: line={r!r}; differs_from_baseline={differs}",
-                        )
-                        if i == 0:
-                            valid_response = r
-                        if i == 0 and r is None:
-                            return AuthEnumResult(
-                                vulnerable=False,
-                                indeterminate=not invalid_responses,
-                                method_tested="NTLM",
-                                protocol_flow_vuln=False,
-                                invalid_user_responses=invalid_responses,
-                                valid_user_response=None,
-                                enumerated_users=(),
-                                detail=None,
-                            )
-                        if r and inv_normalized and _normalize_auth_response_for_comparison(r) not in inv_normalized:
-                            enumerated_list.append(cand)
-                    finally:
-                        self._auth_enum_progress_step_done()
+                if i == 0:
+                    valid_response = r
+                if r is not None:
+                    any_candidate_sig = True
+                if r and inv_normalized and _normalize_auth_response_for_comparison(r) not in inv_normalized:
+                    enumerated_list.append(cand)
             finally:
-                self._auth_enum_progress_session_end()
+                self._auth_enum_progress_step_done()
 
-        elif method_to_test == "NTLM":
+        return self._auth_enum_finalize_method_result(
+            "PLAIN",
+            invalid_responses=invalid_responses,
+            protocol_flow_vuln=False,
+            enumerated_list=enumerated_list,
+            candidates=candidates,
+            any_candidate_sig=any_candidate_sig,
+            valid_response=valid_response,
+        )
+
+    def _auth_enum_test_ntlm_method(
+        self,
+        candidates: list[str],
+        invalid_users: list[str],
+        *,
+        progress_total: int,
+    ) -> AuthEnumResult:
+        if NtlmContext is None:
             return AuthEnumResult(
                 vulnerable=False,
                 indeterminate=True,
@@ -8270,30 +7982,354 @@ class SMTP(BaseModule):
                 detail="NTLM test requires ntlm-auth package",
             )
 
-        response_differs = len(enumerated_list) > 0
-        vulnerable = protocol_flow_vuln or response_differs
-        detail = None
-        if protocol_flow_vuln:
-            detail = "Server responds 5xx after username (before password challenge)"
-        elif response_differs:
-            detail = f"Different responses vs invalid baseline; examples: {invalid_responses[:1]} vs {valid_response}"
+        def _norm_line(code: int, resp: bytes) -> str:
+            txt = self.bytes_to_str(resp).strip()
+            return f"{code} {txt}" if txt else str(code)
 
+        invalid_responses: list[str] = []
+        enumerated_list: list[str] = []
+        valid_response: str | None = None
+        any_candidate_sig = False
+
+        self.ptdebug(f"AUTH-ENUM: NTLM — invalid baseline identities: {invalid_users!r}")
+        for inv_user in invalid_users:
+            self._auth_enum_progress_run_step(progress_total, self._auth_enum_progress_label(inv_user))
+            try:
+                try:
+                    conn, _ = self._get_smtp_for_auth_enum()
+                    code, resp = conn.docmd("AUTH", "NTLM")
+                    if code != 334:
+                        self.ptdebug(
+                            f"AUTH-ENUM NTLM baseline {inv_user!r}: AUTH NTLM → {code} "
+                            f"{self._auth_enum_reply_snip(resp)!r} (skip)",
+                        )
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        continue
+                    conn.send(b64encode(get_NegotiateMessage_data()) + smtplib.bCRLF)
+                    code, resp = conn.getreply()
+                    if code != 334:
+                        self.ptdebug(
+                            f"AUTH-ENUM NTLM baseline {inv_user!r}: after negotiate → {code} "
+                            f"{self._auth_enum_reply_snip(resp)!r} (skip)",
+                        )
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        continue
+                    ctx = NtlmContext(inv_user, self.AUTH_ENUM_PASSWORD)
+                    type3 = ctx.step(b64decode(resp))
+                    conn.send(b64encode(type3) + smtplib.bCRLF)
+                    code, resp = conn.getreply()
+                    if code >= 500:
+                        invalid_responses.append(_norm_line(code, resp))
+                        self.ptdebug(
+                            f"AUTH-ENUM NTLM baseline {inv_user!r}: after Type 3 → {code} "
+                            f"{self._auth_enum_reply_snip(resp)!r}",
+                        )
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                except Exception as ex:
+                    self.ptdebug(f"AUTH-ENUM NTLM baseline {inv_user!r}: exception {type(ex).__name__}: {ex}")
+            finally:
+                self._auth_enum_progress_step_done()
+
+        inv_normalized = (
+            {_normalize_auth_response_for_comparison(r) for r in invalid_responses}
+            if invalid_responses
+            else set()
+        )
         self.ptdebug(
-            f"AUTH-ENUM: summary vulnerable={vulnerable} indeterminate=False "
-            f"protocol_flow_vuln={protocol_flow_vuln} response_differs={response_differs} "
-            f"enumerated={list(enumerated_list)!r} first_candidate_signature={valid_response!r}",
+            f"AUTH-ENUM: NTLM baseline normalized set ({len(inv_normalized)}): {sorted(inv_normalized)!r}",
+        )
+        for i, cand in enumerate(candidates):
+            self._auth_enum_progress_run_step(progress_total, self._auth_enum_progress_label(cand))
+            try:
+                r = self._auth_enum_probe_ntlm_user(cand)
+                differs = bool(
+                    r
+                    and inv_normalized
+                    and _normalize_auth_response_for_comparison(r) not in inv_normalized
+                )
+                self.ptdebug(
+                    f"AUTH-ENUM NTLM candidate[{i}] {cand!r}: line={r!r}; differs_from_baseline={differs}",
+                )
+                if i == 0:
+                    valid_response = r
+                if r is not None:
+                    any_candidate_sig = True
+                if r and inv_normalized and _normalize_auth_response_for_comparison(r) not in inv_normalized:
+                    enumerated_list.append(cand)
+            finally:
+                self._auth_enum_progress_step_done()
+
+        return self._auth_enum_finalize_method_result(
+            "NTLM",
+            invalid_responses=invalid_responses,
+            protocol_flow_vuln=False,
+            enumerated_list=enumerated_list,
+            candidates=candidates,
+            any_candidate_sig=any_candidate_sig,
+            valid_response=valid_response,
         )
 
-        return AuthEnumResult(
-            vulnerable=vulnerable,
-            indeterminate=False,
-            method_tested=method_to_test,
-            protocol_flow_vuln=protocol_flow_vuln,
-            invalid_user_responses=invalid_responses,
-            valid_user_response=valid_response,
-            enumerated_users=tuple(enumerated_list),
-            detail=detail,
+    def _auth_enum_method_threaded(
+        self,
+        method: str,
+        probe_fn,
+        normalize,
+        candidates: list[str],
+        invalid_users: list[str],
+        progress: ThreadedProgress,
+        enum_threads: int,
+    ) -> AuthEnumResult:
+        """Probe one AUTH mechanism with -t worker threads (one fresh connection per probe).
+
+        Baseline + candidate probes run in parallel (each opens its own connection, so there
+        is no connection-reuse benefit to serialising them); the verdict is computed after all
+        probes finish, identically to the sequential path.
+        """
+        is_login = method == "LOGIN"
+        invalid_responses: list[str] = []
+        cand_sigs: list[str | None] = [None] * len(candidates)
+        lock = threading.Lock()
+
+        items = [("b", -1, u) for u in invalid_users]
+        items += [("c", i, u) for i, u in enumerate(candidates)]
+
+        def work(item, _out) -> str:
+            kind, idx, user = item
+            try:
+                sig = probe_fn(user)
+            except Exception:
+                sig = None
+            with lock:
+                if kind == "b":
+                    if sig:
+                        invalid_responses.append(sig)
+                else:
+                    cand_sigs[idx] = sig
+            return user
+
+        progress.run(items, work, enum_threads, finalize=False)
+
+        valid_response = cand_sigs[0] if cand_sigs else None
+        any_candidate_sig = any(s is not None for s in cand_sigs)
+
+        if is_login:
+            protocol_flow_vuln, enumerated_list = self._auth_enum_login_postprocess(
+                invalid_responses, cand_sigs, candidates,
+            )
+        else:
+            protocol_flow_vuln = False
+            inv_normalized = (
+                {normalize(r) for r in invalid_responses} if invalid_responses else set()
+            )
+            enumerated_list = []
+            for i, cand in enumerate(candidates):
+                r = cand_sigs[i]
+                differs = bool(r and inv_normalized and normalize(r) not in inv_normalized)
+                if differs:
+                    enumerated_list.append(cand)
+        self.ptdebug(
+            f"AUTH-ENUM: {method} (threaded) protocol_flow_vuln={protocol_flow_vuln}; "
+            f"enumerated={enumerated_list!r}",
         )
+
+        return self._auth_enum_finalize_method_result(
+            method,
+            invalid_responses=invalid_responses,
+            protocol_flow_vuln=protocol_flow_vuln,
+            enumerated_list=enumerated_list,
+            candidates=candidates,
+            any_candidate_sig=any_candidate_sig,
+            valid_response=valid_response,
+        )
+
+    def _auth_enum_run_methods_threaded(
+        self,
+        methods_to_test: list[str],
+        candidates: list[str],
+        invalid_users: list[str],
+        per_method_steps: int,
+        enum_threads: int,
+    ) -> list[AuthEnumResult]:
+        """Threaded (-t) variant of the AUTH-ENUM mechanism loop with one shared progress bar."""
+        # Methods that actually issue probes (NTLM without ntlm-auth issues none).
+        probe_methods = [
+            m for m in methods_to_test if not (m == "NTLM" and NtlmContext is None)
+        ]
+        progress_total = per_method_steps * len(probe_methods)
+        progress = ThreadedProgress(progress_total, enabled=not self.use_json)
+        method_results: list[AuthEnumResult] = []
+        try:
+            for method in methods_to_test:
+                self.ptdebug(f"AUTH-ENUM: starting mechanism {method} ({enum_threads} threads)")
+                if method == "LOGIN":
+                    method_results.append(
+                        self._auth_enum_method_threaded(
+                            "LOGIN", self._auth_enum_probe_login_user, lambda x: x,
+                            candidates, invalid_users, progress, enum_threads,
+                        ),
+                    )
+                elif method == "PLAIN":
+                    method_results.append(
+                        self._auth_enum_method_threaded(
+                            "PLAIN", self._auth_enum_probe_plain_user,
+                            _normalize_auth_response_for_comparison,
+                            candidates, invalid_users, progress, enum_threads,
+                        ),
+                    )
+                elif method == "NTLM":
+                    if NtlmContext is None:
+                        method_results.append(
+                            AuthEnumResult(
+                                vulnerable=False,
+                                indeterminate=True,
+                                method_tested="NTLM",
+                                protocol_flow_vuln=False,
+                                invalid_user_responses=[],
+                                valid_user_response=None,
+                                enumerated_users=(),
+                                detail="NTLM test requires ntlm-auth package",
+                            ),
+                        )
+                    else:
+                        method_results.append(
+                            self._auth_enum_method_threaded(
+                                "NTLM", self._auth_enum_probe_ntlm_user,
+                                _normalize_auth_response_for_comparison,
+                                candidates, invalid_users, progress, enum_threads,
+                            ),
+                        )
+        finally:
+            progress.finalize()
+        return method_results
+
+    def test_auth_enum(self) -> AuthEnumResult:
+        """
+        AUTH user enumeration: for each advertised mechanism (LOGIN, PLAIN, NTLM), probe two
+        synthetic invalid identities plus candidates from -u/-U or ``default_logins``.
+        """
+        self._auth_enum_dbg_logged_starttls = False
+        candidates, used_default_logins = auth_enum_candidate_names(
+            self.args,
+            wordlist=getattr(self, "wordlist", None),
+        )
+        invalid_users = self._auth_enum_synthetic_invalid_names()
+        cand_src = "default_logins" if used_default_logins else "-u/-U"
+        self.ptdebug(
+            f"AUTH-ENUM: {len(candidates)} candidate(s) ({cand_src}); "
+            f"synthetic baseline: {invalid_users!r}; "
+            f"candidates={candidates if len(candidates) <= 12 else candidates[:12] + ['…']}",
+        )
+
+        def _store_and_return(
+            method_results: list[AuthEnumResult],
+            aggregate: AuthEnumResult,
+        ) -> AuthEnumResult:
+            self.results.auth_enum_methods = tuple(method_results)
+            if any(r.method_tested == "NTLM" for r in method_results):
+                self.results.auth_enum_ntlm_note = auth_enum_ntlm_identity_note(
+                    used_default_logins,
+                    candidates,
+                )
+            else:
+                self.results.auth_enum_ntlm_note = None
+            return aggregate
+
+        try:
+            _, ehlo = self._get_smtp_for_auth_enum()
+        except Exception as e:
+            self.ptdebug(f"AUTH-ENUM: aborted — initial connect/EHLO failed: {e!r}")
+            err = AuthEnumResult(
+                vulnerable=False,
+                indeterminate=True,
+                method_tested="",
+                protocol_flow_vuln=False,
+                invalid_user_responses=[],
+                valid_user_response=None,
+                enumerated_users=(),
+                detail=str(e),
+            )
+            return _store_and_return([], err)
+
+        auth_methods = _get_auth_methods_from_ehlo(ehlo)
+        methods_to_test = self._auth_enum_methods_to_test(auth_methods)
+        self.ptdebug(
+            f"AUTH-ENUM: target {self.args.target.ip}:{self.args.target.port} fqdn={self.fqdn!r}; "
+            f"AUTH from EHLO → {sorted(auth_methods)!r}; probe order → {methods_to_test!r}",
+        )
+        if not methods_to_test:
+            self.ptdebug(
+                "AUTH-ENUM: aborted — EHLO has no AUTH mechanism LOGIN, PLAIN or NTLM "
+                "(after any STARTTLS upgrade inside probe)",
+            )
+            no_auth = AuthEnumResult(
+                vulnerable=False,
+                indeterminate=True,
+                method_tested="",
+                protocol_flow_vuln=False,
+                invalid_user_responses=[],
+                valid_user_response=None,
+                enumerated_users=(),
+                detail="Server does not advertise AUTH LOGIN, PLAIN or NTLM",
+            )
+            return _store_and_return([], no_auth)
+
+        enum_threads = max(1, int(getattr(self.args, "enum_threads", 1) or 1))
+        per_method_steps = len(invalid_users) + len(candidates)
+        method_results: list[AuthEnumResult] = []
+
+        if enum_threads > 1:
+            method_results = self._auth_enum_run_methods_threaded(
+                methods_to_test, candidates, invalid_users, per_method_steps, enum_threads,
+            )
+        else:
+            progress_total = per_method_steps * len(methods_to_test)
+            self._auth_enum_progress_counter = 0
+            self._auth_enum_progress_session_begin()
+            try:
+                for method in methods_to_test:
+                    self.ptdebug(f"AUTH-ENUM: starting mechanism {method}")
+                    if method == "LOGIN":
+                        method_results.append(
+                            self._auth_enum_test_login_method(
+                                candidates,
+                                invalid_users,
+                                progress_total=progress_total,
+                            ),
+                        )
+                    elif method == "PLAIN":
+                        method_results.append(
+                            self._auth_enum_test_plain_method(
+                                candidates,
+                                invalid_users,
+                                progress_total=progress_total,
+                            ),
+                        )
+                    elif method == "NTLM":
+                        method_results.append(
+                            self._auth_enum_test_ntlm_method(
+                                candidates,
+                                invalid_users,
+                                progress_total=progress_total,
+                            ),
+                        )
+            finally:
+                self._auth_enum_progress_session_end()
+
+        aggregate = self._auth_enum_aggregate_results(method_results)
+        self.ptdebug(
+            f"AUTH-ENUM: aggregate vulnerable={aggregate.vulnerable} indeterminate={aggregate.indeterminate} "
+            f"methods_tested={aggregate.method_tested!r} enumerated={list(aggregate.enumerated_users)!r}",
+        )
+        return _store_and_return(method_results, aggregate)
 
     @staticmethod
     def _auth_format_last_two_labels(fqdn: str) -> str | None:
@@ -13723,9 +13759,9 @@ class SMTP(BaseModule):
                 self._stream_rcpt_limit_server_response_verbose(rlim.server_response)
                 self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
             else:
-                icon = self._rcpt_limit_recipient_verdict_icon(rlim.max_accepted)
+                ok_icon = get_colored_text("[✓]", color="NOTVULN")
                 self.ptprint(
-                    f"    {icon} No limit or too high: {rlim.max_accepted} recipients accepted",
+                    f"    {ok_icon} Accepted recipients: {rlim.max_accepted}",
                     Out.TEXT,
                 )
 
@@ -13939,6 +13975,45 @@ class SMTP(BaseModule):
                 for part in (line or "").replace("\r", "").splitlines():
                     self.ptprint(f"        {part}", Out.TEXT)
 
+    def _stream_auth_enum_method_verdict(self, mr: AuthEnumResult) -> None:
+        if mr.indeterminate:
+            icon = get_colored_text("[*]", color="INFO")
+            self.ptprint(
+                f"        {icon} Could not determine: {mr.detail or 'insufficient AUTH responses'}",
+                Out.TEXT,
+            )
+            return
+        if mr.vulnerable:
+            icon = get_colored_text("[✗]", color="VULN")
+            if mr.protocol_flow_vuln:
+                msg = (
+                    "User enumeration is possible because the server responds with 5xx "
+                    "after the username (before the password challenge)"
+                )
+            else:
+                msg = (
+                    "User enumeration is possible because error messages are different "
+                    "for valid and invalid logins"
+                )
+            self.ptprint(f"        {icon} {msg}", Out.TEXT)
+            if mr.enumerated_users:
+                for u in mr.enumerated_users:
+                    self.ptprint(f"            {u}", Out.TEXT)
+            elif mr.detail and not mr.protocol_flow_vuln:
+                # No per-user list: show the technical detail (skip when it just
+                # repeats the protocol-flow verdict sentence above).
+                self.ptprint(f"            {mr.detail}", Out.TEXT)
+            return
+        icon = get_colored_text("[✓]", color="NOTVULN")
+        self.ptprint(
+            "        "
+            f"{icon} User enumeration is not possible because error messages are the same "
+            "for valid and invalid logins (or no valid login was delivered)",
+            Out.TEXT,
+        )
+        if mr.detail:
+            self.ptprint(f"            {mr.detail}", Out.TEXT)
+
     def _stream_auth_enum_result(self) -> None:
         if (auth_enum_error := self.results.auth_enum_error) is not None:
             icon = get_colored_text("[✗]", color="VULN")
@@ -13947,44 +14022,29 @@ class SMTP(BaseModule):
         ae = self.results.auth_enum
         if ae is None:
             return
-        if ae.indeterminate:
-            if ae.detail == "Server does not advertise AUTH LOGIN, PLAIN, or NTLM":
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} Not vulnerable: {ae.detail}", Out.TEXT)
-            else:
-                icon = get_colored_text("[*]", color="INFO")
-                self.ptprint(f"    {icon} Indeterminate: {ae.detail or 'Could not determine'}", Out.TEXT)
+        method_results = self.results.auth_enum_methods
+        if not method_results:
+            if ae.indeterminate:
+                if ae.detail == "Server does not advertise AUTH LOGIN, PLAIN or NTLM":
+                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    self.ptprint(f"    {icon} Not vulnerable: {ae.detail}", Out.TEXT)
+                else:
+                    icon = get_colored_text("[*]", color="INFO")
+                    self.ptprint(f"    {icon} Indeterminate: {ae.detail or 'Could not determine'}", Out.TEXT)
             return
         mech_icon = get_colored_text("[*]", color="INFO")
-        if ae.method_tested:
-            self.ptprint(f"    {mech_icon} Mechanism tested: AUTH {ae.method_tested}", Out.TEXT)
-        if ae.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(
-                f"    {icon} Server allows user enumeration via AUTH without password knowledge",
-                Out.TEXT,
-            )
-            if ae.enumerated_users:
-                info_icon = get_colored_text("[*]", color="INFO")
-                self.ptprint(f"    {info_icon} Enumerated users", Out.TEXT)
-                for u in ae.enumerated_users:
-                    self.ptprint(f"        {u}", Out.TEXT)
-            if ae.detail:
-                self.ptprint(f"        {ae.detail}", Out.TEXT)
-        else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            if ae.detail and "Baseline-only:" in ae.detail:
-                self.ptprint(
-                    f"    {icon} Baseline-only (--auth-enum without -u/-U): no response oracle from multiple synthetic invalid identities",
-                    Out.TEXT,
-                )
-            else:
-                self.ptprint(
-                    f"    {icon} Server does not allow user enumeration via AUTH, or no valid/differentiated user in -u / -U",
-                    Out.TEXT,
-                )
-            if ae.detail:
-                self.ptprint(f"        {ae.detail}", Out.TEXT)
+        info_icon = get_colored_text("[i]", color="INFO")
+        ntlm_note = self.results.auth_enum_ntlm_note
+        for mr in method_results:
+            self.ptprint(f"    {mech_icon} AUTH {mr.method_tested} test enumeration", Out.TEXT)
+            if mr.method_tested == "NTLM" and ntlm_note:
+                self.ptprint(f"        {info_icon} {ntlm_note}", Out.TEXT)
+            self._stream_auth_enum_method_verdict(mr)
+        if ae.vulnerable and ae.enumerated_users and len(method_results) > 1:
+            info_icon = get_colored_text("[*]", color="INFO")
+            self.ptprint(f"    {info_icon} Enumerated users (all mechanisms)", Out.TEXT)
+            for u in ae.enumerated_users:
+                self.ptprint(f"        {u}", Out.TEXT)
 
     def _stream_auth_format_result(self) -> None:
         """PTL-SVC-SMTP-AUTH-FORMAT: text output for AUTH LOGIN identity-shape probes."""

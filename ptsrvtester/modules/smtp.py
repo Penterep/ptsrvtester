@@ -488,7 +488,7 @@ RCPT_LIMIT_VERDICT_WARN_MAX = 500
 # limit is detected to determine whether the server eventually closes the session.
 RCPT_LIMIT_POSTHIT_PROBE_COUNT = 20
 # MTA-not-relay: recommend at least this many local names in -u / -U for a meaningful limit probe.
-RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT = 50
+RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT = 500
 
 # Duplicate RCPT TO (-rdd): same envelope recipient repeated N times in one MAIL transaction.
 # RFC 5321 does not forbid this; delivery fan-out is implementation-defined (dedupe vs N copies).
@@ -554,8 +554,8 @@ NOOP_FLOOD2_RUN_SECONDS = 30.0              # steady-state duration (per thread)
 NOOP_FLOOD2_CONNECT_TIMEOUT = 10.0
 NOOP_FLOOD2_RECV_TIMEOUT = 30.0
 NOOP_FLOOD2_AVG_TIME_OK_MAX_SECONDS = 5.0   # avg time between NOOPs under load ≤ this → OK
-NOOP_FLOOD2_DEBUG_TICK_SECONDS = 2.0        # -vv only: emit persistent ptdebug snapshot every Ns
-NOOP_FLOOD1_DEBUG_TICK_SECONDS = 2.0        # -vv only: same, for the single-connection storm
+NOOP_FLOOD2_DEBUG_TICK_SECONDS = 2.0        # (reserved) legacy storm-tick interval; -vv now logs per-connection events
+NOOP_FLOOD1_PROGRESS_EVERY = 25               # live progress + -vv snapshot interval (commands)
 
 
 class NoopFlood1Result(NamedTuple):
@@ -592,6 +592,14 @@ class NoopFlood2Result(NamedTuple):
     active_connections_end: int = 0    # Sockets still alive when the storm finished
     disconnected_during_test: int = 0  # established - active_connections_end
     early_exit_no_connections: bool = False  # All sockets dropped before the time limit
+    # ── Ramp-up failure breakdown (every requested socket is attempted) ──
+    establish_errors: int = 0          # Generic failures while opening sockets
+    establish_disconnected: int = 0    # Refused / reset / server-closed sockets
+    establish_timeouts: int = 0        # Connect/handshake timeouts
+    # ── Pre-storm liveness sweep ──
+    reaped_before_storm: int = 0       # Established sockets the server already closed
+                                       # before the storm began (idle reap / conn cap).
+    storm_pool_connections: int = 0    # Sockets actually alive at storm start (= 100% base)
 
 
 def _noop_rt_window_display(value: float | None) -> str:
@@ -4118,6 +4126,31 @@ class SMTP(BaseModule):
                 except ValueError:
                     return None, bytes(buf), False
 
+    @staticmethod
+    def _noop_flood1_live_progress_text(sent: int, elapsed_seconds: float) -> str:
+        """Live -nf1 progress: ``NOOPs sent: N - Xs left`` (ETA vs command cap)."""
+        total = NOOP_FLOOD1_MAX_COMMANDS
+        if sent <= 0:
+            return f"NOOPs sent: {sent}"
+        remaining = max(0, int((total - sent) * (elapsed_seconds / sent)))
+        return f"NOOPs sent: {sent} - {remaining}s left"
+
+    @staticmethod
+    def _noop_flood1_debug_line(
+        commands_sent: int, status: int | None, rt_seconds: float,
+    ) -> str:
+        """``-vv`` line every ``NOOP_FLOOD1_PROGRESS_EVERY`` commands (via ``ptdebug``)."""
+        if status == 250:
+            status_part = "250 OK"
+        elif status is None:
+            status_part = "no reply"
+        else:
+            status_part = str(status)
+        return (
+            f"NOOP #{commands_sent}: {status_part} "
+            f"(reaction time: {rt_seconds * 1000:.0f}ms)"
+        )
+
     def noop_flood_test_single(self) -> NoopFlood1Result:
         """-nf1: rapid NOOP flood in a single connection (RFC 5321 §4.1.1.9 expects 250)."""
         # Make `-vv` show the standard "Initial server information" header
@@ -4140,20 +4173,36 @@ class SMTP(BaseModule):
 
         _show_progress = not self.args.json
         _print_lock = threading.Lock()
+        _live_line_dirty = False
 
         def _write_live(text: str) -> None:
             if not _show_progress:
                 return
+            nonlocal _live_line_dirty
             with _print_lock:
-                sys.stdout.write(f"\r    {text:<110}")
+                sys.stdout.write(f"\033[2K\r    {text:<110}")
                 sys.stdout.flush()
+                _live_line_dirty = True
 
-        def _finalize_live() -> None:
-            if not _show_progress:
+        def _commit_live_line() -> None:
+            """Clear the in-place progress row and move to the next line (no scrollback text)."""
+            nonlocal _live_line_dirty
+            if not _show_progress or not _live_line_dirty:
                 return
             with _print_lock:
-                sys.stdout.write("\r" + " " * 120 + "\r")
+                sys.stdout.write("\033[2K\r\n")
                 sys.stdout.flush()
+            _live_line_dirty = False
+
+        def _finalize_live() -> None:
+            """Drop the live progress row so only verdict lines remain after the test."""
+            nonlocal _live_line_dirty
+            if not _show_progress or not _live_line_dirty:
+                return
+            with _print_lock:
+                sys.stdout.write("\033[2K\r")
+                sys.stdout.flush()
+            _live_line_dirty = False
 
         commands_sent = 0
         commands_ok = 0
@@ -4164,7 +4213,6 @@ class SMTP(BaseModule):
         hit_command_cap = False
         hit_time_cap = False
         overall_start = time.perf_counter()
-        last_debug_tick = overall_start  # ``-vv`` time-based safety net for slow servers
 
         try:
             while commands_sent < NOOP_FLOOD1_MAX_COMMANDS:
@@ -4181,10 +4229,12 @@ class SMTP(BaseModule):
                     commands_error += 1
                     disconnected = True
                     disconnect_after = commands_sent
-                    self.ptdebug(
-                        f"NOOP #{commands_sent}: send failed — {exc}",
-                        Out.INFO,
-                    )
+                    if self.args.debug:
+                        _commit_live_line()
+                        self.ptdebug(
+                            f"NOOP #{commands_sent}: send failed — {exc}",
+                            Out.INFO,
+                        )
                     break
 
                 status, raw, closed = self._noop_read_one_reply(sock)
@@ -4197,46 +4247,36 @@ class SMTP(BaseModule):
                 else:
                     commands_error += 1
 
-                # Periodic live progress (every 25 commands to keep terminal calm).
-                if _show_progress and (commands_sent % 25 == 0):
+                # Periodic live progress (every N commands to keep terminal calm).
+                if _show_progress and (commands_sent % NOOP_FLOOD1_PROGRESS_EVERY == 0):
                     _write_live(
-                        f"NOOPs sent: {commands_sent} (ok={commands_ok}, err={commands_error})"
+                        self._noop_flood1_live_progress_text(
+                            commands_sent, time.perf_counter() - overall_start,
+                        )
                     )
 
-                # Persistent debug log: per-25 NOOPs *or* every ~2 seconds, whichever
-                # comes first. The time-based fallback keeps slow servers chatty.
-                now = time.perf_counter()
-                _count_tick = commands_sent <= 5 or commands_sent % 25 == 0
-                _time_tick = (now - last_debug_tick) >= NOOP_FLOOD1_DEBUG_TICK_SECONDS
-                if _count_tick or _time_tick:
-                    if status is None:
-                        self.ptdebug(
-                            f"NOOP #{commands_sent}: no / partial reply "
-                            f"(rt={rt*1000:.0f}ms, closed={closed})",
-                            Out.INFO,
-                        )
-                    else:
-                        reply_text = raw.decode("latin-1", errors="replace").strip()
-                        self.ptdebug(
-                            f"NOOP #{commands_sent}: {status} ({rt*1000:.0f}ms) "
-                            f"— {reply_text[:80]}",
-                            Out.INFO,
-                        )
-                    last_debug_tick = now
+                # -vv: snapshot every Nth NOOP (ADDITIONS colour via ``ptdebug``).
+                if self.args.debug and (commands_sent % NOOP_FLOOD1_PROGRESS_EVERY == 0):
+                    _commit_live_line()
+                    self.ptdebug(
+                        self._noop_flood1_debug_line(commands_sent, status, rt),
+                    )
 
                 if closed:
                     disconnected = True
                     disconnect_after = commands_sent
-                    self.ptdebug(
-                        f"NOOP #{commands_sent}: peer closed connection "
-                        f"(after {commands_sent} NOOPs).",
-                        Out.INFO,
-                    )
+                    if self.args.debug:
+                        _commit_live_line()
+                        self.ptdebug(
+                            f"NOOP #{commands_sent}: peer closed connection "
+                            f"(after {commands_sent} NOOPs).",
+                            Out.INFO,
+                        )
                     break
             else:
                 hit_command_cap = True
         finally:
-            _finalize_live()
+            _finalize_live()  # erase in-place ``NOOPs sent: …`` before verdict output
             try:
                 smtp.close()
             except Exception:
@@ -4285,6 +4325,59 @@ class SMTP(BaseModule):
             error_rate_pct=error_rate_pct,
         )
 
+    @staticmethod
+    def _socket_already_closed(sock: socket.socket) -> bool:
+        """Non-blocking probe: True if the peer has already closed the socket.
+
+        A healthy idle SMTP socket has no pending data → ``recv`` raises
+        ``BlockingIOError`` (treated as alive). A server-closed socket is readable
+        and returns ``b""`` (clean FIN) or raises a connection error (RST).
+        """
+        if sock is None:
+            return True
+        try:
+            sock.setblocking(False)
+        except (OSError, ValueError):
+            return True
+        try:
+            chunk = sock.recv(4096)
+            if chunk == b"":
+                return True  # clean FIN from the server
+            return False     # stray data (e.g. a 4xx notice): treat as still alive
+        except BlockingIOError:
+            return False     # no data pending → connection still open
+        except (OSError, ConnectionError):
+            return True      # RST / already-dead socket
+        finally:
+            try:
+                sock.setblocking(True)
+                sock.settimeout(NOOP_FLOOD2_RECV_TIMEOUT)
+            except (OSError, ValueError):
+                pass
+
+    @staticmethod
+    def _classify_conn_failure(exc: BaseException) -> str:
+        """Bucket a socket/connection failure into ``timeout`` / ``disconnect`` / ``error``."""
+        if isinstance(exc, (socket.timeout, TimeoutError)):
+            return "timeout"
+        if isinstance(
+            exc,
+            (
+                ConnectionRefusedError,
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+                smtplib.SMTPServerDisconnected,
+            ),
+        ):
+            return "disconnect"
+        msg = str(exc).lower()
+        if "timed out" in msg or "timeout" in msg:
+            return "timeout"
+        if any(k in msg for k in ("refused", "reset", "disconnect", "closed", "broken pipe", "aborted")):
+            return "disconnect"
+        return "error"
+
     def noop_flood_test_parallel(self) -> NoopFlood2Result:
         """-nf2: parallel-connection NOOP DoS. Opens up to N sockets, each sends NOOPs
         as fast as possible for ``NOOP_FLOOD2_RUN_SECONDS`` seconds; aggregates error
@@ -4311,26 +4404,46 @@ class SMTP(BaseModule):
 
         _show_progress = not self.args.json
         _print_lock = threading.Lock()
+        _live_dirty = False
 
         def _write_live(text: str) -> None:
             if not _show_progress:
                 return
+            nonlocal _live_dirty
             with _print_lock:
-                sys.stdout.write(f"\r    {text:<110}")
+                sys.stdout.write(f"\033[2K\r    {text}")
                 sys.stdout.flush()
+                _live_dirty = True
 
-        def _finalize_live() -> None:
-            if not _show_progress:
+        def _clear_live() -> None:
+            """Erase the in-place live row (leaves no blank line behind)."""
+            nonlocal _live_dirty
+            if not _show_progress or not _live_dirty:
                 return
             with _print_lock:
-                sys.stdout.write("\r" + " " * 120 + "\r")
+                sys.stdout.write("\033[2K\r")
                 sys.stdout.flush()
+            _live_dirty = False
+
+        def _emit_debug(text: str) -> None:
+            """Thread-safe ``-vv`` line that won't garble the in-place live row."""
+            if not self.args.debug or self.args.json:
+                return
+            nonlocal _live_dirty
+            with _print_lock:
+                if _show_progress and _live_dirty:
+                    sys.stdout.write("\033[2K\r")
+                    sys.stdout.flush()
+                    _live_dirty = False
+                self.ptdebug(text)
 
         # ── Phase 1: establish sockets ───────────────────────────────────
+        # Every requested socket is attempted (a refusal no longer aborts the
+        # ramp-up); failures are bucketed so the analyst sees the real picture.
         connections: list = []
-        # Persistent ramp-up milestones in -vv: a snapshot every ~5% of the
-        # requested pool (capped at ~50 lines for very large pools).
-        ramp_step = max(1, requested // 20)
+        est_err = 0
+        est_disc = 0
+        est_timeout = 0
         ramp_t0 = time.perf_counter()
         for i in range(requested):
             try:
@@ -4340,41 +4453,88 @@ class SMTP(BaseModule):
                 except Exception:
                     pass
                 connections.append(smtp)
-                if _show_progress:
-                    _write_live(f"Connecting: {len(connections)}/{requested}")
-                if len(connections) % ramp_step == 0 or len(connections) == requested:
-                    self.ptdebug(
-                        f"-nf2 ramp-up: {len(connections)}/{requested} sockets established "
-                        f"(elapsed {time.perf_counter() - ramp_t0:.1f}s).",
-                        Out.INFO,
-                    )
             except Exception as exc:
-                self.ptdebug(
-                    f"-nf2: connection #{i + 1} refused/failed — {exc} "
-                    f"(stopping ramp-up, {len(connections)} sockets established).",
-                    Out.INFO,
+                reason = self._classify_conn_failure(exc)
+                if reason == "timeout":
+                    est_timeout += 1
+                elif reason == "disconnect":
+                    est_disc += 1
+                else:
+                    est_err += 1
+                _emit_debug(f"Connection #{i + 1} failed — {reason} ({exc})")
+            if _show_progress:
+                _write_live(
+                    f"Connecting: {i + 1}/{requested}     "
+                    f"(elapsed {time.perf_counter() - ramp_t0:.1f}s)"
                 )
-                break
 
         established = len(connections)
-        _finalize_live()
+        _clear_live()
         if not connections:
             raise TestFailedError("Could not establish any connection for -nf2")
 
-        # Persistent (visible in normal output too) info about the actual size of
-        # the NOOP storm. The user needs this number to interpret the verdicts —
-        # a 100% error rate over 50 sockets that all stayed open is something
-        # entirely different from 100% errors over 50 sockets that all died.
+        # ── Pre-storm liveness sweep ─────────────────────────────────────
+        # The ramp-up is sequential, so the first sockets sit idle while the
+        # rest connect. Servers with a per-IP connection cap / idle reaper tear
+        # those down before the storm even starts — meaning the pool was never
+        # fully alive simultaneously. Detect sockets the server already closed
+        # so they count as a connection-handling failure, not a storm casualty.
+        live_connections: list = []
+        reaped = 0
+        for smtp in connections:
+            if self._socket_already_closed(smtp.sock):
+                reaped += 1
+                try:
+                    smtp.close()
+                except Exception:
+                    pass
+            else:
+                live_connections.append(smtp)
+        connections = live_connections
+        storm_pool = len(connections)
+
+        # Ramp-up statistics (always visible). The storm treats the *live* pool
+        # as 100% — a 100% error rate over 50 live sockets is a different story
+        # from 100% errors over 50 sockets that were already gone.
         info_icon = get_colored_text("[*]", color="INFO")
-        self.ptprint(
-            f"    {info_icon} Established {established} connections"
-            + (f" (out of {requested} requested)" if established != requested else ""),
-            Out.TEXT,
-        )
+        self.ptprint(f"    {info_icon} Established {established} connections", Out.TEXT)
+        self.ptprint(f"    {info_icon} Errors {est_err} connections", Out.TEXT)
+        self.ptprint(f"    {info_icon} Refused at connect {est_disc} connections", Out.TEXT)
+        self.ptprint(f"    {info_icon} Timeout {est_timeout} connections", Out.TEXT)
+        self.ptprint(f"    {info_icon} Dropped while idle {reaped} connections", Out.TEXT)
+
+        if storm_pool == 0:
+            # Every established socket was already closed before we could storm.
+            # Strong "server won't hold connections" signal — report, don't crash.
+            self.ptdebug(
+                f"-nf2: all {established} established sockets were closed before the "
+                f"storm (reaped={reaped}); skipping NOOP phase.",
+                Out.INFO,
+            )
+            return NoopFlood2Result(
+                requested_connections=requested,
+                established_connections=established,
+                run_duration_seconds=0.0,
+                commands_sent=0,
+                commands_ok=0,
+                commands_error=0,
+                min_rt_seconds=None,
+                max_rt_seconds=None,
+                avg_rt_seconds=None,
+                error_rate_pct=0.0,
+                active_connections_end=0,
+                disconnected_during_test=0,
+                early_exit_no_connections=True,
+                establish_errors=est_err,
+                establish_disconnected=est_disc,
+                establish_timeouts=est_timeout,
+                reaped_before_storm=reaped,
+                storm_pool_connections=0,
+            )
 
         self.ptdebug(
-            f"-nf2: {established}/{requested} sockets established; starting NOOP storm "
-            f"for {NOOP_FLOOD2_RUN_SECONDS:.0f}s.",
+            f"-nf2: {storm_pool}/{established} sockets alive after sweep "
+            f"(reaped={reaped}); starting NOOP storm for {NOOP_FLOOD2_RUN_SECONDS:.0f}s.",
             Out.INFO,
         )
 
@@ -4388,7 +4548,7 @@ class SMTP(BaseModule):
         # Live count of sockets still up. Decremented as soon as a worker exits
         # its hammer-loop (close/timeout/exception). Read by the progress ticker
         # to render `(active K/N)` and to detect the all-dropped condition.
-        active_count = established
+        active_count = storm_pool
 
         FLUSH_EVERY = 32  # flush per-thread counters into the shared aggregates this often
 
@@ -4401,15 +4561,16 @@ class SMTP(BaseModule):
                 if local_rtts:
                     agg_rtts.extend(local_rtts)
 
-        def _worker(smtp) -> None:
+        def _worker(idx: int, smtp) -> None:
             nonlocal active_count
             sock = smtp.sock
             local_sent = 0
             local_ok = 0
             local_err = 0
             local_rtts: list[float] = []
-            socket_died = False  # True only if the *socket* failed during the storm,
-                                 # NOT when the worker exits cleanly due to stop_event.
+            total_ok = 0  # running per-socket count of 250 OK replies (not reset on flush)
+            died_reason: str | None = None  # set only if the *socket* failed during the
+                                            # storm, NOT on clean stop_event exit.
             try:
                 while not stop_event.is_set():
                     try:
@@ -4420,6 +4581,7 @@ class SMTP(BaseModule):
                         local_sent += 1
                         if status == 250:
                             local_ok += 1
+                            total_ok += 1
                             local_rtts.append(rt)
                         else:
                             local_err += 1
@@ -4428,23 +4590,29 @@ class SMTP(BaseModule):
                             local_sent = local_ok = local_err = 0
                             local_rtts = []
                         if closed:
-                            socket_died = True
+                            died_reason = "disconnect"
                             break
-                    except (OSError, ConnectionError):
+                    except (OSError, ConnectionError) as exc:
                         local_sent += 1
                         local_err += 1
-                        socket_died = True
+                        died_reason = self._classify_conn_failure(exc)
                         break
             finally:
                 _flush(local_sent, local_ok, local_err, local_rtts)
-                if socket_died:
+                if died_reason is not None:
                     with results_lock:
                         active_count -= 1
+                    t_rel = time.perf_counter() - run_start
+                    if total_ok == 0:
+                        detail = f"no successful reply, t={t_rel:.1f}s"
+                    else:
+                        detail = f"after {total_ok} OK NOOPs, t={t_rel:.1f}s"
+                    _emit_debug(f"Connection #{idx} terminated — {died_reason} ({detail})")
 
         threads: list[threading.Thread] = []
         run_start = time.perf_counter()
-        for smtp in connections:
-            t = threading.Thread(target=_worker, args=(smtp,), daemon=True)
+        for idx, smtp in enumerate(connections, start=1):
+            t = threading.Thread(target=_worker, args=(idx, smtp), daemon=True)
             threads.append(t)
             t.start()
 
@@ -4453,12 +4621,6 @@ class SMTP(BaseModule):
         # — a strong sign of a successful disconnect-storm DoS.
         deadline = run_start + NOOP_FLOOD2_RUN_SECONDS
         early_exit_no_conns = False
-        # ``-vv`` only: emit a persistent (scrolling, not erasable) snapshot every
-        # NOOP_FLOOD2_DEBUG_TICK_SECONDS so the analyst sees what the storm is
-        # actually doing instead of staring at a 30-second silence between
-        # "starting NOOP storm" and the final summary.
-        last_debug_tick = run_start
-        prev_active = established
         while time.perf_counter() < deadline:
             with results_lock:
                 cs, co, ce = agg_commands_sent, agg_commands_ok, agg_commands_error
@@ -4469,27 +4631,15 @@ class SMTP(BaseModule):
             if _show_progress:
                 remaining = int(deadline - time.perf_counter())
                 _write_live(
-                    f"NOOP storm (active {active_now}/{established}): {cs} sent "
+                    f"NOOP storm (active {active_now}/{storm_pool}): {cs} sent "
                     f"(ok={co}, err={ce}) — {remaining:02d}s left"
                 )
-            now = time.perf_counter()
-            if now - last_debug_tick >= NOOP_FLOOD2_DEBUG_TICK_SECONDS:
-                elapsed = now - run_start
-                drops = max(0, prev_active - active_now)
-                drop_note = f", -{drops} since last tick" if drops else ""
-                self.ptdebug(
-                    f"-nf2 storm tick t={elapsed:.1f}s: active={active_now}/{established}, "
-                    f"sent={cs}, ok={co}, err={ce}{drop_note}.",
-                    Out.INFO,
-                )
-                last_debug_tick = now
-                prev_active = active_now
             time.sleep(0.5)
         stop_event.set()
         for t in threads:
             t.join(timeout=NOOP_FLOOD2_RECV_TIMEOUT + 2.0)
         run_duration = time.perf_counter() - run_start
-        _finalize_live()
+        _clear_live()
 
         for smtp in connections:
             try:
@@ -4504,13 +4654,17 @@ class SMTP(BaseModule):
             100.0 * agg_commands_error / agg_commands_sent if agg_commands_sent else 0.0
         )
         # All workers have joined at this point, so active_count is final.
+        # The storm's 100% base is the *live* pool (sockets the server still held
+        # when the storm started), not every socket that ever connected.
         with results_lock:
             active_end = max(active_count, 0)
-        disconnected_during = max(established - active_end, 0)
+        disconnected_during = max(storm_pool - active_end, 0)
 
         self.ptdebug(
-            f"-nf2 summary: established={established}/{requested}, "
-            f"active_end={active_end}, dropped_during_test={disconnected_during}, "
+            f"-nf2 summary: established={established}/{requested} "
+            f"(err={est_err}, disc={est_disc}, timeout={est_timeout}, reaped={reaped}), "
+            f"storm_pool={storm_pool}, active_end={active_end}, "
+            f"dropped_during_test={disconnected_during}, "
             f"early_exit={early_exit_no_conns}, duration={run_duration:.1f}s, "
             f"sent={agg_commands_sent}, ok={agg_commands_ok}, "
             f"error={agg_commands_error} ({error_rate_pct:.1f}%), avg_rt={avg_rt}.",
@@ -4531,6 +4685,11 @@ class SMTP(BaseModule):
             active_connections_end=active_end,
             disconnected_during_test=disconnected_during,
             early_exit_no_connections=early_exit_no_conns,
+            establish_errors=est_err,
+            establish_disconnected=est_disc,
+            establish_timeouts=est_timeout,
+            reaped_before_storm=reaped,
+            storm_pool_connections=storm_pool,
         )
 
 
@@ -4947,14 +5106,17 @@ class SMTP(BaseModule):
             return False, probe_max
 
         for i in range(1, max_try + 1):
-            if live_label is not None:
-                live_label[0] = f"Testing RCPT limit...  attempt {i}"
-            if attempt_hook is not None:
-                attempt_hook(i)
             if explicit_recipients:
                 rcpt_addr = explicit_recipients[i - 1]
             else:
                 rcpt_addr = f"{i}@{domain}"
+            if live_label is not None:
+                live_label[0] = (
+                    f"accepted {accepted} recipients. "
+                    f"Attempt to add recipient: {rcpt_addr}"
+                )
+            if attempt_hook is not None:
+                attempt_hook(i)
             try:
                 status, reply = smtp.docmd("RCPT TO:", f"<{rcpt_addr}>")
                 reply_str = self.bytes_to_str(reply)
@@ -5260,13 +5422,13 @@ class SMTP(BaseModule):
                 pct = min(100, int(attempt * 100 / max_p))
                 if eta is not None and eta >= 0:
                     eta_str = self._format_enum_clock_duration(eta)
-                    prefix = f"    {eta_str} {pct}%  "
+                    prefix = f"    {eta_str} {pct}% ({attempt}/{max_p})  "
                 else:
-                    prefix = f"    --:--:-- {pct}%  "
+                    prefix = f"    --:--:-- {pct}% ({attempt}/{max_p})  "
             else:
                 prefix = "    "
             line = f"{prefix}{_live_label[0]}"
-            sys.stdout.write(f"\r{line:<100}")
+            sys.stdout.write(f"\r{line:<120}")
             sys.stdout.flush()
 
         def _update_attempt(i: int) -> None:
@@ -5284,7 +5446,7 @@ class SMTP(BaseModule):
 
         def _end_progress() -> None:
             _ticker_stop.set()
-            sys.stdout.write(f"\r{' ' * 100}\r")
+            sys.stdout.write(f"\r{' ' * 120}\r")
             sys.stdout.flush()
 
         # ── Pre-check phase (no ticker yet, info lines must stay visible) ──
@@ -5463,7 +5625,13 @@ class SMTP(BaseModule):
                 f"recipients_source={recipients_source}, auth_used={auth_used}",
                 Out.INFO,
             )
-            _live_label[0] = "Testing RCPT limit...  attempt 0"
+            # Progress denominator = the number of RCPT attempts we will actually make
+            # (capped by the wordlist length when explicit recipients are used).
+            if recipients:
+                _max_probe_ref[0] = max(1, min(max_rcpt_attempts, len(recipients)))
+            else:
+                _max_probe_ref[0] = max_rcpt_attempts
+            _live_label[0] = "accepted 0 recipients..."
             result = self._run_rcpt_limit_for_domain(
                 smtp, domain, max_rcpt_attempts=max_rcpt_attempts,
                 live_label=_live_label,
@@ -5489,9 +5657,10 @@ class SMTP(BaseModule):
                         smtp.docmd("RSET")
                     except Exception:
                         pass
-                    _live_label[0] = "Testing RCPT limit...  attempt 0"
+                    _live_label[0] = "accepted 0 recipients..."
                     _attempt_ref[0] = 0
                     _eta_ref[0] = None
+                    _max_probe_ref[0] = max_rcpt_attempts
                     result = self._run_rcpt_limit_for_domain(
                         smtp, parent, max_rcpt_attempts=max_rcpt_attempts,
                         live_label=_live_label,
@@ -15079,7 +15248,7 @@ class SMTP(BaseModule):
                 )
             else:
                 self.ptprint(
-                    f"    {vuln_icon} Server disconnects only after {r.disconnect_after} "
+                    f"    {vuln_icon} Server disconnects after {r.disconnect_after} "
                     f"NOOP commands (more than {NOOP_FLOOD_DISCONNECT_OK_MAX} accepted)",
                     Out.TEXT,
                 )
@@ -15198,11 +15367,12 @@ class SMTP(BaseModule):
                 f"    {warn_icon} Server disconnected all connections before test time limit",
                 Out.TEXT,
             )
-        if r.established_connections > 0 and r.disconnected_during_test > 0:
-            pct = 100.0 * r.disconnected_during_test / r.established_connections
+        storm_base = r.storm_pool_connections or r.established_connections
+        if storm_base > 0 and r.disconnected_during_test > 0:
+            pct = 100.0 * r.disconnected_during_test / storm_base
             self.ptprint(
                 f"    {info_icon} Disconnected connections during test: "
-                f"{r.disconnected_during_test} from {r.established_connections} "
+                f"{r.disconnected_during_test} from {storm_base} "
                 f"({pct:.0f}%)",
                 Out.TEXT,
             )
@@ -15554,16 +15724,22 @@ class SMTP(BaseModule):
                     f"(avg {_noop_rt_window_display(nf2.avg_rt_seconds)})"
                 )
             nf2_parts.append(f"Error rate: {nf2.error_rate_pct:.0f}%")
+            if nf2.reaped_before_storm > 0:
+                nf2_parts.append(
+                    f"Dropped while idle: {nf2.reaped_before_storm} "
+                    f"(storm pool {nf2.storm_pool_connections})"
+                )
             if nf2.early_exit_no_connections:
                 nf2_parts.append(
                     "Server disconnected all connections before test time limit"
                 )
-            if nf2.established_connections > 0 and nf2.disconnected_during_test > 0:
-                pct = 100.0 * nf2.disconnected_during_test / nf2.established_connections
+            nf2_storm_base = nf2.storm_pool_connections or nf2.established_connections
+            if nf2_storm_base > 0 and nf2.disconnected_during_test > 0:
+                pct = 100.0 * nf2.disconnected_during_test / nf2_storm_base
                 nf2_parts.append(
                     "Disconnected during test: "
                     f"{nf2.disconnected_during_test} from "
-                    f"{nf2.established_connections} ({pct:.0f}%)"
+                    f"{nf2_storm_base} ({pct:.0f}%)"
                 )
             parts.append("\r\n".join(nf2_parts))
         elif (nf2_err := self.results.noop_flood2_error) is not None:
@@ -17062,6 +17238,11 @@ class SMTP(BaseModule):
                     "activeConnectionsEnd": nf2.active_connections_end,
                     "disconnectedDuringTest": nf2.disconnected_during_test,
                     "earlyExitNoConnections": nf2.early_exit_no_connections,
+                    "establishErrors": nf2.establish_errors,
+                    "establishDisconnected": nf2.establish_disconnected,
+                    "establishTimeouts": nf2.establish_timeouts,
+                    "reapedBeforeStorm": nf2.reaped_before_storm,
+                    "stormPoolConnections": nf2.storm_pool_connections,
                 }
             })
 

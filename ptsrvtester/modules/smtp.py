@@ -489,6 +489,8 @@ RCPT_LIMIT_VERDICT_WARN_MAX = 500
 RCPT_LIMIT_POSTHIT_PROBE_COUNT = 20
 # MTA-not-relay: recommend at least this many local names in -u / -U for a meaningful limit probe.
 RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT = 500
+# Pre-probe local part for accept-all / catch-all detection via RCPT TO (before -rl storm).
+RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL = "xxxfoofff"
 
 # Duplicate RCPT TO (-rdd): same envelope recipient repeated N times in one MAIL transaction.
 # RFC 5321 does not forbid this; delivery fan-out is implementation-defined (dedupe vs N copies).
@@ -600,6 +602,8 @@ class NoopFlood2Result(NamedTuple):
     reaped_before_storm: int = 0       # Established sockets the server already closed
                                        # before the storm began (idle reap / conn cap).
     storm_pool_connections: int = 0    # Sockets actually alive at storm start (= 100% base)
+    # Per-connection terminations during the storm: tuple of (index, reason, detail).
+    terminated_connections: tuple = ()
 
 
 def _noop_rt_window_display(value: float | None) -> str:
@@ -658,6 +662,13 @@ class RcptLimitResult(NamedTuple):
                                                 # False = stayed open through full POSTHIT probe;
                                                 # None = not measured (skipped/error/no limit found)
     posthit_probe_count: int = 0  # Number of additional RCPT TOs sent after limit hit
+    accept_all_via_rcpt: bool = False  # True when pre-probe accepted RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL@domain
+    # ── Optional catch-all bounce probe (``-m`` MAIL FROM, manual NDR check) ──
+    catch_all_bounce_mailbox: str | None = None  # ``-m`` / ``--mail-from`` when set with ``-rl``
+    catch_all_delivery_rcpt: str | None = None  # Probe RCPT (``xxxfoofff@domain``)
+    catch_all_delivery_attempted: bool = False  # True when a DATA probe was submitted
+    catch_all_delivery_data_ok: bool = False  # True when server accepted DATA (250)
+    catch_all_probe_uuid: str | None = None  # Correlates manual inbox check (Message-ID / X-header)
 
 
 class RcptDuplicateResult(NamedTuple):
@@ -730,8 +741,13 @@ class RoleResult(NamedTuple):
     detail: str            # Human-readable reason
 
 
-# Catch-all test result: "configured" | "not_configured" | "indeterminate"
+# Catch-all test result:
+#   "configured" | "not_configured" | "indeterminate"
+#   | "indeterminate_accept_all_rcpt" (RCPT-only: all invalid RCPT accepted)
 CatchAllResult = str
+CATCH_ALL_INDETERMINATE_VARIANTS = frozenset(
+    {"indeterminate", "indeterminate_accept_all_rcpt"}
+)
 
 
 class AuthEnumResult(NamedTuple):
@@ -1246,7 +1262,7 @@ class SMTPResults:
     blacklist_error: str | None = None  # When run-all blacklist test fails
     encryption: EncryptionResult | None = None
     encryption_error: str | None = None  # When encryption test fails
-    catch_all: CatchAllResult | None = None  # "configured" | "not_configured" | "indeterminate"
+    catch_all: CatchAllResult | None = None  # see CatchAllResult above
     rcpt_limit: RcptLimitResult | None = None
     rcpt_limit_error: str | None = None
     rcpt_duplicate: RcptDuplicateResult | None = None
@@ -1457,7 +1473,7 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-rt", "--rate-limit", "<n>", f"Rate limiting test (default: {RATE_LIMIT_DEFAULT_ATTEMPTS} attempts)"],
                 ["-nf1", "--noop-flood1", "", "NOOP flooding test (1 connection, rapid NOOP commands)"],
                 ["-nf2", "--noop-flood2", "<n>", f"NOOP flooding DoS test (default: {NOOP_FLOOD2_DEFAULT_CONNECTIONS} parallel connections)"],
-                ["-rl", "--recipient-limit", "<n>", "Test RCPT TO limit (default: 1000 RCPT attempts; aborts after 50 policy rejects if none accepted)"],
+                ["-rl", "--recipient-limit", "<n>", "Test RCPT TO limit (default: 1000 RCPT attempts; aborts after 50 policy rejects if none accepted); optional -m sends catch-all bounce probe (check MAIL FROM for NDR)"],
                 ["-rdd", "--rcpt-duplicate", "<n>", f"Probe N duplicate RCPT TO for same address in one MAIL (default {RCPT_DUP_DEFAULT}, max {RCPT_DUP_MAX}; requires -r)"],
                 ["", "--rdd-send", "", "With -rdd: send minimal DATA after RCPT so analyst can verify mailbox copies manually"],
                 ["", "--rl-no-precheck", "", "Skip role/open-relay/auth pre-check for -rl (run RCPT TO probe directly)"],
@@ -1636,11 +1652,14 @@ class SMTPArgs(ArgsWithBruteforce):
         )
         direct.add_argument(
             "-m", "--mail-from", type=str,
-            help="Sender address (MAIL FROM); used by -bomb, -av, -br (default: bombtest/avtest@{fqdn} when not set)",
+            help=(
+                "Sender address (MAIL FROM); used by -bomb, -av, -br (default: bombtest/avtest@{fqdn} when not set). "
+                "Optional with -rl: bounce/NDR mailbox for manual catch-all verification (envelope MAIL FROM)."
+            ),
         )
         direct.add_argument(
             "-r", "--rcpt-to", type=str,
-            help="Recipient address (RCPT TO); required for -bomb, -av, -ssrf, -zipxxe, -sh, -br",
+            help="Recipient address (RCPT TO); required for -bomb, -av, -ssrf, -zipxxe, -sh, -br, -rdd",
         )
         direct.add_argument(
             "-fn",
@@ -1819,7 +1838,10 @@ class SMTPArgs(ArgsWithBruteforce):
             dest="rcpt_limit",
             help=(
                 "Test RCPT TO per-message limit (N = max RCPT TO attempts per session, default: 1000; "
-                f"stops after {RCPT_LIMIT_POLICY_REJECT_CAP} consecutive policy rejections if none accepted)"
+                f"stops after {RCPT_LIMIT_POLICY_REJECT_CAP} consecutive policy rejections if none accepted). "
+                "With optional -m/--mail-from: after accept-all RCPT probe, send a minimal message to "
+                f"{RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL}@<domain> with envelope MAIL FROM -m; check -m "
+                "manually for NDR/bounce (no bounce suggests catch-all)."
             ),
         )
         direct.add_argument(
@@ -4157,6 +4179,10 @@ class SMTP(BaseModule):
         # (banner + EHLO response) before the storm — same UX as `-rl`.
         self._ensure_initial_info(fail_label="-nf1 single-connection storm")
 
+        if self.args.debug and not self.args.json:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
         self.ptdebug("NOOP Flooding test (single connection)", title=True)
         self.ptdebug(
             f"Target {self.args.target.ip}:{self.args.target.port} — up to "
@@ -4184,18 +4210,8 @@ class SMTP(BaseModule):
                 sys.stdout.flush()
                 _live_line_dirty = True
 
-        def _commit_live_line() -> None:
-            """Clear the in-place progress row and move to the next line (no scrollback text)."""
-            nonlocal _live_line_dirty
-            if not _show_progress or not _live_line_dirty:
-                return
-            with _print_lock:
-                sys.stdout.write("\033[2K\r\n")
-                sys.stdout.flush()
-            _live_line_dirty = False
-
-        def _finalize_live() -> None:
-            """Drop the live progress row so only verdict lines remain after the test."""
+        def _clear_live_line() -> None:
+            """Erase the in-place progress row without leaving a blank line."""
             nonlocal _live_line_dirty
             if not _show_progress or not _live_line_dirty:
                 return
@@ -4203,6 +4219,9 @@ class SMTP(BaseModule):
                 sys.stdout.write("\033[2K\r")
                 sys.stdout.flush()
             _live_line_dirty = False
+
+        def _finalize_live() -> None:
+            _clear_live_line()
 
         commands_sent = 0
         commands_ok = 0
@@ -4230,10 +4249,10 @@ class SMTP(BaseModule):
                     disconnected = True
                     disconnect_after = commands_sent
                     if self.args.debug:
-                        _commit_live_line()
                         self.ptdebug(
                             f"NOOP #{commands_sent}: send failed — {exc}",
                             Out.INFO,
+                            indent_override=8,
                         )
                     break
 
@@ -4247,30 +4266,34 @@ class SMTP(BaseModule):
                 else:
                     commands_error += 1
 
-                # Periodic live progress (every N commands to keep terminal calm).
-                if _show_progress and (commands_sent % NOOP_FLOOD1_PROGRESS_EVERY == 0):
+                # Periodic live progress (non-debug only; -vv uses per-N NOOP lines instead).
+                if (
+                    _show_progress
+                    and not self.args.debug
+                    and (commands_sent % NOOP_FLOOD1_PROGRESS_EVERY == 0)
+                ):
                     _write_live(
                         self._noop_flood1_live_progress_text(
                             commands_sent, time.perf_counter() - overall_start,
                         )
                     )
 
-                # -vv: snapshot every Nth NOOP (ADDITIONS colour via ``ptdebug``).
+                # -vv: snapshot every Nth NOOP (ADDITIONS colour, 8-space indent).
                 if self.args.debug and (commands_sent % NOOP_FLOOD1_PROGRESS_EVERY == 0):
-                    _commit_live_line()
                     self.ptdebug(
                         self._noop_flood1_debug_line(commands_sent, status, rt),
+                        indent_override=8,
                     )
 
                 if closed:
                     disconnected = True
                     disconnect_after = commands_sent
                     if self.args.debug:
-                        _commit_live_line()
                         self.ptdebug(
                             f"NOOP #{commands_sent}: peer closed connection "
                             f"(after {commands_sent} NOOPs).",
                             Out.INFO,
+                            indent_override=8,
                         )
                     break
             else:
@@ -4307,6 +4330,9 @@ class SMTP(BaseModule):
             f"last_window_avg={last_window_avg}, slowdown={slowdown_detected}.",
             Out.INFO,
         )
+        if self.args.debug and not self.args.json:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
         return NoopFlood1Result(
             commands_sent=commands_sent,
@@ -4440,33 +4466,78 @@ class SMTP(BaseModule):
         # ── Phase 1: establish sockets ───────────────────────────────────
         # Every requested socket is attempted (a refusal no longer aborts the
         # ramp-up); failures are bucketed so the analyst sees the real picture.
+        # With -t/--threads > 1 the sockets are opened by several worker threads
+        # so the pool fills faster (fewer early sockets reaped for idling). The
+        # terminal output is identical regardless of the thread count.
         connections: list = []
         est_err = 0
         est_disc = 0
         est_timeout = 0
         ramp_t0 = time.perf_counter()
-        for i in range(requested):
+        ramp_threads = max(1, int(getattr(self.args, "enum_threads", 1) or 1))
+
+        def _establish_one():
+            """Open one EHLO'd socket; return (smtp|None, reason|None, exc|None)."""
             try:
-                smtp = self._connect_silent(timeout=NOOP_FLOOD2_CONNECT_TIMEOUT, send_ehlo=True)
+                smtp = self._connect_silent(
+                    timeout=NOOP_FLOOD2_CONNECT_TIMEOUT, send_ehlo=True
+                )
                 try:
                     smtp.sock.settimeout(NOOP_FLOOD2_RECV_TIMEOUT)
                 except Exception:
                     pass
-                connections.append(smtp)
+                return smtp, None, None
             except Exception as exc:
-                reason = self._classify_conn_failure(exc)
+                return None, self._classify_conn_failure(exc), exc
+
+        def _record_result(index: int, smtp, reason, exc) -> None:
+            """Bucket one ramp-up outcome and refresh the live progress row."""
+            nonlocal est_err, est_disc, est_timeout
+            if smtp is not None:
+                connections.append(smtp)
+            else:
                 if reason == "timeout":
                     est_timeout += 1
                 elif reason == "disconnect":
                     est_disc += 1
                 else:
                     est_err += 1
-                _emit_debug(f"Connection #{i + 1} failed — {reason} ({exc})")
+                _emit_debug(f"Connection #{index + 1} failed — {reason} ({exc})")
             if _show_progress:
+                done = len(connections) + est_err + est_disc + est_timeout
                 _write_live(
-                    f"Connecting: {i + 1}/{requested}     "
+                    f"Connecting: {done}/{requested}     "
                     f"(elapsed {time.perf_counter() - ramp_t0:.1f}s)"
                 )
+
+        if ramp_threads <= 1:
+            for i in range(requested):
+                smtp, reason, exc = _establish_one()
+                _record_result(i, smtp, reason, exc)
+        else:
+            ramp_lock = threading.Lock()
+            next_index = [0]
+
+            def _ramp_worker() -> None:
+                while True:
+                    with ramp_lock:
+                        idx = next_index[0]
+                        if idx >= requested:
+                            return
+                        next_index[0] = idx + 1
+                    # Network I/O happens outside the lock so threads run in parallel.
+                    smtp, reason, exc = _establish_one()
+                    with ramp_lock:
+                        _record_result(idx, smtp, reason, exc)
+
+            ramp_workers = [
+                threading.Thread(target=_ramp_worker, daemon=True)
+                for _ in range(min(ramp_threads, requested))
+            ]
+            for w in ramp_workers:
+                w.start()
+            for w in ramp_workers:
+                w.join()
 
         established = len(connections)
         _clear_live()
@@ -4545,6 +4616,8 @@ class SMTP(BaseModule):
         agg_commands_ok = 0
         agg_commands_error = 0
         agg_rtts: list[float] = []
+        # Per-connection terminations (index, reason, detail) collected as workers die.
+        terminated_info: list[tuple[int, str, str]] = []
         # Live count of sockets still up. Decremented as soon as a worker exits
         # its hammer-loop (close/timeout/exception). Read by the progress ticker
         # to render `(active K/N)` and to detect the all-dropped condition.
@@ -4571,6 +4644,7 @@ class SMTP(BaseModule):
             total_ok = 0  # running per-socket count of 250 OK replies (not reset on flush)
             died_reason: str | None = None  # set only if the *socket* failed during the
                                             # storm, NOT on clean stop_event exit.
+            died_cause = ""  # human-readable cause (error text / SMTP code) for the report
             try:
                 while not stop_event.is_set():
                     try:
@@ -4591,22 +4665,35 @@ class SMTP(BaseModule):
                             local_rtts = []
                         if closed:
                             died_reason = "disconnect"
+                            if status is not None:
+                                died_cause = (
+                                    f"[{status}] "
+                                    f"{self.bytes_to_str(_raw).strip()[:80]}"
+                                )
+                            else:
+                                died_cause = "peer closed connection"
                             break
                     except (OSError, ConnectionError) as exc:
                         local_sent += 1
                         local_err += 1
                         died_reason = self._classify_conn_failure(exc)
+                        errno = getattr(exc, "errno", None)
+                        died_cause = f"{type(exc).__name__}: {exc}"
+                        if errno is not None and f"errno {errno}" not in died_cause.lower():
+                            died_cause += f" (errno {errno})"
                         break
             finally:
                 _flush(local_sent, local_ok, local_err, local_rtts)
                 if died_reason is not None:
-                    with results_lock:
-                        active_count -= 1
                     t_rel = time.perf_counter() - run_start
                     if total_ok == 0:
-                        detail = f"no successful reply, t={t_rel:.1f}s"
+                        timing = f"no successful reply, t={t_rel:.1f}s"
                     else:
-                        detail = f"after {total_ok} OK NOOPs, t={t_rel:.1f}s"
+                        timing = f"after {total_ok} OK NOOPs, t={t_rel:.1f}s"
+                    detail = f"{died_cause}; {timing}" if died_cause else timing
+                    with results_lock:
+                        active_count -= 1
+                        terminated_info.append((idx, died_reason, detail))
                     _emit_debug(f"Connection #{idx} terminated — {died_reason} ({detail})")
 
         threads: list[threading.Thread] = []
@@ -4658,6 +4745,7 @@ class SMTP(BaseModule):
         # when the storm started), not every socket that ever connected.
         with results_lock:
             active_end = max(active_count, 0)
+            terminated_sorted = tuple(sorted(terminated_info, key=lambda t: t[0]))
         disconnected_during = max(storm_pool - active_end, 0)
 
         self.ptdebug(
@@ -4690,6 +4778,7 @@ class SMTP(BaseModule):
             establish_timeouts=est_timeout,
             reaped_before_storm=reaped,
             storm_pool_connections=storm_pool,
+            terminated_connections=terminated_sorted,
         )
 
 
@@ -5037,13 +5126,17 @@ class SMTP(BaseModule):
         live_label: list[str] | None = None,
         attempt_hook=None,
         recipients: list[str] | None = None,
+        emit_debug=None,
     ) -> RcptLimitResult:
         """Run MAIL FROM + RCPT TO loop for a given domain. Used so we can retry with parent domain.
         Continues on 554/550/553/450 (policy rejection) to probe session error limit (smtpd_hard_error_limit).
         Stops with no_session_limit after RCPT_LIMIT_POLICY_REJECT_CAP consecutive policy rejects when none accepted.
         max_rcpt_attempts caps RCPT iterations when the server keeps accepting (per-message limit probe).
         live_label/attempt_hook are passed from test_rcpt_limit for live progress display.
-        attempt_hook(i) is called once per attempt with the current attempt index.
+        attempt_hook(i) is called once per attempt with the current attempt index (after
+        the SMTP reply is logged when emit_debug is set, so -vv lines stay on their own row).
+        emit_debug (optional): callable(text, out=..., title=...) that clears the in-place
+        progress row before printing verbose SMTP trace lines.
 
         recipients (optional): explicit list of full RCPT TO addresses (e.g. real local users from -U name file).
         When set, the probe iterates this list instead of generating synthetic 1@dom..N@dom; this is
@@ -5063,11 +5156,17 @@ class SMTP(BaseModule):
                 s = self.bytes_to_str(raw).strip().replace("\r\n", " ").replace("\n", " ")
             return s if len(s) <= limit else s[: limit - 3] + "..."
 
+        def _dbg(text: str, out: Out = Out.INFO, *, title: bool = False) -> None:
+            if emit_debug is not None:
+                emit_debug(text, out=out, title=title)
+            else:
+                self.ptdebug(text, out, title=title)
+
         try:
             status, reply = smtp.docmd("MAIL FROM:", "<>")
             if status != 250:
                 return RcptLimitResult(0, False, self.bytes_to_str(reply), False)
-            self.ptdebug(f"MAIL FROM:<> → [{status}] {_reply_one_line(reply)}", Out.INFO)
+            _dbg(f"MAIL FROM:<> → [{status}] {_reply_one_line(reply)}", Out.INFO)
         except (smtplib.SMTPServerDisconnected, ConnectionResetError, BrokenPipeError, EOFError, OSError) as e:
             return RcptLimitResult(0, True, str(e), False)
 
@@ -5089,7 +5188,7 @@ class SMTP(BaseModule):
                 addr = f"posthit{j}@{domain}"
                 try:
                     pst, prep = smtp.docmd("RCPT TO:", f"<{addr}>")
-                    self.ptdebug(
+                    _dbg(
                         f"POSTHIT [{j}/{probe_max}] RCPT TO:<{addr}> → "
                         f"[{pst}] {_reply_one_line(prep)}",
                         Out.INFO,
@@ -5098,7 +5197,7 @@ class SMTP(BaseModule):
                         return True, j
                 except (smtplib.SMTPServerDisconnected, ConnectionResetError,
                         BrokenPipeError, EOFError, OSError):
-                    self.ptdebug(
+                    _dbg(
                         f"POSTHIT server closed connection after {j} extra rejects",
                         Out.INFO,
                     )
@@ -5115,15 +5214,16 @@ class SMTP(BaseModule):
                     f"accepted {accepted} recipients. "
                     f"Attempt to add recipient: {rcpt_addr}"
                 )
-            if attempt_hook is not None:
-                attempt_hook(i)
             try:
                 status, reply = smtp.docmd("RCPT TO:", f"<{rcpt_addr}>")
                 reply_str = self.bytes_to_str(reply)
-                self.ptdebug(
-                    f"RCPT [{i}/{max_try}] TO:<{rcpt_addr}> → [{status}] {_reply_one_line(reply_str)}",
+                _dbg(
+                    f"[{i}/{max_try}] RCPT TO:<{rcpt_addr}> → "
+                    f"[{status}] {_reply_one_line(reply_str)}",
                     Out.INFO,
                 )
+                if attempt_hook is not None:
+                    attempt_hook(i)
                 if status == 250:
                     accepted += 1
                     continue
@@ -5135,7 +5235,7 @@ class SMTP(BaseModule):
                 if status in (450, 550, 553, 554):
                     failed += 1
                     if accepted == 0 and failed >= policy_reject_cap:
-                        self.ptdebug(
+                        _dbg(
                             f"Server allows {failed} failed RCPTs without disconnect (no smtpd_hard_error_limit)",
                             Out.VULN,
                         )
@@ -5147,7 +5247,7 @@ class SMTP(BaseModule):
 
                 # Session limit: 421 (rate limit / too many errors)
                 if status == 421:
-                    self.ptdebug(f"Server session limit after {i} attempts: {limit_response}", Out.INFO)
+                    _dbg(f"Server session limit after {i} attempts: {limit_response}", Out.INFO)
                     return RcptLimitResult(
                         accepted, True, limit_response, rejected_addresses=(accepted == 0),
                         failed_before_limit=i, session_limit_triggered=True, no_session_limit=False,
@@ -5155,7 +5255,7 @@ class SMTP(BaseModule):
 
                 # Per-message RCPT limit: 452 Too many recipients
                 if status == 452:
-                    self.ptdebug(f"Server per-message limit after {accepted} recipients: {limit_response}", Out.INFO)
+                    _dbg(f"Server per-message limit after {accepted} recipients: {limit_response}", Out.INFO)
                     disc, posthit_n = _probe_disconnect_after_limit()
                     return RcptLimitResult(
                         accepted, True, limit_response, False,
@@ -5164,7 +5264,7 @@ class SMTP(BaseModule):
 
                 # Other 5xx
                 if 500 <= status <= 599:
-                    self.ptdebug(f"Server limit after {accepted} recipients: {limit_response}", Out.INFO)
+                    _dbg(f"Server limit after {accepted} recipients: {limit_response}", Out.INFO)
                     disc, posthit_n = _probe_disconnect_after_limit()
                     return RcptLimitResult(
                         accepted, True, limit_response, False,
@@ -5173,13 +5273,13 @@ class SMTP(BaseModule):
 
                 return RcptLimitResult(accepted, False, limit_response, False)
             except (smtplib.SMTPServerDisconnected, ConnectionResetError, BrokenPipeError, EOFError, OSError) as e:
-                self.ptdebug(f"Server closed connection after {i} attempts", Out.INFO)
+                _dbg(f"Server closed connection after {i} attempts", Out.INFO)
                 return RcptLimitResult(
                     accepted, True, str(e), rejected_addresses=(accepted == 0),
                     failed_before_limit=i, session_limit_triggered=True, no_session_limit=False,
                 )
 
-        self.ptdebug(f"No limit observed up to {accepted} recipients", Out.VULN)
+        _dbg(f"No limit observed up to {accepted} recipients", Out.VULN)
         return RcptLimitResult(accepted, False, None, False)
 
     # ------------------------------------------------------------------
@@ -5268,6 +5368,168 @@ class SMTP(BaseModule):
             out.append(addr)
             if len(out) >= max(1, int(max_n)):
                 break
+        return out
+
+    def _rl_probe_accept_all_rcpt(
+        self,
+        smtp: smtplib.SMTP,
+        domain: str,
+        *,
+        emit_debug=None,
+    ) -> bool:
+        """Pre-probe: does the server accept a clearly invalid local part via RCPT TO?
+
+        Uses ``RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL@domain`` (e.g. ``xxxfoofff@dom``).
+        Leaves the session in a clean state (RSET) when the probe finishes.
+        """
+        addr = f"{RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL}@{domain}"
+
+        def _reply_one_line(raw: str | bytes, limit: int = 160) -> str:
+            if isinstance(raw, str):
+                s = raw.strip().replace("\r\n", " ").replace("\n", " ")
+            else:
+                s = self.bytes_to_str(raw).strip().replace("\r\n", " ").replace("\n", " ")
+            return s if len(s) <= limit else s[: limit - 3] + "..."
+
+        def _dbg(text: str, out: Out = Out.INFO) -> None:
+            if emit_debug is not None:
+                emit_debug(text, out=out)
+            elif self.args.debug and not self.args.json:
+                self.ptdebug(text, out)
+
+        try:
+            smtp.docmd("RSET")
+        except Exception:
+            pass
+        try:
+            status, reply = smtp.docmd("MAIL FROM:", "<>")
+            if status != 250:
+                _dbg(
+                    f"Accept-all probe MAIL FROM:<> → [{status}] {_reply_one_line(reply)}",
+                    Out.INFO,
+                )
+                return False
+            status, reply = smtp.docmd("RCPT TO:", f"<{addr}>")
+            reply_str = self.bytes_to_str(reply)
+            _dbg(
+                f"Accept-all probe RCPT TO:<{addr}> → "
+                f"[{status}] {_reply_one_line(reply_str)}",
+                Out.INFO,
+            )
+            accepted = status in (250, 251, 252)
+        except Exception as e:
+            _dbg(f"Accept-all probe failed: {e}", Out.INFO)
+            accepted = False
+        try:
+            smtp.docmd("RSET")
+        except Exception:
+            pass
+        return accepted
+
+    def _rl_send_catch_all_delivery_probe(
+        self,
+        smtp: smtplib.SMTP,
+        domain: str,
+        bounce_mailbox: str,
+        *,
+        emit_debug=None,
+    ) -> dict:
+        """Submit one minimal message to ``xxxfoofff@domain`` for manual catch-all verification.
+
+        ``bounce_mailbox`` is ``-m`` / envelope MAIL FROM; NDR/bounce on delivery failure is
+        routed there per RFC 5321. The analyst checks that mailbox manually. Leaves RSET.
+        """
+        probe_rcpt = f"{RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL}@{domain}"
+        mail_from = bounce_mailbox.strip("<>").strip()
+        mail_bracket = f"<{mail_from}>"
+        probe_uuid = secrets.token_hex(8)
+
+        def _reply_one_line(raw: str | bytes, limit: int = 160) -> str:
+            if isinstance(raw, str):
+                s = raw.strip().replace("\r\n", " ").replace("\n", " ")
+            else:
+                s = self.bytes_to_str(raw).strip().replace("\r\n", " ").replace("\n", " ")
+            return s if len(s) <= limit else s[: limit - 3] + "..."
+
+        def _dbg(text: str, out: Out = Out.INFO) -> None:
+            if emit_debug is not None:
+                emit_debug(text, out=out)
+            elif self.args.debug and not self.args.json:
+                self.ptdebug(text, out)
+
+        out = {
+            "probe_rcpt": probe_rcpt,
+            "probe_uuid": probe_uuid,
+            "data_ok": False,
+            "data_code": None,
+            "data_reply": None,
+        }
+
+        try:
+            smtp.docmd("RSET")
+        except Exception:
+            pass
+
+        mst, mrp = smtp.docmd("MAIL FROM:", mail_bracket)
+        _dbg(
+            f"Catch-all bounce probe MAIL FROM:{mail_bracket} → "
+            f"[{mst}] {_reply_one_line(mrp)}",
+            Out.INFO,
+        )
+        if mst != 250:
+            out["data_reply"] = f"MAIL FROM rejected: [{mst}] {_reply_one_line(mrp)}"
+            try:
+                smtp.docmd("RSET")
+            except Exception:
+                pass
+            return out
+
+        st, rp = smtp.docmd("RCPT TO:", f"<{probe_rcpt}>")
+        _dbg(
+            f"Catch-all bounce probe RCPT TO:<{probe_rcpt}> → "
+            f"[{st}] {_reply_one_line(rp)}",
+            Out.INFO,
+        )
+        if st not in (250, 251, 252):
+            out["data_reply"] = f"RCPT TO rejected: [{st}] {_reply_one_line(rp)}"
+            try:
+                smtp.docmd("RSET")
+            except Exception:
+                pass
+            return out
+
+        msg_lines = [
+            f"From: {mail_from}",
+            f"To: {probe_rcpt}",
+            f"Subject: penterep-rl-catchall {probe_uuid}",
+            f"Message-ID: <penterep-rl-ca-{probe_uuid}@{domain}>",
+            f"X-Penterep-RL-CatchAll-Probe: {probe_uuid}",
+            f"X-Penterep-RL-Bounce-Mailbox: {mail_from}",
+            "",
+            f"RCPT TO limit catch-all bounce probe id: {probe_uuid}",
+            f"Envelope MAIL FROM: {mail_bracket}",
+            f"Probe recipient: {probe_rcpt}",
+            f"If the address is not catch-all, an NDR/bounce should arrive at {mail_from}.",
+            "No bounce after delivery processing suggests catch-all or delayed reject.",
+        ]
+        raw_msg = "\r\n".join(msg_lines)
+        try:
+            dcode, drp = smtp.data(raw_msg)
+            drep = self.bytes_to_str(drp).strip()[:500]
+            out["data_code"] = dcode
+            out["data_reply"] = drep
+            out["data_ok"] = dcode == 250
+            _dbg(
+                f"Catch-all bounce probe DATA → [{dcode}] {_reply_one_line(drep)}",
+                Out.INFO,
+            )
+        except Exception as e:
+            out["data_reply"] = str(e).strip()[:500]
+            _dbg(f"Catch-all bounce probe DATA failed: {e}", Out.INFO)
+        try:
+            smtp.docmd("RSET")
+        except Exception:
+            pass
         return out
 
     def _rl_run_precheck(self) -> dict:
@@ -5413,8 +5675,11 @@ class SMTP(BaseModule):
         _attempt_ref: list[int] = [0]
         _eta_ref: list[float | None] = [None]
         _max_probe_ref: list[int] = [RCPT_LIMIT_DEFAULT_ATTEMPTS]
+        _print_lock = threading.Lock()
+        _live_dirty = False
 
         def _render_progress() -> None:
+            nonlocal _live_dirty
             attempt = _attempt_ref[0]
             max_p = _max_probe_ref[0]
             eta = _eta_ref[0]
@@ -5428,8 +5693,37 @@ class SMTP(BaseModule):
             else:
                 prefix = "    "
             line = f"{prefix}{_live_label[0]}"
-            sys.stdout.write(f"\r{line:<120}")
-            sys.stdout.flush()
+            with _print_lock:
+                sys.stdout.write(f"\033[2K\r{line:<120}")
+                sys.stdout.flush()
+                _live_dirty = True
+
+        def _clear_progress_line() -> None:
+            nonlocal _live_dirty
+            if not _show_progress or not _live_dirty:
+                return
+            with _print_lock:
+                if _live_dirty:
+                    sys.stdout.write("\033[2K\r")
+                    sys.stdout.flush()
+                    _live_dirty = False
+
+        def _emit_probe_debug(
+            text: str,
+            out: Out = Out.INFO,
+            *,
+            title: bool = False,
+        ) -> None:
+            """Verbose SMTP trace that won't garble the in-place progress row."""
+            nonlocal _live_dirty
+            if not self.args.debug or self.args.json:
+                return
+            with _print_lock:
+                if _show_progress and _live_dirty:
+                    sys.stdout.write("\033[2K\r")
+                    sys.stdout.flush()
+                    _live_dirty = False
+            self.ptdebug(text, out, title=title)
 
         def _update_attempt(i: int) -> None:
             elapsed = time.perf_counter() - _start_time
@@ -5445,9 +5739,12 @@ class SMTP(BaseModule):
                 _render_progress()
 
         def _end_progress() -> None:
+            nonlocal _live_dirty
             _ticker_stop.set()
-            sys.stdout.write(f"\r{' ' * 120}\r")
-            sys.stdout.flush()
+            with _print_lock:
+                sys.stdout.write(f"\033[2K\r{' ' * 120}\r")
+                sys.stdout.flush()
+                _live_dirty = False
 
         # ── Pre-check phase (no ticker yet, info lines must stay visible) ──
         no_precheck = bool(getattr(self.args, "rl_no_precheck", False))
@@ -5504,6 +5801,10 @@ class SMTP(BaseModule):
                 elif open_relay is False:
                     self.ptprint(
                         f"    {info_icon} Open relay: not vulnerable",
+                        Out.TEXT,
+                    )
+                    self.ptprint(
+                        f"    {info_icon} MTA manages email addresses with domain {domain}",
                         Out.TEXT,
                     )
 
@@ -5581,6 +5882,15 @@ class SMTP(BaseModule):
 
         smtp: smtplib.SMTP | None = None
         auth_used = False
+        catch_all_bounce: str | None = None
+        catch_all_delivery_rcpt: str | None = None
+        catch_all_delivery_attempted = False
+        catch_all_delivery_data_ok = False
+        catch_all_probe_uuid: str | None = None
+        mail_from_raw = (getattr(self.args, "mail_from", None) or "").strip()
+        if mail_from_raw and "@" in mail_from_raw:
+            catch_all_bounce = mail_from_raw.strip("<>").strip()
+
         try:
             smtp = self.get_smtp_handler()
             smtp.docmd("EHLO", self.fqdn)
@@ -5595,10 +5905,10 @@ class SMTP(BaseModule):
                             _render_progress()
                         smtp.login(user, passwd)
                         auth_used = True
-                        self.ptdebug(f"AUTH LOGIN succeeded for user {user}", Out.INFO)
+                        _emit_probe_debug(f"AUTH LOGIN succeeded for user {user}", Out.INFO)
                     except Exception as e:
                         msg = f"AUTH LOGIN failed for {user}: {e}"
-                        self.ptdebug(msg, Out.INFO)
+                        _emit_probe_debug(msg, Out.INFO)
                         if _show_progress:
                             _end_progress()
                         self.ptprint(
@@ -5620,9 +5930,29 @@ class SMTP(BaseModule):
                             recipients_source=None,
                         )
 
-            self.ptdebug(
+            _probe_emit_debug = _emit_probe_debug if (self.args.debug and _show_progress) else None
+            accept_all_via_rcpt = self._rl_probe_accept_all_rcpt(
+                smtp,
+                domain,
+                emit_debug=_probe_emit_debug,
+            )
+            if catch_all_bounce and accept_all_via_rcpt:
+                delivery = self._rl_send_catch_all_delivery_probe(
+                    smtp,
+                    domain,
+                    catch_all_bounce,
+                    emit_debug=_probe_emit_debug,
+                )
+                catch_all_delivery_attempted = True
+                catch_all_delivery_rcpt = delivery.get("probe_rcpt")
+                catch_all_probe_uuid = delivery.get("probe_uuid")
+                catch_all_delivery_data_ok = bool(delivery.get("data_ok"))
+
+            _emit_probe_debug(
                 f"RCPT TO limit probe: domain={domain}, max attempts={max_rcpt_attempts}, "
-                f"recipients_source={recipients_source}, auth_used={auth_used}",
+                f"recipients_source={recipients_source}, auth_used={auth_used}, "
+                f"accept_all_via_rcpt={accept_all_via_rcpt}, "
+                f"catch_all_bounce_mailbox={catch_all_bounce or 'none'}",
                 Out.INFO,
             )
             # Progress denominator = the number of RCPT attempts we will actually make
@@ -5637,6 +5967,7 @@ class SMTP(BaseModule):
                 live_label=_live_label,
                 attempt_hook=_update_attempt if _show_progress else None,
                 recipients=recipients,
+                emit_debug=_probe_emit_debug,
             )
             domain_used = domain
 
@@ -5652,7 +5983,7 @@ class SMTP(BaseModule):
             ):
                 parent = self._to_parent_domain(domain)
                 if parent != domain:
-                    self.ptdebug(f"Retrying RCPT TO limit with parent domain: {parent}", Out.INFO)
+                    _emit_probe_debug(f"Retrying RCPT TO limit with parent domain: {parent}", Out.INFO)
                     try:
                         smtp.docmd("RSET")
                     except Exception:
@@ -5665,6 +5996,7 @@ class SMTP(BaseModule):
                         smtp, parent, max_rcpt_attempts=max_rcpt_attempts,
                         live_label=_live_label,
                         attempt_hook=_update_attempt if _show_progress else None,
+                        emit_debug=_probe_emit_debug,
                     )
                     domain_used = parent
 
@@ -5687,6 +6019,12 @@ class SMTP(BaseModule):
                 recipients_source=recipients_source,
                 disconnect_after_limit=getattr(result, "disconnect_after_limit", None),
                 posthit_probe_count=getattr(result, "posthit_probe_count", 0),
+                accept_all_via_rcpt=accept_all_via_rcpt,
+                catch_all_bounce_mailbox=catch_all_bounce,
+                catch_all_delivery_rcpt=catch_all_delivery_rcpt,
+                catch_all_delivery_attempted=catch_all_delivery_attempted,
+                catch_all_delivery_data_ok=catch_all_delivery_data_ok,
+                catch_all_probe_uuid=catch_all_probe_uuid,
             )
         finally:
             if _show_progress:
@@ -6220,7 +6558,7 @@ class SMTP(BaseModule):
         if enumeration_vulns["vrfy"]:
             return catch_all != "configured"
         if enumeration_vulns["rcpt"]:
-            return catch_all not in ("indeterminate", "configured")
+            return catch_all not in (*CATCH_ALL_INDETERMINATE_VARIANTS, "configured")
         return False
 
     def _stream_enumeration_method_rows(
@@ -7147,7 +7485,8 @@ class SMTP(BaseModule):
         Detect Catch-All mailbox: if server accepts 3 invalid addresses as valid,
         catch-all is configured (VRFY/EXPN) or indeterminate (RCPT).
         Uses VRFY or EXPN when available; otherwise RCPT. RCPT cannot distinguish
-        valid address from catch-all, so result is Indeterminate when all accepted.
+        valid address from catch-all, so when all invalid RCPT are accepted the
+        result is ``indeterminate_accept_all_rcpt`` (displayed as accept-all via RCPT).
         Per RFC 5321: 250/251/252 are success for VRFY/EXPN; 550 = user unknown.
         OWASP: RCPT uses full addresses (local@domain) for robustness.
         """
@@ -7218,7 +7557,7 @@ class SMTP(BaseModule):
                                 return "not_configured"
                         except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
                             return "indeterminate"
-                    return "indeterminate"
+                    return "indeterminate_accept_all_rcpt"
                 finally:
                     try:
                         smtp.docmd("RSET")
@@ -13283,7 +13622,7 @@ class SMTP(BaseModule):
             else:
                 enumeration_results["vrfy"] = self.expn_vrfy_enumeration("VRFY", smtp)
         elif enumeration_vulns["rcpt"]:
-            if catch_all in ("indeterminate", "configured"):
+            if catch_all in (*CATCH_ALL_INDETERMINATE_VARIANTS, "configured"):
                 self.ptdebug(
                     f"Skipping RCPT enumeration: catch-all {catch_all} (results would be false positives)",
                     Out.INFO,
@@ -13836,6 +14175,39 @@ class SMTP(BaseModule):
             Out.TEXT,
         )
 
+    def _stream_rcpt_limit_catch_all_delivery_hint(self, rlim: RcptLimitResult) -> None:
+        """Manual catch-all bounce follow-up when optional ``-m`` was passed with ``-rl``."""
+        bounce_mb = getattr(rlim, "catch_all_bounce_mailbox", None)
+        if not bounce_mb:
+            return
+        info_icon = get_colored_text("[*]", color="INFO")
+        warn_icon = get_colored_text("[!]", color="WARNING")
+        probe_local = RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL
+        probe_domain = getattr(rlim, "domain_used", None) or "domain"
+        probe_addr = getattr(rlim, "catch_all_delivery_rcpt", None) or f"{probe_local}@{probe_domain}"
+
+        if getattr(rlim, "catch_all_delivery_attempted", False):
+            if getattr(rlim, "catch_all_delivery_data_ok", False):
+                uuid = getattr(rlim, "catch_all_probe_uuid", None) or "?"
+                self.ptprint(
+                    f"    {info_icon} Catch-all bounce probe: message sent to {probe_addr} "
+                    f"(MAIL FROM: {bounce_mb}) — check {bounce_mb} manually for NDR/bounce "
+                    f"(probe id: {uuid}; no bounce suggests catch-all)",
+                    Out.TEXT,
+                )
+            else:
+                self.ptprint(
+                    f"    {warn_icon} Catch-all bounce probe: could not complete delivery to "
+                    f"{probe_addr} (MAIL FROM: {bounce_mb}) — manual bounce check may be inconclusive",
+                    Out.TEXT,
+                )
+        elif not getattr(rlim, "accept_all_via_rcpt", False):
+            self.ptprint(
+                f"    {info_icon} Catch-all bounce probe skipped: RCPT TO did not accept "
+                f"{probe_local}@{probe_domain} (no message sent; -m not used for bounce check)",
+                Out.TEXT,
+            )
+
     def _stream_rcpt_limit_server_response_verbose(self, server_response: str | None) -> None:
         """Full SMTP reply lines only with -vv/--verbose (``args.debug``)."""
         if not server_response:
@@ -13929,10 +14301,16 @@ class SMTP(BaseModule):
                 self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
             else:
                 ok_icon = get_colored_text("[✓]", color="NOTVULN")
+                accept_all_suffix = (
+                    " (accept-all via RCPT)"
+                    if getattr(rlim, "accept_all_via_rcpt", False)
+                    else ""
+                )
                 self.ptprint(
-                    f"    {ok_icon} Accepted recipients: {rlim.max_accepted}",
+                    f"    {ok_icon} Accepted recipients: {rlim.max_accepted}{accept_all_suffix}",
                     Out.TEXT,
                 )
+        self._stream_rcpt_limit_catch_all_delivery_hint(rlim)
 
     def _stream_rcpt_duplicate_result(self) -> None:
         if (err := self.results.rcpt_duplicate_error) is not None:
@@ -14115,6 +14493,11 @@ class SMTP(BaseModule):
             self.ptprint(f"{info_icon} Catch All mailbox configured", Out.TEXT)
         elif catch_all == "not_configured":
             self.ptprint(f"{info_icon} Catch All mailbox not configured", Out.TEXT)
+        elif catch_all == "indeterminate_accept_all_rcpt":
+            self.ptprint(
+                f"{info_icon} Catch All mailbox indeterminate (accept-all via RCPT)",
+                Out.TEXT,
+            )
         elif catch_all == "indeterminate":
             self.ptprint(f"{info_icon} Catch All mailbox indeterminate", Out.TEXT)
 
@@ -15237,7 +15620,7 @@ class SMTP(BaseModule):
             return
 
         vuln_icon = get_colored_text("[✗]", color="VULN")
-        ok_icon = get_colored_text("[OK]", color="NOTVULN")
+        ok_icon = get_colored_text("[✓]", color="NOTVULN")
 
         # 1) Disconnect behaviour.
         if r.disconnected and r.disconnect_after is not None:
@@ -15316,7 +15699,7 @@ class SMTP(BaseModule):
             return
 
         vuln_icon = get_colored_text("[✗]", color="VULN")
-        ok_icon = get_colored_text("[OK]", color="NOTVULN")
+        ok_icon = get_colored_text("[✓]", color="NOTVULN")
         warn_icon = get_colored_text("[!]", color="VULN")
         info_icon = get_colored_text("[*]", color="INFO")
 
@@ -15376,6 +15759,10 @@ class SMTP(BaseModule):
                 f"({pct:.0f}%)",
                 Out.TEXT,
             )
+            # Per-connection breakdown (ADDITIONS colour, same as -vv debug output).
+            for idx, reason, detail in r.terminated_connections:
+                line = f"        Connection #{idx} terminated — {reason} ({detail})"
+                self.ptprint(get_colored_text(line, color="ADDITIONS"), Out.TEXT)
 
     def _on_brute_success(self, cred: Creds) -> None:
         """Callback for real-time streaming of found credentials (thread-safe)."""
@@ -16023,6 +16410,17 @@ class SMTP(BaseModule):
             precheck_obj["openRelay"] = bool(rlim.open_relay)
         if getattr(rlim, "recipients_source", None):
             precheck_obj["recipientsSource"] = rlim.recipients_source
+        if getattr(rlim, "accept_all_via_rcpt", False):
+            precheck_obj["acceptAllViaRcpt"] = True
+        if (bounce_mb := getattr(rlim, "catch_all_bounce_mailbox", None)):
+            precheck_obj["catchAllBounceMailbox"] = bounce_mb
+        if getattr(rlim, "catch_all_delivery_attempted", False):
+            precheck_obj["catchAllBounceProbe"] = {
+                "probeRcpt": getattr(rlim, "catch_all_delivery_rcpt", None),
+                "mailFrom": getattr(rlim, "catch_all_bounce_mailbox", None),
+                "dataAccepted": bool(getattr(rlim, "catch_all_delivery_data_ok", False)),
+                "probeUuid": getattr(rlim, "catch_all_probe_uuid", None),
+            }
 
         # Skipped: emit a structured record but no vulnerability code.
         if getattr(rlim, "skipped", False):
@@ -16481,7 +16879,14 @@ class SMTP(BaseModule):
         if self._is_enum_only_output():
             props: dict = {}
             if (catch_all := self.results.catch_all) is not None:
-                desc_map = {"not_configured": "CatchAll not_configured", "configured": "CatchAll configured", "indeterminate": "CatchAll indeterminate"}
+                desc_map = {
+                    "not_configured": "CatchAll not_configured",
+                    "configured": "CatchAll configured",
+                    "indeterminate": "CatchAll indeterminate",
+                    "indeterminate_accept_all_rcpt": (
+                        "CatchAll indeterminate (accept-all via RCPT)"
+                    ),
+                }
                 props["description"] = desc_map.get(catch_all, f"CatchAll {catch_all}")
             if catch_all == "configured":
                 props["enumerationNotes"] = (
@@ -17243,6 +17648,10 @@ class SMTP(BaseModule):
                     "establishTimeouts": nf2.establish_timeouts,
                     "reapedBeforeStorm": nf2.reaped_before_storm,
                     "stormPoolConnections": nf2.storm_pool_connections,
+                    "terminatedConnections": [
+                        {"index": idx, "reason": reason, "detail": detail}
+                        for idx, reason, detail in nf2.terminated_connections
+                    ],
                 }
             })
 

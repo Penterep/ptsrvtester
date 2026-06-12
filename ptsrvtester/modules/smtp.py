@@ -663,12 +663,19 @@ class RcptLimitResult(NamedTuple):
                                                 # None = not measured (skipped/error/no limit found)
     posthit_probe_count: int = 0  # Number of additional RCPT TOs sent after limit hit
     accept_all_via_rcpt: bool = False  # True when pre-probe accepted RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL@domain
-    # ── Optional catch-all bounce probe (``-m`` MAIL FROM, manual NDR check) ──
-    catch_all_bounce_mailbox: str | None = None  # ``-m`` / ``--mail-from`` when set with ``-rl``
+    # ── Legacy catch-all bounce probe fields (unused; kept for JSON compat) ──
+    catch_all_bounce_mailbox: str | None = None
     catch_all_delivery_rcpt: str | None = None  # Probe RCPT (``xxxfoofff@domain``)
     catch_all_delivery_attempted: bool = False  # True when a DATA probe was submitted
     catch_all_delivery_data_ok: bool = False  # True when server accepted DATA (250)
     catch_all_probe_uuid: str | None = None  # Correlates manual inbox check (Message-ID / X-header)
+    # ── ``-rls`` / ``--recipient-limit-send``: deliver message after RCPT storm ──
+    limit_send_mode: bool = False  # True when ``-rls`` was used
+    limit_send_attempted: bool = False  # True when DATA was submitted (accepted > 0)
+    limit_send_ok: bool = False  # True when server accepted DATA (250)
+    limit_send_data_code: int | None = None
+    limit_send_data_reply: str | None = None
+    limit_send_mail_from: str | None = None  # Envelope MAIL FROM from ``-m``
 
 
 class RcptDuplicateResult(NamedTuple):
@@ -1388,9 +1395,32 @@ def _smtp_users_file_supplies_name_list(args: ArgsWithBruteforce) -> bool:
         return True
     if getattr(args, "auth_enum", False):
         return True
-    if getattr(args, "rcpt_limit", None) is not None:
+    if _rcpt_limit_active(args):
         return True
     return False
+
+
+def _rcpt_limit_active(args) -> bool:
+    """True when ``-rl`` or ``-rls`` is active."""
+    return (
+        getattr(args, "rcpt_limit", None) is not None
+        or getattr(args, "rcpt_limit_send", None) is not None
+    )
+
+
+def _rcpt_limit_send_mode(args) -> bool:
+    """True for ``-rls`` / ``--recipient-limit-send`` (submit DATA after RCPT storm)."""
+    return getattr(args, "rcpt_limit_send", None) is not None
+
+
+def _rcpt_limit_max_attempts(args) -> int:
+    """Max RCPT iterations for ``-rl`` / ``-rls`` (default ``RCPT_LIMIT_DEFAULT_ATTEMPTS``)."""
+    raw = getattr(args, "rcpt_limit_send", None)
+    if raw is None:
+        raw = getattr(args, "rcpt_limit", None)
+    if raw is None:
+        return RCPT_LIMIT_DEFAULT_ATTEMPTS
+    return max(1, int(raw))
 
 
 class SMTPArgs(ArgsWithBruteforce):
@@ -1473,7 +1503,8 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-rt", "--rate-limit", "<n>", f"Rate limiting test (default: {RATE_LIMIT_DEFAULT_ATTEMPTS} attempts)"],
                 ["-nf1", "--noop-flood1", "", "NOOP flooding test (1 connection, rapid NOOP commands)"],
                 ["-nf2", "--noop-flood2", "<n>", f"NOOP flooding DoS test (default: {NOOP_FLOOD2_DEFAULT_CONNECTIONS} parallel connections)"],
-                ["-rl", "--recipient-limit", "<n>", "Test RCPT TO limit (default: 1000 RCPT attempts; aborts after 50 policy rejects if none accepted); optional -m sends catch-all bounce probe (check MAIL FROM for NDR)"],
+                ["-rl", "--recipient-limit", "<n>", "Test RCPT TO limit (without -u/-U is generated 1000 random recipients; optional -m sets envelope MAIL FROM)"],
+                ["-rls", "--recipient-limit-send", "<n>", "Like -rl but submits DATA after RCPT storm (requires -m); tests whether multi-recipient delivery succeeds"],
                 ["-rdd", "--rcpt-duplicate", "<n>", f"Probe N duplicate RCPT TO for same address in one MAIL (default {RCPT_DUP_DEFAULT}, max {RCPT_DUP_MAX}; requires -r)"],
                 ["", "--rdd-send", "", "With -rdd: send minimal DATA after RCPT so analyst can verify mailbox copies manually"],
                 ["", "--rl-no-precheck", "", "Skip role/open-relay/auth pre-check for -rl (run RCPT TO probe directly)"],
@@ -1654,7 +1685,8 @@ class SMTPArgs(ArgsWithBruteforce):
             "-m", "--mail-from", type=str,
             help=(
                 "Sender address (MAIL FROM); used by -bomb, -av, -br (default: bombtest/avtest@{fqdn} when not set). "
-                "Optional with -rl: bounce/NDR mailbox for manual catch-all verification (envelope MAIL FROM)."
+                "Required for -rls/--recipient-limit-send (envelope MAIL FROM). "
+                "Optional with -rl: envelope MAIL FROM for the RCPT TO probe (default <> when omitted)."
             ),
         )
         direct.add_argument(
@@ -1837,11 +1869,23 @@ class SMTPArgs(ArgsWithBruteforce):
             metavar="N",
             dest="rcpt_limit",
             help=(
-                "Test RCPT TO per-message limit (N = max RCPT TO attempts per session, default: 1000; "
-                f"stops after {RCPT_LIMIT_POLICY_REJECT_CAP} consecutive policy rejections if none accepted). "
-                "With optional -m/--mail-from: after accept-all RCPT probe, send a minimal message to "
-                f"{RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL}@<domain> with envelope MAIL FROM -m; check -m "
-                "manually for NDR/bounce (no bounce suggests catch-all)."
+                "Test RCPT TO per-message limit (without -u/-U generates 1000 random recipients; "
+                "-m/--mail-from optional as envelope MAIL FROM, default <>). "
+                f"N = max RCPT attempts per session (default: {RCPT_LIMIT_DEFAULT_ATTEMPTS})."
+            ),
+        )
+        direct.add_argument(
+            "-rls", "--recipient-limit-send",
+            nargs="?",
+            type=int,
+            const=RCPT_LIMIT_DEFAULT_ATTEMPTS,
+            default=None,
+            metavar="N",
+            dest="rcpt_limit_send",
+            help=(
+                "Like -rl/--recipient-limit but after the RCPT TO storm submits one message (DATA) "
+                f"with all accepted recipients (default: {RCPT_LIMIT_DEFAULT_ATTEMPTS} RCPT attempts). "
+                "Requires -m/--mail-from as envelope MAIL FROM; reports whether DATA succeeded (250) or failed."
             ),
         )
         direct.add_argument(
@@ -2170,6 +2214,19 @@ class SMTP(BaseModule):
                 )
             if not args.rcpt_to or not str(args.rcpt_to).strip():
                 raise argparse.ArgumentError(None, "-br/--bounce-replay requires -r/--rcpt-to (recipient)")
+        rls_n = getattr(args, "rcpt_limit_send", None)
+        rl_n = getattr(args, "rcpt_limit", None)
+        if rls_n is not None and rl_n is not None:
+            raise argparse.ArgumentError(
+                None,
+                "-rls/--recipient-limit-send cannot be combined with -rl/--recipient-limit",
+            )
+        if rls_n is not None:
+            if not args.mail_from or not str(args.mail_from).strip() or "@" not in str(args.mail_from):
+                raise argparse.ArgumentError(
+                    None,
+                    "-rls/--recipient-limit-send requires -m/--mail-from (envelope MAIL FROM for delivery)",
+                )
         rdd_n = getattr(args, "rcpt_duplicate", None)
         if rdd_n is not None:
             if not args.rcpt_to or not str(args.rcpt_to).strip():
@@ -2224,7 +2281,7 @@ class SMTP(BaseModule):
         if args.user is not None and (
             args.enumerate is not None
             or getattr(args, "auth_enum", False)
-            or getattr(args, "rcpt_limit", None) is not None
+            or _rcpt_limit_active(args)
         ):
             raw.extend(x for x in text_or_file(args.user, None) if x != "")
         if raw:
@@ -2302,7 +2359,7 @@ class SMTP(BaseModule):
             or self.args.rate_limit
             or getattr(self.args, "noop_flood1", False)
             or getattr(self.args, "noop_flood2", None) is not None
-            or getattr(self.args, "rcpt_limit", False)
+            or _rcpt_limit_active(self.args)
             or getattr(self.args, "rcpt_duplicate", None) is not None
             or getattr(self.args, "probe_accepted_domain", False)
             or self.do_brute
@@ -2318,7 +2375,7 @@ class SMTP(BaseModule):
     def run(self):
         self.results = SMTPResults()
         smtp = None
-        if getattr(self.args, "rl_no_precheck", False) and not getattr(self.args, "rcpt_limit", None):
+        if getattr(self.args, "rl_no_precheck", False) and not _rcpt_limit_active(self.args):
             self.args.rcpt_limit = RCPT_LIMIT_DEFAULT_ATTEMPTS
         self.run_all_mode = self._is_run_all_mode()
 
@@ -2365,7 +2422,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2394,7 +2451,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2424,7 +2481,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2455,7 +2512,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2488,7 +2545,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2531,7 +2588,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2598,7 +2655,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2637,7 +2694,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2677,7 +2734,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2733,7 +2790,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2772,7 +2829,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2816,7 +2873,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2839,7 +2896,7 @@ class SMTP(BaseModule):
 
         # Standalone RCPT TO limit only: no banner, no other tests, just this test
         only_rcpt_limit = (
-            getattr(self.args, "rcpt_limit", False)
+            _rcpt_limit_active(self.args)
             and not self.args.banner
             and not self.args.commands
             and not self.args.interactive
@@ -2856,7 +2913,7 @@ class SMTP(BaseModule):
             and getattr(self.args, "rcpt_duplicate", None) is None
         )
         if only_rcpt_limit:
-            self.ptprint("RCPT TO limit", Out.INFO)
+            self.ptprint(self._rcpt_limit_section_title(), Out.INFO)
             try:
                 self.results.rcpt_limit = self.test_rcpt_limit()
                 self._stream_rcpt_limit_result()
@@ -2870,7 +2927,7 @@ class SMTP(BaseModule):
         # Standalone duplicate RCPT TO (-rdd): same envelope recipient N times in one MAIL
         only_rcpt_duplicate = (
             getattr(self.args, "rcpt_duplicate", None) is not None
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and not self.args.banner
             and not self.args.commands
             and not self.args.interactive
@@ -2912,7 +2969,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and not self.do_brute
         )
         if only_probe_accepted_domain:
@@ -2938,7 +2995,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2964,7 +3021,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -2992,7 +3049,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -3022,7 +3079,7 @@ class SMTP(BaseModule):
             and self.args.enumerate is None
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -3050,13 +3107,16 @@ class SMTP(BaseModule):
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_noop_flood1:
-            self.ptprint("NOOP Flooding test (1 connection)", Out.INFO)
+            self.ptprint(
+                f"NOOP Flooding test ({NOOP_FLOOD1_MAX_COMMANDS} NOOPs in 1 connection)",
+                Out.INFO,
+            )
             try:
                 self.results.noop_flood1 = self.noop_flood_test_single()
                 self._stream_noop_flood1_result()
@@ -3078,14 +3138,18 @@ class SMTP(BaseModule):
             and self.args.enumerate is None
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
         )
         if only_noop_flood2:
             requested = self.args.noop_flood2 or NOOP_FLOOD2_DEFAULT_CONNECTIONS
-            self.ptprint(f"NOOP Flooding DoS test ({requested} connection)", Out.INFO)
+            self.ptprint(
+                f"NOOP Flooding DoS test ({requested} connections within "
+                f"{int(NOOP_FLOOD2_RUN_SECONDS)} seconds)",
+                Out.INFO,
+            )
             try:
                 self.results.noop_flood2 = self.noop_flood_test_parallel()
                 self._stream_noop_flood2_result()
@@ -3109,7 +3173,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -3139,7 +3203,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -3168,7 +3232,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -3197,7 +3261,7 @@ class SMTP(BaseModule):
             and not self.args.rate_limit
             and not getattr(self.args, "noop_flood1", False)
             and not getattr(self.args, "noop_flood2", None)
-            and not getattr(self.args, "rcpt_limit", False)
+            and not _rcpt_limit_active(self.args)
             and getattr(self.args, "rcpt_duplicate", None) is None
             and not getattr(self.args, "probe_accepted_domain", False)
             and not self.do_brute
@@ -3229,7 +3293,7 @@ class SMTP(BaseModule):
             or getattr(self.args, "role_identify", False)
             or self.args.enumerate is not None
             or self.args.rate_limit
-            or getattr(self.args, "rcpt_limit", False)
+            or _rcpt_limit_active(self.args)
             or getattr(self.args, "rcpt_duplicate", None) is not None
             or self.do_brute
         )
@@ -3244,7 +3308,7 @@ class SMTP(BaseModule):
                 or getattr(self.args, "helo_validation", False)
                 or getattr(self.args, "auth_downgrade", False)
                 or getattr(self.args, "invalid_commands", False)
-                or (getattr(self.args, "rcpt_limit", False) and not getattr(self.args, "domain", None))
+                or (_rcpt_limit_active(self.args) and not getattr(self.args, "domain", None))
             )
             self.results.banner_requested = do_banner
             self.results.commands_requested = self.args.commands or getattr(self.args, "authentications", False)
@@ -3366,8 +3430,8 @@ class SMTP(BaseModule):
                 self.results.rate_limit = self.rate_limit_test()
                 self._stream_rate_limit_result()
 
-            if getattr(self.args, "rcpt_limit", False):
-                self.ptprint("RCPT TO limit", Out.INFO)
+            if _rcpt_limit_active(self.args):
+                self.ptprint(self._rcpt_limit_section_title(), Out.INFO)
                 try:
                     self.results.rcpt_limit = self.test_rcpt_limit()
                 except TestFailedError as e:
@@ -4183,7 +4247,10 @@ class SMTP(BaseModule):
             sys.stdout.write("\n")
             sys.stdout.flush()
 
-        self.ptdebug("NOOP Flooding test (single connection)", title=True)
+        self.ptdebug(
+            f"NOOP Flooding test ({NOOP_FLOOD1_MAX_COMMANDS} NOOPs in 1 connection)",
+            title=True,
+        )
         self.ptdebug(
             f"Target {self.args.target.ip}:{self.args.target.port} — up to "
             f"{NOOP_FLOOD1_MAX_COMMANDS} NOOPs (hard cap: {NOOP_FLOOD1_OVERALL_CAP_SECONDS:.0f}s, "
@@ -4421,7 +4488,11 @@ class SMTP(BaseModule):
             )
             requested = NOOP_FLOOD2_MAX_CONNECTIONS
 
-        self.ptdebug("NOOP Flooding DoS test (parallel connections)", title=True)
+        self.ptdebug(
+            f"NOOP Flooding DoS test ({requested} connections within "
+            f"{int(NOOP_FLOOD2_RUN_SECONDS)} seconds)",
+            title=True,
+        )
         self.ptdebug(
             f"Target {self.args.target.ip}:{self.args.target.port} — up to {requested} sockets, "
             f"steady-state duration {NOOP_FLOOD2_RUN_SECONDS:.0f}s, per-reply timeout "
@@ -5118,6 +5189,11 @@ class SMTP(BaseModule):
             pass
         return "test.com"
 
+    def _rcpt_limit_section_title(self) -> str:
+        if _rcpt_limit_send_mode(self.args):
+            return "RCPT TO limit (send)"
+        return "RCPT TO limit"
+
     def _run_rcpt_limit_for_domain(
         self,
         smtp: smtplib.SMTP,
@@ -5127,6 +5203,9 @@ class SMTP(BaseModule):
         attempt_hook=None,
         recipients: list[str] | None = None,
         emit_debug=None,
+        *,
+        send_data_at_end: bool = False,
+        envelope_mail_from: str | None = None,
     ) -> RcptLimitResult:
         """Run MAIL FROM + RCPT TO loop for a given domain. Used so we can retry with parent domain.
         Continues on 554/550/553/450 (policy rejection) to probe session error limit (smtpd_hard_error_limit).
@@ -5162,13 +5241,66 @@ class SMTP(BaseModule):
             else:
                 self.ptdebug(text, out, title=title)
 
+        mail_from_addr = (envelope_mail_from or "").strip("<>").strip() if envelope_mail_from else ""
+        mail_from_bracket = f"<{mail_from_addr}>" if mail_from_addr else "<>"
+
+        def _attempt_data_send(accepted_count: int) -> tuple[bool, bool, int | None, str | None]:
+            if not send_data_at_end or accepted_count <= 0:
+                return False, False, None, None
+            probe_uuid = secrets.token_hex(8)
+            msg_lines = [
+                f"From: {mail_from_addr or f'penterep-rls@{domain}'}",
+                f"Subject: penterep-rl-limit-send {probe_uuid}",
+                f"Message-ID: <penterep-rls-{probe_uuid}@{domain}>",
+                f"X-Penterep-RL-Limit-Send: {probe_uuid}",
+                "",
+                f"RCPT TO limit send probe id: {probe_uuid}",
+                f"Envelope MAIL FROM: {mail_from_bracket}",
+                f"Accepted RCPT TO count in this transaction: {accepted_count}",
+            ]
+            raw_msg = "\r\n".join(msg_lines)
+            try:
+                dcode, drp = smtp.data(raw_msg)
+                drep = self.bytes_to_str(drp).strip()[:500]
+                _dbg(
+                    f"Limit-send DATA ({accepted_count} RCPT) → [{dcode}] {_reply_one_line(drep)}",
+                    Out.INFO,
+                )
+                return True, dcode == 250, dcode, drep
+            except Exception as e:
+                drep = str(e).strip()[:500]
+                _dbg(f"Limit-send DATA failed: {e}", Out.INFO)
+                return True, False, None, drep
+
+        def _pack_result(
+            accepted: int,
+            limit_triggered: bool,
+            server_response: str | None,
+            rejected_addresses: bool = False,
+            **extra,
+        ) -> RcptLimitResult:
+            send_attempted, send_ok, send_code, send_reply = _attempt_data_send(accepted)
+            return RcptLimitResult(
+                accepted,
+                limit_triggered,
+                server_response,
+                rejected_addresses,
+                limit_send_mode=send_data_at_end,
+                limit_send_attempted=send_attempted,
+                limit_send_ok=send_ok,
+                limit_send_data_code=send_code,
+                limit_send_data_reply=send_reply,
+                limit_send_mail_from=mail_from_addr or None,
+                **extra,
+            )
+
         try:
-            status, reply = smtp.docmd("MAIL FROM:", "<>")
+            status, reply = smtp.docmd("MAIL FROM:", mail_from_bracket)
             if status != 250:
-                return RcptLimitResult(0, False, self.bytes_to_str(reply), False)
-            _dbg(f"MAIL FROM:<> → [{status}] {_reply_one_line(reply)}", Out.INFO)
+                return _pack_result(0, False, self.bytes_to_str(reply), False)
+            _dbg(f"MAIL FROM:{mail_from_bracket} → [{status}] {_reply_one_line(reply)}", Out.INFO)
         except (smtplib.SMTPServerDisconnected, ConnectionResetError, BrokenPipeError, EOFError, OSError) as e:
-            return RcptLimitResult(0, True, str(e), False)
+            return _pack_result(0, True, str(e), False)
 
         accepted = 0
         failed = 0
@@ -5239,7 +5371,7 @@ class SMTP(BaseModule):
                             f"Server allows {failed} failed RCPTs without disconnect (no smtpd_hard_error_limit)",
                             Out.VULN,
                         )
-                        return RcptLimitResult(
+                        return _pack_result(
                             0, False, first_policy_response, rejected_addresses=True,
                             failed_before_limit=failed, session_limit_triggered=False, no_session_limit=True,
                         )
@@ -5248,7 +5380,7 @@ class SMTP(BaseModule):
                 # Session limit: 421 (rate limit / too many errors)
                 if status == 421:
                     _dbg(f"Server session limit after {i} attempts: {limit_response}", Out.INFO)
-                    return RcptLimitResult(
+                    return _pack_result(
                         accepted, True, limit_response, rejected_addresses=(accepted == 0),
                         failed_before_limit=i, session_limit_triggered=True, no_session_limit=False,
                     )
@@ -5256,31 +5388,31 @@ class SMTP(BaseModule):
                 # Per-message RCPT limit: 452 Too many recipients
                 if status == 452:
                     _dbg(f"Server per-message limit after {accepted} recipients: {limit_response}", Out.INFO)
+                    result = _pack_result(accepted, True, limit_response, False)
                     disc, posthit_n = _probe_disconnect_after_limit()
-                    return RcptLimitResult(
-                        accepted, True, limit_response, False,
+                    return result._replace(
                         disconnect_after_limit=disc, posthit_probe_count=posthit_n,
                     )
 
                 # Other 5xx
                 if 500 <= status <= 599:
                     _dbg(f"Server limit after {accepted} recipients: {limit_response}", Out.INFO)
+                    result = _pack_result(accepted, True, limit_response, False)
                     disc, posthit_n = _probe_disconnect_after_limit()
-                    return RcptLimitResult(
-                        accepted, True, limit_response, False,
+                    return result._replace(
                         disconnect_after_limit=disc, posthit_probe_count=posthit_n,
                     )
 
-                return RcptLimitResult(accepted, False, limit_response, False)
+                return _pack_result(accepted, False, limit_response, False)
             except (smtplib.SMTPServerDisconnected, ConnectionResetError, BrokenPipeError, EOFError, OSError) as e:
                 _dbg(f"Server closed connection after {i} attempts", Out.INFO)
-                return RcptLimitResult(
+                return _pack_result(
                     accepted, True, str(e), rejected_addresses=(accepted == 0),
                     failed_before_limit=i, session_limit_triggered=True, no_session_limit=False,
                 )
 
         _dbg(f"No limit observed up to {accepted} recipients", Out.VULN)
-        return RcptLimitResult(accepted, False, None, False)
+        return _pack_result(accepted, False, None, False)
 
     # ------------------------------------------------------------------
     # RCPT TO limit pre-check: role identification, open-relay verdict,
@@ -5751,7 +5883,10 @@ class SMTP(BaseModule):
         forced_role = getattr(self.args, "smtp_role", None)
         info_icon = get_colored_text("[*]", color="INFO")
 
-        self.ptdebug("RCPT TO limit test (per message)", title=True)
+        if _rcpt_limit_send_mode(self.args):
+            self.ptdebug("RCPT TO limit test (per message, with DATA send)", title=True)
+        else:
+            self.ptdebug("RCPT TO limit test (per message)", title=True)
 
         # Populate self.results.info so domain resolution + precheck work the same in
         # standalone (-rl alone) and run-all flows. Also makes the "Initial server
@@ -5760,10 +5895,12 @@ class SMTP(BaseModule):
         self._ensure_initial_info(fail_label="-rl precheck")
 
         domain = self._get_rcpt_limit_domain()
-        raw_rl = getattr(self.args, "rcpt_limit", None)
-        max_rcpt_attempts = int(raw_rl) if raw_rl is not None else RCPT_LIMIT_DEFAULT_ATTEMPTS
-        if max_rcpt_attempts < 1:
-            max_rcpt_attempts = RCPT_LIMIT_DEFAULT_ATTEMPTS
+        send_mode = _rcpt_limit_send_mode(self.args)
+        max_rcpt_attempts = _rcpt_limit_max_attempts(self.args)
+        envelope_mail_from: str | None = None
+        mail_from_raw = (getattr(self.args, "mail_from", None) or "").strip()
+        if mail_from_raw and "@" in mail_from_raw:
+            envelope_mail_from = mail_from_raw.strip("<>").strip()
         _max_probe_ref[0] = max_rcpt_attempts
 
         precheck: dict = {}
@@ -5772,6 +5909,7 @@ class SMTP(BaseModule):
         open_relay: bool | None = None
         recipients: list[str] | None = None
         recipients_source = "synthetic"
+        rl_wordlist_notice: tuple[list[str], int] | None = None
 
         if no_precheck:
             self.ptprint(f"    {info_icon} Pre-check skipped (--rl-no-precheck)", Out.TEXT)
@@ -5815,18 +5953,8 @@ class SMTP(BaseModule):
                 recipients = self._rl_build_recipients_from_wordlist(domain, max_rcpt_attempts)
                 if recipients:
                     recipients_source = "wordlist"
-                    self.ptprint(
-                        f"    {info_icon} Using {len(recipients)} recipient(s) "
-                        f"{self._rl_name_list_source_phrase()} for MTA-not-relay probe",
-                        Out.TEXT,
-                    )
                     wl_n = len(getattr(self, "wordlist", None) or [])
-                    if wl_n < RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT:
-                        self.ptprint(
-                            f"    {info_icon} For a valid test, a username list with more than "
-                            f"{RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT} valid recipients is required",
-                            Out.TEXT,
-                        )
+                    rl_wordlist_notice = (recipients, wl_n)
                 else:
                     msg = (
                         "Server is not an open relay; the test cannot run with synthetic recipients. "
@@ -5877,19 +6005,8 @@ class SMTP(BaseModule):
                     Out.TEXT,
                 )
 
-        if _show_progress:
-            threading.Thread(target=_ticker, daemon=True).start()
-
         smtp: smtplib.SMTP | None = None
         auth_used = False
-        catch_all_bounce: str | None = None
-        catch_all_delivery_rcpt: str | None = None
-        catch_all_delivery_attempted = False
-        catch_all_delivery_data_ok = False
-        catch_all_probe_uuid: str | None = None
-        mail_from_raw = (getattr(self.args, "mail_from", None) or "").strip()
-        if mail_from_raw and "@" in mail_from_raw:
-            catch_all_bounce = mail_from_raw.strip("<>").strip()
 
         try:
             smtp = self.get_smtp_handler()
@@ -5936,23 +6053,17 @@ class SMTP(BaseModule):
                 domain,
                 emit_debug=_probe_emit_debug,
             )
-            if catch_all_bounce and accept_all_via_rcpt:
-                delivery = self._rl_send_catch_all_delivery_probe(
-                    smtp,
-                    domain,
-                    catch_all_bounce,
-                    emit_debug=_probe_emit_debug,
-                )
-                catch_all_delivery_attempted = True
-                catch_all_delivery_rcpt = delivery.get("probe_rcpt")
-                catch_all_probe_uuid = delivery.get("probe_uuid")
-                catch_all_delivery_data_ok = bool(delivery.get("data_ok"))
+            if accept_all_via_rcpt and open_relay is not True:
+                self._stream_rcpt_limit_catch_all_notice()
+            if rl_wordlist_notice is not None:
+                recs, wl_n = rl_wordlist_notice
+                self._stream_rcpt_limit_wordlist_notices(recs, wl_n)
 
             _emit_probe_debug(
                 f"RCPT TO limit probe: domain={domain}, max attempts={max_rcpt_attempts}, "
                 f"recipients_source={recipients_source}, auth_used={auth_used}, "
                 f"accept_all_via_rcpt={accept_all_via_rcpt}, "
-                f"catch_all_bounce_mailbox={catch_all_bounce or 'none'}",
+                f"envelope_mail_from={envelope_mail_from or '<>'}",
                 Out.INFO,
             )
             # Progress denominator = the number of RCPT attempts we will actually make
@@ -5962,12 +6073,16 @@ class SMTP(BaseModule):
             else:
                 _max_probe_ref[0] = max_rcpt_attempts
             _live_label[0] = "accepted 0 recipients..."
+            if _show_progress:
+                threading.Thread(target=_ticker, daemon=True).start()
             result = self._run_rcpt_limit_for_domain(
                 smtp, domain, max_rcpt_attempts=max_rcpt_attempts,
                 live_label=_live_label,
                 attempt_hook=_update_attempt if _show_progress else None,
                 recipients=recipients,
                 emit_debug=_probe_emit_debug,
+                send_data_at_end=send_mode,
+                envelope_mail_from=envelope_mail_from,
             )
             domain_used = domain
 
@@ -5997,6 +6112,8 @@ class SMTP(BaseModule):
                         live_label=_live_label,
                         attempt_hook=_update_attempt if _show_progress else None,
                         emit_debug=_probe_emit_debug,
+                        send_data_at_end=send_mode,
+                        envelope_mail_from=envelope_mail_from,
                     )
                     domain_used = parent
 
@@ -6020,11 +6137,12 @@ class SMTP(BaseModule):
                 disconnect_after_limit=getattr(result, "disconnect_after_limit", None),
                 posthit_probe_count=getattr(result, "posthit_probe_count", 0),
                 accept_all_via_rcpt=accept_all_via_rcpt,
-                catch_all_bounce_mailbox=catch_all_bounce,
-                catch_all_delivery_rcpt=catch_all_delivery_rcpt,
-                catch_all_delivery_attempted=catch_all_delivery_attempted,
-                catch_all_delivery_data_ok=catch_all_delivery_data_ok,
-                catch_all_probe_uuid=catch_all_probe_uuid,
+                limit_send_mode=getattr(result, "limit_send_mode", send_mode),
+                limit_send_attempted=getattr(result, "limit_send_attempted", False),
+                limit_send_ok=getattr(result, "limit_send_ok", False),
+                limit_send_data_code=getattr(result, "limit_send_data_code", None),
+                limit_send_data_reply=getattr(result, "limit_send_data_reply", None),
+                limit_send_mail_from=getattr(result, "limit_send_mail_from", envelope_mail_from),
             )
         finally:
             if _show_progress:
@@ -14163,6 +14281,30 @@ class SMTP(BaseModule):
             return get_colored_text("[!]", color="WARNING")
         return get_colored_text("[✗]", color="VULN")
 
+    def _stream_rcpt_limit_catch_all_notice(self) -> None:
+        """Print when pre-probe RCPT TO accepts a clearly invalid local part."""
+        info_icon = get_colored_text("[*]", color="INFO")
+        self.ptprint(
+            f"    {info_icon} Server accepts non-exist recipients in RCPT TO "
+            "(likely Catch-all is configured)",
+            Out.TEXT,
+        )
+
+    def _stream_rcpt_limit_wordlist_notices(self, recipients: list[str], wordlist_size: int) -> None:
+        """Deferred MTA-not-relay wordlist info (after accept-all pre-probe)."""
+        info_icon = get_colored_text("[*]", color="INFO")
+        self.ptprint(
+            f"    {info_icon} Using {len(recipients)} recipient(s) "
+            f"{self._rl_name_list_source_phrase()} for MTA-not-relay probe",
+            Out.TEXT,
+        )
+        if wordlist_size < RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT:
+            self.ptprint(
+                f"    {info_icon} For a valid test, a username list with more than "
+                f"{RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT} valid recipients is required",
+                Out.TEXT,
+            )
+
     def _maybe_stream_rcpt_limit_domain_hint(self, server_response: str | None) -> None:
         """Print -d/--domain hint when auto domain looks wrong (relay / unroutable)."""
         if getattr(self.args, "domain", None):
@@ -14188,11 +14330,8 @@ class SMTP(BaseModule):
 
         if getattr(rlim, "catch_all_delivery_attempted", False):
             if getattr(rlim, "catch_all_delivery_data_ok", False):
-                uuid = getattr(rlim, "catch_all_probe_uuid", None) or "?"
                 self.ptprint(
-                    f"    {info_icon} Catch-all bounce probe: message sent to {probe_addr} "
-                    f"(MAIL FROM: {bounce_mb}) — check {bounce_mb} manually for NDR/bounce "
-                    f"(probe id: {uuid}; no bounce suggests catch-all)",
+                    f"    {info_icon} Check mailbox {bounce_mb} for delivered message",
                     Out.TEXT,
                 )
             else:
@@ -14300,14 +14439,40 @@ class SMTP(BaseModule):
                 self._stream_rcpt_limit_server_response_verbose(rlim.server_response)
                 self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
             else:
-                ok_icon = get_colored_text("[✓]", color="NOTVULN")
-                accept_all_suffix = (
-                    " (accept-all via RCPT)"
-                    if getattr(rlim, "accept_all_via_rcpt", False)
-                    else ""
-                )
+                icon = self._rcpt_limit_recipient_verdict_icon(rlim.max_accepted)
                 self.ptprint(
-                    f"    {ok_icon} Accepted recipients: {rlim.max_accepted}{accept_all_suffix}",
+                    f"    {icon} Accepted recipients: {rlim.max_accepted}",
+                    Out.TEXT,
+                )
+        if getattr(rlim, "limit_send_mode", False):
+            ok_icon = get_colored_text("[✓]", color="NOTVULN")
+            bad_icon = get_colored_text("[✗]", color="VULN")
+            info_icon = get_colored_text("[*]", color="INFO")
+            mail_from = getattr(rlim, "limit_send_mail_from", None) or "?"
+            if getattr(rlim, "limit_send_attempted", False):
+                if getattr(rlim, "limit_send_ok", False):
+                    self.ptprint(
+                        f"    {ok_icon} Message with {rlim.max_accepted} recipient(s) accepted "
+                        f"by server (DATA 250, MAIL FROM: {mail_from})",
+                        Out.TEXT,
+                    )
+                    self.ptprint(
+                        f"    {info_icon} Check mailbox {mail_from} for NDR, bounce, "
+                        "or other delivery status notifications",
+                        Out.TEXT,
+                    )
+                else:
+                    code = getattr(rlim, "limit_send_data_code", None)
+                    reply = (getattr(rlim, "limit_send_data_reply", None) or "").strip()
+                    code_s = str(code) if code is not None else "?"
+                    self.ptprint(
+                        f"    {bad_icon} Message delivery failed after {rlim.max_accepted} "
+                        f"accepted RCPT TO (DATA [{code_s}] {reply})".rstrip(),
+                        Out.TEXT,
+                    )
+            elif rlim.max_accepted == 0:
+                self.ptprint(
+                    f"    {info_icon} Message not sent: no RCPT TO accepted in this transaction",
                     Out.TEXT,
                 )
         self._stream_rcpt_limit_catch_all_delivery_hint(rlim)
@@ -14490,16 +14655,16 @@ class SMTP(BaseModule):
                         self.ptprint(f"    {r}")
         info_icon = get_colored_text("[*]", color="INFO")
         if catch_all == "configured":
-            self.ptprint(f"{info_icon} Catch All mailbox configured", Out.TEXT)
+            self.ptprint(f"    {info_icon} Catch All mailbox configured", Out.TEXT)
         elif catch_all == "not_configured":
-            self.ptprint(f"{info_icon} Catch All mailbox not configured", Out.TEXT)
+            self.ptprint(f"    {info_icon} Catch All mailbox not configured", Out.TEXT)
         elif catch_all == "indeterminate_accept_all_rcpt":
             self.ptprint(
-                f"{info_icon} Catch All mailbox indeterminate (accept-all via RCPT)",
+                f"    {info_icon} Catch All mailbox indeterminate (accept-all via RCPT)",
                 Out.TEXT,
             )
         elif catch_all == "indeterminate":
-            self.ptprint(f"{info_icon} Catch All mailbox indeterminate", Out.TEXT)
+            self.ptprint(f"    {info_icon} Catch All mailbox indeterminate", Out.TEXT)
 
     def _stream_ntlm_result(self) -> None:
         if (ntlm_error := self.results.ntlm_error) is not None:
@@ -16412,6 +16577,16 @@ class SMTP(BaseModule):
             precheck_obj["recipientsSource"] = rlim.recipients_source
         if getattr(rlim, "accept_all_via_rcpt", False):
             precheck_obj["acceptAllViaRcpt"] = True
+        if getattr(rlim, "limit_send_mode", False):
+            precheck_obj["limitSendMode"] = True
+        if getattr(rlim, "limit_send_attempted", False):
+            precheck_obj["limitSend"] = {
+                "mailFrom": getattr(rlim, "limit_send_mail_from", None),
+                "dataAccepted": bool(getattr(rlim, "limit_send_ok", False)),
+                "dataCode": getattr(rlim, "limit_send_data_code", None),
+                "dataReply": getattr(rlim, "limit_send_data_reply", None),
+                "acceptedRcptCount": rlim.max_accepted,
+            }
         if (bounce_mb := getattr(rlim, "catch_all_bounce_mailbox", None)):
             precheck_obj["catchAllBounceMailbox"] = bounce_mb
         if getattr(rlim, "catch_all_delivery_attempted", False):

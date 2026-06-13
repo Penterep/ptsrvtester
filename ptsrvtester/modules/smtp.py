@@ -491,6 +491,77 @@ RCPT_LIMIT_POSTHIT_PROBE_COUNT = 20
 RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT = 500
 # Pre-probe local part for accept-all / catch-all detection via RCPT TO (before -rl storm).
 RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL = "xxxfoofff"
+# Client IP rate limit (Postfix and similar): 450 4.7.1 Error: too much mail from <ip>
+_RL_TOO_MUCH_MAIL_RE = re.compile(
+    r"4\.7\.1\s+Error:\s+too much mail from\s+[\da-fA-F:.]+",
+    re.IGNORECASE,
+)
+
+
+def _rl_extract_too_much_mail_error(text: str | None) -> str | None:
+    """Return normalized ``4.7.1 Error: too much mail from …`` line when present."""
+    if not text:
+        return None
+    one_line = " ".join(str(text).replace("\r", "\n").split())
+    if m := _RL_TOO_MUCH_MAIL_RE.search(one_line):
+        return m.group(0)
+    lower = one_line.lower()
+    if "too much mail from" not in lower:
+        return None
+    start = lower.find("4.7.1")
+    if start >= 0:
+        return one_line[start:].strip()
+    start = lower.find("too much mail from")
+    return one_line[start:].strip()
+
+
+DEFAULT_SMTP_SUBJECT = "SMTP test"
+DEFAULT_SMTP_DATA = "SMTP test message."
+
+
+def _smtp_minimal_probe_data(
+    *,
+    from_addr: str,
+    subject: str,
+    body: str,
+    message_id_tag: str,
+    domain: str,
+    probe_uuid: str,
+    to_addr: str | None = None,
+) -> str:
+    """Minimal RFC822 payload for SMTP DATA probes (no vendor X-headers)."""
+    lines = [f"From: {from_addr}"]
+    if to_addr:
+        lines.append(f"To: {to_addr}")
+    lines.extend(
+        [
+            f"Subject: {subject}",
+            f"Message-ID: <{message_id_tag}-{probe_uuid}@{domain}>",
+            "",
+            body,
+        ]
+    )
+    return "\r\n".join(lines)
+
+
+# Outbound SMTP test e-mail markers (no PT / Penterep prefix in headers or bodies).
+EMAIL_HDR_TEST = "X-Test"
+EMAIL_HDR_TEST_ID = "X-Test-ID"
+EMAIL_TEST_ANTIVIRUS = "SMTP-ANTIVIRUS"
+EMAIL_TEST_SSRF = "SMTP-SSRF"
+EMAIL_TEST_ZIPXXE = "SMTP-ZIPXXE"
+EMAIL_TEST_ALIAS = "SMTP-ALIAS"
+EMAIL_TEST_REPLAY = "SMTP-REPLAY"
+EMAIL_TEST_BOMB = "SMTP-BOMB"
+_PTL_EMAIL_TAG_RE = re.compile(r"PTL-SVC-SMTP-")
+
+
+def _email_subject_clean(subject: str) -> str:
+    """Strip legacy PTL-SVC-SMTP-* vendor tags from Subject lines."""
+    s = re.sub(r"\s*\(PTL-SVC-SMTP-[^)]+\)", "", subject or "")
+    s = _PTL_EMAIL_TAG_RE.sub("", s)
+    return " ".join(s.split()).strip()
+
 
 # Duplicate RCPT TO (-rdd): same envelope recipient repeated N times in one MAIL transaction.
 # RFC 5321 does not forbid this; delivery fan-out is implementation-defined (dedupe vs N copies).
@@ -654,7 +725,7 @@ class RcptLimitResult(NamedTuple):
     auth_used: bool = False  # True if --rl performed AUTH LOGIN before probing
     open_relay: bool | None = None  # Open relay verdict (only meaningful for MTA/hybrid)
     skipped: bool = False  # True when --rl was not relevant for this server configuration
-    skip_reason: str | None = None  # 'mta_not_relay_no_wordlist' | 'submission_auth_required' | 'auth_failed'
+    skip_reason: str | None = None  # 'mta_not_relay_no_wordlist' | 'submission_auth_required' | 'auth_failed' | 'rate_limited'
     skip_message: str | None = None  # Human-readable explanation for output / JSON
     recipients_source: str | None = None  # 'synthetic' (1@dom, 2@dom) | 'wordlist' (real local users)
     # ── Post-hit disconnect probe (only when limit_triggered is True) ───────────
@@ -1423,6 +1494,16 @@ def _rcpt_limit_max_attempts(args) -> int:
     return max(1, int(raw))
 
 
+def _normalize_smtp_role(value: str) -> str:
+    """Argparse ``type`` for ``-R`` / ``--role``: case-insensitive ``mta`` or ``submission``."""
+    role = (value or "").strip().lower()
+    if role not in ("mta", "submission"):
+        raise argparse.ArgumentTypeError(
+            f"invalid role {value!r} (choose mta or submission)"
+        )
+    return role
+
+
 class SMTPArgs(ArgsWithBruteforce):
     target: Target
     tls: bool
@@ -1446,6 +1527,8 @@ class SMTPArgs(ArgsWithBruteforce):
     probe_accepted_domain: bool
     rcpt_duplicate: int | None
     rcpt_duplicate_send: bool
+    smtp_subject: str | None
+    smtp_data: str | None
 
     @staticmethod
     def get_help():
@@ -1486,6 +1569,8 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-r", "--rcpt-to", "<email>", "Recipient (To); required for -bomb, -av, -ssrf, -zipxxe, -sh, -bcc, -al, -br, -rdd"],
                 ["-fn", "--from-name", "<name>", "Sender display name in From header"],
                 ["-cc", "--cc", "<emails>", "CC recipients, comma-separated; required for -bcc"],
+                ["", "--subject", "<text>", f"Subject for outbound test messages (default: {DEFAULT_SMTP_SUBJECT!r})"],
+                ["", "--data", "<text>", f"Plain-text body for outbound test messages (default: {DEFAULT_SMTP_DATA!r})"],
                 ["-sh", "--spoof-headers", "", "Test header spoofing (From, Reply-To, Return-Path); requires -r"],
                 ["", "--spoofhdr-variants", "<v1,v2,...>", "Variants: from,reply_to,return_path (default: all)"],
                 ["", "--spoofhdr-timeout", "<sec>", "Timeout per message for Spoof headers test (default: 30)"],
@@ -1712,6 +1797,22 @@ class SMTPArgs(ArgsWithBruteforce):
             help="CC recipients, comma-separated; used by -bomb, -av, -ssrf; required for -bcc (no validation)",
         )
         direct.add_argument(
+            "--subject",
+            type=str,
+            metavar="text",
+            dest="smtp_subject",
+            default=None,
+            help=f"Subject line for outbound test messages (default: {DEFAULT_SMTP_SUBJECT!r})",
+        )
+        direct.add_argument(
+            "--data",
+            type=str,
+            metavar="text",
+            dest="smtp_data",
+            default=None,
+            help=f"Plain-text body for outbound test messages (default: {DEFAULT_SMTP_DATA!r})",
+        )
+        direct.add_argument(
             "-br",
             "--bounce-replay",
             action="store_true",
@@ -1918,8 +2019,8 @@ class SMTPArgs(ArgsWithBruteforce):
             action="store_true",
             dest="rcpt_duplicate_send",
             help=(
-                "With -rdd: after all RCPT replies, submit one minimal DATA payload (Message-ID + "
-                "X-Penterep-RDD-Probe) so the analyst can correlate manual inbox checks."
+                "With -rdd: after all RCPT replies, submit one minimal DATA payload (Message-ID) "
+                "so the analyst can correlate manual inbox checks."
             ),
         )
         direct.add_argument(
@@ -1947,8 +2048,7 @@ class SMTPArgs(ArgsWithBruteforce):
         direct.add_argument(
             "-R",
             "--role",
-            type=str,
-            choices=["mta", "submission"],
+            type=_normalize_smtp_role,
             default=None,
             metavar="{mta,submission}",
             dest="smtp_role",
@@ -3060,7 +3160,7 @@ class SMTP(BaseModule):
                 smtp, _ = self.initial_info(get_commands=False)
                 mail_from = self.args.mail_from or f"relaytest@{self.fqdn}"
                 rcpt_to = self.args.rcpt_to or "relaytest@external.relaytest.local"
-                self.results.open_relay = self.open_relay_test(smtp, "TEST", mail_from, rcpt_to)
+                self.results.open_relay = self.open_relay_test(smtp, mail_from, rcpt_to)
                 self._stream_open_relay_result()
             except Exception as e:
                 self.results.info_error = str(e)
@@ -3410,7 +3510,7 @@ class SMTP(BaseModule):
             if self.args.open_relay:
                 self.ptprint("Open relay", Out.INFO)
                 self.results.open_relay = self.open_relay_test(
-                    smtp, "TEST", self.args.mail_from, self.args.rcpt_to
+                    smtp, self.args.mail_from, self.args.rcpt_to
                 )
                 self._stream_open_relay_result()
 
@@ -3526,7 +3626,7 @@ class SMTP(BaseModule):
         try:
             mail_from = self.args.mail_from or f"relaytest@{self.fqdn}"
             rcpt_to = self.args.rcpt_to or "relaytest@external.relaytest.local"
-            self.results.open_relay = self.open_relay_test(smtp, "TEST", mail_from, rcpt_to)
+            self.results.open_relay = self.open_relay_test(smtp, mail_from, rcpt_to)
         except TestFailedError as e:
             self.results.open_relay_error = str(e)
         except Exception as e:
@@ -4853,13 +4953,64 @@ class SMTP(BaseModule):
         )
 
 
-    def open_relay_test(self, smtp, msg, mail_from, rcpt_to) -> bool:
+    def _outbound_subject(self) -> str:
+        val = getattr(self.args, "smtp_subject", None)
+        if val is not None:
+            return str(val)
+        return DEFAULT_SMTP_SUBJECT
+
+    def _outbound_data(self) -> str:
+        val = getattr(self.args, "smtp_data", None)
+        if val is not None:
+            return str(val)
+        return DEFAULT_SMTP_DATA
+
+    def _outbound_data_with_url(self, url: str) -> str:
+        """Plain body from ``--data`` with an optional URL embedded (SSRF / internal probes)."""
+        body = self._outbound_data()
+        if not url:
+            return body
+        if "{{CANARY_URL}}" in body:
+            return body.replace("{{CANARY_URL}}", url)
+        if url not in body:
+            body = f"{body}\n{url}"
+        return body
+
+    def _outbound_minimal_probe(
+        self,
+        *,
+        from_addr: str,
+        message_id_tag: str,
+        domain: str,
+        probe_uuid: str,
+        to_addr: str | None = None,
+    ) -> str:
+        return _smtp_minimal_probe_data(
+            from_addr=from_addr,
+            subject=self._outbound_subject(),
+            body=self._outbound_data(),
+            message_id_tag=message_id_tag,
+            domain=domain,
+            probe_uuid=probe_uuid,
+            to_addr=to_addr,
+        )
+
+    def open_relay_test(self, smtp, mail_from, rcpt_to) -> bool:
         """OWASP/Nmap-style multi-vector open relay test. Tests: empty FROM, internal→external,
         external→external, literal IP sender. Returns True if any vector succeeds."""
         self.ptdebug(f"Open Relay Test:", title=True)
         ext_domain = "external.relaytest.local"
         host_domain = self.fqdn or "relaytest.local"
         target_ip = getattr(self.args.target, "ip", None) or "127.0.0.1"
+        sample_to = rcpt_to or f"relaytest@{ext_domain}"
+        sample_from = mail_from or f"relaytest@{host_domain}"
+        msg = (
+            f"From: <{sample_from}>\r\n"
+            f"To: <{sample_to}>\r\n"
+            f"Subject: {self._outbound_subject()}\r\n"
+            f"\r\n"
+            f"{self._outbound_data()}\r\n"
+        )
 
         vectors: list[tuple[str, str, str]] = [
             ("MAIL FROM:<> (null sender)", "<>", f"relaytest@{ext_domain}"),
@@ -5135,14 +5286,15 @@ class SMTP(BaseModule):
             return ".".join(parts[1:])
         return host
 
-    def _get_rcpt_limit_domain(self) -> str:
-        """Domain for RCPT TO limit test: -d/--domain, or from server banner/EHLO (via PSL), or fqdn, or test.com.
-        User -d is used as-is. Domain from server: FQDN is resolved to registrable domain via Public Suffix List
-        (e.g. relay01.prod.amazon.co.jp -> amazon.co.jp); fallback to full hostname or _to_parent_domain if PSL fails.
+    def _resolve_rcpt_limit_domain(self) -> tuple[str, str]:
+        """Return ``(domain, source)`` for RCPT TO limit tests.
+
+        ``source`` is one of: ``domain_arg``, ``banner``, ``ehlo``, ``fqdn``, ``ptr``, ``default``.
+        User ``-d`` is used as-is. Server hostnames are reduced via PSL when applicable.
         """
         domain = getattr(self.args, "domain", None)
         if domain and domain.strip():
-            return domain.strip()
+            return domain.strip(), "domain_arg"
         host: str | None = None
         info = getattr(self.results, "info", None)
         if info and getattr(info, "banner", None):
@@ -5155,8 +5307,8 @@ class SMTP(BaseModule):
             if host and "." in host:
                 psl_domain = _registrable_domain_psl(host)
                 if psl_domain:
-                    return psl_domain
-                return host
+                    return psl_domain, "banner"
+                return host, "banner"
         if info and getattr(info, "ehlo", None):
             raw = (info.ehlo or "").replace("\r\n", "\n").replace("\r", "\n")
             for line in raw.split("\n"):
@@ -5171,23 +5323,50 @@ class SMTP(BaseModule):
                     host = rest.split()[0]
                     psl_domain = _registrable_domain_psl(host)
                     if psl_domain:
-                        return psl_domain
-                    return host
+                        return psl_domain, "ehlo"
+                    return host, "ehlo"
         if self.fqdn and "." in self.fqdn and "pentereptools" not in self.fqdn.lower():
             psl_domain = _registrable_domain_psl(self.fqdn)
             if psl_domain:
-                return psl_domain
-            return self._to_parent_domain(self.fqdn)
+                return psl_domain, "fqdn"
+            return self._to_parent_domain(self.fqdn), "fqdn"
         try:
             ptr_host = socket.gethostbyaddr(self.target_ip)[0]
             if ptr_host and "." in ptr_host:
                 psl_domain = _registrable_domain_psl(ptr_host)
                 if psl_domain:
-                    return psl_domain
-                return self._to_parent_domain(ptr_host) if len(ptr_host.split(".")) >= 3 else ptr_host
+                    return psl_domain, "ptr"
+                return self._to_parent_domain(ptr_host) if len(ptr_host.split(".")) >= 3 else ptr_host, "ptr"
         except (socket.herror, socket.gaierror, socket.timeout, OSError):
             pass
-        return "test.com"
+        return "test.com", "default"
+
+    def _get_rcpt_limit_domain(self) -> str:
+        """Domain for RCPT TO limit test: -d/--domain, or from server banner/EHLO (via PSL), or fqdn, or test.com.
+        User -d is used as-is. Domain from server: FQDN is resolved to registrable domain via Public Suffix List
+        (e.g. relay01.prod.amazon.co.jp -> amazon.co.jp); fallback to full hostname or _to_parent_domain if PSL fails.
+        """
+        return self._resolve_rcpt_limit_domain()[0]
+
+    @staticmethod
+    def _rl_domain_source_phrase(source: str) -> str:
+        """Human label for where the RCPT-limit domain was taken from."""
+        return {
+            "domain_arg": "-d/--domain",
+            "banner": "banner",
+            "ehlo": "EHLO",
+            "fqdn": "client FQDN",
+            "ptr": "reverse DNS (PTR)",
+            "default": "default fallback",
+        }.get(source, source)
+
+    def _stream_rcpt_limit_domain_source(self, domain: str, source: str) -> None:
+        info_icon = get_colored_text("[*]", color="INFO")
+        src = self._rl_domain_source_phrase(source)
+        self.ptprint(
+            f"    {info_icon} Domain derived from {src}: {domain}",
+            Out.TEXT,
+        )
 
     def _rcpt_limit_section_title(self) -> str:
         if _rcpt_limit_send_mode(self.args):
@@ -5248,17 +5427,12 @@ class SMTP(BaseModule):
             if not send_data_at_end or accepted_count <= 0:
                 return False, False, None, None
             probe_uuid = secrets.token_hex(8)
-            msg_lines = [
-                f"From: {mail_from_addr or f'penterep-rls@{domain}'}",
-                f"Subject: penterep-rl-limit-send {probe_uuid}",
-                f"Message-ID: <penterep-rls-{probe_uuid}@{domain}>",
-                f"X-Penterep-RL-Limit-Send: {probe_uuid}",
-                "",
-                f"RCPT TO limit send probe id: {probe_uuid}",
-                f"Envelope MAIL FROM: {mail_from_bracket}",
-                f"Accepted RCPT TO count in this transaction: {accepted_count}",
-            ]
-            raw_msg = "\r\n".join(msg_lines)
+            raw_msg = self._outbound_minimal_probe(
+                from_addr=mail_from_addr or f"rls@{domain}",
+                message_id_tag="rls",
+                domain=domain,
+                probe_uuid=probe_uuid,
+            )
             try:
                 dcode, drp = smtp.data(raw_msg)
                 drep = self.bytes_to_str(drp).strip()[:500]
@@ -5508,11 +5682,14 @@ class SMTP(BaseModule):
         domain: str,
         *,
         emit_debug=None,
-    ) -> bool:
+    ) -> tuple[bool, str | None]:
         """Pre-probe: does the server accept a clearly invalid local part via RCPT TO?
 
         Uses ``RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL@domain`` (e.g. ``xxxfoofff@dom``).
         Leaves the session in a clean state (RSET) when the probe finishes.
+
+        Returns ``(accept_all, rate_limit_error)`` where ``rate_limit_error`` is set when
+        ``MAIL FROM`` was rejected with a ``too much mail from`` policy response.
         """
         addr = f"{RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL}@{domain}"
 
@@ -5536,11 +5713,13 @@ class SMTP(BaseModule):
         try:
             status, reply = smtp.docmd("MAIL FROM:", "<>")
             if status != 250:
+                reply_str = self.bytes_to_str(reply)
+                rate_err = _rl_extract_too_much_mail_error(reply_str)
                 _dbg(
-                    f"Accept-all probe MAIL FROM:<> → [{status}] {_reply_one_line(reply)}",
+                    f"Accept-all probe MAIL FROM:<> → [{status}] {_reply_one_line(reply_str)}",
                     Out.INFO,
                 )
-                return False
+                return False, rate_err
             status, reply = smtp.docmd("RCPT TO:", f"<{addr}>")
             reply_str = self.bytes_to_str(reply)
             _dbg(
@@ -5552,11 +5731,67 @@ class SMTP(BaseModule):
         except Exception as e:
             _dbg(f"Accept-all probe failed: {e}", Out.INFO)
             accepted = False
+            rate_err = None
+        else:
+            rate_err = None
         try:
             smtp.docmd("RSET")
         except Exception:
             pass
-        return accepted
+        return accepted, rate_err
+
+    def _rl_probe_envelope_mail_from_rate_limit(
+        self,
+        smtp: smtplib.SMTP,
+        envelope_mail_from: str | None,
+    ) -> str | None:
+        """Return rate-limit text when envelope ``MAIL FROM`` is rejected with ``too much mail``."""
+        mail_from_addr = (envelope_mail_from or "").strip("<>").strip() if envelope_mail_from else ""
+        mail_from_bracket = f"<{mail_from_addr}>" if mail_from_addr else "<>"
+        try:
+            smtp.docmd("RSET")
+        except Exception:
+            pass
+        try:
+            status, reply = smtp.docmd("MAIL FROM:", mail_from_bracket)
+            if status != 250:
+                return _rl_extract_too_much_mail_error(self.bytes_to_str(reply))
+        except Exception:
+            pass
+        finally:
+            try:
+                smtp.docmd("RSET")
+            except Exception:
+                pass
+        return None
+
+    def _rl_rate_limited_result(
+        self,
+        message: str,
+        *,
+        domain: str,
+        effective_role: str | None,
+        auth_required: bool | None,
+        open_relay: bool | None,
+        recipients_source: str | None,
+    ) -> RcptLimitResult:
+        """Early exit when the server blocks this client with ``too much mail from``."""
+        bad_icon = get_colored_text("[✗]", color="VULN")
+        self.ptprint(f"    {bad_icon} {message}", Out.TEXT)
+        return RcptLimitResult(
+            max_accepted=0,
+            limit_triggered=False,
+            server_response=message,
+            rejected_addresses=False,
+            domain_used=domain,
+            role=effective_role,
+            auth_required=auth_required,
+            open_relay=open_relay,
+            skipped=True,
+            skip_reason="rate_limited",
+            skip_message=message,
+            recipients_source=recipients_source,
+        )
 
     def _rl_send_catch_all_delivery_probe(
         self,
@@ -5630,21 +5865,13 @@ class SMTP(BaseModule):
                 pass
             return out
 
-        msg_lines = [
-            f"From: {mail_from}",
-            f"To: {probe_rcpt}",
-            f"Subject: penterep-rl-catchall {probe_uuid}",
-            f"Message-ID: <penterep-rl-ca-{probe_uuid}@{domain}>",
-            f"X-Penterep-RL-CatchAll-Probe: {probe_uuid}",
-            f"X-Penterep-RL-Bounce-Mailbox: {mail_from}",
-            "",
-            f"RCPT TO limit catch-all bounce probe id: {probe_uuid}",
-            f"Envelope MAIL FROM: {mail_bracket}",
-            f"Probe recipient: {probe_rcpt}",
-            f"If the address is not catch-all, an NDR/bounce should arrive at {mail_from}.",
-            "No bounce after delivery processing suggests catch-all or delayed reject.",
-        ]
-        raw_msg = "\r\n".join(msg_lines)
+        raw_msg = self._outbound_minimal_probe(
+            from_addr=mail_from,
+            message_id_tag="rl-ca",
+            domain=domain,
+            probe_uuid=probe_uuid,
+            to_addr=probe_rcpt,
+        )
         try:
             dcode, drp = smtp.data(raw_msg)
             drep = self.bytes_to_str(drp).strip()[:500]
@@ -5664,7 +5891,46 @@ class SMTP(BaseModule):
             pass
         return out
 
-    def _rl_run_precheck(self) -> dict:
+    def _stream_rcpt_limit_precheck_role(
+        self,
+        effective_role: str | None,
+        auth_required: bool | None,
+    ) -> None:
+        """Print ``[*] Role: …`` immediately after role identification (-rl / -rls pre-check)."""
+        info_icon = get_colored_text("[*]", color="INFO")
+        if effective_role is not None:
+            self.ptprint(
+                f"    {info_icon} {self._rl_role_label(effective_role, self.args.target.port, auth_required, rcpt_limit_submission=(effective_role == 'submission'))}",
+                Out.TEXT,
+            )
+        else:
+            self.ptprint(
+                f"    {info_icon} Role: could not be determined (pre-check failed)",
+                Out.TEXT,
+            )
+
+    def _stream_rcpt_limit_precheck_open_relay(
+        self,
+        open_relay: bool | None,
+        domain: str,
+        domain_source: str,
+    ) -> None:
+        """Print open-relay verdict and domain source right after open-relay probe."""
+        info_icon = get_colored_text("[*]", color="INFO")
+        if open_relay is True:
+            self.ptprint(
+                f"    {info_icon} Open relay: vulnerable (synthetic recipients accepted)",
+                Out.TEXT,
+            )
+            self._stream_rcpt_limit_domain_source(domain, domain_source)
+        elif open_relay is False:
+            self.ptprint(
+                f"    {info_icon} Open relay: not vulnerable",
+                Out.TEXT,
+            )
+            self._stream_rcpt_limit_domain_source(domain, domain_source)
+
+    def _rl_run_precheck(self, domain: str, domain_source: str) -> dict:
         """Pre-check before -rl: detect role + (for MTA/hybrid) open-relay verdict.
 
         Reuses cached ``self.results.role`` / ``self.results.open_relay`` when already populated
@@ -5715,8 +5981,12 @@ class SMTP(BaseModule):
             out["role"] = forced_role or role_obj.role
             out["auth_required"] = role_obj.auth_required
             out["port_hint"] = getattr(role_obj, "port_hint", None)
+            if rl_err := _rl_extract_too_much_mail_error(role_obj.detail):
+                out["rate_limit_error"] = rl_err
         elif forced_role:
             out["role"] = forced_role
+
+        self._stream_rcpt_limit_precheck_role(out.get("role"), out.get("auth_required"))
 
         # --- Open relay probe (only relevant for MTA/hybrid) ---
         effective_role = out["role"]
@@ -5728,7 +5998,7 @@ class SMTP(BaseModule):
                     or_smtp = self.get_smtp_handler()
                     try:
                         or_smtp.docmd("EHLO", self.fqdn)
-                        open_relay = self.open_relay_test(or_smtp, "TEST", None, None)
+                        open_relay = self.open_relay_test(or_smtp, None, None)
                         self.results.open_relay = open_relay
                         out["open_relay"] = open_relay
                     finally:
@@ -5738,6 +6008,7 @@ class SMTP(BaseModule):
                             pass
                 except Exception as e:
                     self.ptdebug(f"Pre-check open-relay probe failed: {e}", Out.INFO)
+            self._stream_rcpt_limit_precheck_open_relay(out.get("open_relay"), domain, domain_source)
         return out
 
     @staticmethod
@@ -5756,6 +6027,11 @@ class SMTP(BaseModule):
         one-line ``AUTH not required`` that contradicts the skip message.
         """
         role_str = (role or "unknown")
+        if role_str == "indeterminate":
+            return (
+                f"Role: undetermined (port {port}) — "
+                "could not classify server (MTA / Submission / Hybrid)"
+            )
         if rcpt_limit_submission and role_str == "submission":
             if auth_required is True:
                 auth_label = "EHLO: AUTH — -rl probe uses -u/-p"
@@ -5894,7 +6170,7 @@ class SMTP(BaseModule):
         # by -nf1/-nf2 too).
         self._ensure_initial_info(fail_label="-rl precheck")
 
-        domain = self._get_rcpt_limit_domain()
+        domain, domain_source = self._resolve_rcpt_limit_domain()
         send_mode = _rcpt_limit_send_mode(self.args)
         max_rcpt_attempts = _rcpt_limit_max_attempts(self.args)
         envelope_mail_from: str | None = None
@@ -5910,41 +6186,16 @@ class SMTP(BaseModule):
         recipients: list[str] | None = None
         recipients_source = "synthetic"
         rl_wordlist_notice: tuple[list[str], int] | None = None
+        rate_limit_msg: str | None = None
 
         if no_precheck:
             self.ptprint(f"    {info_icon} Pre-check skipped (--rl-no-precheck)", Out.TEXT)
         else:
-            precheck = self._rl_run_precheck()
+            precheck = self._rl_run_precheck(domain, domain_source)
             effective_role = precheck.get("role")
             auth_required = precheck.get("auth_required")
             open_relay = precheck.get("open_relay")
-
-            if effective_role is not None:
-                self.ptprint(
-                    f"    {info_icon} {self._rl_role_label(effective_role, self.args.target.port, auth_required, rcpt_limit_submission=(effective_role == 'submission'))}",
-                    Out.TEXT,
-                )
-            else:
-                self.ptprint(
-                    f"    {info_icon} Role: could not be determined (pre-check failed)",
-                    Out.TEXT,
-                )
-
-            if effective_role in ("mta", "hybrid"):
-                if open_relay is True:
-                    self.ptprint(
-                        f"    {info_icon} Open relay: vulnerable (synthetic recipients accepted)",
-                        Out.TEXT,
-                    )
-                elif open_relay is False:
-                    self.ptprint(
-                        f"    {info_icon} Open relay: not vulnerable",
-                        Out.TEXT,
-                    )
-                    self.ptprint(
-                        f"    {info_icon} MTA manages email addresses with domain {domain}",
-                        Out.TEXT,
-                    )
+            rate_limit_msg = precheck.get("rate_limit_error")
 
             # Decide test path
             if effective_role in ("mta", "hybrid") and open_relay is False:
@@ -6000,9 +6251,21 @@ class SMTP(BaseModule):
                     )
 
             elif effective_role == "indeterminate":
-                self.ptprint(
-                    f"    {info_icon} Pre-check inconclusive — falling back to default RCPT TO probe",
-                    Out.TEXT,
+                if not rate_limit_msg:
+                    self.ptprint(
+                        f"    {info_icon} Continuing with generic RCPT TO probe — "
+                        "use -U/-u for local recipients or -R to force role",
+                        Out.TEXT,
+                    )
+
+            if rate_limit_msg:
+                return self._rl_rate_limited_result(
+                    rate_limit_msg,
+                    domain=domain,
+                    effective_role=effective_role,
+                    auth_required=auth_required,
+                    open_relay=open_relay,
+                    recipients_source=None,
                 )
 
         smtp: smtplib.SMTP | None = None
@@ -6048,11 +6311,31 @@ class SMTP(BaseModule):
                         )
 
             _probe_emit_debug = _emit_probe_debug if (self.args.debug and _show_progress) else None
-            accept_all_via_rcpt = self._rl_probe_accept_all_rcpt(
+            accept_all_via_rcpt, accept_all_rate_err = self._rl_probe_accept_all_rcpt(
                 smtp,
                 domain,
                 emit_debug=_probe_emit_debug,
             )
+            if accept_all_rate_err:
+                return self._rl_rate_limited_result(
+                    accept_all_rate_err,
+                    domain=domain,
+                    effective_role=effective_role,
+                    auth_required=auth_required,
+                    open_relay=open_relay,
+                    recipients_source=recipients_source,
+                )
+            if env_rate_err := self._rl_probe_envelope_mail_from_rate_limit(
+                smtp, envelope_mail_from
+            ):
+                return self._rl_rate_limited_result(
+                    env_rate_err,
+                    domain=domain,
+                    effective_role=effective_role,
+                    auth_required=auth_required,
+                    open_relay=open_relay,
+                    recipients_source=recipients_source,
+                )
             if accept_all_via_rcpt and open_relay is not True:
                 self._stream_rcpt_limit_catch_all_notice()
             if rl_wordlist_notice is not None:
@@ -6060,7 +6343,7 @@ class SMTP(BaseModule):
                 self._stream_rcpt_limit_wordlist_notices(recs, wl_n)
 
             _emit_probe_debug(
-                f"RCPT TO limit probe: domain={domain}, max attempts={max_rcpt_attempts}, "
+                f"RCPT TO limit test summary: domain={domain}, max attempts={max_rcpt_attempts}, "
                 f"recipients_source={recipients_source}, auth_used={auth_used}, "
                 f"accept_all_via_rcpt={accept_all_via_rcpt}, "
                 f"envelope_mail_from={envelope_mail_from or '<>'}",
@@ -6206,18 +6489,13 @@ class SMTP(BaseModule):
             drep: str | None = None
 
             if send_data and all_2xx:
-                msg_lines = [
-                    f"From: penterep-rdd@{dom}",
-                    f"To: {display_to}",
-                    f"Subject: penterep-rcpt-dup {probe_uuid}",
-                    f"Message-ID: <penterep-rdd-{probe_uuid}@{dom}>",
-                    f"X-Penterep-RDD-Probe: {probe_uuid}",
-                    "",
-                    f"Duplicate RCPT probe id: {probe_uuid}",
-                    "Verify manually how many copies arrived in the recipient mailbox.",
-                    "Submitted after repeated RCPT TO for the same address in one SMTP transaction.",
-                ]
-                raw_msg = "\r\n".join(msg_lines)
+                raw_msg = self._outbound_minimal_probe(
+                    from_addr=f"rdd@{dom}",
+                    message_id_tag="rdd",
+                    domain=dom,
+                    probe_uuid=probe_uuid,
+                    to_addr=display_to,
+                )
                 try:
                     dcode, drp = smtp.data(raw_msg)
                     drep = self.bytes_to_str(drp).strip()[:500]
@@ -11114,13 +11392,12 @@ class SMTP(BaseModule):
                 f"{rp}"
                 f"From: <{bounce_addr}>\r\n"
                 f"To: <{recipient}>\r\n"
-                f"Subject: Bounce-replay test ID: {tid}\r\n"
-                f"X-PT-Test-ID: {tid}\r\n"
+                f"Subject: {self._outbound_subject()}\r\n"
+                f"{EMAIL_HDR_TEST_ID}: {tid}\r\n"
                 f"Date: {time.strftime('%a, %d %b %Y %H:%M:%S +0000', time.gmtime())}\r\n"
                 f"Message-ID: <{tid}.{int(time.time())}@{msg_id_domain}>\r\n"
                 f"\r\n"
-                f"Bounce replay probe (PTL-SVC-SMTP-REPLAY). "
-                f"{'Return-Path header present. ' if include_return_path else 'MAIL FROM envelope + From only. '}\r\n"
+                f"{self._outbound_data()}\r\n"
             )
 
         def _connect_br() -> tuple[smtplib.SMTP | smtplib.SMTP_SSL, int]:
@@ -11505,15 +11782,19 @@ class SMTP(BaseModule):
         def _send_one(idx: int) -> tuple[str, int | str | None, str]:
             """Returns (reason, status_or_error, error_type). For connection_lost, error_type is classification."""
             rid = f"{random.getrandbits(16):04x}" if bomb_randomize else ""
-            subject = f"BOMB Test Message {idx}" + (f" [id:{rid}]" if rid else "")
-            body = f"Tested message content – PTL-SVC-SMTP-BOMB flood test message no {idx}." + (f" Id:{rid}" if rid else "")
+            subject = self._outbound_subject()
+            if rid:
+                subject = f"{subject} [{rid}]"
+            elif bomb_count > 1:
+                subject = f"{subject} {idx}"
+            body = self._outbound_data() + (f" Id:{rid}" if rid else "")
             from_hdr = f'"{from_name}" <{mail_from}>' if from_name else f"<{mail_from}>"
             to_hdr = f"<{rcpt}>"
             cc_hdr = ", ".join(f"<{c}>" for c in cc_list) if cc_list else ""
             headers = [f"From: {from_hdr}", f"To: {to_hdr}"]
             if cc_hdr:
                 headers.append(f"Cc: {cc_hdr}")
-            headers.extend([f"Subject: {subject}", f"X-PT-Test-ID: {rid or str(idx)}", "Date: " + time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())])
+            headers.extend([f"Subject: {subject}", f"{EMAIL_HDR_TEST_ID}: {rid or str(idx)}", "Date: " + time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())])
             msg = "\r\n".join(headers) + "\r\n\r\n" + body + "\r\n"
             recipients = [rcpt] + cc_list
 
@@ -11824,8 +12105,8 @@ class SMTP(BaseModule):
             (avoids false SECURE when message has no payload).
             Supports: bodyBase64, bodyQuotedPrintable (encoded_content), rawEml (mime_malformed).
             """
-            subject = msg_def.get("subject", "Antivirus test")
-            body = msg_def.get("body", "Antivirus test message.")
+            subject = self._outbound_subject()
+            body = self._outbound_data()
             body_html = msg_def.get("bodyHtml")
             body_base64 = msg_def.get("bodyBase64")
             body_qp = msg_def.get("bodyQuotedPrintable")
@@ -11855,7 +12136,7 @@ class SMTP(BaseModule):
             if cc_hdr:
                 msg["Cc"] = cc_hdr
             msg["Date"] = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())
-            msg["X-PT-Test"] = "PTL-SVC-SMTP-ANTIVIRUS"
+            msg[EMAIL_HDR_TEST] = EMAIL_TEST_ANTIVIRUS
             for k, v in custom_headers.items():
                 msg[k] = str(v)
 
@@ -12094,12 +12375,12 @@ class SMTP(BaseModule):
         if "from" in variants:
             envelope_addr = mail_from
             from_header = "CEO <ceo@trusted-company.com>"
-            msg = MIMEText("Spoof headers – From spoof test.\r\n", "plain", "utf-8")
+            msg = MIMEText(f"{self._outbound_data()}\r\n", "plain", "utf-8")
             msg["From"] = from_header
             msg["To"] = f"<{rcpt}>"
-            msg["Subject"] = "Spoof headers – From spoof test"
+            msg["Subject"] = self._outbound_subject()
             msg["Date"] = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())
-            msg["X-PT-Test"] = "SPOOFHDR"
+            msg[EMAIL_HDR_TEST] = "SPOOFHDR"
             raw_msg = msg.as_string()
             smtp, conn_err = _connect_sh()
             accepted, rejected, err = False, False, False
@@ -12148,13 +12429,13 @@ class SMTP(BaseModule):
         if "reply_to" in variants:
             envelope_addr = mail_from
             from_header = "support@trusted.com"
-            msg = MIMEText("Spoof headers – Reply-To spoof test. Please reply.\r\n", "plain", "utf-8")
+            msg = MIMEText(f"{self._outbound_data()}\r\n", "plain", "utf-8")
             msg["From"] = from_header
             msg["Reply-To"] = "attacker@evil.com"
             msg["To"] = f"<{rcpt}>"
-            msg["Subject"] = "Spoof headers – Reply-To spoof test"
+            msg["Subject"] = self._outbound_subject()
             msg["Date"] = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())
-            msg["X-PT-Test"] = "SPOOFHDR"
+            msg[EMAIL_HDR_TEST] = "SPOOFHDR"
             raw_msg = msg.as_string()
             smtp, conn_err = _connect_sh()
             accepted, rejected, err = False, False, False
@@ -12201,13 +12482,13 @@ class SMTP(BaseModule):
         # Variant 3: Return-Path – client injects Return-Path (RFC 3834: server should set it)
         if "return_path" in variants:
             envelope_addr = mail_from
-            msg = MIMEText("Spoof headers – Return-Path spoof test.\r\n", "plain", "utf-8")
+            msg = MIMEText(f"{self._outbound_data()}\r\n", "plain", "utf-8")
             msg["From"] = "admin@trusted.com"
             msg["Return-Path"] = "<admin@trusted.com>"
             msg["To"] = f"<{rcpt}>"
-            msg["Subject"] = "Spoof headers – Return-Path spoof test"
+            msg["Subject"] = self._outbound_subject()
             msg["Date"] = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())
-            msg["X-PT-Test"] = "SPOOFHDR"
+            msg[EMAIL_HDR_TEST] = "SPOOFHDR"
             raw_msg = msg.as_string()
             smtp, conn_err = _connect_sh()
             accepted, rejected, err = False, False, False
@@ -12363,18 +12644,14 @@ class SMTP(BaseModule):
         cc_hdr = ", ".join(f"<{a}>" for a in cc_addrs)
         bcc_hdr = ", ".join(f"<{a}>" for a in bcc_addrs)
 
-        msg = MIMEText(
-            "BCC disclosure test. Manual verification required – check that Bcc header is NOT visible to To/Cc recipients.\r\n",
-            "plain",
-            "utf-8",
-        )
+        msg = MIMEText(f"{self._outbound_data()}\r\n", "plain", "utf-8")
         msg["From"] = f"<{mail_from}>"
         msg["To"] = to_hdr
         msg["Cc"] = cc_hdr
         msg["Bcc"] = bcc_hdr
-        msg["Subject"] = "Bcc header test – manual verification required"
+        msg["Subject"] = self._outbound_subject()
         msg["Date"] = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())
-        msg["X-PT-Test"] = "BCC"
+        msg[EMAIL_HDR_TEST] = "BCC"
         raw_msg = msg.as_string()
 
         smtp, conn_err = _connect_bcc()
@@ -12542,16 +12819,12 @@ class SMTP(BaseModule):
                 detail_str = f"Connection failed: {conn_err}"
             else:
                 try:
-                    msg = MIMEText(
-                        f"Alias bypass test – variant '{variant_name}'. Manual verification required.\r\n",
-                        "plain",
-                        "utf-8",
-                    )
+                    msg = MIMEText(f"{self._outbound_data()}\r\n", "plain", "utf-8")
                     msg["From"] = f"<{mail_from}>"
                     msg["To"] = f"<{addr}>"
-                    msg["Subject"] = f"Alias bypass test – {variant_name} (PTL-SVC-SMTP-ALIAS)"
+                    msg["Subject"] = self._outbound_subject()
                     msg["Date"] = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())
-                    msg["X-PT-Test"] = "PTL-SVC-SMTP-ALIAS"
+                    msg[EMAIL_HDR_TEST] = EMAIL_TEST_ALIAS
                     raw_msg = msg.as_string()
 
                     smtp.docmd("MAIL", f"FROM:<{mail_from}>")
@@ -12693,7 +12966,7 @@ class SMTP(BaseModule):
             if cc_hdr:
                 msg["Cc"] = cc_hdr
             msg["Date"] = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())
-            msg["X-PT-Test"] = "PTL-SVC-SMTP-SSRF"
+            msg[EMAIL_HDR_TEST] = EMAIL_TEST_SSRF
             msg.attach(MIMEText(body, "plain", "utf-8"))
             if body_html:
                 msg.attach(MIMEText(body_html, "html", "utf-8"))
@@ -12701,18 +12974,19 @@ class SMTP(BaseModule):
 
         # Inline fallback when no definition files
         FALLBACK_VARIANTS: dict[str, dict] = {
-            "plain": {"subject": "SSRF test - plain (PTL-SVC-SMTP-SSRF)", "body": "Test SSRF: {{CANARY_URL}}", "bodyHtml": None},
-            "html_link": {"subject": "SSRF test - HTML link (PTL-SVC-SMTP-SSRF)", "body": "Link below.", "bodyHtml": '<html><body><a href="{{CANARY_URL}}">link</a></body></html>'},
-            "html_img": {"subject": "SSRF test - HTML img (PTL-SVC-SMTP-SSRF)", "body": "Image below.", "bodyHtml": '<html><body><img src="{{CANARY_URL}}" /></body></html>'},
-            "html_iframe": {"subject": "SSRF test - HTML iframe (PTL-SVC-SMTP-SSRF)", "body": "Iframe.", "bodyHtml": '<html><body><iframe src="{{CANARY_URL}}"></iframe></body></html>'},
-            "multipart": {"subject": "SSRF test - multipart (PTL-SVC-SMTP-SSRF)", "body": "Plain: {{CANARY_URL}}", "bodyHtml": '<html><body><a href="{{CANARY_URL}}">link</a></body></html>'},
-            "ssrf_malformed": {"subject": "SSRF test - Malformed MIME (PTL-SVC-SMTP-SSRF)"},
-            "ssrf_nested": {"subject": "SSRF test - Deeply Nested (PTL-SVC-SMTP-SSRF)"},
+            "plain": {"subject": "SSRF test - plain", "body": "Test SSRF: {{CANARY_URL}}", "bodyHtml": None},
+            "html_link": {"subject": "SSRF test - HTML link", "body": "Link below.", "bodyHtml": '<html><body><a href="{{CANARY_URL}}">link</a></body></html>'},
+            "html_img": {"subject": "SSRF test - HTML img", "body": "Image below.", "bodyHtml": '<html><body><img src="{{CANARY_URL}}" /></body></html>'},
+            "html_iframe": {"subject": "SSRF test - HTML iframe", "body": "Iframe.", "bodyHtml": '<html><body><iframe src="{{CANARY_URL}}"></iframe></body></html>'},
+            "multipart": {"subject": "SSRF test - multipart", "body": "Plain: {{CANARY_URL}}", "bodyHtml": '<html><body><a href="{{CANARY_URL}}">link</a></body></html>'},
+            "ssrf_malformed": {"subject": "SSRF test - Malformed MIME"},
+            "ssrf_nested": {"subject": "SSRF test - Deeply Nested"},
         }
 
         def _build_ssrf_malformed_mime(subject: str) -> str:
             """Malformed MIME – wrong boundary in nested part (parser differential test)."""
             bnd1, bnd_wrong = "BND1", "BND_WRONG"
+            plain_body = self._outbound_data_with_url(canary_url)
             raw = (
                 f"From: {from_hdr}\r\n"
                 f"To: <{rcpt}>\r\n"
@@ -12721,12 +12995,12 @@ class SMTP(BaseModule):
                 f'Content-Type: multipart/mixed; boundary="{bnd1}"\r\n\r\n'
                 f"--{bnd1}\r\n"
                 "Content-Type: text/plain\r\n\r\n"
-                "Malformed MIME – nested part uses wrong boundary to confuse parser.\r\n"
+                f"{plain_body}\r\n"
                 f"--{bnd1}\r\n"
                 f'Content-Type: multipart/alternative; boundary="BND2"\r\n\r\n'
                 f"--{bnd_wrong}\r\n"
                 "Content-Type: text/plain\r\n\r\n"
-                f"SSRF test link: {canary_url}\r\n"
+                f"{plain_body}\r\n"
                 f"--{bnd1}--\r\n"
             )
             return raw
@@ -12736,7 +13010,7 @@ class SMTP(BaseModule):
             boundaries = [f"NEST{i}" for i in range(layers)]
             innermost = (
                 f"Content-Type: text/plain; charset=utf-8\r\n\r\n"
-                f"SSRF test – canary URL: {canary_url}\r\n"
+                f"{self._outbound_data_with_url(canary_url)}\r\n"
             )
             body_part = innermost
             for i in range(layers - 1, 0, -1):
@@ -12755,7 +13029,7 @@ class SMTP(BaseModule):
                 f"Subject: {subject}\r\n"
                 f"MIME-Version: 1.0\r\n"
                 f"Date: {time.strftime('%a, %d %b %Y %H:%M:%S +0000', time.gmtime())}\r\n"
-                f"X-PT-Test: PTL-SVC-SMTP-SSRF\r\n"
+                f"{EMAIL_HDR_TEST}: {EMAIL_TEST_SSRF}\r\n"
                 f'Content-Type: multipart/alternative; boundary="{top_boundary}"\r\n'
                 f"\r\n{body}"
             )
@@ -12774,15 +13048,14 @@ class SMTP(BaseModule):
                         defs_to_use = json.load(f)
                 except (json.JSONDecodeError, OSError):
                     pass
-            subject = defs_to_use.get("subject", f"SSRF test - {var_name}")
+            subject = self._outbound_subject()
             if var_name == "ssrf_malformed":
                 raw_msg = _build_ssrf_malformed_mime(subject)
             elif var_name == "ssrf_nested":
                 raw_msg = _build_ssrf_nested_mime(subject)
             else:
-                body = defs_to_use.get("body", f"Test: {{CANARY_URL}}")
+                body = self._outbound_data_with_url(canary_url)
                 body_html = defs_to_use.get("bodyHtml")
-                body = body.replace("{{CANARY_URL}}", canary_url)
                 if body_html:
                     body_html = body_html.replace("{{CANARY_URL}}", canary_url)
                 raw_msg = _build_ssrf_mime(subject, body, body_html)
@@ -12853,8 +13126,8 @@ class SMTP(BaseModule):
                 ("http://localhost/ssrf-pt-test", "internal_localhost"),
                 ("http://10.0.0.1/ssrf-pt-test", "internal_10"),
             ]:
-                body = f"Test SSRF internal: {internal_url}"
-                raw_msg = _build_ssrf_mime(f"SSRF internal - {label}", body, None)
+                body = self._outbound_data_with_url(internal_url)
+                raw_msg = _build_ssrf_mime(self._outbound_subject(), body, None)
                 smtp, conn_err = _connect_ssrf()
                 sent, accepted, rejected, err_count = 0, 0, 0, 0
                 smtp_trace = []
@@ -13066,7 +13339,7 @@ class SMTP(BaseModule):
             body_len = near_size_body_len if (idx % 3 == 1 and size_limit_bytes) else len(min_body)
             body = "X" * body_len
             msg = (
-                f"From: <{mail_from}>\r\nTo: <{rcpt}>\r\nSubject: FLOOD test {idx+1}\r\n"
+                f"From: <{mail_from}>\r\nTo: <{rcpt}>\r\nSubject: {self._outbound_subject()}\r\n"
                 f"MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\n{body}\r\n"
             )
             smtp2, _ = _connect_flood()
@@ -13294,7 +13567,7 @@ class SMTP(BaseModule):
             msg["From"] = from_hdr
             msg["To"] = f"<{rcpt}>"
             msg["Date"] = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())
-            msg["X-PT-Test"] = "PTL-SVC-SMTP-ZIPXXE"
+            msg[EMAIL_HDR_TEST] = EMAIL_TEST_ZIPXXE
             msg.attach(MIMEText(body, "plain", "utf-8"))
             part = MIMEBase(*content_type.split("/", 1))
             part.set_payload(attachment_data)
@@ -13314,8 +13587,8 @@ class SMTP(BaseModule):
                 smtp_trace.append(f"connection failed: {conn_err}")
             else:
                 try:
-                    subject = f"ZIPXXE test - {var_name} (PTL-SVC-SMTP-ZIPXXE)"
-                    body = "ZIPXXE test message. Monitor server and canary."
+                    subject = self._outbound_subject()
+                    body = self._outbound_data()
                     if var_name == "billion_laughs_attach":
                         raw_msg = _build_mime_with_attachment(
                             subject, body, BILLION_LAUGHS_XML.encode("utf-8"), "billion_laughs.xml", "application/xml"
@@ -13328,7 +13601,7 @@ class SMTP(BaseModule):
                             f"MIME-Version: 1.0\r\n"
                             f"Content-Type: application/xml; charset=utf-8\r\n"
                             f"Date: {time.strftime('%a, %d %b %Y %H:%M:%S +0000', time.gmtime())}\r\n"
-                            f"X-PT-Test: PTL-SVC-SMTP-ZIPXXE\r\n"
+                            f"{EMAIL_HDR_TEST}: {EMAIL_TEST_ZIPXXE}\r\n"
                             f"\r\n{BILLION_LAUGHS_XML}"
                         )
                     elif var_name == "xxe_zip":
@@ -13351,18 +13624,18 @@ class SMTP(BaseModule):
                             f"MIME-Version: 1.0\r\n"
                             f"Content-Type: application/xml; charset=utf-8\r\n"
                             f"Date: {time.strftime('%a, %d %b %Y %H:%M:%S +0000', time.gmtime())}\r\n"
-                            f"X-PT-Test: PTL-SVC-SMTP-ZIPXXE\r\n"
+                            f"{EMAIL_HDR_TEST}: {EMAIL_TEST_ZIPXXE}\r\n"
                             f"\r\n{xxe_body_xml}"
                         )
                     elif var_name == "zip_bomb":
                         zip_data = build_minimal_zip_bomb()
                         raw_msg = _build_mime_with_attachment(
-                            subject, "ZIPXXE zip bomb test (minimal). Monitor server resources.", zip_data, "zipbomb.zip", "application/zip"
+                            subject, body, zip_data, "zipbomb.zip", "application/zip"
                         )
                     elif var_name == "zip_bomb_full":
                         zip_data = build_full_zip_bomb()
                         raw_msg = _build_mime_with_attachment(
-                            subject, "ZIPXXE full zip bomb (~100KB→~100MB). Monitor server! DoS risk.", zip_data, "zipbomb_full.zip", "application/zip"
+                            subject, body, zip_data, "zipbomb_full.zip", "application/zip"
                         )
                     else:
                         continue
@@ -14435,9 +14708,15 @@ class SMTP(BaseModule):
                 self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
         else:
             if rlim.max_accepted == 0:
-                self.ptprint(f"    {info_icon} Could not test: no recipients accepted", Out.TEXT)
+                rl_err = _rl_extract_too_much_mail_error(rlim.server_response)
+                if rl_err:
+                    bad_icon = get_colored_text("[✗]", color="VULN")
+                    self.ptprint(f"    {bad_icon} {rl_err}", Out.TEXT)
+                else:
+                    self.ptprint(f"    {info_icon} Could not test: no recipients accepted", Out.TEXT)
                 self._stream_rcpt_limit_server_response_verbose(rlim.server_response)
-                self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
+                if not rl_err:
+                    self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
             else:
                 icon = self._rcpt_limit_recipient_verdict_icon(rlim.max_accepted)
                 self.ptprint(
@@ -15320,7 +15599,7 @@ class SMTP(BaseModule):
         )
         self.ptprint(f"    {p1_icon} {p1_msg}", Out.TEXT)
         if br.message_accepted and br.test_id:
-            self.ptprint(f"        Test ID: {br.test_id} (X-PT-Test-ID)", Out.TEXT)
+            self.ptprint(f"        Test ID: {br.test_id} ({EMAIL_HDR_TEST_ID})", Out.TEXT)
 
         # Probe 1 was indeterminate → Probe 2 never ran
         if br.probe1_indeterminate and not has_probe2:
@@ -15338,7 +15617,7 @@ class SMTP(BaseModule):
         )
         self.ptprint(f"    {p2_icon} {p2_msg}", Out.TEXT)
         if p2_accepted and getattr(br, "test_id_return_path", ""):
-            self.ptprint(f"        Test ID: {br.test_id_return_path} (X-PT-Test-ID)", Out.TEXT)
+            self.ptprint(f"        Test ID: {br.test_id_return_path} ({EMAIL_HDR_TEST_ID})", Out.TEXT)
 
     def _stream_mail_bomb_result(self) -> None:
         if (err := self.results.mail_bomb_error) is not None:

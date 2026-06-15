@@ -11,20 +11,44 @@ from ptlibs.ptjsonlib import PtJsonLib
 from ._version import __version__
 
 
-def text(data: bytes) -> str | None:
+def text(data: bytes | str | None) -> str | None:
     """
-    Attempts to decode bytes as a string
+    Decode NTLM string fields (UTF-16 LE when UNICODE negotiated, else OEM/ASCII).
 
     Args:
-        data (bytes): bytes to decode
+        data: raw bytes from challenge/target info, or already-decoded str
 
     Returns:
         str | None: decoded string or None
     """
-    try:
-        return data.decode()
-    except:
+    if data is None:
         return None
+    if isinstance(data, str):
+        cleaned = data.replace("\x00", "").strip()
+        return cleaned or None
+    if not data:
+        return None
+
+    # MS-NLMP: Unicode strings are UTF-16 LE (high byte often 0 for ASCII hostnames).
+    if len(data) % 2 == 0 and len(data) >= 2:
+        high_bytes = data[1::2]
+        if high_bytes == b"\x00" * len(high_bytes) or (
+            b"\x00" in data and data.index(b"\x00") % 2 == 1
+        ):
+            try:
+                decoded = data.decode("utf-16-le").rstrip("\x00")
+                if decoded and "\x00" not in decoded:
+                    return decoded
+            except UnicodeDecodeError:
+                pass
+
+    for encoding in ("ascii", "latin-1"):
+        try:
+            decoded = data.decode(encoding).rstrip("\x00")
+            return decoded or None
+        except UnicodeDecodeError:
+            continue
+    return None
 
 
 class NTLMInfo(NamedTuple):

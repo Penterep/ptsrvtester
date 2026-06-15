@@ -1771,7 +1771,8 @@ class SMTPArgs(ArgsWithBruteforce):
             help=(
                 "Sender address (MAIL FROM); used by -bomb, -av, -br (default: bombtest/avtest@{fqdn} when not set). "
                 "Required for -rls/--recipient-limit-send (envelope MAIL FROM). "
-                "Optional with -rl: envelope MAIL FROM for the RCPT TO probe (default <> when omitted)."
+                "Optional with -rl/-rls: envelope MAIL FROM for RCPT probes and accept-all pre-probe "
+                "(default <> when omitted)."
             ),
         )
         direct.add_argument(
@@ -4998,7 +4999,8 @@ class SMTP(BaseModule):
     def open_relay_test(self, smtp, mail_from, rcpt_to) -> bool:
         """OWASP/Nmap-style multi-vector open relay test. Tests: empty FROM, internal→external,
         external→external, literal IP sender. Returns True if any vector succeeds."""
-        self.ptdebug(f"Open Relay Test:", title=True)
+        self.ptdebug("Open Relay Test:", title=True)
+        verbose = bool(self.args.debug and not self.args.json)
         ext_domain = "external.relaytest.local"
         host_domain = self.fqdn or "relaytest.local"
         target_ip = getattr(self.args.target, "ip", None) or "127.0.0.1"
@@ -5022,23 +5024,109 @@ class SMTP(BaseModule):
         if mail_from and rcpt_to:
             vectors.insert(0, (f"user: {mail_from} -> {rcpt_to}", mail_from, rcpt_to))
 
-        for label, from_addr, to_addr in vectors:
-            try:
-                smtp.sendmail(from_addr, [to_addr], msg)
-                self.ptdebug(f"Server is vulnerable to Open relay ({label})", Out.VULN)
-                return True
-            except smtplib.SMTPRecipientsRefused as e:
-                self.ptdebug(f"Relay rejected: {label} - {e}", Out.INFO)
-            except smtplib.SMTPResponseException as e:
-                self.ptdebug(f"Relay rejected: {label} - {e.smtp_code} {e.smtp_error}", Out.INFO)
-            except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
-                self.ptdebug(f"Relay rejected: {label} - {e}", Out.INFO)
-            except Exception as e:
-                self.ptdebug(f"Relay rejected: {label} - {e}", Out.INFO)
+        def _reply_one_line(raw: str | bytes, limit: int = 160) -> str:
+            if isinstance(raw, str):
+                s = raw.strip().replace("\r\n", " ").replace("\n", " ")
+            else:
+                s = self.bytes_to_str(raw).strip().replace("\r\n", " ").replace("\n", " ")
+            return s if len(s) <= limit else s[: limit - 3] + "..."
+
+        def _envelope_addr(addr: str) -> str:
+            if addr == "<>":
+                return "<>"
+            if addr.startswith("<") and addr.endswith(">"):
+                return addr
+            return f"<{addr}>"
+
+        def _relay_vector(label: str, from_addr: str, to_addr: str) -> bool:
+            """Run one relay vector; return True when DATA is accepted (open relay)."""
+            mail_env = _envelope_addr(from_addr)
+            rcpt_env = _envelope_addr(to_addr)
             try:
                 smtp.docmd("RSET")
             except Exception:
                 pass
+            try:
+                mail_status, mail_reply = smtp.docmd("MAIL FROM:", mail_env)
+                mail_rep = _reply_one_line(mail_reply)
+                if verbose:
+                    self.ptdebug(
+                        f"Open relay ({label}): MAIL FROM:{mail_env} → [{mail_status}] {mail_rep}",
+                        Out.INFO,
+                    )
+                if mail_status not in (250, 251):
+                    if not verbose:
+                        self.ptdebug(
+                            f"Relay rejected: {label} — MAIL FROM [{mail_status}] {mail_rep}",
+                            Out.INFO,
+                        )
+                    return False
+
+                rcpt_status, rcpt_reply = smtp.docmd("RCPT TO:", rcpt_env)
+                rcpt_rep = _reply_one_line(rcpt_reply)
+                if verbose:
+                    self.ptdebug(
+                        f"Open relay ({label}): RCPT TO:{rcpt_env} → [{rcpt_status}] {rcpt_rep}",
+                        Out.INFO,
+                    )
+                if rcpt_status not in (250, 251, 252):
+                    if not verbose:
+                        self.ptdebug(
+                            f"Relay rejected: {label} — RCPT TO [{rcpt_status}] {rcpt_rep}",
+                            Out.INFO,
+                        )
+                    return False
+
+                data_status, data_reply = smtp.data(msg)
+                data_rep = _reply_one_line(data_reply)
+                if verbose:
+                    self.ptdebug(
+                        f"Open relay ({label}): DATA → [{data_status}] {data_rep}",
+                        Out.INFO,
+                    )
+                if data_status == 250:
+                    self.ptdebug(f"Server is vulnerable to Open relay ({label})", Out.VULN)
+                    return True
+                if not verbose:
+                    self.ptdebug(
+                        f"Relay rejected: {label} — DATA [{data_status}] {data_rep}",
+                        Out.INFO,
+                    )
+                return False
+            except smtplib.SMTPRecipientsRefused as e:
+                detail = _reply_one_line(str(e))
+                if verbose:
+                    self.ptdebug(f"Open relay ({label}): RCPT TO:{rcpt_env} → {detail}", Out.INFO)
+                else:
+                    self.ptdebug(f"Relay rejected: {label} — RCPT TO {detail}", Out.INFO)
+            except smtplib.SMTPResponseException as e:
+                code = getattr(e, "smtp_code", "?")
+                err = _reply_one_line(getattr(e, "smtp_error", b"") or str(e))
+                if verbose:
+                    self.ptdebug(f"Open relay ({label}): SMTP [{code}] {err}", Out.INFO)
+                else:
+                    self.ptdebug(f"Relay rejected: {label} — [{code}] {err}", Out.INFO)
+            except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
+                detail = _reply_one_line(str(e))
+                if verbose:
+                    self.ptdebug(f"Open relay ({label}): connection error — {detail}", Out.INFO)
+                else:
+                    self.ptdebug(f"Relay rejected: {label} — {detail}", Out.INFO)
+            except Exception as e:
+                detail = _reply_one_line(str(e))
+                if verbose:
+                    self.ptdebug(f"Open relay ({label}): error — {detail}", Out.INFO)
+                else:
+                    self.ptdebug(f"Relay rejected: {label} — {detail}", Out.INFO)
+            try:
+                smtp.docmd("RSET")
+            except Exception:
+                pass
+            return False
+
+        for label, from_addr, to_addr in vectors:
+            if _relay_vector(label, from_addr, to_addr):
+                return True
 
         self.ptdebug("Server is not vulnerable to Open relay", Out.NOTVULN)
         return False
@@ -5102,8 +5190,22 @@ class SMTP(BaseModule):
             target_domain = f"[{self.target_ip}]"
 
         ext_domain = "gmail.com"
+        mail_from = "<roletest@example.com>"
         local_rcpt = f"postmaster@{target_domain}"
         ext_rcpt = f"roletest@{ext_domain}"
+
+        def _reply_one_line(raw: str | bytes, limit: int = 160) -> str:
+            if isinstance(raw, str):
+                s = raw.strip().replace("\r\n", " ").replace("\n", " ")
+            else:
+                s = self.bytes_to_str(raw).strip().replace("\r\n", " ").replace("\n", " ")
+            return s if len(s) <= limit else s[: limit - 3] + "..."
+
+        def _log_step(step: str, status: int, reply: str | bytes) -> None:
+            self.ptdebug(
+                f"Role probe {step} → [{status}] {_reply_one_line(reply)}",
+                Out.INFO,
+            )
 
         local_auth_required: bool | None = None
         local_detail = ""
@@ -5117,8 +5219,8 @@ class SMTP(BaseModule):
 
             # 1. MAIL FROM
             try:
-                status, reply = smtp.docmd("MAIL", f"FROM:<roletest@example.com>")
-                self.ptdebug(f"Role probe MAIL FROM: {status} {self.bytes_to_str(reply)}", Out.INFO)
+                status, reply = smtp.docmd("MAIL FROM:", mail_from)
+                _log_step(f"MAIL FROM:{mail_from}", status, reply)
                 if status not in (250, 251):
                     return None, f"MAIL FROM rejected: {status} {self.bytes_to_str(reply)}"
             except Exception as e:
@@ -5126,25 +5228,26 @@ class SMTP(BaseModule):
 
             # 2. RCPT TO local domain
             try:
-                status, reply = smtp.docmd("RCPT", f"TO:<{local_rcpt}>")
+                local_env = f"<{local_rcpt}>"
+                status, reply = smtp.docmd("RCPT TO:", local_env)
                 reply_str = self.bytes_to_str(reply)
-                self.ptdebug(f"Role probe RCPT TO (local) {local_rcpt}: {status} {reply_str}", Out.INFO)
+                _log_step(f"RCPT TO (local): {local_env}", status, reply)
                 if status in (250, 251):
                     local_auth_required = False
-                    local_detail = f"RCPT TO:<{local_rcpt}> accepted without auth ({status})"
+                    local_detail = f"RCPT TO:{local_env} accepted without auth ({status})"
                 elif 530 <= status <= 535:
                     local_auth_required = True
-                    local_detail = f"RCPT TO:<{local_rcpt}> requires authentication ({status})"
+                    local_detail = f"RCPT TO:{local_env} requires authentication ({status})"
                 elif status in (550, 551, 553):
                     local_auth_required = False
-                    local_detail = f"RCPT TO:<{local_rcpt}> rejected user ({status}) but no auth required"
+                    local_detail = f"RCPT TO:{local_env} rejected user ({status}) but no auth required"
                 elif status in (450, 451, 452):
                     local_auth_required = False
-                    local_detail = f"RCPT TO:<{local_rcpt}> greylisting detected ({status}); no auth required"
+                    local_detail = f"RCPT TO:{local_env} greylisting detected ({status}); no auth required"
                 elif status == 421:
                     return None, f"Server closed connection ({status})"
                 else:
-                    local_detail = f"RCPT TO:<{local_rcpt}> unexpected response: {status} {reply_str}"
+                    local_detail = f"RCPT TO:{local_env} unexpected response: {status} {reply_str}"
             except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
                 return None, f"Connection lost during RCPT TO probe: {e}"
             except Exception as e:
@@ -5154,12 +5257,17 @@ class SMTP(BaseModule):
             if local_auth_required is False:
                 try:
                     smtp.docmd("RSET")
-                    smtp.docmd("MAIL", "FROM:<roletest@example.com>")
-                    status, reply = smtp.docmd("RCPT", f"TO:<{ext_rcpt}>")
-                    reply_str = self.bytes_to_str(reply)
-                    self.ptdebug(f"Role probe RCPT TO (ext) {ext_rcpt}: {status} {reply_str}", Out.INFO)
-                    if status in (250, 251):
-                        local_detail += f"; RCPT TO:<{ext_rcpt}> also accepted (possible open relay)"
+                    status, reply = smtp.docmd("MAIL FROM:", mail_from)
+                    _log_step(f"MAIL FROM:{mail_from}", status, reply)
+                    if status not in (250, 251):
+                        pass
+                    else:
+                        ext_env = f"<{ext_rcpt}>"
+                        status, reply = smtp.docmd("RCPT TO:", ext_env)
+                        reply_str = self.bytes_to_str(reply)
+                        _log_step(f"RCPT TO (ext): {ext_env}", status, reply)
+                        if status in (250, 251):
+                            local_detail += f"; RCPT TO:{ext_env} also accepted (possible open relay)"
                 except Exception:
                     pass
 
@@ -5421,7 +5529,7 @@ class SMTP(BaseModule):
                 self.ptdebug(text, out, title=title)
 
         mail_from_addr = (envelope_mail_from or "").strip("<>").strip() if envelope_mail_from else ""
-        mail_from_bracket = f"<{mail_from_addr}>" if mail_from_addr else "<>"
+        mail_from_bracket = self._envelope_mail_from_bracket(envelope_mail_from)
 
         def _attempt_data_send(accepted_count: int) -> tuple[bool, bool, int | None, str | None]:
             if not send_data_at_end or accepted_count <= 0:
@@ -5642,6 +5750,15 @@ class SMTP(BaseModule):
             return "from command line (-u)"
         return "from name list"
 
+    def _envelope_mail_from_bracket(self, envelope: str | None = None) -> str:
+        """SMTP ``MAIL FROM`` bracket from ``-m`` / explicit envelope, else null sender ``<>``."""
+        if envelope is not None:
+            addr = str(envelope).strip("<>").strip()
+        else:
+            raw = (getattr(self.args, "mail_from", None) or "").strip()
+            addr = raw.strip("<>").strip() if raw and "@" in raw else ""
+        return f"<{addr}>" if addr else "<>"
+
     def _rl_build_recipients_from_wordlist(self, domain: str, max_n: int) -> list[str]:
         """Build full RCPT TO addresses from in-memory name list (-u / -U) for MTA-not-relay testing.
 
@@ -5681,6 +5798,7 @@ class SMTP(BaseModule):
         smtp: smtplib.SMTP,
         domain: str,
         *,
+        envelope_mail_from: str | None = None,
         emit_debug=None,
     ) -> tuple[bool, str | None]:
         """Pre-probe: does the server accept a clearly invalid local part via RCPT TO?
@@ -5692,6 +5810,7 @@ class SMTP(BaseModule):
         ``MAIL FROM`` was rejected with a ``too much mail from`` policy response.
         """
         addr = f"{RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL}@{domain}"
+        mail_bracket = self._envelope_mail_from_bracket(envelope_mail_from)
 
         def _reply_one_line(raw: str | bytes, limit: int = 160) -> str:
             if isinstance(raw, str):
@@ -5711,15 +5830,20 @@ class SMTP(BaseModule):
         except Exception:
             pass
         try:
-            status, reply = smtp.docmd("MAIL FROM:", "<>")
-            if status != 250:
-                reply_str = self.bytes_to_str(reply)
+            status, reply = smtp.docmd("MAIL FROM:", mail_bracket)
+            reply_str = self.bytes_to_str(reply)
+            mail_rep = _reply_one_line(reply_str)
+            if status not in (250, 251):
                 rate_err = _rl_extract_too_much_mail_error(reply_str)
                 _dbg(
-                    f"Accept-all probe MAIL FROM:<> → [{status}] {_reply_one_line(reply_str)}",
+                    f"Accept-all probe MAIL FROM:{mail_bracket} → [{status}] {mail_rep}",
                     Out.INFO,
                 )
                 return False, rate_err
+            _dbg(
+                f"Accept-all probe MAIL FROM:{mail_bracket} → [{status}] {mail_rep}",
+                Out.INFO,
+            )
             status, reply = smtp.docmd("RCPT TO:", f"<{addr}>")
             reply_str = self.bytes_to_str(reply)
             _dbg(
@@ -5747,7 +5871,7 @@ class SMTP(BaseModule):
     ) -> str | None:
         """Return rate-limit text when envelope ``MAIL FROM`` is rejected with ``too much mail``."""
         mail_from_addr = (envelope_mail_from or "").strip("<>").strip() if envelope_mail_from else ""
-        mail_from_bracket = f"<{mail_from_addr}>" if mail_from_addr else "<>"
+        mail_from_bracket = self._envelope_mail_from_bracket(envelope_mail_from)
         try:
             smtp.docmd("RSET")
         except Exception:
@@ -6070,7 +6194,8 @@ class SMTP(BaseModule):
           • run on Submission only after authentication (``-u``/``-p``);
           • use real local recipients from ``-u`` / ``-U`` (valid local usernames) for an MTA that is not an open relay
             (synthetic ``1@dom`` would be rejected as "Relay denied");
-          • fall back to the original behavior for indeterminate / open-relay servers.
+          • when ``-u`` / ``-U`` is given, use that name list even if role is indeterminate or open-relay;
+          • fall back to synthetic ``1@dom`` only when role is indeterminate/open-relay and no name list was provided.
 
         When the server is an MTA-not-relay and no valid local usernames are provided via ``-u``/``-U``,
         the test ends with an explicit "skipped" verdict (no false-positive vuln).
@@ -6251,12 +6376,7 @@ class SMTP(BaseModule):
                     )
 
             elif effective_role == "indeterminate":
-                if not rate_limit_msg:
-                    self.ptprint(
-                        f"    {info_icon} Continuing with generic RCPT TO probe — "
-                        "use -U/-u for local recipients or -R to force role",
-                        Out.TEXT,
-                    )
+                pass  # recipients / hint resolved after pre-check (honour -u/-U when given)
 
             if rate_limit_msg:
                 return self._rl_rate_limited_result(
@@ -6267,6 +6387,26 @@ class SMTP(BaseModule):
                     open_relay=open_relay,
                     recipients_source=None,
                 )
+
+        if recipients is None:
+            wl_recipients = self._rl_build_recipients_from_wordlist(domain, max_rcpt_attempts)
+            if wl_recipients:
+                recipients = wl_recipients
+                recipients_source = "wordlist"
+                wl_n = len(getattr(self, "wordlist", None) or [])
+                rl_wordlist_notice = (recipients, wl_n)
+
+        if (
+            not no_precheck
+            and effective_role == "indeterminate"
+            and recipients_source == "synthetic"
+            and not rate_limit_msg
+        ):
+            self.ptprint(
+                f"    {info_icon} Continuing with generic RCPT TO probe — "
+                "use -U/-u for local recipients or -R to force role",
+                Out.TEXT,
+            )
 
         smtp: smtplib.SMTP | None = None
         auth_used = False
@@ -6314,6 +6454,7 @@ class SMTP(BaseModule):
             accept_all_via_rcpt, accept_all_rate_err = self._rl_probe_accept_all_rcpt(
                 smtp,
                 domain,
+                envelope_mail_from=envelope_mail_from,
                 emit_debug=_probe_emit_debug,
             )
             if accept_all_rate_err:
@@ -6577,12 +6718,13 @@ class SMTP(BaseModule):
         self, smtp: smtplib.SMTP, domain: str, random_local: str
     ) -> tuple[int, str, str]:
         """Score one domain: (0–100, confidence high|medium|low|none, short detail)."""
+        mail_bracket = self._envelope_mail_from_bracket()
         try:
             smtp.docmd("RSET")
         except Exception:
             pass
         try:
-            st_m, rep_m = smtp.docmd("MAIL FROM:", "<>")
+            st_m, rep_m = smtp.docmd("MAIL FROM:", mail_bracket)
         except Exception as e:
             return (0, "none", f"MAIL FROM failed: {e}")
         if st_m != 250:
@@ -6599,7 +6741,7 @@ class SMTP(BaseModule):
         except Exception:
             pass
         try:
-            st_m2, _ = smtp.docmd("MAIL FROM:", "<>")
+            st_m2, _ = smtp.docmd("MAIL FROM:", mail_bracket)
         except Exception as e:
             return (0, "none", f"MAIL FROM after RSET failed: {e}")
         if st_m2 != 250:
@@ -7700,8 +7842,15 @@ class SMTP(BaseModule):
     _MAIL_RCPT_TRANSACTION_OK = (250, 251, 252)
 
     def _mail_from_candidates_rcpt(self, domain: str) -> tuple[str, ...]:
-        """Candidates for MAIL FROM before RCPT probes: null sender (RFC 5321), same domain, legacy."""
-        return ("<>", f"<mail@{domain}>", "<mail@from.me>")
+        """Candidates for MAIL FROM before RCPT probes: ``-m`` when set, then null sender, domain, legacy."""
+        candidates: list[str] = []
+        explicit = self._envelope_mail_from_bracket()
+        if explicit != "<>":
+            candidates.append(explicit)
+        for c in ("<>", f"<mail@{domain}>", "<mail@from.me>"):
+            if c not in candidates:
+                candidates.append(c)
+        return tuple(candidates)
 
     def _try_mail_from_for_rcpt_probe(
         self, smtp: smtplib.SMTP, domain: str
@@ -7889,6 +8038,7 @@ class SMTP(BaseModule):
         CATCHALL_INVALID = ("catchallnx001", "catchallnx002", "catchallnx003")
         VRFY_EXPN_ACCEPT = (250, 251, 252)
         domain = self._get_rcpt_limit_domain()
+        mail_bracket = self._envelope_mail_from_bracket()
 
         def _choose_method() -> str | None:
             if self.results.enum_results:
@@ -7908,7 +8058,7 @@ class SMTP(BaseModule):
             except Exception:
                 pass
             try:
-                smtp.docmd("MAIL FROM:", "<>")
+                smtp.docmd("MAIL FROM:", mail_bracket)
                 status, _ = smtp.docmd("RCPT TO:", f"<catchallprobe@{domain}>")
                 if status in (250, 251, 252, 550):
                     return "rcpt"
@@ -7942,7 +8092,7 @@ class SMTP(BaseModule):
                 except Exception:
                     pass
                 try:
-                    smtp.docmd("MAIL FROM:", "<>")
+                    smtp.docmd("MAIL FROM:", mail_bracket)
                 except Exception:
                     return "indeterminate"
                 try:
@@ -14717,12 +14867,11 @@ class SMTP(BaseModule):
                 self._stream_rcpt_limit_server_response_verbose(rlim.server_response)
                 if not rl_err:
                     self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
-            else:
-                icon = self._rcpt_limit_recipient_verdict_icon(rlim.max_accepted)
-                self.ptprint(
-                    f"    {icon} Accepted recipients: {rlim.max_accepted}",
-                    Out.TEXT,
-                )
+        icon = self._rcpt_limit_recipient_verdict_icon(rlim.max_accepted)
+        self.ptprint(
+            f"    {icon} Accepted recipients: {rlim.max_accepted}",
+            Out.TEXT,
+        )
         if getattr(rlim, "limit_send_mode", False):
             ok_icon = get_colored_text("[✓]", color="NOTVULN")
             bad_icon = get_colored_text("[✗]", color="VULN")
@@ -16286,6 +16435,19 @@ class SMTP(BaseModule):
                     result.append(f"{label}{display}")
         return result
 
+    @staticmethod
+    def _bounce_replay_trace_line_clean(line: str) -> str:
+        if line.startswith("---") and line.endswith("---"):
+            return line.strip("- ").strip()
+        return line
+
+    def _bounce_replay_flat_description(self, br: BounceReplayResult) -> str:
+        if br.smtp_trace:
+            return "\r\n".join(
+                self._bounce_replay_trace_line_clean(l) for l in br.smtp_trace
+            )
+        return br.detail or "Bounce replay test"
+
     def _build_flat_description(self) -> str:
         """Build description string for flat (non-node) JSON output."""
         parts: list[str] = []
@@ -16309,7 +16471,7 @@ class SMTP(BaseModule):
         if (br_err := self.results.bounce_replay_error) is not None:
             return f"Bounce replay test error: {br_err}"
         if (br := self.results.bounce_replay) is not None:
-            return br.detail or "Bounce replay test"
+            return self._bounce_replay_flat_description(br)
         if (mb_err := self.results.mail_bomb_error) is not None:
             return f"Mail bomb test error: {mb_err}"
         if (mb := self.results.mail_bomb) is not None:
@@ -17174,23 +17336,6 @@ class SMTP(BaseModule):
                 }
             elif (id_err := self.results.identify_error) is not None:
                 props["serverIdentifyError"] = id_err
-            if (br := self.results.bounce_replay) is not None:
-                props["bounceReplay"] = {
-                    "vulnerable": br.vulnerable,
-                    "indeterminate": br.indeterminate,
-                    "messageAccepted": br.message_accepted,
-                    "messageAcceptedReturnPath": getattr(br, "message_accepted_return_path", False),
-                    "rcptRejectedInSession": br.rcpt_rejected_in_session,
-                    "bounceAddr": br.bounce_addr,
-                    "recipientUsed": br.recipient_used,
-                    "testId": br.test_id,
-                    "testIdReturnPath": getattr(br, "test_id_return_path", "") or None,
-                    "smtpTrace": list(br.smtp_trace),
-                    "tarpittingOrTimeout": br.tarpitting_or_timeout,
-                    "detail": br.detail,
-                }
-            elif (br_err := self.results.bounce_replay_error) is not None:
-                props["bounceReplayError"] = br_err
             if (mb := self.results.mail_bomb) is not None:
                 props["mailBomb"] = {
                     "vulnerable": mb.vulnerable,
@@ -17768,12 +17913,8 @@ class SMTP(BaseModule):
         if (br_err := self.results.bounce_replay_error) is not None:
             properties.update({"bounceReplayError": br_err})
         elif (br := self.results.bounce_replay) is not None:
-            def _trace_line_clean(line: str) -> str:
-                if line.startswith("---") and line.endswith("---"):
-                    return line.strip("- ").strip()
-                return line
             br_description = (
-                "\r\n".join(_trace_line_clean(l) for l in br.smtp_trace)
+                "\r\n".join(self._bounce_replay_trace_line_clean(l) for l in br.smtp_trace)
                 if br.smtp_trace else None
             )
             br_props: dict = {

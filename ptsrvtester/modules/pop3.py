@@ -5,10 +5,10 @@ from enum import Enum
 from typing import NamedTuple
 
 from ptlibs.ptjsonlib import PtJsonLib
-from ptlibs.ptprinthelper import get_colored_text
 from ..ptntlmauth.ptntlmauth import NTLMInfo, get_NegotiateMessage_data, decode_ChallengeMessage_blob
 
 from ._base import BaseModule, BaseArgs, Out
+from .utils import ptprinthelper
 from .utils.helpers import (
     Target,
     Creds,
@@ -89,6 +89,14 @@ def _parse_capa_commands(
         result.append(("STLS (is not allowed)", "ERROR"))
 
     return result
+
+
+def _capa_level_bullet(level: str) -> str:
+    if level == "ERROR":
+        return "VULN"
+    if level == "WARNING":
+        return "WARNING"
+    return "NOTVULN"
 
 
 # region data classes
@@ -286,14 +294,6 @@ class POP3(BaseModule):
         self.results: POP3Results
         self.pop3: poplib.POP3
         self._output_lock = threading.Lock()
-        self._streamed_banner = False
-        self._streamed_capa = False
-        self._streamed_help_info = False
-        self._streamed_encryption = False
-        self._streamed_catch_all = False
-        self._streamed_brute = False
-        self._streamed_anonymous = False
-        self._streamed_ntlm = False
 
     def _is_default_mode(self) -> bool:
         """True when only target is given (no test switches). Run basic info + anonymous + encryption."""
@@ -415,6 +415,7 @@ class POP3(BaseModule):
                 self.results.encryption = self.test_encryption()
             except Exception as e:
                 self.results.encryption_error = str(e)
+            self.ptprint("Encryption", Out.INFO)
             self._stream_encryption_result()
             return
 
@@ -432,6 +433,7 @@ class POP3(BaseModule):
         if self._is_default_mode():
             # Only target given: run basic tests, stream immediately after each
             self.results.info = self.info(get_commands=True)
+            self.ptprint("Banner", Out.INFO)
             self._stream_banner_result()
             self._stream_capa_result()
             if self.args.target.port == 995:
@@ -446,10 +448,13 @@ class POP3(BaseModule):
                 self.results.encryption = EncryptionResult(
                     plaintext_ok=True, stls_ok=False, tls_ok=False
                 )
+            self.ptprint("Encryption", Out.INFO)
             self._stream_encryption_result()
             self.results.anonymous = self.auth_anonymous()
+            self.ptprint("Anonymous authentication", Out.INFO)
             self._stream_anonymous_result()
             self.results.help_info = self._do_help_info(self.pop3)
+            self.ptprint("Help/Implementation info", Out.INFO)
             self._stream_help_info_result()
             return
 
@@ -464,11 +469,14 @@ class POP3(BaseModule):
                 info.capability if do_commands else None,
                 getattr(info, "capability_stls", None) if do_commands else None,
             )
+            if do_banner:
+                self.ptprint("Banner", Out.INFO)
             self._stream_banner_result()
             self._stream_capa_result()
 
         if self.args.help_info:
             self.results.help_info = self._do_help_info(self.pop3)
+            self.ptprint("Help/Implementation info", Out.INFO)
             self._stream_help_info_result()
 
         if self.args.isencrypt:
@@ -476,13 +484,16 @@ class POP3(BaseModule):
                 self.results.encryption = self.test_encryption()
             except Exception as e:
                 self.results.encryption_error = str(e)
+            self.ptprint("Encryption", Out.INFO)
             self._stream_encryption_result()
 
         if self.args.ntlm:
+            self.ptprint("NTLM information", Out.INFO)
             self.results.ntlm = self.auth_ntlm()
             self._stream_ntlm_result()
 
         if self.args.anonymous:
+            self.ptprint("Anonymous authentication", Out.INFO)
             self.results.anonymous = self.auth_anonymous()
             self._stream_anonymous_result()
 
@@ -497,14 +508,15 @@ class POP3(BaseModule):
                     self.results.info = silent
                     self.results.banner_requested = True
                     self.results.commands_requested = True
+                    self.ptprint("Banner", Out.INFO)
                     self._stream_banner_result()
                     self._stream_capa_result()
 
             self.results.catch_all = self._test_catch_all()
+            self.ptprint("Catch-all test", Out.INFO)
             self._stream_catch_all_result()
 
-            if not self.use_json:
-                self.ptprint("Login bruteforce", Out.INFO)
+            self.ptprint("Login bruteforce", Out.INFO)
             self.results.creds = simple_bruteforce(
                 self._try_login,
                 self.args.user,
@@ -725,104 +737,88 @@ class POP3(BaseModule):
     def _on_brute_success(self, cred: Creds) -> None:
         """Callback for real-time streaming of found credentials (thread-safe)."""
         with self._output_lock:
-            self.ptprint(f"    user: {cred.user}, password: {cred.passw}", Out.TEXT)
+            ptprinthelper.ptprint(
+                f"user: {cred.user}, password: {cred.passw}",
+                bullet_type="TEXT",
+                condition=not self.use_json,
+                indent=4,
+            )
 
     def _stream_banner_result(self) -> None:
         """Stream banner + Service Identification immediately (thread-safe)."""
-        if self.use_json:
-            return
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if not (info := self.results.info) or info.banner is None:
             return
         with self._output_lock:
-            self.ptprint("Banner", Out.INFO)
             sid = identify_service(info.banner)
             if sid is None:
-                icon = get_colored_text("[✓]", color="NOTVULN")
+                banner_bullet = "NOTVULN"
             elif sid.version is not None:
-                icon = get_colored_text("[✗]", color="VULN")
+                banner_bullet = "VULN"
             else:
-                icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
+                banner_bullet = "WARNING"
+            pp(info.banner, bullet_type=banner_bullet, condition=show, indent=4)
             if sid is not None:
                 self.ptprint("Service Identification", Out.INFO)
-                self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
-                self.ptprint(
-                    f"    Version:  {sid.version if sid.version else 'unknown'}",
-                    Out.TEXT,
+                pp(f"Product:  {sid.product}", bullet_type="TEXT", condition=show, indent=4)
+                pp(
+                    f"Version:  {sid.version if sid.version else 'unknown'}",
+                    bullet_type="TEXT",
+                    condition=show,
+                    indent=4,
                 )
-                self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
-        self._streamed_banner = True
+                pp(f"CPE:      {sid.cpe}", bullet_type="TEXT", condition=show, indent=4)
+
+    def _emit_capa_section(
+        self, title: str, capa: dict[str, list[str]], connection_encrypted: bool
+    ) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
+        self.ptprint(title, Out.INFO)
+        for display_str, level in _parse_capa_commands(capa, connection_encrypted):
+            pp(display_str, bullet_type=_capa_level_bullet(level), condition=show, indent=4)
 
     def _stream_capa_result(self) -> None:
         """Stream CAPA capabilities immediately (thread-safe)."""
-        if self.use_json:
-            return
         if not (info := self.results.info) or not (info.capability or getattr(info, "capability_stls", None)):
             return
         capa_stls = getattr(info, "capability_stls", None)
         encrypted = self.args.target.port == 995 or self.args.tls
         with self._output_lock:
             if info.capability is not None and capa_stls is not None:
-                self.ptprint("CAPA command (PLAIN)", Out.INFO)
-                for display_str, level in _parse_capa_commands(info.capability, False):
-                    icon = get_colored_text("[✗]", color="VULN") if level == "ERROR" else (
-                        get_colored_text("[!]", color="WARNING") if level == "WARNING"
-                        else get_colored_text("[✓]", color="NOTVULN")
-                    )
-                    self.ptprint(f"    {icon} {display_str}", Out.TEXT)
-                self.ptprint("CAPA command (STLS)", Out.INFO)
-                for display_str, level in _parse_capa_commands(capa_stls, True):
-                    icon = get_colored_text("[✗]", color="VULN") if level == "ERROR" else (
-                        get_colored_text("[!]", color="WARNING") if level == "WARNING"
-                        else get_colored_text("[✓]", color="NOTVULN")
-                    )
-                    self.ptprint(f"    {icon} {display_str}", Out.TEXT)
+                self._emit_capa_section("CAPA command (PLAIN)", info.capability, False)
+                self._emit_capa_section("CAPA command (STLS)", capa_stls, True)
             elif info.capability is not None:
                 title = "CAPA command (TLS)" if encrypted else "CAPA command (PLAIN)"
-                self.ptprint(title, Out.INFO)
-                for display_str, level in _parse_capa_commands(info.capability, encrypted):
-                    icon = get_colored_text("[✗]", color="VULN") if level == "ERROR" else (
-                        get_colored_text("[!]", color="WARNING") if level == "WARNING"
-                        else get_colored_text("[✓]", color="NOTVULN")
-                    )
-                    self.ptprint(f"    {icon} {display_str}", Out.TEXT)
-        self._streamed_capa = True
+                self._emit_capa_section(title, info.capability, encrypted)
 
     def _stream_help_info_result(self) -> None:
         """Stream HELP and IMPLEMENTATION info disclosure result (thread-safe)."""
-        if self.use_json:
-            return
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         hi = self.results.help_info
         if hi is None:
             return
         with self._output_lock:
-            self.ptprint("Help/Implementation info", Out.INFO)
             if hi.help_response is not None:
-                icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(f"    {icon} HELP:", Out.TEXT)
+                pp("HELP:", bullet_type="WARNING", condition=show, indent=4)
                 for line in hi.help_response.splitlines():
-                    self.ptprint(f"        {line}", Out.TEXT)
+                    pp(line, bullet_type="TEXT", condition=show, indent=8)
             else:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} HELP: not supported", Out.TEXT)
+                pp("HELP: not supported", bullet_type="NOTVULN", condition=show, indent=4)
             if hi.implementation is not None:
-                icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(f"    {icon} IMPLEMENTATION: {hi.implementation}", Out.TEXT)
+                pp(f"IMPLEMENTATION: {hi.implementation}", bullet_type="WARNING", condition=show, indent=4)
             else:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} IMPLEMENTATION: not advertised in CAPA", Out.TEXT)
-        self._streamed_help_info = True
+                pp("IMPLEMENTATION: not advertised in CAPA", bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_encryption_result(self) -> None:
         """Stream encryption test result to terminal (thread-safe)."""
-        if self.use_json:
-            return
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         with self._output_lock:
-            self.ptprint("Encryption", Out.INFO)
             if (encryption_error := self.results.encryption_error) is not None:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Encryption test failed: {encryption_error}", Out.TEXT)
-                self._streamed_encryption = True
+                pp(f"Encryption test failed: {encryption_error}", bullet_type="VULN", condition=show, indent=4)
                 return
             enc = self.results.encryption
             if enc is None:
@@ -830,100 +826,99 @@ class POP3(BaseModule):
             plaintext_only = enc.plaintext_ok and not enc.stls_ok and not enc.tls_ok
             any_ok = enc.plaintext_ok or enc.stls_ok or enc.tls_ok
             if plaintext_only:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Plaintext only", Out.TEXT)
+                pp("Plaintext only", bullet_type="VULN", condition=show, indent=4)
             elif any_ok:
                 if enc.plaintext_ok:
-                    icon = (
-                        get_colored_text("[!]", color="WARNING")
-                        if (enc.stls_ok or enc.tls_ok)
-                        else get_colored_text("[✓]", color="NOTVULN")
-                    )
-                    self.ptprint(f"    {icon} Plaintext", Out.TEXT)
+                    bullet = "WARNING" if (enc.stls_ok or enc.tls_ok) else "NOTVULN"
+                    pp("Plaintext", bullet_type=bullet, condition=show, indent=4)
                 if enc.stls_ok:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} STLS", Out.TEXT)
+                    pp("STLS", bullet_type="NOTVULN", condition=show, indent=4)
                 if enc.tls_ok:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} TLS", Out.TEXT)
+                    pp("TLS", bullet_type="NOTVULN", condition=show, indent=4)
             else:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(
-                    f"    {icon} No connection mode available (plaintext, STLS, TLS failed)",
-                    Out.TEXT,
+                pp(
+                    "No connection mode available (plaintext, STLS, TLS failed)",
+                    bullet_type="VULN",
+                    condition=show,
+                    indent=4,
                 )
-        self._streamed_encryption = True
 
     def _stream_catch_all_result(self) -> None:
         """Stream catch-all test result immediately (thread-safe)."""
-        if self.use_json:
-            return
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         catch_all = getattr(self.results, "catch_all", None)
         if catch_all is None:
             return
         with self._output_lock:
-            self.ptprint("Catch-all test", Out.INFO)
             if catch_all == "indeterminate":
-                icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(
-                    f"    {icon} Server accepted invalid credentials (indeterminate). Results may be false positives.",
-                    Out.TEXT,
+                pp(
+                    "Server accepted invalid credentials (indeterminate). Results may be false positives.",
+                    bullet_type="WARNING",
+                    condition=show,
+                    indent=4,
                 )
             else:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} Not configured (server rejects invalid creds)", Out.TEXT)
-        self._streamed_catch_all = True
+                pp("Not configured (server rejects invalid creds)", bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_anonymous_result(self) -> None:
         """Stream anonymous auth result immediately (thread-safe)."""
-        if self.use_json:
-            return
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (anonymous := self.results.anonymous) is None:
             return
         with self._output_lock:
-            self.ptprint("Anonymous authentication", Out.INFO)
             if anonymous:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Enabled", Out.TEXT)
+                pp("Enabled", bullet_type="VULN", condition=show, indent=4)
             else:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} Disabled", Out.TEXT)
-        self._streamed_anonymous = True
+                pp("Disabled", bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_ntlm_result(self) -> None:
         """Stream NTLM info result immediately (thread-safe)."""
-        if self.use_json:
-            return
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (ntlm := self.results.ntlm) is None:
             return
         with self._output_lock:
-            self.ptprint("NTLM information", Out.INFO)
             if not ntlm.success:
-                self.ptprint("    NTLM information failed", Out.TEXT)
+                pp("Not available", bullet_type="NOTVULN", condition=show, indent=4)
             elif ntlm.ntlm is not None:
-                self.ptprint(f"    Target name: {ntlm.ntlm.target_name}", Out.TEXT)
-                self.ptprint(f"    NetBios domain name: {ntlm.ntlm.netbios_domain}", Out.TEXT)
-                self.ptprint(f"    NetBios computer name: {ntlm.ntlm.netbios_computer}", Out.TEXT)
-                self.ptprint(f"    DNS domain name: {ntlm.ntlm.dns_domain}", Out.TEXT)
-                self.ptprint(f"    DNS computer name: {ntlm.ntlm.dns_computer}", Out.TEXT)
-                self.ptprint(f"    DNS tree: {ntlm.ntlm.dns_tree}", Out.TEXT)
-                self.ptprint(f"    OS version: {ntlm.ntlm.os_version}", Out.TEXT)
-        self._streamed_ntlm = True
+                pp("NTLM information", bullet_type="VULN", condition=show, indent=4)
+                for line in (
+                    f"Target name: {ntlm.ntlm.target_name}",
+                    f"NetBios domain name: {ntlm.ntlm.netbios_domain}",
+                    f"NetBios computer name: {ntlm.ntlm.netbios_computer}",
+                    f"DNS domain name: {ntlm.ntlm.dns_domain}",
+                    f"DNS computer name: {ntlm.ntlm.dns_computer}",
+                    f"DNS tree: {ntlm.ntlm.dns_tree}",
+                    f"OS version: {ntlm.ntlm.os_version}",
+                ):
+                    for part in (line or "").replace("\r", "").splitlines():
+                        pp(part, bullet_type="TEXT", condition=show, indent=8)
 
     def _stream_brute_result(self) -> None:
         """Stream brute-force summary (credentials already streamed via on_success) (thread-safe)."""
         creds = self.results.creds
-        if creds is None:
+        if creds is None or len(creds) == 0:
             return
-        if not self.use_json and len(creds) > 0:
-            with self._output_lock:
-                self.ptprint(f"    Found {len(creds)} valid credentials", Out.INFO)
-        self._streamed_brute = True
+        with self._output_lock:
+            ptprinthelper.ptprint(
+                f"Found {len(creds)} valid credentials",
+                bullet_type="INFO",
+                condition=not self.use_json,
+                indent=4,
+            )
 
     # region output
 
     def output(self) -> None:
-        """Formats and outputs module results, both normal and JSON mode"""
+        """Build JSON node(s) and print result. Terminal output is streamed from run()."""
+        if (info_error := getattr(self.results, "info_error", None)) is not None:
+            if self.use_json:
+                self.ptjsonlib.end_error(info_error, self.use_json)
+            ptprinthelper.ptprint(info_error, bullet_type="VULN", condition=not self.use_json, indent=4)
+            return
+
         properties = {
             "software_type": None,
             "name": "pop3",
@@ -933,23 +928,6 @@ class POP3(BaseModule):
         }
         deferred_vulns = []
 
-        # Connection error: use unified error format (status=error, empty nodes)
-        if (info_error := getattr(self.results, "info_error", None)) is not None:
-            if self.use_json:
-                self.ptjsonlib.end_error(info_error, self.use_json)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-            properties.update({"infoError": info_error})
-            pop3_node = self.ptjsonlib.create_node_object("software", None, None, properties)
-            self.ptjsonlib.add_node(pop3_node)
-            node_key = pop3_node["key"]
-            for v in deferred_vulns:
-                self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
-            self.ptjsonlib.set_status("finished", "")
-            self.ptprint(self.ptjsonlib.get_result_json(), json=True)
-            return
-
-        # Banner (skip terminal output if already streamed; always add to properties for JSON)
         if (info := self.results.info) and info.banner is not None:
             sid = identify_service(info.banner)
             vendor = vendor_from_cpe(sid.cpe) if sid else None
@@ -965,25 +943,7 @@ class POP3(BaseModule):
                 if sid.version is not None:
                     deferred_vulns.append({"vuln_code": "PTV-SVC-BANNER"})
                 properties.update({"cpe": sid.cpe})
-            if not self.use_json and not self._streamed_banner:
-                self.ptprint("Banner", Out.INFO)
-                if sid is None:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                elif sid.version is not None:
-                    icon = get_colored_text("[✗]", color="VULN")
-                else:
-                    icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
-                if sid is not None:
-                    self.ptprint("Service Identification", Out.INFO)
-                    self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
-                    self.ptprint(
-                        f"    Version:  {sid.version if sid.version else 'unknown'}",
-                        Out.TEXT,
-                    )
-                    self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
 
-        # CAPA command (skip terminal output if streamed; always add to properties for JSON)
         if (info := self.results.info) and (info.capability or getattr(info, "capability_stls", None)):
             capa_stls = getattr(info, "capability_stls", None)
             encrypted = self.args.target.port == 995 or self.args.tls
@@ -999,53 +959,14 @@ class POP3(BaseModule):
             if json_lines:
                 properties.update({"capability": "\n".join(json_lines)})
 
-            if not self.use_json and not self._streamed_capa:
-                def _emit_capa_section(title: str, capa: dict[str, list[str]], connection_encrypted: bool) -> None:
-                    self.ptprint(title, Out.INFO)
-                    for display_str, level in _parse_capa_commands(capa, connection_encrypted=connection_encrypted):
-                        icon = get_colored_text("[✗]", color="VULN") if level == "ERROR" else (
-                            get_colored_text("[!]", color="WARNING") if level == "WARNING"
-                            else get_colored_text("[✓]", color="NOTVULN")
-                        )
-                        self.ptprint(f"    {icon} {display_str}", Out.TEXT)
-
-                if info.capability is not None and capa_stls is not None:
-                    _emit_capa_section("CAPA command (PLAIN)", info.capability, False)
-                    _emit_capa_section("CAPA command (STLS)", capa_stls, True)
-                elif info.capability is not None:
-                    title = "CAPA command (TLS)" if encrypted else "CAPA command (PLAIN)"
-                    _emit_capa_section(title, info.capability, encrypted)
-
-        # Help/Implementation info (skip terminal output if streamed; always add to properties for JSON)
         if (hi := self.results.help_info) is not None:
             if hi.help_response is not None:
                 properties.update({"helpCommand": hi.help_response})
             if hi.implementation is not None:
                 properties.update({"implementation": hi.implementation})
-            if not self.use_json and not self._streamed_help_info:
-                self.ptprint("Help/Implementation info", Out.INFO)
-                if hi.help_response is not None:
-                    icon = get_colored_text("[!]", color="WARNING")
-                    self.ptprint(f"    {icon} HELP:", Out.TEXT)
-                    for line in hi.help_response.splitlines():
-                        self.ptprint(f"        {line}", Out.TEXT)
-                else:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} HELP: not supported", Out.TEXT)
-                if hi.implementation is not None:
-                    icon = get_colored_text("[!]", color="WARNING")
-                    self.ptprint(f"    {icon} IMPLEMENTATION: {hi.implementation}", Out.TEXT)
-                else:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} IMPLEMENTATION: not advertised in CAPA", Out.TEXT)
 
-        # Encryption (skip terminal output if streamed; always add to properties for JSON)
         if (encryption_error := self.results.encryption_error) is not None:
             properties.update({"encryptionError": encryption_error})
-            if not self.use_json and not self._streamed_encryption:
-                self.ptprint("Encryption", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Encryption test failed: {encryption_error}", Out.TEXT)
         elif (enc := self.results.encryption) is not None:
             properties.update(
                 {
@@ -1056,56 +977,18 @@ class POP3(BaseModule):
                     }
                 }
             )
-            if not self.use_json and not self._streamed_encryption:
-                self.ptprint("Encryption", Out.INFO)
-                plaintext_only = enc.plaintext_ok and not enc.stls_ok and not enc.tls_ok
-                any_ok = enc.plaintext_ok or enc.stls_ok or enc.tls_ok
-                if plaintext_only:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(f"    {icon} Plaintext only", Out.TEXT)
-                elif any_ok:
-                    if enc.plaintext_ok:
-                        icon = (
-                            get_colored_text("[!]", color="WARNING")
-                            if (enc.stls_ok or enc.tls_ok)
-                            else get_colored_text("[✓]", color="NOTVULN")
-                        )
-                        self.ptprint(f"    {icon} Plaintext", Out.TEXT)
-                    if enc.stls_ok:
-                        icon = get_colored_text("[✓]", color="NOTVULN")
-                        self.ptprint(f"    {icon} STLS", Out.TEXT)
-                    if enc.tls_ok:
-                        icon = get_colored_text("[✓]", color="NOTVULN")
-                        self.ptprint(f"    {icon} TLS", Out.TEXT)
-                else:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(
-                        f"    {icon} No connection mode available (plaintext, STLS, TLS failed)",
-                        Out.TEXT,
-                    )
 
-        # Anonymous (skip if streamed; always add vuln to deferred for JSON)
-        if (anonymous := self.results.anonymous) is not None:
-            if anonymous:
-                deferred_vulns.append(
-                    {"vuln_code": VULNS.Anonymous.value, "vuln_request": "anonymous authentication"}
-                )
-            if not self.use_json and not self._streamed_anonymous:
-                self.ptprint("Anonymous authentication", Out.INFO)
-                if anonymous:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(f"    {icon} Enabled", Out.TEXT)
-                else:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} Disabled", Out.TEXT)
+        if (anonymous := self.results.anonymous) is not None and anonymous:
+            deferred_vulns.append(
+                {"vuln_code": VULNS.Anonymous.value, "vuln_request": "anonymous authentication"}
+            )
 
-        # NTLM (skip if streamed; always add to properties and deferred for JSON)
         if ntlm := self.results.ntlm:
             if not ntlm.success:
                 properties.update({"ntlmInfoStatus": "failed"})
             elif ntlm.ntlm is not None:
                 properties.update({"ntlmInfoStatus": "ok"})
-                out_lines: list[str] = [
+                out_lines = [
                     f"Target name: {ntlm.ntlm.target_name}",
                     f"NetBios domain name: {ntlm.ntlm.netbios_domain}",
                     f"NetBios computer name: {ntlm.ntlm.netbios_computer}",
@@ -1121,32 +1004,12 @@ class POP3(BaseModule):
                         "vuln_response": "\n".join(out_lines),
                     }
                 )
-            if not self.use_json and not self._streamed_ntlm:
-                self.ptprint("NTLM information", Out.INFO)
-                if not ntlm.success:
-                    self.ptprint("    NTLM information failed", Out.TEXT)
-                elif ntlm.ntlm is not None:
-                    for line in [
-                        f"Target name: {ntlm.ntlm.target_name}",
-                        f"NetBios domain name: {ntlm.ntlm.netbios_domain}",
-                        f"NetBios computer name: {ntlm.ntlm.netbios_computer}",
-                        f"DNS domain name: {ntlm.ntlm.dns_domain}",
-                        f"DNS computer name: {ntlm.ntlm.dns_computer}",
-                        f"DNS tree: {ntlm.ntlm.dns_tree}",
-                        f"OS version: {ntlm.ntlm.os_version}",
-                    ]:
-                        self.ptprint(f"    {line}", Out.TEXT)
 
-        # Catch-all / indeterminate (when brute was run)
-        if (catch_all := getattr(self.results, "catch_all", None)) is not None:
-            if catch_all == "indeterminate":
-                properties.update({"catchAll": "indeterminate"})
+        if (catch_all := getattr(self.results, "catch_all", None)) == "indeterminate":
+            properties.update({"catchAll": "indeterminate"})
 
-        # Login bruteforce (skip terminal output if streamed; always add to deferred for JSON)
         if (creds := self.results.creds) is not None and len(creds) > 0:
-            json_lines: list[str] = [
-                f"user: {cred.user}, password: {cred.passw}" for cred in creds
-            ]
+            json_lines = [f"user: {cred.user}, password: {cred.passw}" for cred in creds]
             if self.args.user is not None:
                 user_str = f"username: {self.args.user}"
             else:
@@ -1163,13 +1026,7 @@ class POP3(BaseModule):
                 }
             )
 
-        # Create node at the end with all collected properties and bind vulnerabilities
-        pop3_node = self.ptjsonlib.create_node_object(
-            "software",
-            None,
-            None,
-            properties,
-        )
+        pop3_node = self.ptjsonlib.create_node_object("software", None, None, properties)
         self.ptjsonlib.add_node(pop3_node)
         node_key = pop3_node["key"]
         for v in deferred_vulns:

@@ -20,7 +20,8 @@ except ImportError:
     NtlmContext = None
 
 from ._base import BaseModule, BaseArgs, Out
-from ptlibs.ptprinthelper import get_colored_text
+from .utils import ptprinthelper
+from .utils.ptprinthelper import get_colored_text
 from .utils.helpers import (
     Target,
     Creds,
@@ -491,6 +492,9 @@ RCPT_LIMIT_POSTHIT_PROBE_COUNT = 20
 RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT = 500
 # Pre-probe local part for accept-all / catch-all detection via RCPT TO (before -rl storm).
 RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL = "xxxfoofff"
+# -id RCPT error-syntax probe (invalid recipient; throwaway MAIL FROM).
+_ID_RCPT_ERROR_MAIL_FROM = "probe@probe.invalid"
+_ID_RCPT_ERROR_RCPT = "nonexistent-local@invalid.invalid"
 # Client IP rate limit (Postfix and similar): 450 4.7.1 Error: too much mail from <ip>
 _RL_TOO_MUCH_MAIL_RE = re.compile(
     r"4\.7\.1\s+Error:\s+too much mail from\s+[\da-fA-F:.]+",
@@ -1157,6 +1161,7 @@ class AntivirusCategoryResult(NamedTuple):
     error: int
     smtp_trace: tuple[str, ...]
     detail: str | None
+    message_summary: tuple[str, ...] = ()
 
 
 class AntivirusResult(NamedTuple):
@@ -1178,6 +1183,7 @@ class SsrfVariantResult(NamedTuple):
     error: int
     smtp_trace: tuple[str, ...]
     detail: str | None
+    message_summary: tuple[str, ...] = ()
 
 
 class SsrfResult(NamedTuple):
@@ -1199,6 +1205,7 @@ class ZipxxeVariantResult(NamedTuple):
     error: int
     smtp_trace: tuple[str, ...]
     detail: str | None
+    message_summary: tuple[str, ...] = ()
 
 
 class ZipxxeResult(NamedTuple):
@@ -1245,6 +1252,7 @@ class BccTestResult(NamedTuple):
     elapsed_sec: float
     detail: str | None
     verification_instructions: str
+    smtp_trace: tuple[str, ...]
 
 
 class AliasVariantResult(NamedTuple):
@@ -1258,6 +1266,7 @@ class AliasVariantResult(NamedTuple):
     smtp_reply: str | None
     detail: str | None
     uucp_warning: bool  # True when bang_simple accepted – warn about UUCP/relay risk
+    smtp_trace: tuple[str, ...]
 
 
 class AliasTestResult(NamedTuple):
@@ -1554,8 +1563,8 @@ class SMTPArgs(ArgsWithBruteforce):
             ]},
             {"options": [
                 ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
-                ["-id", "--identify", "", "Identify SMTP server software from typical responses"],
-                ["", "--id-aggressive", "", "Enhanced fingerprinting via VRFY/EXPN and RFC-edge probing (may trigger WAF/IDS)"],
+                ["-id", "--identify", "", "Identify SMTP server software from typical responses (banner, EHLO, HELP, RCPT error syntax, TLS)"],
+                ["", "--id-aggressive", "", "Enhanced fingerprinting via VRFY, unknown commands (FOOBAR), and RFC-edge probing (may trigger WAF/IDS)"],
                 ["-c", "--commands", "", "Grab EHLO (alias for -A, different JSON)"],
                 ["-A", "--authentications", "", "Grab EHLO (alias for -c, different JSON)"],
                 ["-af", "--auth-format", "", "AUTH LOGIN identity shape probe (username vs e-mail vs NetBIOS)"],
@@ -2422,7 +2431,6 @@ class SMTP(BaseModule):
 
         self.args = args
         self._brute_stream_lock = threading.Lock()
-        self._streamed_ptr_domain = False
         self.results: SMTPResults
 
     def _is_run_all_mode(self) -> bool:
@@ -3711,13 +3719,16 @@ class SMTP(BaseModule):
             self.results.ntlm_error = str(e)
         self._stream_ntlm_result()
 
-    def connect(self, timeout: float = 15.0) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL, int, bytes]:
+    def connect(self, timeout: float = 15.0, *, fatal: bool = True) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL, int, bytes]:
         """Port 465 is implicit TLS only (SMTPS), so we use TLS even without --tls.
         For IP targets we connect manually with server_hostname=None so SNI does not break.
 
         timeout controls the socket read/write deadline for all operations on the
         returned SMTP object.  Callers that need a non-default value (e.g. enumeration
-        uses 30 s; retry after server silence uses 10 s) pass it explicitly."""
+        uses 30 s; retry after server silence uses 10 s) pass it explicitly.
+
+        When ``fatal`` is False the caller receives :class:`ConnectionError` instead of
+        ``end_error`` / process exit — used by threaded AUTH-ENUM probes."""
         try:
             if self.args.tls or self.args.target.port == 465:
                 ctx = ssl._create_unverified_context()
@@ -3763,7 +3774,9 @@ class SMTP(BaseModule):
             )
             if self.args.target.port == 587 and not self.args.starttls and "refused" in str(e).lower():
                 msg += " (port 587 typically requires --starttls)"
-            self._fail(msg)
+            if fatal:
+                self._fail(msg)
+            raise ConnectionError(msg) from e
 
     def _connect_silent(self, timeout: float = 15.0, send_ehlo: bool = True) -> smtplib.SMTP:
         """Like connect() but NEVER calls _fail() – raises plain Exception on failure.
@@ -3927,15 +3940,14 @@ class SMTP(BaseModule):
             return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
 
         def _print_verdict(is_vuln: bool, text: str) -> None:
-            if is_vuln:
-                icon = get_colored_text("[✗]", color="VULN")
-            else:
-                icon = get_colored_text("[OK]", color="NOTVULN")
-            self.ptprint(f"        {icon} {text}", Out.TEXT)
+            ptprinthelper.ptprint(
+                text, bullet_type="VULN" if is_vuln else "NOTVULN",
+                condition=not self.use_json, indent=8,
+            )
 
         def _print_info(text: str) -> None:
-            icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(f"        {icon} {text}", Out.TEXT)
+            ptprinthelper.ptprint(text, bullet_type="TITLE",
+                                  condition=not self.use_json, indent=8)
 
         # ── Background watcher: blocks on socket.recv() until the server
         # closes / replies (or the cap is reached) and records the elapsed time.
@@ -4077,11 +4089,10 @@ class SMTP(BaseModule):
         if banned and connected >= RATE_LIMIT_CONN_VULN_THRESHOLD:
             _print_info(f"You are banned when {connected} threads was connected")
         elif not banned:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(
-                f"        {icon} No blocking occurred despite a large number of "
+            ptprinthelper.ptprint(
+                f"No blocking occurred despite a large number of "
                 f"established connections ({connected} connections are active)",
-                Out.TEXT,
+                bullet_type="VULN", condition=not self.use_json, indent=8,
             )
 
         if connected >= RATE_LIMIT_CONN_VULN_THRESHOLD:
@@ -4739,12 +4750,13 @@ class SMTP(BaseModule):
         # Ramp-up statistics (always visible). The storm treats the *live* pool
         # as 100% — a 100% error rate over 50 live sockets is a different story
         # from 100% errors over 50 sockets that were already gone.
-        info_icon = get_colored_text("[*]", color="INFO")
-        self.ptprint(f"    {info_icon} Established {established} connections", Out.TEXT)
-        self.ptprint(f"    {info_icon} Errors {est_err} connections", Out.TEXT)
-        self.ptprint(f"    {info_icon} Refused at connect {est_disc} connections", Out.TEXT)
-        self.ptprint(f"    {info_icon} Timeout {est_timeout} connections", Out.TEXT)
-        self.ptprint(f"    {info_icon} Dropped while idle {reaped} connections", Out.TEXT)
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
+        pp(f"Established {established} connections", bullet_type="TITLE", condition=show, indent=4)
+        pp(f"Errors {est_err} connections", bullet_type="TITLE", condition=show, indent=4)
+        pp(f"Refused at connect {est_disc} connections", bullet_type="TITLE", condition=show, indent=4)
+        pp(f"Timeout {est_timeout} connections", bullet_type="TITLE", condition=show, indent=4)
+        pp(f"Dropped while idle {reaped} connections", bullet_type="TITLE", condition=show, indent=4)
 
         if storm_pool == 0:
             # Every established socket was already closed before we could storm.
@@ -5469,11 +5481,10 @@ class SMTP(BaseModule):
         }.get(source, source)
 
     def _stream_rcpt_limit_domain_source(self, domain: str, source: str) -> None:
-        info_icon = get_colored_text("[*]", color="INFO")
         src = self._rl_domain_source_phrase(source)
-        self.ptprint(
-            f"    {info_icon} Domain derived from {src}: {domain}",
-            Out.TEXT,
+        ptprinthelper.ptprint(
+            f"Domain derived from {src}: {domain}",
+            bullet_type="TITLE", condition=not self.use_json, indent=4,
         )
 
     def _rcpt_limit_section_title(self) -> str:
@@ -5900,8 +5911,7 @@ class SMTP(BaseModule):
         recipients_source: str | None,
     ) -> RcptLimitResult:
         """Early exit when the server blocks this client with ``too much mail from``."""
-        bad_icon = get_colored_text("[✗]", color="VULN")
-        self.ptprint(f"    {bad_icon} {message}", Out.TEXT)
+        ptprinthelper.ptprint(message, bullet_type="VULN", condition=not self.use_json, indent=4)
         return RcptLimitResult(
             max_accepted=0,
             limit_triggered=False,
@@ -6021,16 +6031,16 @@ class SMTP(BaseModule):
         auth_required: bool | None,
     ) -> None:
         """Print ``[*] Role: …`` immediately after role identification (-rl / -rls pre-check)."""
-        info_icon = get_colored_text("[*]", color="INFO")
+        show = not self.use_json
         if effective_role is not None:
-            self.ptprint(
-                f"    {info_icon} {self._rl_role_label(effective_role, self.args.target.port, auth_required, rcpt_limit_submission=(effective_role == 'submission'))}",
-                Out.TEXT,
+            ptprinthelper.ptprint(
+                self._rl_role_label(effective_role, self.args.target.port, auth_required, rcpt_limit_submission=(effective_role == 'submission')),
+                bullet_type="TITLE", condition=show, indent=4,
             )
         else:
-            self.ptprint(
-                f"    {info_icon} Role: could not be determined (pre-check failed)",
-                Out.TEXT,
+            ptprinthelper.ptprint(
+                "Role: could not be determined (pre-check failed)",
+                bullet_type="TITLE", condition=show, indent=4,
             )
 
     def _stream_rcpt_limit_precheck_open_relay(
@@ -6040,17 +6050,17 @@ class SMTP(BaseModule):
         domain_source: str,
     ) -> None:
         """Print open-relay verdict and domain source right after open-relay probe."""
-        info_icon = get_colored_text("[*]", color="INFO")
+        show = not self.use_json
         if open_relay is True:
-            self.ptprint(
-                f"    {info_icon} Open relay: vulnerable (synthetic recipients accepted)",
-                Out.TEXT,
+            ptprinthelper.ptprint(
+                "Open relay: vulnerable (synthetic recipients accepted)",
+                bullet_type="TITLE", condition=show, indent=4,
             )
             self._stream_rcpt_limit_domain_source(domain, domain_source)
         elif open_relay is False:
-            self.ptprint(
-                f"    {info_icon} Open relay: not vulnerable",
-                Out.TEXT,
+            ptprinthelper.ptprint(
+                "Open relay: not vulnerable",
+                bullet_type="TITLE", condition=show, indent=4,
             )
             self._stream_rcpt_limit_domain_source(domain, domain_source)
 
@@ -6282,7 +6292,6 @@ class SMTP(BaseModule):
         # ── Pre-check phase (no ticker yet, info lines must stay visible) ──
         no_precheck = bool(getattr(self.args, "rl_no_precheck", False))
         forced_role = getattr(self.args, "smtp_role", None)
-        info_icon = get_colored_text("[*]", color="INFO")
 
         if _rcpt_limit_send_mode(self.args):
             self.ptdebug("RCPT TO limit test (per message, with DATA send)", title=True)
@@ -6314,7 +6323,8 @@ class SMTP(BaseModule):
         rate_limit_msg: str | None = None
 
         if no_precheck:
-            self.ptprint(f"    {info_icon} Pre-check skipped (--rl-no-precheck)", Out.TEXT)
+            ptprinthelper.ptprint("Pre-check skipped (--rl-no-precheck)", bullet_type="TITLE",
+                                  condition=not self.use_json, indent=4)
         else:
             precheck = self._rl_run_precheck(domain, domain_source)
             effective_role = precheck.get("role")
@@ -6336,7 +6346,8 @@ class SMTP(BaseModule):
                         "Server is not an open relay; the test cannot run with synthetic recipients. "
                         "Use -u or -U with valid local usernames (or --rl-no-precheck to attempt a raw probe)."
                     )
-                    self.ptprint(f"    {info_icon} Skipping: {msg}", Out.TEXT)
+                    ptprinthelper.ptprint(f"Skipping: {msg}", bullet_type="TITLE",
+                                          condition=not self.use_json, indent=4)
                     return RcptLimitResult(
                         max_accepted=0,
                         limit_triggered=False,
@@ -6359,7 +6370,8 @@ class SMTP(BaseModule):
                         "Submission server requires authenticated session for RCPT TO probe. "
                         "Pass -u/--user and -p/--password (or --rl-no-precheck for an anonymous probe)."
                     )
-                    self.ptprint(f"    {info_icon} Skipping: {msg}", Out.TEXT)
+                    ptprinthelper.ptprint(f"Skipping: {msg}", bullet_type="TITLE",
+                                          condition=not self.use_json, indent=4)
                     return RcptLimitResult(
                         max_accepted=0,
                         limit_triggered=False,
@@ -6402,10 +6414,10 @@ class SMTP(BaseModule):
             and recipients_source == "synthetic"
             and not rate_limit_msg
         ):
-            self.ptprint(
-                f"    {info_icon} Continuing with generic RCPT TO probe — "
+            ptprinthelper.ptprint(
+                "Continuing with generic RCPT TO probe — "
                 "use -U/-u for local recipients or -R to force role",
-                Out.TEXT,
+                bullet_type="TITLE", condition=not self.use_json, indent=4,
             )
 
         smtp: smtplib.SMTP | None = None
@@ -6431,10 +6443,8 @@ class SMTP(BaseModule):
                         _emit_probe_debug(msg, Out.INFO)
                         if _show_progress:
                             _end_progress()
-                        self.ptprint(
-                            f"    {get_colored_text('[✗]', color='VULN')} {msg}",
-                            Out.TEXT,
-                        )
+                        ptprinthelper.ptprint(msg, bullet_type="VULN",
+                                              condition=not self.use_json, indent=4)
                         return RcptLimitResult(
                             max_accepted=0,
                             limit_triggered=False,
@@ -6856,51 +6866,49 @@ class SMTP(BaseModule):
         )
 
     def _stream_accepted_domain_probe_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if self.use_json:
             return
         if (err := self.results.accepted_domain_probe_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Test failed: {err}", Out.TEXT)
+            pp(f"Test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         r = self.results.accepted_domain_probe
         if r is None:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
-        head_icon = get_colored_text("[i]", color="INFO")
-        warn_head_icon = get_colored_text("[!]", color="WARNING")
         if r.universal_accept_detected:
-            self.ptprint(
-                f"    {info_icon} Server is \"Accept-All\" or uses deferred verification "
+            pp(
+                "Server is \"Accept-All\" or uses deferred verification "
                 "(invalid.invalid accepted).",
-                Out.TEXT,
+                bullet_type="TITLE", condition=show, indent=4,
             )
-        domain_line_icon = (
-            warn_head_icon
+        domain_line_bullet = (
+            "WARNING"
             if (r.universal_accept_detected or getattr(r, "likely_placeholder_domain", False))
-            else head_icon
+            else "TITLE"
         )
         if r.domain and r.confidence != "none":
-            self.ptprint(
-                f"    {domain_line_icon} Accepted recipient domain: {r.domain} (confidence: {r.confidence})",
-                Out.TEXT,
+            pp(
+                f"Accepted recipient domain: {r.domain} (confidence: {r.confidence})",
+                bullet_type=domain_line_bullet, condition=show, indent=4,
             )
             if r.detail:
-                self.ptprint(f"    {info_icon} {r.detail}", Out.TEXT)
+                pp(r.detail, bullet_type="TITLE", condition=show, indent=4)
             if getattr(r, "likely_placeholder_domain", False):
-                self.ptprint(
-                    f"    {warn_head_icon} WARNING: {r.domain} matches a known placeholder / example "
+                pp(
+                    f"WARNING: {r.domain} matches a known placeholder / example "
                     "domain; this often reflects default MTA configuration, not an operational "
                     "recipient namespace.",
-                    Out.TEXT,
+                    bullet_type="WARNING", condition=show, indent=4,
                 )
         else:
-            no_dom_icon = warn_head_icon if r.universal_accept_detected else head_icon
-            self.ptprint(
-                f"    {no_dom_icon} Could not determine an accepted recipient domain",
-                Out.TEXT,
+            no_dom_bullet = "WARNING" if r.universal_accept_detected else "TITLE"
+            pp(
+                "Could not determine an accepted recipient domain",
+                bullet_type=no_dom_bullet, condition=show, indent=4,
             )
             if r.detail:
-                self.ptprint(f"    {info_icon} {r.detail}", Out.TEXT)
+                pp(r.detail, bullet_type="TITLE", condition=show, indent=4)
 
     def _accepted_domain_probe_props_json(self) -> dict[str, object]:
         """JSON fragment for -pd (no vulnerabilities)."""
@@ -7103,48 +7111,48 @@ class SMTP(BaseModule):
         self, enum_results: list[EnumResult], catch_all: str | None
     ) -> None:
         """Print EXPN/VRFY/RCPT status lines (same as first loop in _stream_enumeration_result)."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         requested_set = self._enumeration_requested_method_set()
         filtered = [e for e in enum_results if e.method.upper() in requested_set]
-        warn_icon = get_colored_text("[!]", color="WARNING")
         for e in filtered:
             if catch_all == "configured":
-                self.ptprint(
-                    f"    {warn_icon} {e.method.upper()} method: Indeterminate (Useless due to Catch All)",
-                    Out.TEXT,
-                )
+                pp(f"{e.method.upper()} method: Indeterminate (Useless due to Catch All)",
+                   bullet_type="WARNING", condition=show, indent=4)
             elif e.blocked_by_rbl:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(
-                    f"    {icon} {e.method.upper()} method protected by RBL/Reputation (Client IP blocked)",
-                    Out.TEXT,
-                )
+                pp(f"{e.method.upper()} method protected by RBL/Reputation (Client IP blocked)",
+                   bullet_type="NOTVULN", condition=show, indent=4)
                 if e.server_reply:
                     for line in (e.server_reply or "").replace("\r", "").splitlines():
-                        self.ptprint(f"        {line.strip()}", Out.TEXT)
+                        pp(line.strip(), bullet_type="TEXT", condition=show, indent=8)
             else:
                 slowdown = ""
                 if e.slowdown is not None:
                     slowdown = " (rate limited)" if e.slowdown else " (not rate limited)"
-                icon = get_colored_text("[✗]", color="VULN") if e.vulnerable else get_colored_text("[✓]", color="NOTVULN")
+                verdict_bullet = "VULN" if e.vulnerable else "NOTVULN"
                 if e.vulnerable:
                     if e.server_reply:
                         raw = (e.server_reply or "").replace("\r", "").splitlines()
                         parts = [re.sub(r" +", " ", p.strip()) for p in raw if p.strip()]
                         if parts:
                             if len(parts) == 1:
-                                self.ptprint(f"    {icon} {e.method.upper()} method is enabled ({parts[0]}){slowdown}", Out.TEXT)
+                                pp(f"{e.method.upper()} method is enabled ({parts[0]}){slowdown}",
+                                   bullet_type=verdict_bullet, condition=show, indent=4)
                             else:
-                                self.ptprint(
-                                    f"    {icon} {e.method.upper()} method is enabled ({parts[0]}{')' if len(parts) == 1 else ''}{slowdown if len(parts) == 1 else ''}",
-                                    Out.TEXT,
+                                pp(
+                                    f"{e.method.upper()} method is enabled ({parts[0]}{')' if len(parts) == 1 else ''}{slowdown if len(parts) == 1 else ''}",
+                                    bullet_type=verdict_bullet, condition=show, indent=4,
                                 )
                                 for i, part in enumerate(parts[1:]):
                                     is_last = i == len(parts) - 2
-                                    self.ptprint(f"        {part}{')' if is_last else ''}{slowdown if is_last else ''}", Out.TEXT)
+                                    pp(f"{part}{')' if is_last else ''}{slowdown if is_last else ''}",
+                                       bullet_type="TEXT", condition=show, indent=8)
                         else:
-                            self.ptprint(f"    {icon} {e.method.upper()} method is enabled{slowdown}", Out.TEXT)
+                            pp(f"{e.method.upper()} method is enabled{slowdown}",
+                               bullet_type=verdict_bullet, condition=show, indent=4)
                     else:
-                        self.ptprint(f"    {icon} {e.method.upper()} method is enabled{slowdown}", Out.TEXT)
+                        pp(f"{e.method.upper()} method is enabled{slowdown}",
+                           bullet_type=verdict_bullet, condition=show, indent=4)
                 else:
                     if e.server_reply and "Relay protection active" in e.server_reply:
                         status = "is deny (Relay protection active)"
@@ -7152,7 +7160,8 @@ class SMTP(BaseModule):
                         status = "is deny (Administrative prohibition)"
                     else:
                         status = "is deny"
-                    self.ptprint(f"    {icon} {e.method.upper()} method {status}{slowdown}", Out.TEXT)
+                    pp(f"{e.method.upper()} method {status}{slowdown}",
+                       bullet_type=verdict_bullet, condition=show, indent=4)
 
     @staticmethod
     def _expn_vrfy_result_strings(reply_str: str) -> list[str]:
@@ -8527,12 +8536,37 @@ class SMTP(BaseModule):
     AUTH_ENUM_PASSWORD = "PtSrv_Test_!@#_2026"
     AUTH_ENUM_METHOD_PROBE_ORDER = ("LOGIN", "PLAIN", "NTLM")
 
+    def _auth_enum_connect_aborted(self) -> str | None:
+        return getattr(self, "_auth_enum_conn_abort", None)
+
+    def _auth_enum_note_connect_abort(self, msg: str) -> None:
+        lock = getattr(self, "_auth_enum_abort_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._auth_enum_abort_lock = lock
+        with lock:
+            if self._auth_enum_conn_abort is None:
+                self._auth_enum_conn_abort = msg
+
     def _get_smtp_for_auth_enum(self) -> tuple[smtplib.SMTP, str]:
         """
         Get SMTP connection; EHLO parsed for AUTH extensions (LOGIN / PLAIN / NTLM).
         On port 25/587: if plain EHLO lacks LOGIN, NTLM, and PLAIN but has STARTTLS, upgrade and re-EHLO.
+
+        Uses non-fatal connect so threaded AUTH-ENUM workers never call ``end_error`` on
+        transient failures (avoids duplicate error lines and premature ``os._exit``).
         """
-        smtp = self.get_smtp_handler()
+        if abort := self._auth_enum_connect_aborted():
+            raise ConnectionError(abort)
+        try:
+            smtp, status, reply = self.connect(timeout=15.0, fatal=False)
+        except ConnectionError as e:
+            self._auth_enum_note_connect_abort(str(e))
+            raise
+        if status != 220:
+            msg = f"SMTP Info - [{status}] {self.bytes_to_str(reply)}"
+            self._auth_enum_note_connect_abort(msg)
+            raise ConnectionError(msg)
         _, ehlo_bytes = smtp.ehlo(self.fqdn)
         ehlo = ehlo_bytes.decode() if ehlo_bytes else ""
 
@@ -9158,6 +9192,8 @@ class SMTP(BaseModule):
 
         def work(item, _out) -> str:
             kind, idx, user = item
+            if self._auth_enum_connect_aborted():
+                return user
             try:
                 sig = probe_fn(user)
             except Exception:
@@ -9271,6 +9307,7 @@ class SMTP(BaseModule):
         synthetic invalid identities plus candidates from -u/-U or ``default_logins``.
         """
         self._auth_enum_dbg_logged_starttls = False
+        self._auth_enum_conn_abort = None
         candidates, used_default_logins = auth_enum_candidate_names(
             self.args,
             wordlist=getattr(self, "wordlist", None),
@@ -9377,6 +9414,20 @@ class SMTP(BaseModule):
                         )
             finally:
                 self._auth_enum_progress_session_end()
+
+        if abort_msg := self._auth_enum_connect_aborted():
+            self.results.auth_enum_error = abort_msg
+            err = AuthEnumResult(
+                vulnerable=False,
+                indeterminate=True,
+                method_tested="",
+                protocol_flow_vuln=False,
+                invalid_user_responses=[],
+                valid_user_response=None,
+                enumerated_users=(),
+                detail=abort_msg,
+            )
+            return _store_and_return(method_results, err)
 
         aggregate = self._auth_enum_aggregate_results(method_results)
         self.ptdebug(
@@ -11241,6 +11292,22 @@ class SMTP(BaseModule):
         )
         return False, msg, primary_mx, mail_dom
 
+    def _collect_identify_rcpt_error_sample(self, smtp: smtplib.SMTP) -> str | None:
+        """MAIL FROM + invalid RCPT TO for error-syntax fingerprinting (default -id)."""
+        try:
+            smtp.docmd("RSET")
+            status_mf, mf_reply = smtp.docmd(f"MAIL FROM:<{_ID_RCPT_ERROR_MAIL_FROM}>")
+            if status_mf not in (250, 251):
+                return None
+            status_rcpt, rcpt_reply = smtp.docmd(f"RCPT TO:<{_ID_RCPT_ERROR_RCPT}>")
+            if not rcpt_reply or status_rcpt in (250, 251):
+                return None
+            if isinstance(rcpt_reply, bytes):
+                return rcpt_reply.decode(errors="replace")
+            return str(rcpt_reply)
+        except Exception:
+            return None
+
     def test_server_identify(self) -> ServerIdentifyResult:
         """
         Identify SMTP server software from banner, EHLO, HELP, TLS cert, and optionally aggressive probes.
@@ -11403,12 +11470,20 @@ class SMTP(BaseModule):
             except ValueError:
                 pass  # host is hostname
 
-            # Aggressive: VRFY (collect error), unknown cmd (X-PENTEST/SQUASH/X-NON-EXISTENT), line length probe
+            # RCPT error-syntax probe (default -id): invalid recipient after MAIL FROM.
+            if (rcpt_err := self._collect_identify_rcpt_error_sample(smtp)) is not None:
+                error_samples.append(rcpt_err)
+
+            # Aggressive: VRFY (collect error), unknown cmd, line length probe
             if id_aggressive:
+                try:
+                    smtp.docmd("RSET")
+                except Exception:
+                    pass
                 status_vrfy, vrfy_bytes = smtp.docmd("VRFY", "root")
                 if vrfy_bytes and status_vrfy not in (250, 251):
                     error_samples.append(vrfy_bytes.decode(errors="replace"))
-                # Unknown command: X-PENTEST, fallback SQUASH, fallback X-NON-EXISTENT
+                # Unknown command: X-PENTEST, fallback SQUASH, X-NON-EXISTENT, FOOBAR
                 status_unk, unk_bytes = smtp.docmd("X-PENTEST")
                 if unk_bytes:
                     unknown_cmd_response = unk_bytes.decode(errors="replace")
@@ -11420,6 +11495,10 @@ class SMTP(BaseModule):
                         status_xn, xn_bytes = smtp.docmd("X-NON-EXISTENT")
                         if xn_bytes:
                             unknown_cmd_response = xn_bytes.decode(errors="replace")
+                        else:
+                            status_fb, fb_bytes = smtp.docmd("FOOBAR")
+                            if fb_bytes:
+                                unknown_cmd_response = fb_bytes.decode(errors="replace")
                 # Line length probe: EHLO with 1000+ char param (RFC 5321 max 1000) - Postfix: "500 5.5.2 Error: line too long"
                 try:
                     status_ll, ll_bytes = smtp.docmd("EHLO", "a" * 1000)
@@ -11587,6 +11666,11 @@ class SMTP(BaseModule):
             return smtp, 220
 
         smtp_trace: list[str] = []
+        self._bounce_replay_streamed_live = False
+
+        def _br_smtp_reply(status: int, reply) -> str:
+            text = self.bytes_to_str(reply).strip().replace("\r\n", " ").replace("\n", " ")
+            return f"{status} {text}" if text else str(status)
 
         def _phase(
             smtp: smtplib.SMTP | smtplib.SMTP_SSL,
@@ -11594,48 +11678,43 @@ class SMTP(BaseModule):
             body: str,
         ) -> tuple[bool, bool, bool, bool, str | None]:
             """Returns (data_accepted_250, rcpt_rejected_5xx, mail_rejected, indeterminate, detail)."""
-            smtp_trace.append(f"--- {label} ---")
+            self._mail_test_trace_append(smtp_trace, f"--- {label} ---")
             try:
-                mail_status, _ = smtp.docmd("MAIL", f"FROM:<{bounce_addr}>")
-                smtp_trace.append(f"MAIL FROM: {mail_status}")
+                mail_status, mail_reply = smtp.docmd("MAIL", f"FROM:<{bounce_addr}>")
+                mail_line = _br_smtp_reply(mail_status, mail_reply)
+                self._mail_test_trace_append(smtp_trace, f"MAIL FROM: {mail_line}")
             except socket.timeout:
-                smtp_trace.append("MAIL FROM: timeout")
+                self._mail_test_trace_append(smtp_trace, "MAIL FROM: timeout")
                 return False, False, True, True, "Timeout (30s) on MAIL FROM"
             if mail_status not in (250, 251):
-                if mail_status == 530:
-                    d = "NOT VULNERABLE: Authentication required"
-                elif mail_status in (551, 553, 554):
-                    d = "NOT VULNERABLE: Sender rejected by policy"
-                else:
-                    d = f"NOT VULNERABLE: MAIL FROM rejected ({mail_status})"
-                return False, False, True, False, d
+                return False, False, True, False, f"MAIL FROM rejected: {mail_line}"
             try:
-                rcpt_status, _ = smtp.docmd("RCPT", f"TO:<{recipient}>")
-                smtp_trace.append(f"RCPT TO: {rcpt_status}")
+                rcpt_status, rcpt_reply = smtp.docmd("RCPT", f"TO:<{recipient}>")
+                rcpt_line = _br_smtp_reply(rcpt_status, rcpt_reply)
+                self._mail_test_trace_append(smtp_trace, f"RCPT TO: {rcpt_line}")
             except socket.timeout:
-                smtp_trace.append("RCPT TO: timeout")
+                self._mail_test_trace_append(smtp_trace, "RCPT TO: timeout")
                 return False, False, False, True, "Timeout (30s) on RCPT TO"
-            if rcpt_status in (550, 551, 552, 553, 554):
-                return False, True, False, False, "NOT VULNERABLE: RCPT rejected in session – no bounce expected for this probe"
             if rcpt_status not in (250, 251):
-                return False, False, True, False, f"NOT VULNERABLE: RCPT unexpected ({rcpt_status})"
+                return False, True, False, False, f"RCPT TO rejected: {rcpt_line}"
             try:
-                data_status, _ = smtp.data(body)
-                smtp_trace.append(f"DATA: {data_status}")
+                data_status, data_reply = smtp.data(body)
+                data_line = _br_smtp_reply(data_status, data_reply)
+                self._mail_test_trace_append(smtp_trace, f"DATA: {data_line}")
             except socket.timeout:
-                smtp_trace.append("DATA: timeout")
+                self._mail_test_trace_append(smtp_trace, "DATA: timeout")
                 return False, False, False, True, "Timeout (30s) on DATA"
             except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
-                smtp_trace.append(f"DATA: {e}")
+                self._mail_test_trace_append(smtp_trace, f"DATA: {e}")
                 return False, False, False, True, f"Connection closed during DATA: {e}"
             if data_status == 250:
                 return True, False, False, False, None
-            return False, False, True, False, f"NOT VULNERABLE: DATA rejected ({data_status})"
+            return False, False, True, False, f"DATA rejected: {data_line}"
 
         try:
             smtp, conn_status = _connect_br()
             if conn_status != 220:
-                smtp_trace.append(f"Connect: {conn_status}")
+                self._mail_test_trace_append(smtp_trace, f"Connect: {conn_status}")
                 try:
                     smtp.quit()
                 except Exception:
@@ -11655,15 +11734,22 @@ class SMTP(BaseModule):
                     test_id_return_path="",
                 )
 
+            self._br_stream_probe_section_title("Test From header without Return-Path")
             try:
                 ehlo_status, _ = smtp.docmd("EHLO", self.fqdn or "bounce-test.local")
-                smtp_trace.append(f"EHLO: {ehlo_status}")
+                self._mail_test_trace_append(smtp_trace, f"EHLO: {ehlo_status}")
             except socket.timeout:
-                smtp_trace.append("EHLO: timeout")
+                self._mail_test_trace_append(smtp_trace, "EHLO: timeout")
                 try:
                     smtp.quit()
                 except Exception:
                     pass
+                self._br_stream_probe_verdict(
+                    accepted=False,
+                    indeterminate=True,
+                    detail="Timeout (30s) on EHLO - possible greylisting or tarpitting (WARNING)",
+                    bounce_addr=bounce_addr,
+                )
                 return BounceReplayResult(
                     vulnerable=False,
                     indeterminate=True,
@@ -11682,6 +11768,13 @@ class SMTP(BaseModule):
             body1 = _build_body(include_return_path=False, tid=test_id)
             acc1, rcpt_rej1, mail_rej1, indet1, det1 = _phase(
                 smtp, "Probe 1: MAIL FROM + DATA (From header; no Return-Path in body)", body1
+            )
+            self._br_stream_probe_verdict(
+                accepted=acc1,
+                indeterminate=indet1,
+                detail=det1,
+                bounce_addr=bounce_addr,
+                test_id=test_id,
             )
             if indet1:
                 try:
@@ -11707,13 +11800,21 @@ class SMTP(BaseModule):
 
             try:
                 smtp.docmd("RSET")
-                smtp_trace.append("RSET")
+                self._mail_test_trace_append(smtp_trace, "RSET")
             except Exception:
                 pass
 
+            self._br_stream_probe_section_title("Test From headers and Return-Path")
             body2 = _build_body(include_return_path=True, tid=test_id_rp)
             acc2, rcpt_rej2, mail_rej2, indet2, det2 = _phase(
                 smtp, "Probe 2: MAIL FROM + DATA (Return-Path + From headers)", body2
+            )
+            self._br_stream_probe_verdict(
+                accepted=acc2,
+                indeterminate=indet2,
+                detail=det2,
+                bounce_addr=bounce_addr,
+                test_id=test_id_rp,
             )
 
             try:
@@ -12135,6 +12236,9 @@ class SMTP(BaseModule):
         if aborted_500 and abort_at_ref[0] is not None:
             detail_parts.append(f"stopped early (SMTP 500 at msg {abort_at_ref[0]})")
 
+        bomb_detail = "; ".join(detail_parts)
+        self._mail_test_live_done("bomb", bomb_detail)
+
         return BombResult(
             vulnerable=vulnerable,
             indeterminate=indeterminate,
@@ -12154,7 +12258,7 @@ class SMTP(BaseModule):
             per_message_delivered=per_message_delivered,
             aborted_on_smtp_500=aborted_500,
             abort_at_message=abort_at_ref[0],
-            detail="; ".join(detail_parts),
+            detail=bomb_detail,
         )
 
     def _get_antivirus_definitions_path(self) -> Path:
@@ -12189,6 +12293,9 @@ class SMTP(BaseModule):
         if incl_zip_bomb and "zip_bomb" not in categories:
             categories.append("zip_bomb")
 
+        if self.args.debug and not self.args.json:
+            self.ptdebug("Antivirus / antispam test", title=True)
+
         base_path = self._get_antivirus_definitions_path()
         _ssl_ctx = ssl._create_unverified_context()
         use_tls = self.args.tls or port == 465
@@ -12204,6 +12311,30 @@ class SMTP(BaseModule):
             "eicar", "double_ext", "executable", "nested_archive",
             "encoded_content", "html_sanitization", "xxe", "mime_malformed",
         })
+        def _av_smtp_reply(status: int, reply) -> str:
+            text = self.bytes_to_str(reply).strip().replace("\r\n", " ").replace("\n", " ")
+            return f"{status} {text}" if text else str(status)
+
+        def _av_trace_append(lines: list[str], line: str) -> None:
+            lines.append(line)
+            if self.args.debug and not self.args.json:
+                if line.startswith("---") and line.endswith("---"):
+                    self.ptdebug(line.strip("- ").strip(), title=True)
+                else:
+                    self.ptdebug(line, Out.TEXT)
+
+        def _av_msg_summary(name: str, status: int | None, outcome: str) -> str:
+            if status is not None:
+                return f"{name}: {status} ({outcome})"
+            return f"{name}: ({outcome})"
+
+        def _av_debug_vv(line: str, *, title: bool = False) -> None:
+            if self.args.debug and not self.args.json:
+                self.ptdebug(line, Out.TEXT, title=title)
+
+        def _av_fail_line(trace: list[str], line: str) -> None:
+            trace.append(line)
+            _av_debug_vv(line)
 
         def _connect_av() -> tuple[smtplib.SMTP | smtplib.SMTP_SSL | None, str]:
             """Connect to SMTP. No AUTH – suitable for port 25 (MTA). For port 587 (Submission),
@@ -12318,6 +12449,8 @@ class SMTP(BaseModule):
             return msg.as_string(), missing
 
         for cat in categories:
+            if self.args.debug and not self.args.json:
+                self.ptdebug(f"Category: {cat}", title=True)
             cat_path = base_path / "categories" / cat
             msg_dir = cat_path / "messages"
             att_dir = cat_path / "attachments"
@@ -12325,6 +12458,9 @@ class SMTP(BaseModule):
             if not msg_files and skip_absent:
                 continue
             if not msg_files:
+                _empty_detail = (
+                    f"No definition files in {msg_dir}" if msg_dir.is_dir() else "Category path missing"
+                )
                 cat_results.append(
                     AntivirusCategoryResult(
                         category=cat,
@@ -12333,60 +12469,90 @@ class SMTP(BaseModule):
                         rejected=0,
                         error=0,
                         smtp_trace=(),
-                        detail=f"No definition files in {msg_dir}" if msg_dir.is_dir() else f"Category path missing",
+                        detail=_empty_detail,
                     )
                 )
+                if not self.use_json and self.args.debug:
+                    ptprinthelper.ptprint(
+                        f"{cat}: {_empty_detail}",
+                        bullet_type="TITLE",
+                        condition=True,
+                        indent=4,
+                    )
                 continue
             accepted, rejected, err_count = 0, 0, 0
             smtp_trace: list[str] = []
+            msg_summaries: list[str] = []
             for mf in msg_files:
                 try:
                     with open(mf, encoding="utf-8") as f:
                         msg_def = json.load(f)
                 except (json.JSONDecodeError, OSError) as e:
                     err_count += 1
-                    smtp_trace.append(f"{mf.name}: load error {e}")
+                    _av_fail_line(smtp_trace, f"{mf.name}: load error {e}")
+                    msg_summaries.append(_av_msg_summary(mf.name, None, "error"))
                     continue
                 raw_msg, missing_att = _build_mime(msg_def, att_dir, msg_dir)
                 if missing_att:
                     err_count += 1
                     warn_msg = f"{mf.name}: missing attachments {missing_att} – test incomplete (avoid false SECURE)"
-                    smtp_trace.append(warn_msg)
-                    if not self.use_json:
-                        warn_icon = get_colored_text("[!]", color="WARNING")
-                        self.ptprint(f"    {warn_icon} {cat}: {warn_msg}", Out.TEXT)
+                    _av_fail_line(smtp_trace, warn_msg)
+                    msg_summaries.append(_av_msg_summary(mf.name, None, "error"))
+                    ptprinthelper.ptprint(f"{cat}: {warn_msg}", bullet_type="WARNING",
+                                          condition=not self.use_json and not self.args.debug, indent=4)
                     continue
                 smtp, conn_err = _connect_av()
                 if smtp is None:
                     err_count += 1
-                    smtp_trace.append(f"{mf.name}: connection failed {conn_err}")
+                    _av_fail_line(smtp_trace, f"{mf.name}: connection failed {conn_err}")
+                    msg_summaries.append(_av_msg_summary(mf.name, None, "error"))
                     continue
                 try:
-                    smtp.docmd("EHLO", self.fqdn or "av-test.local")
-                    smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                    status, reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
-                    if status not in (250, 251):
+                    _av_trace_append(smtp_trace, f"--- {mf.name} ---")
+                    ehlo_status, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "av-test.local")
+                    _av_trace_append(smtp_trace, f"EHLO: {_av_smtp_reply(ehlo_status, ehlo_reply)}")
+                    mail_status, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
+                    _av_trace_append(smtp_trace, f"MAIL FROM: {_av_smtp_reply(mail_status, mail_reply)}")
+                    if mail_status not in (250, 251):
                         rejected += 1
-                        smtp_trace.append(f"{mf.name}: {status} (rejected)")
+                        msg_summaries.append(_av_msg_summary(mf.name, mail_status, "rejected"))
                         try:
                             smtp.quit()
                         except Exception:
                             pass
                         continue
+                    rcpt_status, rcpt_reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
+                    _av_trace_append(smtp_trace, f"RCPT TO: {_av_smtp_reply(rcpt_status, rcpt_reply)}")
+                    if rcpt_status not in (250, 251):
+                        rejected += 1
+                        msg_summaries.append(_av_msg_summary(mf.name, rcpt_status, "rejected"))
+                        try:
+                            smtp.quit()
+                        except Exception:
+                            pass
+                        continue
+                    cc_failed = False
                     for c in cc_list:
-                        s, _ = smtp.docmd("RCPT", f"TO:<{c}>")
-                        if s not in (250, 251):
+                        cc_status, cc_reply = smtp.docmd("RCPT", f"TO:<{c}>")
+                        _av_trace_append(smtp_trace, f"RCPT TO <{c}>: {_av_smtp_reply(cc_status, cc_reply)}")
+                        if cc_status not in (250, 251):
+                            rejected += 1
+                            msg_summaries.append(_av_msg_summary(mf.name, cc_status, "rejected"))
+                            cc_failed = True
+                            try:
+                                smtp.quit()
+                            except Exception:
+                                pass
                             break
-                    data_status, data_reply = smtp.data(raw_msg)
-                    if data_status == 250:
-                        accepted += 1
-                        smtp_trace.append(f"{mf.name}: 250 (accepted)")
-                    elif 400 <= data_status < 500:
-                        rejected += 1
-                        smtp_trace.append(f"{mf.name}: {data_status} (rejected)")
-                    else:
-                        rejected += 1
-                        smtp_trace.append(f"{mf.name}: {data_status} (rejected)")
+                    if not cc_failed:
+                        data_status, data_reply = smtp.data(raw_msg)
+                        _av_trace_append(smtp_trace, f"DATA: {_av_smtp_reply(data_status, data_reply)}")
+                        if data_status == 250:
+                            accepted += 1
+                            msg_summaries.append(_av_msg_summary(mf.name, data_status, "accepted"))
+                        else:
+                            rejected += 1
+                            msg_summaries.append(_av_msg_summary(mf.name, data_status, "rejected"))
                     try:
                         smtp.quit()
                     except Exception:
@@ -12400,7 +12566,8 @@ class SMTP(BaseModule):
                     socket.timeout,
                 ) as e:
                     err_count += 1
-                    smtp_trace.append(f"{mf.name}: error {e}")
+                    _av_fail_line(smtp_trace, f"{mf.name}: error {e}")
+                    msg_summaries.append(_av_msg_summary(mf.name, None, "error"))
                     try:
                         smtp.quit()
                     except Exception:
@@ -12415,10 +12582,18 @@ class SMTP(BaseModule):
                     accepted=accepted,
                     rejected=rejected,
                     error=err_count,
-                    smtp_trace=tuple(smtp_trace[-30:]),
+                    smtp_trace=tuple(smtp_trace),
                     detail=detail,
+                    message_summary=tuple(msg_summaries),
                 )
             )
+            if not self.use_json and self.args.debug:
+                ptprinthelper.ptprint(
+                    f"{cat}: {detail}",
+                    bullet_type="TITLE",
+                    condition=True,
+                    indent=4,
+                )
 
         elapsed = time.perf_counter() - start_time
         total_accepted = sum(c.accepted for c in cat_results)
@@ -12429,9 +12604,20 @@ class SMTP(BaseModule):
         indeterminate = all_error or (len(cat_results) == 0)
         vulnerable = risky_accepted > 0 and risky_sent > 0
         partial_protection = not vulnerable and total_accepted > 0 and total_rejected > 0
-        detail = "All risky content blocked" if not vulnerable and not indeterminate else (
-            f"Risky content passed: {risky_accepted}/{risky_sent} in risky categories"
-        )
+        if indeterminate:
+            if all_error and total_accepted == 0 and total_rejected == 0:
+                detail = (
+                    "Test incomplete: all message attempts failed before RCPT/DATA "
+                    "(connection refused, timeout, or rate limiting — retry in a few seconds)"
+                )
+            elif len(cat_results) == 0:
+                detail = "No test categories available"
+            else:
+                detail = "Could not complete antivirus test"
+        elif not vulnerable:
+            detail = "All risky content blocked"
+        else:
+            detail = f"Risky content passed: {risky_accepted}/{risky_sent} in risky categories"
         return AntivirusResult(
             vulnerable=vulnerable,
             indeterminate=indeterminate,
@@ -12742,7 +12928,7 @@ class SMTP(BaseModule):
             "SEARCH for 'Bcc' or Bcc recipient addresses. If NOT FOUND: SECURE. If FOUND: VULNERABLE (BCC disclosure)."
         )
 
-        def _connect_bcc() -> tuple[smtplib.SMTP | smtplib.SMTP_SSL | None, str]:
+        def _connect_bcc(trace: list[str]) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL | None, str]:
             try:
                 if use_tls:
                     try:
@@ -12755,16 +12941,21 @@ class SMTP(BaseModule):
                     smtp = smtplib.SMTP(timeout=timeout)
                     smtp.sock = sock_ssl
                     smtp.file = None
-                    st, _ = smtp.getreply()
+                    st, reply = smtp.getreply()
                     if st != 220:
+                        self._mail_test_trace_append(trace, f"Connect: {self._smtp_trace_reply(st, reply)}")
                         return None, f"Connect: {st}"
+                    self._mail_test_trace_append(trace, f"Connect: {self._smtp_trace_reply(st, reply)}")
                 else:
                     smtp = smtplib.SMTP(timeout=timeout)
-                    st, _ = smtp.connect(host, port)
+                    st, reply = smtp.connect(host, port)
                     if st != 220:
+                        self._mail_test_trace_append(trace, f"Connect: {self._smtp_trace_reply(st, reply)}")
                         return None, f"Connect: {st}"
+                    self._mail_test_trace_append(trace, f"Connect: {self._smtp_trace_reply(st, reply)}")
                     if use_starttls:
-                        st2, _ = smtp.docmd("STARTTLS")
+                        st2, reply2 = smtp.docmd("STARTTLS")
+                        self._mail_test_trace_append(trace, f"STARTTLS: {self._smtp_trace_reply(st2, reply2)}")
                         if st2 != 220:
                             return None, f"STARTTLS: {st2}"
                         try:
@@ -12779,14 +12970,18 @@ class SMTP(BaseModule):
                         smtp.ehlo_resp = None
                         smtp.esmtp_features = {}
                         smtp.does_esmtp = False
-                smtp.docmd("EHLO", self.fqdn or "bcc-test.local")
+                ehlo_st, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "bcc-test.local")
+                self._mail_test_trace_append(trace, f"EHLO: {self._smtp_trace_reply(ehlo_st, ehlo_reply)}")
                 if do_auth:
                     try:
                         smtp.login(auth_user, auth_pass)
+                        self._mail_test_trace_append(trace, "AUTH: ok")
                     except smtplib.SMTPAuthenticationError as e:
+                        self._mail_test_trace_append(trace, f"AUTH failed: {e}")
                         return None, f"AUTH failed: {e}"
                 return smtp, ""
             except Exception as e:
+                self._mail_test_trace_append(trace, f"Connect: {e}")
                 return None, str(e)
 
         start_time = time.perf_counter()
@@ -12804,7 +12999,9 @@ class SMTP(BaseModule):
         msg[EMAIL_HDR_TEST] = "BCC"
         raw_msg = msg.as_string()
 
-        smtp, conn_err = _connect_bcc()
+        smtp_trace: list[str] = []
+        self._mail_test_trace_append(smtp_trace, "--- bcc disclosure ---")
+        smtp, conn_err = _connect_bcc(smtp_trace)
         message_accepted = False
         status_code = None
         reply_str = None
@@ -12814,22 +13011,32 @@ class SMTP(BaseModule):
             detail = f"Connection failed: {conn_err}"
         else:
             try:
-                smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                for recp in all_recipients:
-                    status, reply = smtp.docmd("RCPT", f"TO:<{recp}>")
-                    if status not in (250, 251):
-                        detail = f"RCPT TO:<{recp}> rejected: {status}"
-                        break
+                mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
+                self._mail_test_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                if mail_st not in (250, 251):
+                    detail = f"MAIL FROM rejected: {mail_st}"
                 else:
-                    data_status, data_reply = smtp.data(raw_msg)
-                    status_code = data_status
-                    reply_str = data_reply.decode() if isinstance(data_reply, bytes) else str(data_reply)
-                    if data_status == 250:
-                        message_accepted = True
-                        detail = "Message sent successfully. Manual verification required."
+                    for recp in all_recipients:
+                        status, reply = smtp.docmd("RCPT", f"TO:<{recp}>")
+                        self._mail_test_trace_append(
+                            smtp_trace,
+                            f"RCPT TO <{recp}>: {self._smtp_trace_reply(status, reply)}",
+                        )
+                        if status not in (250, 251):
+                            detail = f"RCPT TO:<{recp}> rejected: {status}"
+                            break
                     else:
-                        detail = f"Server rejected DATA: {data_status}"
+                        data_status, data_reply = smtp.data(raw_msg)
+                        self._mail_test_trace_append(smtp_trace, f"DATA: {self._smtp_trace_reply(data_status, data_reply)}")
+                        status_code = data_status
+                        reply_str = data_reply.decode() if isinstance(data_reply, bytes) else str(data_reply)
+                        if data_status == 250:
+                            message_accepted = True
+                            detail = "Message sent successfully. Manual verification required."
+                        else:
+                            detail = f"Server rejected DATA: {data_status}"
             except Exception as e:
+                self._mail_test_trace_append(smtp_trace, f"error: {e}")
                 detail = str(e)
             finally:
                 try:
@@ -12838,6 +13045,12 @@ class SMTP(BaseModule):
                     pass
 
         elapsed = time.perf_counter() - start_time
+        bcc_row_detail = (
+            "1 accepted, 0 rejected, 0 error"
+            if message_accepted
+            else (detail or "0 accepted, 1 rejected, 0 error")
+        )
+        self._mail_test_live_done("bcc disclosure", bcc_row_detail)
 
         return BccTestResult(
             message_accepted=message_accepted,
@@ -12849,6 +13062,7 @@ class SMTP(BaseModule):
             elapsed_sec=elapsed,
             detail=detail or None,
             verification_instructions=VERIFICATION_INSTRUCTIONS,
+            smtp_trace=tuple(smtp_trace),
         )
 
     def _generate_alias_variants(self, recipient: str) -> dict[str, str]:
@@ -12905,7 +13119,7 @@ class SMTP(BaseModule):
         use_tls = self.args.tls or port == 465
         use_starttls = self.args.starttls and not use_tls
 
-        def _connect_alias() -> tuple[smtplib.SMTP | smtplib.SMTP_SSL | None, str]:
+        def _connect_alias(trace: list[str]) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL | None, str]:
             try:
                 if use_tls:
                     try:
@@ -12918,16 +13132,21 @@ class SMTP(BaseModule):
                     smtp = smtplib.SMTP(timeout=timeout)
                     smtp.sock = sock_ssl
                     smtp.file = None
-                    st, _ = smtp.getreply()
+                    st, reply = smtp.getreply()
                     if st != 220:
+                        self._mail_test_trace_append(trace, f"Connect: {self._smtp_trace_reply(st, reply)}")
                         return None, f"Connect: {st}"
+                    self._mail_test_trace_append(trace, f"Connect: {self._smtp_trace_reply(st, reply)}")
                 else:
                     smtp = smtplib.SMTP(timeout=timeout)
-                    st, _ = smtp.connect(host, port)
+                    st, reply = smtp.connect(host, port)
                     if st != 220:
+                        self._mail_test_trace_append(trace, f"Connect: {self._smtp_trace_reply(st, reply)}")
                         return None, f"Connect: {st}"
+                    self._mail_test_trace_append(trace, f"Connect: {self._smtp_trace_reply(st, reply)}")
                     if use_starttls:
-                        st2, _ = smtp.docmd("STARTTLS")
+                        st2, reply2 = smtp.docmd("STARTTLS")
+                        self._mail_test_trace_append(trace, f"STARTTLS: {self._smtp_trace_reply(st2, reply2)}")
                         if st2 != 220:
                             return None, f"STARTTLS: {st2}"
                         try:
@@ -12942,14 +13161,18 @@ class SMTP(BaseModule):
                         smtp.ehlo_resp = None
                         smtp.esmtp_features = {}
                         smtp.does_esmtp = False
-                smtp.docmd("EHLO", self.fqdn or "alias-test.local")
+                ehlo_st, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "alias-test.local")
+                self._mail_test_trace_append(trace, f"EHLO: {self._smtp_trace_reply(ehlo_st, ehlo_reply)}")
                 if do_auth:
                     try:
                         smtp.login(auth_user, auth_pass)
+                        self._mail_test_trace_append(trace, "AUTH: ok")
                     except smtplib.SMTPAuthenticationError as e:
+                        self._mail_test_trace_append(trace, f"AUTH failed: {e}")
                         return None, f"AUTH failed: {e}"
                 return smtp, ""
             except Exception as e:
+                self._mail_test_trace_append(trace, f"Connect: {e}")
                 return None, str(e)
 
         start_time = time.perf_counter()
@@ -12962,8 +13185,10 @@ class SMTP(BaseModule):
             accepted = rejected = error = False
             status_code = None
             reply_str = None
+            smtp_trace: list[str] = []
+            self._mail_test_trace_append(smtp_trace, f"--- {variant_name} ({addr}) ---")
 
-            smtp, conn_err = _connect_alias()
+            smtp, conn_err = _connect_alias(smtp_trace)
             if smtp is None:
                 error = True
                 detail_str = f"Connection failed: {conn_err}"
@@ -12977,23 +13202,37 @@ class SMTP(BaseModule):
                     msg[EMAIL_HDR_TEST] = EMAIL_TEST_ALIAS
                     raw_msg = msg.as_string()
 
-                    smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                    status, reply = smtp.docmd("RCPT", f"TO:<{addr}>")
-                    status_code = status
-                    reply_str = reply.decode() if isinstance(reply, bytes) else str(reply)
-
-                    if status in (250, 251):
-                        accepted = True
-                        data_status, data_reply = smtp.data(raw_msg)
-                        if data_status != 250:
-                            detail_str = f"RCPT OK but DATA rejected: {data_status}"
-                        if is_bang_simple:
-                            uucp_warning = True
-                    else:
+                    mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
+                    self._mail_test_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                    if mail_st not in (250, 251):
                         rejected = True
-                        detail_str = f"[{status}] {reply_str.strip()}"
+                        detail_str = f"MAIL FROM rejected: {mail_st}"
+                    else:
+                        status, reply = smtp.docmd("RCPT", f"TO:<{addr}>")
+                        status_code = status
+                        reply_str = reply.decode() if isinstance(reply, bytes) else str(reply)
+                        self._mail_test_trace_append(
+                            smtp_trace,
+                            f"RCPT TO <{addr}>: {self._smtp_trace_reply(status, reply)}",
+                        )
+
+                        if status in (250, 251):
+                            accepted = True
+                            data_status, data_reply = smtp.data(raw_msg)
+                            self._mail_test_trace_append(
+                                smtp_trace,
+                                f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                            )
+                            if data_status != 250:
+                                detail_str = f"RCPT OK but DATA rejected: {data_status}"
+                            if is_bang_simple:
+                                uucp_warning = True
+                        else:
+                            rejected = True
+                            detail_str = f"[{status}] {reply_str.strip()}"
                 except Exception as e:
                     error = True
+                    self._mail_test_trace_append(smtp_trace, f"error: {e}")
                     detail_str = str(e)
                 finally:
                     try:
@@ -13001,6 +13240,14 @@ class SMTP(BaseModule):
                     except Exception:
                         pass
 
+            if accepted and not (detail_str and "DATA rejected" in detail_str):
+                row_detail = "1 accepted, 0 rejected, 0 error"
+            elif rejected:
+                row_detail = detail_str or "rejected"
+            elif error:
+                row_detail = detail_str or "error"
+            else:
+                row_detail = detail_str or "skipped"
             var_results.append(
                 AliasVariantResult(
                     variant=variant_name,
@@ -13012,8 +13259,10 @@ class SMTP(BaseModule):
                     smtp_reply=reply_str,
                     detail=detail_str,
                     uucp_warning=uucp_warning,
+                    smtp_trace=tuple(smtp_trace),
                 )
             )
+            self._mail_test_live_done(f"{variant_name} ({addr})", row_detail)
 
         elapsed = time.perf_counter() - start_time
         accepted_count = sum(1 for v in var_results if v.accepted)
@@ -13212,33 +13461,47 @@ class SMTP(BaseModule):
             smtp, conn_err = _connect_ssrf()
             sent, accepted, rejected, err_count = 0, 0, 0, 0
             smtp_trace: list[str] = []
+            self._mail_test_trace_append(smtp_trace, f"--- {var_name} ---")
             if smtp is None:
                 err_count = 1
-                smtp_trace.append(f"connection failed: {conn_err}")
+                self._mail_test_trace_append(smtp_trace, f"Connect: {conn_err}")
             else:
                 try:
-                    smtp.docmd("EHLO", self.fqdn or "ssrf-test.local")
-                    smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                    status, reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
-                    if status not in (250, 251):
+                    ehlo_st, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "ssrf-test.local")
+                    self._mail_test_trace_append(smtp_trace, f"EHLO: {self._smtp_trace_reply(ehlo_st, ehlo_reply)}")
+                    mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
+                    self._mail_test_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                    if mail_st not in (250, 251):
                         rejected = 1
-                        smtp_trace.append(f"RCPT: {status} (rejected)")
-                    else:
-                        for c in cc_list:
-                            s, _ = smtp.docmd("RCPT", f"TO:<{c}>")
-                            if s not in (250, 251):
-                                break
-                        data_status, data_reply = smtp.data(raw_msg)
                         sent = 1
-                        if data_status == 250:
-                            accepted = 1
-                            smtp_trace.append("250 OK (accepted)")
-                        elif 400 <= data_status < 500:
+                    else:
+                        status, reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
+                        self._mail_test_trace_append(
+                            smtp_trace,
+                            f"RCPT TO <{rcpt}>: {self._smtp_trace_reply(status, reply)}",
+                        )
+                        if status not in (250, 251):
                             rejected = 1
-                            smtp_trace.append(f"{data_status} (rejected)")
+                            sent = 1
                         else:
-                            rejected = 1
-                            smtp_trace.append(f"{data_status} (rejected)")
+                            for c in cc_list:
+                                s, cc_reply = smtp.docmd("RCPT", f"TO:<{c}>")
+                                self._mail_test_trace_append(
+                                    smtp_trace,
+                                    f"RCPT TO <{c}>: {self._smtp_trace_reply(s, cc_reply)}",
+                                )
+                                if s not in (250, 251):
+                                    break
+                            data_status, data_reply = smtp.data(raw_msg)
+                            sent = 1
+                            self._mail_test_trace_append(
+                                smtp_trace,
+                                f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                            )
+                            if data_status == 250:
+                                accepted = 1
+                            else:
+                                rejected = 1
                     try:
                         smtp.quit()
                     except Exception:
@@ -13252,12 +13515,18 @@ class SMTP(BaseModule):
                     socket.timeout,
                 ) as e:
                     err_count = 1
-                    smtp_trace.append(f"error: {e}")
+                    self._mail_test_trace_append(smtp_trace, f"error: {e}")
                     try:
                         smtp.quit()
                     except Exception:
                         pass
             detail = f"{accepted} accepted, {rejected} rejected, {err_count} error" if sent or err_count else "skipped"
+            msg_summary = self._mail_variant_msg_summary(
+                tuple(smtp_trace),
+                accepted=accepted,
+                rejected=rejected,
+                error=err_count,
+            )
             var_results.append(
                 SsrfVariantResult(
                     variant=var_name,
@@ -13267,8 +13536,10 @@ class SMTP(BaseModule):
                     error=err_count,
                     smtp_trace=tuple(smtp_trace),
                     detail=detail,
+                    message_summary=msg_summary,
                 )
             )
+            self._mail_test_live_done(var_name, detail)
 
         if incl_internal:
             for internal_url, label in [
@@ -13281,37 +13552,57 @@ class SMTP(BaseModule):
                 smtp, conn_err = _connect_ssrf()
                 sent, accepted, rejected, err_count = 0, 0, 0, 0
                 smtp_trace = []
+                self._mail_test_trace_append(smtp_trace, f"--- {label} ---")
                 if smtp is None:
                     err_count = 1
-                    smtp_trace.append(f"connection failed: {conn_err}")
+                    self._mail_test_trace_append(smtp_trace, f"Connect: {conn_err}")
                 else:
                     try:
-                        smtp.docmd("EHLO", self.fqdn or "ssrf-test.local")
-                        smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                        status, _ = smtp.docmd("RCPT", f"TO:<{rcpt}>")
-                        if status not in (250, 251):
+                        ehlo_st, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "ssrf-test.local")
+                        self._mail_test_trace_append(smtp_trace, f"EHLO: {self._smtp_trace_reply(ehlo_st, ehlo_reply)}")
+                        mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
+                        self._mail_test_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                        if mail_st not in (250, 251):
                             rejected = 1
-                            smtp_trace.append(f"RCPT: {status}")
-                        else:
-                            data_status, _ = smtp.data(raw_msg)
                             sent = 1
-                            if data_status == 250:
-                                accepted = 1
-                                smtp_trace.append("250 OK")
-                            else:
+                        else:
+                            status, reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
+                            self._mail_test_trace_append(
+                                smtp_trace,
+                                f"RCPT TO <{rcpt}>: {self._smtp_trace_reply(status, reply)}",
+                            )
+                            if status not in (250, 251):
                                 rejected = 1
-                                smtp_trace.append(f"{data_status}")
+                                sent = 1
+                            else:
+                                data_status, data_reply = smtp.data(raw_msg)
+                                sent = 1
+                                self._mail_test_trace_append(
+                                    smtp_trace,
+                                    f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                                )
+                                if data_status == 250:
+                                    accepted = 1
+                                else:
+                                    rejected = 1
                         try:
                             smtp.quit()
                         except Exception:
                             pass
                     except Exception as e:
                         err_count = 1
-                        smtp_trace.append(str(e))
+                        self._mail_test_trace_append(smtp_trace, str(e))
                         try:
                             smtp.quit()
                         except Exception:
                             pass
+                int_detail = f"{accepted} accepted, {rejected} rejected, {err_count} error"
+                int_summary = self._mail_variant_msg_summary(
+                    tuple(smtp_trace),
+                    accepted=accepted,
+                    rejected=rejected,
+                    error=err_count,
+                )
                 var_results.append(
                     SsrfVariantResult(
                         variant=label,
@@ -13320,9 +13611,11 @@ class SMTP(BaseModule):
                         rejected=rejected,
                         error=err_count,
                         smtp_trace=tuple(smtp_trace),
-                        detail=f"{accepted} accepted, {rejected} rejected, {err_count} error",
+                        detail=int_detail,
+                        message_summary=int_summary,
                     )
                 )
+                self._mail_test_live_done(label, int_detail)
 
         elapsed = time.perf_counter() - start_time
         total_accepted = sum(v.accepted for v in var_results)
@@ -13424,13 +13717,16 @@ class SMTP(BaseModule):
             size_limit_bytes = None
         size_advertised = size_limit_bytes is not None
         size_effective = size_advertised and (size_limit_bytes or 0) > 0
-        smtp_trace.append(f"SIZE_CHECK: {'SIZE ' + str(size_limit_bytes or 0) + ' B' if size_advertised else 'not advertised'}")
+        size_line = (
+            f"SIZE_CHECK: {'SIZE ' + str(size_limit_bytes or 0) + ' B' if size_advertised else 'not advertised'}"
+        )
+        self._mail_test_trace_append(smtp_trace, size_line)
 
         size_enforced: bool | None = None
         if size_effective and not skip_size_test:
             try:
                 status, reply = smtp.docmd("MAIL", f"FROM:<{mail_from}> SIZE=1099511627776")
-                smtp_trace.append(f"SIZE_ENFORCEMENT: MAIL SIZE=1TB -> {status}")
+                self._mail_test_trace_append(smtp_trace, f"SIZE_ENFORCEMENT: MAIL SIZE=1TB -> {status}")
                 size_enforced = status == 552
                 if status != 552:
                     try:
@@ -13438,8 +13734,13 @@ class SMTP(BaseModule):
                     except Exception:
                         pass
             except Exception as e:
-                smtp_trace.append(f"SIZE_ENFORCEMENT: error {e}")
+                self._mail_test_trace_append(smtp_trace, f"SIZE_ENFORCEMENT: error {e}")
                 size_enforced = False
+        size_summary = (
+            f"{'SIZE ' + str(size_limit_bytes) + ' B advertised' if size_advertised else 'not advertised'}; "
+            f"enforced: {'yes' if size_enforced else 'no' if size_enforced is not None else 'n/a'}"
+        )
+        self._mail_test_live_done("SIZE", size_summary)
 
         try:
             smtp.quit()
@@ -13480,9 +13781,9 @@ class SMTP(BaseModule):
 
         for idx in range(flood_count):
             if time.perf_counter() > deadline:
-                smtp_trace.append(
-                    f"QUEUE_STRESS: timeout after {queue_attempts} attempts "
-                    f"({sent} DATA completed)"
+                self._mail_test_trace_append(
+                    smtp_trace,
+                    f"QUEUE_STRESS: timeout after {queue_attempts} attempts ({sent} DATA completed)",
                 )
                 break
             queue_attempts += 1
@@ -13512,7 +13813,7 @@ class SMTP(BaseModule):
                         first_rejection_at = idx + 1
                     if data_status == 421:
                         panic_421 = True
-                        smtp_trace.append(f"QUEUE_STRESS: 421 at msg {idx+1} - panic stop")
+                        self._mail_test_trace_append(smtp_trace, f"QUEUE_STRESS: 421 at msg {idx+1} - panic stop")
                         try:
                             smtp2.quit()
                         except Exception:
@@ -13520,7 +13821,7 @@ class SMTP(BaseModule):
                         break
                     if data_status == 452:
                         secure_452 = True
-                        smtp_trace.append(f"QUEUE_STRESS: 452 at msg {idx+1} - disk protection")
+                        self._mail_test_trace_append(smtp_trace, f"QUEUE_STRESS: 452 at msg {idx+1} - disk protection")
                         try:
                             smtp2.quit()
                         except Exception:
@@ -13541,10 +13842,16 @@ class SMTP(BaseModule):
             last_half = sum(rtts[-len(rtts) // 2 :]) / (len(rtts) // 2)
             if last_half > first_half * 2.0:
                 tarpitting_detected = True
-        smtp_trace.append(
+        self._mail_test_trace_append(
+            smtp_trace,
             f"QUEUE_STRESS: attempts={queue_attempts}, delivered={accepted} (250 OK), "
-            f"data_completed={sent} (no TCP error), failed={rejected} (non-250 or disconnect/timeout)"
+            f"data_completed={sent} (no TCP error), failed={rejected} (non-250 or disconnect/timeout)",
         )
+        queue_summary = (
+            f"attempts={queue_attempts}, delivered={accepted}, "
+            f"data_completed={sent}, failed={rejected}"
+        )
+        self._mail_test_live_done("queue", queue_summary)
 
         elapsed = time.perf_counter() - start_time
         vuln = (
@@ -13732,9 +14039,10 @@ class SMTP(BaseModule):
             smtp, conn_err = _connect_zipxxe()
             sent, accepted, rejected, err_count = 0, 0, 0, 0
             smtp_trace: list[str] = []
+            self._mail_test_trace_append(smtp_trace, f"--- {var_name} ---")
             if smtp is None:
                 err_count = 1
-                smtp_trace.append(f"connection failed: {conn_err}")
+                self._mail_test_trace_append(smtp_trace, f"Connect: {conn_err}")
             else:
                 try:
                     subject = self._outbound_subject()
@@ -13789,21 +14097,33 @@ class SMTP(BaseModule):
                         )
                     else:
                         continue
-                    smtp.docmd("EHLO", self.fqdn or "zipxxe-test.local")
-                    smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                    status, reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
-                    if status not in (250, 251):
+                    ehlo_st, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "zipxxe-test.local")
+                    self._mail_test_trace_append(smtp_trace, f"EHLO: {self._smtp_trace_reply(ehlo_st, ehlo_reply)}")
+                    mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
+                    self._mail_test_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                    if mail_st not in (250, 251):
                         rejected = 1
-                        smtp_trace.append(f"RCPT: {status} (rejected)")
-                    else:
-                        data_status, _ = smtp.data(raw_msg)
                         sent = 1
-                        if data_status == 250:
-                            accepted = 1
-                            smtp_trace.append("250 OK (accepted)")
-                        else:
+                    else:
+                        status, reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
+                        self._mail_test_trace_append(
+                            smtp_trace,
+                            f"RCPT TO <{rcpt}>: {self._smtp_trace_reply(status, reply)}",
+                        )
+                        if status not in (250, 251):
                             rejected = 1
-                            smtp_trace.append(f"{data_status} (rejected)")
+                            sent = 1
+                        else:
+                            data_status, data_reply = smtp.data(raw_msg)
+                            sent = 1
+                            self._mail_test_trace_append(
+                                smtp_trace,
+                                f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                            )
+                            if data_status == 250:
+                                accepted = 1
+                            else:
+                                rejected = 1
                     try:
                         smtp.quit()
                     except Exception:
@@ -13817,13 +14137,19 @@ class SMTP(BaseModule):
                     socket.timeout,
                 ) as e:
                     err_count = 1
-                    smtp_trace.append(f"error: {e}")
+                    self._mail_test_trace_append(smtp_trace, f"error: {e}")
                     try:
                         if smtp:
                             smtp.quit()
                     except Exception:
                         pass
             detail = f"{accepted} accepted, {rejected} rejected, {err_count} error" if sent or err_count else "skipped"
+            msg_summary = self._mail_variant_msg_summary(
+                tuple(smtp_trace),
+                accepted=accepted,
+                rejected=rejected,
+                error=err_count,
+            )
             var_results.append(
                 ZipxxeVariantResult(
                     variant=var_name,
@@ -13833,8 +14159,10 @@ class SMTP(BaseModule):
                     error=err_count,
                     smtp_trace=tuple(smtp_trace),
                     detail=detail,
+                    message_summary=msg_summary,
                 )
             )
+            self._mail_test_live_done(var_name, detail)
 
         elapsed = time.perf_counter() - start_time
         total_accepted = sum(v.accepted for v in var_results)
@@ -14212,8 +14540,7 @@ class SMTP(BaseModule):
                 self._stream_enumeration_method_rows(partial_enum_rows, catch_all)
                 self._enum_methods_streamed_early = True
                 if self._wordlist_enumeration_will_run(enumeration_vulns, catch_all):
-                    # Out.TEXT: no INFO bullet; color only via get_colored_text → single "[+]"
-                    self.ptprint(get_colored_text("[+] Enumerated", "INFO"), Out.TEXT)
+                    self.ptprint("Enumerated", Out.INFO)
                     sys.stdout.flush()
                     self._enum_progress_start = time.time()
                     self._enum_hits_streamed_live = True
@@ -14511,53 +14838,53 @@ class SMTP(BaseModule):
         if self.use_json or not (domain := getattr(self.results, "resolved_domain", None)):
             return
         self.ptprint("PTR / Domain", Out.INFO)
-        icon = get_colored_text("[*]", color="INFO")
-        self.ptprint(f"    {icon} Resolved domain: {domain}", Out.TEXT)
-        self._streamed_ptr_domain = True
+        ptprinthelper.ptprint(f"Resolved domain: {domain}", bullet_type="TITLE",
+                              condition=not self.use_json, indent=4)
 
     def _stream_banner_result(self) -> None:
         """Print banner result to terminal (header already printed before initial_info())."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if not self.results.banner_requested:
             return
         if not (info := self.results.info) or info.banner is None:
             self.ptprint("Service Identification", Out.INFO)
-            info_icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(f"    {info_icon} No information found", Out.TEXT)
+            pp("No information found", bullet_type="TITLE", condition=show, indent=4)
             return
         sid = identify_service(info.banner)
         if sid is None:
-            icon = get_colored_text("[✓]", color="NOTVULN")
+            banner_bullet = "NOTVULN"
         elif sid.version is not None:
-            icon = get_colored_text("[✗]", color="VULN")
+            banner_bullet = "VULN"
         else:
-            icon = get_colored_text("[!]", color="WARNING")
-        self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
+            banner_bullet = "WARNING"
+        pp(info.banner, bullet_type=banner_bullet, condition=show, indent=4)
         if sid is None:
             self.ptprint("Service Identification", Out.INFO)
-            info_icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(f"    {info_icon} No information found", Out.TEXT)
+            pp("No information found", bullet_type="TITLE", condition=show, indent=4)
         elif sid is not None:
             self.ptprint("Service Identification", Out.INFO)
-            self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
-            self.ptprint(f"    Version:  {sid.version if sid.version else 'unknown'}", Out.TEXT)
-            self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
+            pp(f"Product:  {sid.product}", bullet_type="TEXT", condition=show, indent=4)
+            pp(f"Version:  {sid.version if sid.version else 'unknown'}", bullet_type="TEXT", condition=show, indent=4)
+            pp(f"CPE:      {sid.cpe}", bullet_type="TEXT", condition=show, indent=4)
 
     def _stream_ehlo_result(self) -> None:
         """Print EHLO section header(s) and result."""
         if not self.results.commands_requested or not (info := self.results.info) or info.ehlo is None:
             return
+        show = not self.use_json
         ehlo_starttls = getattr(info, "ehlo_starttls", None)
 
         def _print_ehlo_parsed(ehlo_raw: str, connection_encrypted: bool) -> None:
             parsed = _parse_ehlo_commands(ehlo_raw, connection_encrypted=connection_encrypted)
             for display_str, level in parsed:
                 if level == "ERROR":
-                    icon = get_colored_text("[✗]", color="VULN")
+                    b = "VULN"
                 elif level == "WARNING":
-                    icon = get_colored_text("[!]", color="WARNING")
+                    b = "WARNING"
                 else:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} {display_str}", Out.TEXT)
+                    b = "NOTVULN"
+                ptprinthelper.ptprint(display_str, bullet_type=b, condition=show, indent=4)
 
         if ehlo_starttls:
             self.ptprint("EHLO extensions (PLAIN)", Out.INFO)
@@ -14579,23 +14906,22 @@ class SMTP(BaseModule):
                 and not getattr(info, "ehlo_starttls", None)
             ):
                 self.ptprint("EHLO extensions (STARTTLS)", Out.INFO)
-                icon = get_colored_text("[*]", color="INFO")
-                self.ptprint(
-                    f"    {icon} Failed to establish STARTTLS connection or STARTTLS command is not available in EHLO (try -vv for debug)",
-                    Out.TEXT,
+                ptprinthelper.ptprint(
+                    "Failed to establish STARTTLS connection or STARTTLS command is not available in EHLO (try -vv for debug)",
+                    bullet_type="TITLE", condition=show, indent=4,
                 )
 
     def _stream_role_result(self) -> None:
         """Print role identification result."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (role_error := self.results.role_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Role identification failed: {role_error}", Out.TEXT)
+            pp(f"Role identification failed: {role_error}", bullet_type="VULN", condition=show, indent=4)
             return
         role_r = self.results.role
         if role_r is None:
             return
 
-        info_icon = get_colored_text("[*]", color="INFO")
         port = self.args.target.port
 
         # Port hint line
@@ -14605,8 +14931,8 @@ class SMTP(BaseModule):
             465: "typical Submission port (implicit TLS)",
             2525: "alternative Submission port",
         }
-        port_label = port_labels.get(port, f"non-standard SMTP port")
-        self.ptprint(f"    {info_icon} Port {port} ({port_label})", Out.TEXT)
+        port_label = port_labels.get(port, "non-standard SMTP port")
+        pp(f"Port {port} ({port_label})", bullet_type="TITLE", condition=show, indent=4)
 
         # AUTH line
         if role_r.auth_advertised:
@@ -14618,37 +14944,35 @@ class SMTP(BaseModule):
             )
             methods = sorted(set(methods_plain + methods_starttls))
             methods_str = ", ".join(methods) if methods else "unknown"
-            self.ptprint(f"    {info_icon} AUTH advertised in EHLO ({methods_str})", Out.TEXT)
+            pp(f"AUTH advertised in EHLO ({methods_str})", bullet_type="TITLE", condition=show, indent=4)
         else:
-            self.ptprint(f"    {info_icon} AUTH not advertised in EHLO", Out.TEXT)
+            pp("AUTH not advertised in EHLO", bullet_type="TITLE", condition=show, indent=4)
 
         # RCPT TO probe result line (if probe was performed)
         if role_r.auth_required is True:
-            self.ptprint(f"    {info_icon} RCPT TO requires authentication", Out.TEXT)
+            pp("RCPT TO requires authentication", bullet_type="TITLE", condition=show, indent=4)
         elif role_r.auth_required is False:
-            self.ptprint(f"    {info_icon} RCPT TO accepted without authentication", Out.TEXT)
+            pp("RCPT TO accepted without authentication", bullet_type="TITLE", condition=show, indent=4)
 
         # Greylisting detection (450/451 = server has active anti-spam sender reputation checks)
         if "greylisting detected" in role_r.detail.lower():
-            self.ptprint(f"    {info_icon} Greylisting detected (server returned 450/451)", Out.TEXT)
+            pp("Greylisting detected (server returned 450/451)", bullet_type="TITLE", condition=show, indent=4)
 
         # Final role line
         role_display = {
-            "mta": ("MTA (Public Mail Server)", "[✓]", "NOTVULN"),
-            "submission": ("Submission (Mail Submission Agent)", "[✓]", "NOTVULN"),
-            "hybrid": ("Hybrid (MTA + Submission) -- consider separating roles", "[✗]", "VULN"),
-            "indeterminate": ("Indeterminate -- could not reliably determine role", "[✗]", "VULN"),
+            "mta": ("MTA (Public Mail Server)", "NOTVULN"),
+            "submission": ("Submission (Mail Submission Agent)", "NOTVULN"),
+            "hybrid": ("Hybrid (MTA + Submission) -- consider separating roles", "VULN"),
+            "indeterminate": ("Indeterminate -- could not reliably determine role", "WARNING"),
         }
-        label, icon_text, color = role_display.get(
-            role_r.role, ("Unknown", "[✗]", "VULN")
-        )
-        icon = get_colored_text(icon_text, color=color)
-        self.ptprint(f"    {icon} {label}", Out.TEXT)
+        label, bullet = role_display.get(role_r.role, ("Unknown", "VULN"))
+        pp(label, bullet_type=bullet, condition=show, indent=4)
 
     def _stream_encryption_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (encryption_error := self.results.encryption_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Encryption test failed: {encryption_error}", Out.TEXT)
+            pp(f"Encryption test failed: {encryption_error}", bullet_type="VULN", condition=show, indent=4)
             return
         enc = self.results.encryption
         if enc is None:
@@ -14656,76 +14980,65 @@ class SMTP(BaseModule):
         plaintext_only = enc.plaintext_ok and not enc.starttls_ok and not enc.tls_ok
         any_ok = enc.plaintext_ok or enc.starttls_ok or enc.tls_ok
         if plaintext_only:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Plaintext only", Out.TEXT)
+            pp("Plaintext only", bullet_type="VULN", condition=show, indent=4)
         elif any_ok:
             if enc.plaintext_ok:
                 # Plaintext available together with STARTTLS/TLS = warning
-                icon = (
-                    get_colored_text("[!]", color="WARNING")
-                    if (enc.starttls_ok or enc.tls_ok)
-                    else get_colored_text("[✓]", color="NOTVULN")
-                )
-                self.ptprint(f"    {icon} Plaintext", Out.TEXT)
+                bullet = "WARNING" if (enc.starttls_ok or enc.tls_ok) else "NOTVULN"
+                pp("Plaintext", bullet_type=bullet, condition=show, indent=4)
             if enc.starttls_ok:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} STARTTLS", Out.TEXT)
+                pp("STARTTLS", bullet_type="NOTVULN", condition=show, indent=4)
             if enc.tls_ok:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} TLS", Out.TEXT)
+                pp("TLS", bullet_type="NOTVULN", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(
-                f"    {icon} No connection mode available (plaintext, STARTTLS, TLS failed)",
-                Out.TEXT,
-            )
+            pp("No connection mode available (plaintext, STARTTLS, TLS failed)",
+               bullet_type="VULN", condition=show, indent=4)
 
     def _stream_open_relay_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (open_relay_error := self.results.open_relay_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Open relay test failed: {open_relay_error}", Out.TEXT)
+            pp(f"Open relay test failed: {open_relay_error}", bullet_type="VULN", condition=show, indent=4)
             return
         if (open_relay := self.results.open_relay) is None:
             return
         if open_relay:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Open relay is allowed", Out.TEXT)
+            pp("Open relay is allowed", bullet_type="VULN", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} Open relay is denied", Out.TEXT)
+            pp("Open relay is denied", bullet_type="NOTVULN", condition=show, indent=4)
 
     @staticmethod
-    def _rcpt_limit_recipient_verdict_icon(max_accepted: int) -> str:
-        """Terminal icon from accepted RCPT count before limit/cap: ≤100 OK, 101–500 warn, >500 error."""
+    def _rcpt_limit_recipient_verdict_bullet(max_accepted: int) -> str:
+        """Bullet type from accepted RCPT count before limit/cap: ≤100 OK, 101–500 warn, >500 error."""
         n = max_accepted if max_accepted is not None else 0
         if n <= RCPT_LIMIT_VERDICT_OK_MAX:
-            return get_colored_text("[✓]", color="NOTVULN")
+            return "NOTVULN"
         if n <= RCPT_LIMIT_VERDICT_WARN_MAX:
-            return get_colored_text("[!]", color="WARNING")
-        return get_colored_text("[✗]", color="VULN")
+            return "WARNING"
+        return "VULN"
 
     def _stream_rcpt_limit_catch_all_notice(self) -> None:
         """Print when pre-probe RCPT TO accepts a clearly invalid local part."""
-        info_icon = get_colored_text("[*]", color="INFO")
-        self.ptprint(
-            f"    {info_icon} Server accepts non-exist recipients in RCPT TO "
+        ptprinthelper.ptprint(
+            "Server accepts non-exist recipients in RCPT TO "
             "(likely Catch-all is configured)",
-            Out.TEXT,
+            bullet_type="TITLE", condition=not self.use_json, indent=4,
         )
 
     def _stream_rcpt_limit_wordlist_notices(self, recipients: list[str], wordlist_size: int) -> None:
         """Deferred MTA-not-relay wordlist info (after accept-all pre-probe)."""
-        info_icon = get_colored_text("[*]", color="INFO")
-        self.ptprint(
-            f"    {info_icon} Using {len(recipients)} recipient(s) "
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
+        pp(
+            f"Using {len(recipients)} recipient(s) "
             f"{self._rl_name_list_source_phrase()} for MTA-not-relay probe",
-            Out.TEXT,
+            bullet_type="TITLE", condition=show, indent=4,
         )
         if wordlist_size < RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT:
-            self.ptprint(
-                f"    {info_icon} For a valid test, a username list with more than "
+            pp(
+                f"For a valid test, a username list with more than "
                 f"{RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT} valid recipients is required",
-                Out.TEXT,
+                bullet_type="TITLE", condition=show, indent=4,
             )
 
     def _maybe_stream_rcpt_limit_domain_hint(self, server_response: str | None) -> None:
@@ -14734,10 +15047,9 @@ class SMTP(BaseModule):
             return
         if not self._rcpt_response_suggests_bad_domain(server_response):
             return
-        info_icon = get_colored_text("[*]", color="INFO")
-        self.ptprint(
-            f"    {info_icon} Try -d/--domain <domain> to set recipient domain for this test",
-            Out.TEXT,
+        ptprinthelper.ptprint(
+            "Try -d/--domain <domain> to set recipient domain for this test",
+            bullet_type="TITLE", condition=not self.use_json, indent=4,
         )
 
     def _stream_rcpt_limit_catch_all_delivery_hint(self, rlim: RcptLimitResult) -> None:
@@ -14745,29 +15057,27 @@ class SMTP(BaseModule):
         bounce_mb = getattr(rlim, "catch_all_bounce_mailbox", None)
         if not bounce_mb:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
-        warn_icon = get_colored_text("[!]", color="WARNING")
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         probe_local = RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL
         probe_domain = getattr(rlim, "domain_used", None) or "domain"
         probe_addr = getattr(rlim, "catch_all_delivery_rcpt", None) or f"{probe_local}@{probe_domain}"
 
         if getattr(rlim, "catch_all_delivery_attempted", False):
             if getattr(rlim, "catch_all_delivery_data_ok", False):
-                self.ptprint(
-                    f"    {info_icon} Check mailbox {bounce_mb} for delivered message",
-                    Out.TEXT,
-                )
+                pp(f"Check mailbox {bounce_mb} for delivered message",
+                   bullet_type="TITLE", condition=show, indent=4)
             else:
-                self.ptprint(
-                    f"    {warn_icon} Catch-all bounce probe: could not complete delivery to "
+                pp(
+                    f"Catch-all bounce probe: could not complete delivery to "
                     f"{probe_addr} (MAIL FROM: {bounce_mb}) — manual bounce check may be inconclusive",
-                    Out.TEXT,
+                    bullet_type="WARNING", condition=show, indent=4,
                 )
         elif not getattr(rlim, "accept_all_via_rcpt", False):
-            self.ptprint(
-                f"    {info_icon} Catch-all bounce probe skipped: RCPT TO did not accept "
+            pp(
+                f"Catch-all bounce probe skipped: RCPT TO did not accept "
                 f"{probe_local}@{probe_domain} (no message sent; -m not used for bounce check)",
-                Out.TEXT,
+                bullet_type="TITLE", condition=show, indent=4,
             )
 
     def _stream_rcpt_limit_server_response_verbose(self, server_response: str | None) -> None:
@@ -14778,81 +15088,63 @@ class SMTP(BaseModule):
             self.ptdebug(line, Out.TEXT)
 
     def _stream_rcpt_limit_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         rcptmax_advertised = None
         if (info := getattr(self.results, "info", None)) and getattr(info, "ehlo", None):
             rcptmax_advertised = _parse_rcptmax_from_ehlo(info.ehlo)
         if (rcpt_limit_err := self.results.rcpt_limit_error) is not None:
             if rcptmax_advertised is not None:
-                info_icon = get_colored_text("[*]", color="INFO")
-                self.ptprint(
-                    f"    {info_icon} Advertised in EHLO (RFC 9422): RCPTMAX={rcptmax_advertised}",
-                    Out.TEXT,
-                )
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Test failed: {rcpt_limit_err}", Out.TEXT)
+                pp(f"Advertised in EHLO (RFC 9422): RCPTMAX={rcptmax_advertised}",
+                   bullet_type="TITLE", condition=show, indent=4)
+            pp(f"Test failed: {rcpt_limit_err}", bullet_type="VULN", condition=show, indent=4)
             return
         rlim = self.results.rcpt_limit
         if rlim is None:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
         # Pre-check verdict / skip path (printed live by test_rcpt_limit; nothing more to do
         # here except announce the per-message verdict, which is already absent for skip cases).
         if getattr(rlim, "skipped", False):
             return
         if getattr(rlim, "auth_used", False):
-            self.ptprint(
-                f"    {info_icon} Authenticated session used for RCPT TO probe",
-                Out.TEXT,
-            )
+            pp("Authenticated session used for RCPT TO probe", bullet_type="TITLE", condition=show, indent=4)
         if rcptmax_advertised is not None:
-            self.ptprint(
-                f"    {info_icon} Advertised in EHLO (RFC 9422): RCPTMAX={rcptmax_advertised}",
-                Out.TEXT,
-            )
+            pp(f"Advertised in EHLO (RFC 9422): RCPTMAX={rcptmax_advertised}",
+               bullet_type="TITLE", condition=show, indent=4)
         if getattr(rlim, "session_limit_triggered", False):
-            icon = get_colored_text("[✓]", color="NOTVULN")
             attempts = getattr(rlim, "failed_before_limit", 0)
             attempts_suffix = f" (after {attempts} attempts)" if attempts else ""
-            self.ptprint(
-                f"    {icon} Session limit enforced (421 or disconnect){attempts_suffix}",
-                Out.TEXT,
-            )
+            pp(f"Session limit enforced (421 or disconnect){attempts_suffix}",
+               bullet_type="NOTVULN", condition=show, indent=4)
             self._stream_rcpt_limit_server_response_verbose(rlim.server_response)
         elif getattr(rlim, "rejected_addresses", False) and getattr(rlim, "no_session_limit", False):
-            warn_icon = get_colored_text("[!]", color="WARNING")
             attempts = getattr(rlim, "failed_before_limit", 0)
             if attempts:
-                self.ptprint(
-                    f"    {warn_icon} Could not test per-message limit: server rejects {attempts} tested addresses "
+                pp(
+                    f"Could not test per-message limit: server rejects {attempts} tested addresses "
                     f"(allowed {attempts} failed RCPTs without disconnect)",
-                    Out.TEXT,
+                    bullet_type="WARNING", condition=show, indent=4,
                 )
             else:
-                self.ptprint(
-                    f"    {warn_icon} Could not test per-message limit: server rejects tested addresses "
+                pp(
+                    "Could not test per-message limit: server rejects tested addresses "
                     "(allowed failed RCPTs without disconnect)",
-                    Out.TEXT,
+                    bullet_type="WARNING", condition=show, indent=4,
                 )
             self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
         elif rlim.limit_triggered:
-            icon = self._rcpt_limit_recipient_verdict_icon(rlim.max_accepted)
-            self.ptprint(
-                f"    {icon} Max {rlim.max_accepted} recipients per message (next recipients are rejected)",
-                Out.TEXT,
+            pp(
+                f"Max {rlim.max_accepted} recipients per message (next recipients are rejected)",
+                bullet_type=self._rcpt_limit_recipient_verdict_bullet(rlim.max_accepted),
+                condition=show, indent=4,
             )
             disc = getattr(rlim, "disconnect_after_limit", None)
             if disc is True:
-                ok_icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(
-                    f"    {ok_icon} Connection was disconnected after many invalid recipients",
-                    Out.TEXT,
-                )
+                pp("Connection was disconnected after many invalid recipients",
+                   bullet_type="NOTVULN", condition=show, indent=4)
             elif disc is False:
-                bad_icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(
-                    f"    {bad_icon} Connection is not disconnected after many invalid recipients",
-                    Out.TEXT,
-                )
+                pp("Connection is not disconnected after many invalid recipients",
+                   bullet_type="VULN", condition=show, indent=4)
             self._stream_rcpt_limit_server_response_verbose(rlim.server_response)
             if rlim.max_accepted == 0:
                 self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
@@ -14860,152 +15152,130 @@ class SMTP(BaseModule):
             if rlim.max_accepted == 0:
                 rl_err = _rl_extract_too_much_mail_error(rlim.server_response)
                 if rl_err:
-                    bad_icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(f"    {bad_icon} {rl_err}", Out.TEXT)
+                    pp(rl_err, bullet_type="VULN", condition=show, indent=4)
                 else:
-                    self.ptprint(f"    {info_icon} Could not test: no recipients accepted", Out.TEXT)
+                    pp("Could not test: no recipients accepted", bullet_type="TITLE", condition=show, indent=4)
                 self._stream_rcpt_limit_server_response_verbose(rlim.server_response)
                 if not rl_err:
                     self._maybe_stream_rcpt_limit_domain_hint(rlim.server_response)
-        icon = self._rcpt_limit_recipient_verdict_icon(rlim.max_accepted)
-        self.ptprint(
-            f"    {icon} Accepted recipients: {rlim.max_accepted}",
-            Out.TEXT,
+        pp(
+            f"Accepted recipients: {rlim.max_accepted}",
+            bullet_type=self._rcpt_limit_recipient_verdict_bullet(rlim.max_accepted),
+            condition=show, indent=4,
         )
         if getattr(rlim, "limit_send_mode", False):
-            ok_icon = get_colored_text("[✓]", color="NOTVULN")
-            bad_icon = get_colored_text("[✗]", color="VULN")
-            info_icon = get_colored_text("[*]", color="INFO")
             mail_from = getattr(rlim, "limit_send_mail_from", None) or "?"
             if getattr(rlim, "limit_send_attempted", False):
                 if getattr(rlim, "limit_send_ok", False):
-                    self.ptprint(
-                        f"    {ok_icon} Message with {rlim.max_accepted} recipient(s) accepted "
+                    pp(
+                        f"Message with {rlim.max_accepted} recipient(s) accepted "
                         f"by server (DATA 250, MAIL FROM: {mail_from})",
-                        Out.TEXT,
+                        bullet_type="NOTVULN", condition=show, indent=4,
                     )
-                    self.ptprint(
-                        f"    {info_icon} Check mailbox {mail_from} for NDR, bounce, "
+                    pp(
+                        f"Check mailbox {mail_from} for NDR, bounce, "
                         "or other delivery status notifications",
-                        Out.TEXT,
+                        bullet_type="TITLE", condition=show, indent=4,
                     )
                 else:
                     code = getattr(rlim, "limit_send_data_code", None)
                     reply = (getattr(rlim, "limit_send_data_reply", None) or "").strip()
                     code_s = str(code) if code is not None else "?"
-                    self.ptprint(
-                        f"    {bad_icon} Message delivery failed after {rlim.max_accepted} "
+                    pp(
+                        f"Message delivery failed after {rlim.max_accepted} "
                         f"accepted RCPT TO (DATA [{code_s}] {reply})".rstrip(),
-                        Out.TEXT,
+                        bullet_type="VULN", condition=show, indent=4,
                     )
             elif rlim.max_accepted == 0:
-                self.ptprint(
-                    f"    {info_icon} Message not sent: no RCPT TO accepted in this transaction",
-                    Out.TEXT,
-                )
+                pp("Message not sent: no RCPT TO accepted in this transaction",
+                   bullet_type="TITLE", condition=show, indent=4)
         self._stream_rcpt_limit_catch_all_delivery_hint(rlim)
 
     def _stream_rcpt_duplicate_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.rcpt_duplicate_error) is not None:
             if _rcpt_duplicate_error_is_environmental(err):
-                icon = get_colored_text("[i]", color="INFO")
-                self.ptprint(
-                    f"    {icon} Duplicate RCPT probe could not run: {err}",
-                    Out.TEXT,
-                )
+                pp(f"Duplicate RCPT probe could not run: {err}", bullet_type="TITLE", condition=show, indent=4)
             else:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Duplicate RCPT probe failed: {err}", Out.TEXT)
+                pp(f"Duplicate RCPT probe failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         r = self.results.rcpt_duplicate
         if r is None:
             return
-        ok_icon = get_colored_text("[✓]", color="NOTVULN")
-        vuln_icon = get_colored_text("[✗]", color="VULN")
-        info_icon = get_colored_text("[i]", color="INFO")
         if r.all_rcpt_2xx:
-            icon = vuln_icon if r.duplicate_count >= 3 else info_icon
-            self.ptprint(
-                f"    {icon} All {r.duplicate_count} duplicate RCPT TO accepted for {r.recipient!r} "
+            bullet = "VULN" if r.duplicate_count >= 3 else "TITLE"
+            pp(
+                f"All {r.duplicate_count} duplicate RCPT TO accepted for {r.recipient!r} "
                 f"(delivery fan-out is implementation-defined; check mailbox / logs manually)",
-                Out.TEXT,
+                bullet_type=bullet, condition=show, indent=4,
             )
         else:
             fi = r.first_failure_index
             c = r.rcpt_replies[fi][0] if fi is not None and fi < len(r.rcpt_replies) else "?"
-            self.ptprint(
-                f"    {ok_icon} Duplicate RCPT not fully accepted "
+            pp(
+                f"Duplicate RCPT not fully accepted "
                 f"(first non-2xx at #{fi + 1 if fi is not None else '?'}: {c})",
-                Out.TEXT,
+                bullet_type="NOTVULN", condition=show, indent=4,
             )
         if r.data_sent and r.probe_uuid:
-            self.ptprint(
-                f"    {info_icon} DATA accepted with probe id {r.probe_uuid} — correlate in recipient inbox",
-                Out.TEXT,
-            )
+            pp(f"DATA accepted with probe id {r.probe_uuid} — correlate in recipient inbox",
+               bullet_type="TITLE", condition=show, indent=4)
         if r.all_rcpt_2xx and r.duplicate_count >= 3:
-            self.ptprint(
-                f"    {info_icon} Expect one delivery after DATA if amplification is mitigated; "
+            pp(
+                f"Expect one delivery after DATA if amplification is mitigated; "
                 f"several copies or leaky Delivered-To/Received warrant documenting",
-                Out.TEXT,
+                bullet_type="TITLE", condition=show, indent=4,
             )
         if getattr(self.args, "rcpt_duplicate_send", False) and not r.data_sent:
             extra = f": {r.data_reply_snippet}" if r.data_reply_snippet else ""
-            self.ptprint(
-                f"    {info_icon} DATA not completed{extra}",
-                Out.TEXT,
-            )
+            pp(f"DATA not completed{extra}", bullet_type="TITLE", condition=show, indent=4)
 
     def _stream_blacklist_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (blacklist_error := self.results.blacklist_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Blacklist test failed: {blacklist_error}", Out.TEXT)
+            pp(f"Blacklist test failed: {blacklist_error}", bullet_type="VULN", condition=show, indent=4)
             return
         if self.results.blacklist_private_ip_skipped:
-            info_icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(
-                f"    {info_icon}Private/internal IP - blacklist check not applicable (addresses in private ranges are not listed on public blacklists)",
-                Out.TEXT,
+            pp(
+                "Private/internal IP - blacklist check not applicable (addresses in private ranges are not listed on public blacklists)",
+                bullet_type="TITLE", condition=show, indent=4,
             )
             return
         blacklist = self.results.blacklist
         if blacklist is None:
             return
         if not blacklist.listed:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} Clean", Out.TEXT)
+            pp("Clean", bullet_type="NOTVULN", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✗]", color="VULN")
             if (results := blacklist.results) is not None:
                 for r in results:
                     r_str = f'{r.blacklist.strip()}: "{r.reason}" (TTL={r.ttl})'
-                    self.ptprint(f"    {icon} {r_str}", Out.TEXT)
+                    pp(r_str, bullet_type="VULN", condition=show, indent=4)
 
     def _stream_spf_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if self.results.spf_requires_domain:
-            info_icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(
-                f"    {info_icon} Test requires target specified by a domain name",
-                Out.TEXT,
-            )
+            pp("Test requires target specified by a domain name", bullet_type="TITLE", condition=show, indent=4)
             return
         if (spf_error := self.results.spf_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} SPF test failed: {spf_error}", Out.TEXT)
+            pp(f"SPF test failed: {spf_error}", bullet_type="VULN", condition=show, indent=4)
             return
         spf_records = self.results.spf_records
         if spf_records is None:
             return
         for ns, records in spf_records.items():
-            info_icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(f"    {info_icon} Nameserver {ns}", Out.TEXT)
+            pp(f"Nameserver {ns}", bullet_type="TITLE", condition=show, indent=4)
             for r in records:
-                self.ptprint(f"        {r}", Out.TEXT)
+                pp(r, bullet_type="TEXT", condition=show, indent=8)
 
     def _stream_enumeration_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (enum_error := self.results.enum_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Enumeration test failed: {enum_error}", Out.TEXT)
+            pp(f"Enumeration test failed: {enum_error}", bullet_type="VULN", condition=show, indent=4)
             return
         enum_results = self.results.enum_results
         if enum_results is None:
@@ -15025,47 +15295,45 @@ class SMTP(BaseModule):
         if skip_hits:
             self._enum_hits_streamed_live = False
 
-        warn_icon = get_colored_text("[!]", color="WARNING")
         if not skip_methods:
             for e in filtered:
                 if catch_all == "configured":
-                    self.ptprint(
-                        f"    {warn_icon} {e.method.upper()} method: Indeterminate (Useless due to Catch All)",
-                        Out.TEXT,
-                    )
+                    pp(f"{e.method.upper()} method: Indeterminate (Useless due to Catch All)",
+                       bullet_type="WARNING", condition=show, indent=4)
                 elif e.blocked_by_rbl:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(
-                        f"    {icon} {e.method.upper()} method protected by RBL/Reputation (Client IP blocked)",
-                        Out.TEXT,
-                    )
+                    pp(f"{e.method.upper()} method protected by RBL/Reputation (Client IP blocked)",
+                       bullet_type="NOTVULN", condition=show, indent=4)
                     if e.server_reply:
                         for line in (e.server_reply or "").replace("\r", "").splitlines():
-                            self.ptprint(f"        {line.strip()}", Out.TEXT)
+                            pp(line.strip(), bullet_type="TEXT", condition=show, indent=8)
                 else:
                     slowdown = ""
                     if e.slowdown is not None:
                         slowdown = " (rate limited)" if e.slowdown else " (not rate limited)"
-                    icon = get_colored_text("[✗]", color="VULN") if e.vulnerable else get_colored_text("[✓]", color="NOTVULN")
+                    verdict_bullet = "VULN" if e.vulnerable else "NOTVULN"
                     if e.vulnerable:
                         if e.server_reply:
                             raw = (e.server_reply or "").replace("\r", "").splitlines()
                             parts = [re.sub(r" +", " ", p.strip()) for p in raw if p.strip()]
                             if parts:
                                 if len(parts) == 1:
-                                    self.ptprint(f"    {icon} {e.method.upper()} method is enabled ({parts[0]}){slowdown}", Out.TEXT)
+                                    pp(f"{e.method.upper()} method is enabled ({parts[0]}){slowdown}",
+                                       bullet_type=verdict_bullet, condition=show, indent=4)
                                 else:
-                                    self.ptprint(
-                                        f"    {icon} {e.method.upper()} method is enabled ({parts[0]}{')' if len(parts) == 1 else ''}{slowdown if len(parts) == 1 else ''}",
-                                        Out.TEXT,
+                                    pp(
+                                        f"{e.method.upper()} method is enabled ({parts[0]}{')' if len(parts) == 1 else ''}{slowdown if len(parts) == 1 else ''}",
+                                        bullet_type=verdict_bullet, condition=show, indent=4,
                                     )
                                     for i, part in enumerate(parts[1:]):
                                         is_last = i == len(parts) - 2
-                                        self.ptprint(f"        {part}{')' if is_last else ''}{slowdown if is_last else ''}", Out.TEXT)
+                                        pp(f"{part}{')' if is_last else ''}{slowdown if is_last else ''}",
+                                           bullet_type="TEXT", condition=show, indent=8)
                             else:
-                                self.ptprint(f"    {icon} {e.method.upper()} method is enabled{slowdown}", Out.TEXT)
+                                pp(f"{e.method.upper()} method is enabled{slowdown}",
+                                   bullet_type=verdict_bullet, condition=show, indent=4)
                         else:
-                            self.ptprint(f"    {icon} {e.method.upper()} method is enabled{slowdown}", Out.TEXT)
+                            pp(f"{e.method.upper()} method is enabled{slowdown}",
+                               bullet_type=verdict_bullet, condition=show, indent=4)
                     else:
                         # Show policy note when available (relay protection / admin prohibition)
                         if e.server_reply and "Relay protection active" in e.server_reply:
@@ -15074,40 +15342,36 @@ class SMTP(BaseModule):
                             status = "is deny (Administrative prohibition)"
                         else:
                             status = "is deny"
-                        self.ptprint(f"    {icon} {e.method.upper()} method {status}{slowdown}", Out.TEXT)
+                        pp(f"{e.method.upper()} method {status}{slowdown}",
+                           bullet_type=verdict_bullet, condition=show, indent=4)
         if not skip_hits:
             for e in filtered:
                 if e.vulnerable and (results := e.results) is not None:
                     sorted_results = sorted(results, key=str)
                     for r in sorted_results:
-                        self.ptprint(f"    {r}")
-        info_icon = get_colored_text("[*]", color="INFO")
+                        pp(str(r), bullet_type="TEXT", condition=show, indent=4)
         if catch_all == "configured":
-            self.ptprint(f"    {info_icon} Catch All mailbox configured", Out.TEXT)
+            pp("Catch All mailbox configured", bullet_type="TITLE", condition=show, indent=4)
         elif catch_all == "not_configured":
-            self.ptprint(f"    {info_icon} Catch All mailbox not configured", Out.TEXT)
+            pp("Catch All mailbox not configured", bullet_type="TITLE", condition=show, indent=4)
         elif catch_all == "indeterminate_accept_all_rcpt":
-            self.ptprint(
-                f"    {info_icon} Catch All mailbox indeterminate (accept-all via RCPT)",
-                Out.TEXT,
-            )
+            pp("Catch All mailbox indeterminate (accept-all via RCPT)", bullet_type="TITLE", condition=show, indent=4)
         elif catch_all == "indeterminate":
-            self.ptprint(f"    {info_icon} Catch All mailbox indeterminate", Out.TEXT)
+            pp("Catch All mailbox indeterminate", bullet_type="TITLE", condition=show, indent=4)
 
     def _stream_ntlm_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (ntlm_error := self.results.ntlm_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} NTLM test failed: {ntlm_error}", Out.TEXT)
+            pp(f"NTLM test failed: {ntlm_error}", bullet_type="VULN", condition=show, indent=4)
             return
         ntlm = self.results.ntlm
         if ntlm is None:
             return
         if not ntlm.success:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} Not available", Out.TEXT)
+            pp("Not available", bullet_type="NOTVULN", condition=show, indent=4)
         elif ntlm.ntlm is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} NTLM information", Out.TEXT)
+            pp("NTLM information", bullet_type="VULN", condition=show, indent=4)
             for line in (
                 f"Target name: {ntlm.ntlm.target_name}",
                 f"NetBios domain name: {ntlm.ntlm.netbios_domain}",
@@ -15118,18 +15382,16 @@ class SMTP(BaseModule):
                 f"OS version: {ntlm.ntlm.os_version}",
             ):
                 for part in (line or "").replace("\r", "").splitlines():
-                    self.ptprint(f"        {part}", Out.TEXT)
+                    pp(part, bullet_type="TEXT", condition=show, indent=8)
 
     def _stream_auth_enum_method_verdict(self, mr: AuthEnumResult) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if mr.indeterminate:
-            icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(
-                f"        {icon} Could not determine: {mr.detail or 'insufficient AUTH responses'}",
-                Out.TEXT,
-            )
+            pp(f"Could not determine: {mr.detail or 'insufficient AUTH responses'}",
+               bullet_type="TITLE", condition=show, indent=8)
             return
         if mr.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
             if mr.protocol_flow_vuln:
                 msg = (
                     "User enumeration is possible because the server responds with 5xx "
@@ -15140,29 +15402,28 @@ class SMTP(BaseModule):
                     "User enumeration is possible because error messages are different "
                     "for valid and invalid logins"
                 )
-            self.ptprint(f"        {icon} {msg}", Out.TEXT)
+            pp(msg, bullet_type="VULN", condition=show, indent=8)
             if mr.enumerated_users:
                 for u in mr.enumerated_users:
-                    self.ptprint(f"            {u}", Out.TEXT)
+                    pp(u, bullet_type="TEXT", condition=show, indent=12)
             elif mr.detail and not mr.protocol_flow_vuln:
                 # No per-user list: show the technical detail (skip when it just
                 # repeats the protocol-flow verdict sentence above).
-                self.ptprint(f"            {mr.detail}", Out.TEXT)
+                pp(mr.detail, bullet_type="TEXT", condition=show, indent=12)
             return
-        icon = get_colored_text("[✓]", color="NOTVULN")
-        self.ptprint(
-            "        "
-            f"{icon} User enumeration is not possible because error messages are the same "
+        pp(
+            "User enumeration is not possible because error messages are the same "
             "for valid and invalid logins (or no valid login was delivered)",
-            Out.TEXT,
+            bullet_type="NOTVULN", condition=show, indent=8,
         )
         if mr.detail:
-            self.ptprint(f"            {mr.detail}", Out.TEXT)
+            pp(mr.detail, bullet_type="TEXT", condition=show, indent=12)
 
     def _stream_auth_enum_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (auth_enum_error := self.results.auth_enum_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} AUTH enumeration test failed: {auth_enum_error}", Out.TEXT)
+            pp(f"AUTH enumeration test failed: {auth_enum_error}", bullet_type="VULN", condition=show, indent=4)
             return
         ae = self.results.auth_enum
         if ae is None:
@@ -15171,48 +15432,43 @@ class SMTP(BaseModule):
         if not method_results:
             if ae.indeterminate:
                 if ae.detail == "Server does not advertise AUTH LOGIN, PLAIN or NTLM":
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} Not vulnerable: {ae.detail}", Out.TEXT)
+                    pp(f"Not vulnerable: {ae.detail}", bullet_type="NOTVULN", condition=show, indent=4)
                 else:
-                    icon = get_colored_text("[*]", color="INFO")
-                    self.ptprint(f"    {icon} Indeterminate: {ae.detail or 'Could not determine'}", Out.TEXT)
+                    pp(f"Indeterminate: {ae.detail or 'Could not determine'}", bullet_type="TITLE", condition=show, indent=4)
             return
-        mech_icon = get_colored_text("[*]", color="INFO")
-        info_icon = get_colored_text("[i]", color="INFO")
         ntlm_note = self.results.auth_enum_ntlm_note
         for mr in method_results:
-            self.ptprint(f"    {mech_icon} AUTH {mr.method_tested} test enumeration", Out.TEXT)
+            pp(f"AUTH {mr.method_tested} test enumeration", bullet_type="TITLE", condition=show, indent=4)
             if mr.method_tested == "NTLM" and ntlm_note:
-                self.ptprint(f"        {info_icon} {ntlm_note}", Out.TEXT)
+                pp(ntlm_note, bullet_type="TITLE", condition=show, indent=8)
             self._stream_auth_enum_method_verdict(mr)
         if ae.vulnerable and ae.enumerated_users and len(method_results) > 1:
-            info_icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(f"    {info_icon} Enumerated users (all mechanisms)", Out.TEXT)
+            pp("Enumerated users (all mechanisms)", bullet_type="TITLE", condition=show, indent=4)
             for u in ae.enumerated_users:
-                self.ptprint(f"        {u}", Out.TEXT)
+                pp(u, bullet_type="TEXT", condition=show, indent=8)
 
     def _stream_auth_format_result(self) -> None:
         """PTL-SVC-SMTP-AUTH-FORMAT: text output for AUTH LOGIN identity-shape probes."""
-        info_icon = get_colored_text("[i]", color="INFO")
-        plus_icon = get_colored_text("[+]", color="INFO")
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.auth_format_error) is not None:
-            self.ptprint(f"    {info_icon} AUTH format probe failed: {err}", Out.TEXT)
+            pp(f"AUTH format probe failed: {err}", bullet_type="TITLE", condition=show, indent=4)
             return
         af = self.results.auth_format
         if af is None:
             return
-        self.ptprint(f"    {plus_icon} AUTH Analysis ({af.method_tested})", Out.TEXT)
+        pp(f"AUTH Analysis ({af.method_tested})", bullet_type="INFO", condition=show, indent=4)
         if af.challenge_decoded is not None:
-            self.ptprint(f"    {info_icon} AUTH LOGIN challenge (decoded): {af.challenge_decoded!r}", Out.TEXT)
+            pp(f"AUTH LOGIN challenge (decoded): {af.challenge_decoded!r}", bullet_type="TITLE", condition=show, indent=4)
         if af.challenge_hint:
-            self.ptprint(f"    {info_icon} Challenge heuristic: {af.challenge_hint}", Out.TEXT)
-        self.ptprint(f"    {info_icon} Auth Format Probe:", Out.TEXT)
+            pp(f"Challenge heuristic: {af.challenge_hint}", bullet_type="TITLE", condition=show, indent=4)
+        pp("Auth Format Probe:", bullet_type="TITLE", condition=show, indent=4)
         if af.target_domain_used:
-            self.ptprint(f"        {info_icon} Target domain used: {af.target_domain_used}", Out.TEXT)
+            pp(f"Target domain used: {af.target_domain_used}", bullet_type="TITLE", condition=show, indent=8)
         else:
-            self.ptprint(f"        {info_icon} Target domain used: (none — probe B skipped)", Out.TEXT)
+            pp("Target domain used: (none — probe B skipped)", bullet_type="TITLE", condition=show, indent=8)
         if af.target_domain_analyst_note:
-            self.ptprint(f"        {info_icon} {af.target_domain_analyst_note}", Out.TEXT)
+            pp(af.target_domain_analyst_note, bullet_type="TITLE", condition=show, indent=8)
         if af.target_domain_source == "ehlo_last2" and af.target_domain_ehlo_hostname and af.target_domain_used:
             self.ptdebug(
                 f"AUTH-FORMAT: scan target is IP; EHLO hostname {af.target_domain_ehlo_hostname!r} "
@@ -15232,22 +15488,17 @@ class SMTP(BaseModule):
             )
         for r in af.rows:
             if r.skipped:
-                self.ptprint(f"        {info_icon} {r.label}: skipped ({r.skip_reason or 'n/a'})", Out.TEXT)
+                pp(f"{r.label}: skipped ({r.skip_reason or 'n/a'})", bullet_type="TITLE", condition=show, indent=8)
             elif r.password_phase:
                 tail = f"final reply {r.code_after_password}" if r.code_after_password is not None else "password phase"
-                self.ptprint(
-                    f"        {info_icon} {r.label}: accepted → password phase ({tail})",
-                    Out.TEXT,
-                )
+                pp(f"{r.label}: accepted → password phase ({tail})", bullet_type="TITLE", condition=show, indent=8)
             else:
                 rep = (r.reply_after_identity or "").replace("\r\n", " ").strip()
                 if len(rep) > 140:
                     rep = rep[:137] + "..."
-                self.ptprint(
-                    f"        {info_icon} {r.label}: rejected at username ({r.code_after_identity}) {rep}".rstrip(),
-                    Out.TEXT,
-                )
-        self.ptprint(f"    {info_icon} Auth Identity Format: {af.conclusion}", Out.TEXT)
+                pp(f"{r.label}: rejected at username ({r.code_after_identity}) {rep}".rstrip(),
+                   bullet_type="TITLE", condition=show, indent=8)
+        pp(f"Auth Identity Format: {af.conclusion}", bullet_type="TITLE", condition=show, indent=4)
         if af.conclusion_id == "flexible_all_formats":
             ch_tail = ""
             hint_note = af.challenge_hint
@@ -15259,55 +15510,52 @@ class SMTP(BaseModule):
                 ch_tail = f" Challenge hint: {af.challenge_decoded!r}."
             elif hint_note:
                 ch_tail = f" Challenge hint: {hint_note}."
-            self.ptprint(
-                f"    {info_icon} Note: All probes that ran reached password phase — server may be masking "
+            pp(
+                f"Note: All probes that ran reached password phase — server may be masking "
                 f"expected format (catch-all behavior).{ch_tail}",
-                Out.TEXT,
+                bullet_type="TITLE", condition=show, indent=4,
             )
         if af.netbios_domain_used:
-            self.ptprint(f"    {info_icon} NTLM-derived DOMAIN for NetBIOS probe: {af.netbios_domain_used}", Out.TEXT)
+            pp(f"NTLM-derived DOMAIN for NetBIOS probe: {af.netbios_domain_used}", bullet_type="TITLE", condition=show, indent=4)
 
     def _stream_helo_validation_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.helo_validation_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} HELO validation test failed: {err}", Out.TEXT)
+            pp(f"HELO validation test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         hv = self.results.helo_validation
         if hv is None:
             return
         if hv.indeterminate:
-            icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(f"    {icon} Indeterminate: {hv.detail or 'Baseline failed'}", Out.TEXT)
+            pp(f"Indeterminate: {hv.detail or 'Baseline failed'}", bullet_type="TITLE", condition=show, indent=4)
             return
         if hv.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} VULNERABLE: {hv.detail}", Out.TEXT)
+            pp(f"VULNERABLE: {hv.detail}", bullet_type="VULN", condition=show, indent=4)
         elif hv.weak_config:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} WEAK CONFIG: {hv.detail}", Out.TEXT)
+            pp(f"WEAK CONFIG: {hv.detail}", bullet_type="WARNING", condition=show, indent=4)
         elif hv.ehlo_bypass:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} EHLO bypass: {hv.detail}", Out.TEXT)
+            pp(f"EHLO bypass: {hv.detail}", bullet_type="VULN", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} SECURE: {hv.detail}", Out.TEXT)
+            pp(f"SECURE: {hv.detail}", bullet_type="NOTVULN", condition=show, indent=4)
         if hv.accepted_vectors or hv.rejected_vectors:
-            self.ptprint(f"        Accepted: {hv.accepted_vectors}", Out.TEXT)
-            self.ptprint(f"        Rejected: {hv.rejected_vectors}", Out.TEXT)
+            pp(f"Accepted: {hv.accepted_vectors}", bullet_type="TEXT", condition=show, indent=8)
+            pp(f"Rejected: {hv.rejected_vectors}", bullet_type="TEXT", condition=show, indent=8)
 
     def _stream_inv_comm_result(self) -> None:
-        """Terminal: all probe lines use INFO [i] icon only (-iv); severity stays in the text."""
-        info_icon = get_colored_text("[i]", color="INFO")
+        """Terminal: all probe lines use the INFO bullet only (-iv); severity stays in the text."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.inv_comm_error) is not None:
-            self.ptprint(f"    {info_icon} Invalid commands test failed: {err}", Out.TEXT)
+            pp(f"Invalid commands test failed: {err}", bullet_type="TITLE", condition=show, indent=4)
             return
         ic = self.results.inv_comm
         if ic is None:
             return
         if ic.indeterminate:
-            self.ptprint(f"    {info_icon} Indeterminate: {ic.detail or 'Could not complete'}", Out.TEXT)
+            pp(f"Indeterminate: {ic.detail or 'Could not complete'}", bullet_type="TITLE", condition=show, indent=4)
             return
-        if not self.use_json and ic.tests:
+        if show and ic.tests:
             for t in ic.tests:
                 if t.vulnerable:
                     vt = getattr(t, "vuln_type", None) or "crash"
@@ -15319,41 +15567,41 @@ class SMTP(BaseModule):
                         msg = f"VULNERABLE (TIMEOUT): No response (timeout) for '{t.command_display}'{time_str}"
                     else:
                         msg = f"VULNERABLE (CRASH): Server stopped responding after '{t.command_display}'{time_str}"
-                    self.ptprint(f"    {info_icon} {msg}", Out.TEXT)
+                    pp(msg, bullet_type="TITLE", condition=show, indent=4)
                 else:
                     status_str = str(t.status) if t.status is not None else "connection lost"
                     display_reply = self._inv_comm_reply_for_display(t.status, t.reply)
                     short_reply = display_reply or ""
                     time_str = f" ({t.response_time_sec:.2f}s)" if getattr(t, "response_time_sec", None) is not None else ""
-                    self.ptprint(
-                        f"    {info_icon} {t.command_display}: {status_str} {short_reply}{time_str}",
-                        Out.TEXT,
-                    )
+                    pp(f"{t.command_display}: {status_str} {short_reply}{time_str}",
+                       bullet_type="TITLE", condition=show, indent=4)
                 if t.info_leak:
-                    self.ptprint(f"        {info_icon} Verbose error (possible info leak)", Out.TEXT)
+                    pp("Verbose error (possible info leak)", bullet_type="TITLE", condition=show, indent=8)
                 if getattr(t, "slow_response", False):
                     if getattr(ic, "tarpitting_detected", False):
-                        self.ptprint(f"        {info_icon} Tarpitting detected (constant delay - likely smtpd_error_sleep_time)", Out.TEXT)
+                        pp("Tarpitting detected (constant delay - likely smtpd_error_sleep_time)",
+                           bullet_type="TITLE", condition=show, indent=8)
                     else:
-                        self.ptprint(f"        {info_icon} Slow response (possible ReDoS in parser)", Out.TEXT)
+                        pp("Slow response (possible ReDoS in parser)", bullet_type="TITLE", condition=show, indent=8)
         if getattr(ic, "tarpitting_detected", False):
-            self.ptprint(f"    {info_icon} INFO: Tarpitting detected (constant delay on invalid commands - likely smtpd_error_sleep_time, not parser bug)", Out.TEXT)
+            pp("INFO: Tarpitting detected (constant delay on invalid commands - likely smtpd_error_sleep_time, not parser bug)",
+               bullet_type="TITLE", condition=show, indent=4)
         if ic.vulnerable:
             pass  # Vulnerabilities already shown per-test above
         elif ic.weakness:
-            self.ptprint(f"    {info_icon} WEAKNESS: {ic.detail}", Out.TEXT)
+            pp(f"WEAKNESS: {ic.detail}", bullet_type="TITLE", condition=show, indent=4)
         else:
-            self.ptprint(f"    {info_icon} {ic.detail}", Out.TEXT)
+            pp(ic.detail, bullet_type="TITLE", condition=show, indent=4)
 
     def _stream_helo_only_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.helo_only_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} HELO-only test failed: {err}", Out.TEXT)
+            pp(f"HELO-only test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         ho = self.results.helo_only
         if ho is None:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
 
         def _strip_status_prefix(reply: str | None) -> str:
             """Strip leading '250 ' or '250-' from reply for display."""
@@ -15366,342 +15614,608 @@ class SMTP(BaseModule):
                 return r[4:].strip()
             return r
 
-        if not self.use_json:
-            self.ptprint(f"    {info_icon} Connection: {ho.connection_type}", Out.TEXT)
-            helo_first = (ho.helo_reply or "").replace("\r", "\n").split("\n")[0].strip()
-            self.ptprint(f"    {info_icon} HELO test.local: {ho.helo_status} {_strip_status_prefix(helo_first)}", Out.TEXT)
-            ehlo_first = (ho.ehlo_reply or "").replace("\r", "\n").split("\n")[0].strip()
-            self.ptprint(f"    {info_icon} EHLO test.local: {ho.ehlo_status} {_strip_status_prefix(ehlo_first)}", Out.TEXT)
-            if ho.extensions:
-                for ext in ho.extensions:
-                    self.ptprint(f"        {ext}", Out.TEXT)
+        pp(f"Connection: {ho.connection_type}", bullet_type="TITLE", condition=show, indent=4)
+        helo_first = (ho.helo_reply or "").replace("\r", "\n").split("\n")[0].strip()
+        pp(f"HELO test.local: {ho.helo_status} {_strip_status_prefix(helo_first)}", bullet_type="TITLE", condition=show, indent=4)
+        ehlo_first = (ho.ehlo_reply or "").replace("\r", "\n").split("\n")[0].strip()
+        pp(f"EHLO test.local: {ho.ehlo_status} {_strip_status_prefix(ehlo_first)}", bullet_type="TITLE", condition=show, indent=4)
+        if ho.extensions:
+            for ext in ho.extensions:
+                pp(ext, bullet_type="TEXT", condition=show, indent=8)
         if ho.indeterminate:
-            self.ptprint(f"    {info_icon} Indeterminate: {ho.detail or 'Could not complete'}", Out.TEXT)
+            pp(f"Indeterminate: {ho.detail or 'Could not complete'}", bullet_type="TITLE", condition=show, indent=4)
         elif ho.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} VULNERABLE: {ho.detail}", Out.TEXT)
+            pp(f"VULNERABLE: {ho.detail}", bullet_type="VULN", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} {ho.detail}", Out.TEXT)
+            pp(ho.detail, bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_helo_bypass_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.helo_bypass_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} HELO bypass test failed: {err}", Out.TEXT)
+            pp(f"HELO bypass test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         hb = self.results.helo_bypass
         if hb is None:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
-        if not self.use_json:
-            if hb.accepts_invalid_format:
-                self.ptprint(f"    {info_icon} Info: Accepts loose EHLO formats: {', '.join(hb.accepts_invalid_format)}", Out.TEXT)
-            if hb.tarpitting_detected:
-                self.ptprint(f"    {info_icon} Tarpitting detected for: {', '.join(hb.tarpitting_detected)}", Out.TEXT)
+        if hb.accepts_invalid_format:
+            pp(f"Info: Accepts loose EHLO formats: {', '.join(hb.accepts_invalid_format)}",
+               bullet_type="TITLE", condition=show, indent=4)
+        if hb.tarpitting_detected:
+            pp(f"Tarpitting detected for: {', '.join(hb.tarpitting_detected)}",
+               bullet_type="TITLE", condition=show, indent=4)
         if hb.indeterminate:
-            self.ptprint(f"    {info_icon} Indeterminate: {hb.detail or 'Could not complete'}", Out.TEXT)
+            pp(f"Indeterminate: {hb.detail or 'Could not complete'}", bullet_type="TITLE", condition=show, indent=4)
         elif hb.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
             bypass_ehlo = tuple(hb.submission_bypass_ehlo) + tuple(hb.relay_bypass_ehlo)
-            self.ptprint(f"    {icon} CRITICAL: Relay/Submission bypass with EHLO: {', '.join(bypass_ehlo)}", Out.TEXT)
+            pp(f"CRITICAL: Relay/Submission bypass with EHLO: {', '.join(bypass_ehlo)}",
+               bullet_type="VULN", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} No relay bypass detected (Authorization required)", Out.TEXT)
+            pp("No relay bypass detected (Authorization required)", bullet_type="NOTVULN", condition=show, indent=4)
+
+    @staticmethod
+    def _identify_probe_snippet(text: str, max_len: int = 120) -> str:
+        one = text.replace("\r\n", " ").replace("\n", " ").strip()
+        if len(one) > max_len:
+            return one[: max_len - 3] + "..."
+        return one
+
+    def _stream_identify_probe_evidence(self, r: ServerIdentifyResult) -> None:
+        """HELP / RCPT error / unknown-command samples collected during -id."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
+        if not show:
+            return
+        has_help = bool(r.help_response and r.help_response.strip())
+        has_errors = bool(r.error_syntax_samples)
+        has_unk = bool(r.unknown_cmd_response and r.unknown_cmd_response.strip())
+        if not (has_help or has_errors or has_unk):
+            return
+        scored_methods = {s.method for s in (r.scoring_matrix or [])}
+        pp("Protocol probe evidence", bullet_type="TITLE", condition=show, indent=4)
+        verbose = self.args.debug
+        if has_help:
+            help_snip = self._identify_probe_snippet(r.help_response or "")
+            pp(
+                f"HELP: {help_snip}",
+                bullet_type="TITLE" if "help" in scored_methods else "TEXT",
+                condition=show, indent=8,
+            )
+            if verbose and r.help_response and len((r.help_response or "").strip()) > len(help_snip):
+                for line in (r.help_response or "").replace("\r", "").splitlines()[:10]:
+                    ln = line.strip()
+                    if ln:
+                        pp(ln, bullet_type="TEXT", condition=show, indent=12)
+        for i, sample in enumerate(r.error_syntax_samples or []):
+            if not (sample or "").strip():
+                continue
+            label = "RCPT error" if i == 0 else f"Error sample {i + 1}"
+            snip = self._identify_probe_snippet(sample)
+            pp(
+                f"{label}: {snip}",
+                bullet_type="TITLE" if "error_syntax" in scored_methods else "TEXT",
+                condition=show, indent=8,
+            )
+            if verbose and len(sample.strip()) > len(snip):
+                for line in sample.replace("\r", "").splitlines()[:6]:
+                    ln = line.strip()
+                    if ln:
+                        pp(ln, bullet_type="TEXT", condition=show, indent=12)
+        if has_unk:
+            snip = self._identify_probe_snippet(r.unknown_cmd_response or "")
+            pp(
+                f"Unknown command: {snip}",
+                bullet_type="TITLE" if "behavioral_unknown_cmd" in scored_methods else "TEXT",
+                condition=show, indent=8,
+            )
 
     def _stream_identify_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.identify_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Server identification failed: {err}", Out.TEXT)
+            pp(f"Server identification failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         r = self.results.identify
         if r is None:
             return
-        ok_icon = get_colored_text("[✓]", color="NOTVULN")
-        warn_icon = get_colored_text("[!]", color="WARNING")
-        id_detail_icon = get_colored_text("[i]", color="INFO")
-        if not self.use_json:
-            banner_display = (r.banner or "").replace("\r", "").strip()
-            if r.hidden_banner and banner_display:
-                self.ptprint(f"    {get_colored_text('[*] Banner:', color='INFO')} {banner_display} (Hidden)", Out.TEXT)
-            elif r.banner:
-                self.ptprint(f"    {get_colored_text('[*] Banner:', color='INFO')} {banner_display}", Out.TEXT)
-            if r.hidden_banner or not r.scoring_matrix:
-                self.ptprint(f"    {get_colored_text('[*] Analyzing behavioral patterns...', color='INFO')}", Out.TEXT)
-            # Behavioral Analysis section (v1.0.5) - Evidence-based: show matched/missing verbs
-            if getattr(r, "behavioral_profile_product", None) or getattr(r, "behavioral_profile_detail", None) or getattr(r, "behavioral_discrepancies", None) or getattr(r, "latency_avg_ms", None) is not None or getattr(r, "cert_software_context", None):
-                self.ptprint(f"    {get_colored_text('[*] Behavioral Analysis', color='INFO')}", Out.TEXT)
-                if getattr(r, "behavioral_profile_product", None) and getattr(r, "behavioral_profile_sim", 0) > 0:
-                    self.ptprint(
-                        f"        {id_detail_icon} EHLO profile: {r.behavioral_profile_sim}% match "
-                        f"'{r.behavioral_profile_product}' "
-                        f"{f'({r.behavioral_profile_detail})' if getattr(r, 'behavioral_profile_detail', None) else ''}",
-                        Out.TEXT,
-                    )
-                    # Evidence-based: matched and missing verbs
-                    matched = getattr(r, "behavioral_matched_verbs", None) or ()
-                    missing = getattr(r, "behavioral_missing_verbs", None) or ()
-                    product_name = r.behavioral_profile_product or ""
-                    signature_label = (
-                        f" ({product_name} signature)" if product_name.strip() else " (EHLO profile match)"
-                    )
-                    if matched:
-                        self.ptprint(f"        {id_detail_icon} Matched verbs: {', '.join(matched)}{signature_label}", Out.TEXT)
-                    if missing:
-                        parts = []
-                        for v in missing:
-                            # Case-insensitive lookup: verbs normalized to uppercase (server may return "auth" vs "AUTH")
-                            hint = PROFILE_MISSING_HINTS.get((product_name, (v or "").upper()))
-                            parts.append(f"{v} ({hint})" if hint else v)
-                        self.ptprint(f"        {id_detail_icon} Missing verbs: {', '.join(parts)}", Out.TEXT)
-                if getattr(r, "unknown_cmd_response", None) and getattr(self.args, "id_aggressive", False):
-                    self.ptprint(f"        Unknown command: {r.unknown_cmd_response.strip()}", Out.TEXT)
-                if getattr(r, "latency_avg_ms", None) is not None:
-                    jitter = getattr(r, "latency_jitter_ms", None)
-                    jitter_str = f", jitter {jitter:.0f} ms" if jitter is not None and jitter > 0 else ""
-                    proxy_hint = " (possible proxy/filter)" if jitter and jitter > 50 else " (direct MTA)"
-                    self.ptprint(
-                        f"        {id_detail_icon} Latency: avg {r.latency_avg_ms:.0f} ms{jitter_str}{proxy_hint}",
-                        Out.TEXT,
-                    )
-                if getattr(r, "cert_software_context", None):
-                    self.ptprint(f"        TLS cert context: {r.cert_software_context}", Out.TEXT)
-                for d in getattr(r, "behavioral_discrepancies", None) or []:
-                    self.ptprint(f"        {warn_icon} {d}", Out.TEXT)
-            has_tls_cert = bool(
-                r.tls_cert_subject or r.tls_cert_issuer or (r.tls_cert_san and r.tls_cert_san)
-            )
-            bad_tls_icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {get_colored_text('[*] TLS Certificate Info:', color='INFO')}", Out.TEXT)
-            if has_tls_cert:
-                if r.tls_cert_subject:
-                    self.ptprint(f"        {id_detail_icon} Subject: {r.tls_cert_subject}", Out.TEXT)
-                if r.tls_cert_san:
-                    self.ptprint(f"        {id_detail_icon} SAN: {', '.join(r.tls_cert_san)}", Out.TEXT)
-                if r.tls_cert_issuer:
-                    self.ptprint(f"        {id_detail_icon} Issuer: {r.tls_cert_issuer}", Out.TEXT)
-                if r.tls_cert_self_signed:
-                    ss_icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(f"        {ss_icon} Self-signed: yes", Out.TEXT)
-                else:
-                    self.ptprint(f"        {ok_icon} Self-signed: no", Out.TEXT)
-                mx_msg = getattr(r, "mx_cert_message", None)
-                mx_st = getattr(r, "mx_cert_ok", None)
-                if mx_msg:
-                    if mx_st is True:
-                        self.ptprint(f"        {ok_icon} {mx_msg}", Out.TEXT)
-                    elif mx_st is False:
-                        self.ptprint(f"        {warn_icon} {mx_msg}", Out.TEXT)
-                    else:
-                        self.ptprint(f"        {id_detail_icon} {mx_msg}", Out.TEXT)
-                if getattr(r, "tls_policy", None) and r.tls_policy != "n/a":
-                    self.ptprint(f"        TLS policy: {r.tls_policy}", Out.TEXT)
-                if getattr(r, "tls_downgrade_probed", False):
-                    downgrade = getattr(r, "tls_downgrade_findings", None) or []
-                    if downgrade:
-                        for w in downgrade:
-                            self.ptprint(f"        {warn_icon} TLS downgrade: {w}", Out.TEXT)
-                    else:
-                        self.ptprint(f"        {ok_icon} TLS downgrade: TLS 1.0/1.1 rejected (Good)", Out.TEXT)
-                if getattr(r, "cert_domain_match", False):
-                    self.ptprint(f"        {ok_icon} Cert domain match: SAN aligns with target", Out.TEXT)
-                elif has_tls_cert and (r.tls_cert_subject or (r.tls_cert_san and len(r.tls_cert_san) > 0)):
-                    self.ptprint(
-                        f"        {id_detail_icon} Cert domain match: no clear SAN/Subject tie to connection target",
-                        Out.TEXT,
-                    )
-                for w in getattr(r, "tls_cert_warnings", None) or []:
-                    self.ptprint(f"        {warn_icon} {w}", Out.TEXT)
-                for w in getattr(r, "tls_cipher_warnings", None) or []:
-                    self.ptprint(f"        {warn_icon} {w}", Out.TEXT)
-                if getattr(r, "os_hint", None):
-                    self.ptprint(f"        {id_detail_icon} OS hint: {r.os_hint}", Out.TEXT)
+        if not show:
+            return
+        banner_display = (r.banner or "").replace("\r", "").strip()
+        if r.hidden_banner and banner_display:
+            pp(f"Banner: {banner_display} (Hidden)", bullet_type="TITLE", condition=show, indent=4)
+        elif r.banner:
+            pp(f"Banner: {banner_display}", bullet_type="TITLE", condition=show, indent=4)
+        if r.hidden_banner or not r.scoring_matrix:
+            pp("Analyzing behavioral patterns...", bullet_type="TITLE", condition=show, indent=4)
+        self._stream_identify_probe_evidence(r)
+        # Behavioral Analysis section (v1.0.5) - Evidence-based: show matched/missing verbs
+        if getattr(r, "behavioral_profile_product", None) or getattr(r, "behavioral_profile_detail", None) or getattr(r, "behavioral_discrepancies", None) or getattr(r, "latency_avg_ms", None) is not None or getattr(r, "cert_software_context", None):
+            pp("Behavioral Analysis", bullet_type="TITLE", condition=show, indent=4)
+            if getattr(r, "behavioral_profile_product", None) and getattr(r, "behavioral_profile_sim", 0) > 0:
+                pp(
+                    f"EHLO profile: {r.behavioral_profile_sim}% match "
+                    f"'{r.behavioral_profile_product}' "
+                    f"{f'({r.behavioral_profile_detail})' if getattr(r, 'behavioral_profile_detail', None) else ''}",
+                    bullet_type="TITLE", condition=show, indent=8,
+                )
+                # Evidence-based: matched and missing verbs
+                matched = getattr(r, "behavioral_matched_verbs", None) or ()
+                missing = getattr(r, "behavioral_missing_verbs", None) or ()
+                product_name = r.behavioral_profile_product or ""
+                signature_label = (
+                    f" ({product_name} signature)" if product_name.strip() else " (EHLO profile match)"
+                )
+                if matched:
+                    pp(f"Matched verbs: {', '.join(matched)}{signature_label}", bullet_type="TITLE", condition=show, indent=8)
+                if missing:
+                    parts = []
+                    for v in missing:
+                        # Case-insensitive lookup: verbs normalized to uppercase (server may return "auth" vs "AUTH")
+                        hint = PROFILE_MISSING_HINTS.get((product_name, (v or "").upper()))
+                        parts.append(f"{v} ({hint})" if hint else v)
+                    pp(f"Missing verbs: {', '.join(parts)}", bullet_type="TITLE", condition=show, indent=8)
+            if getattr(r, "latency_avg_ms", None) is not None:
+                jitter = getattr(r, "latency_jitter_ms", None)
+                jitter_str = f", jitter {jitter:.0f} ms" if jitter is not None and jitter > 0 else ""
+                proxy_hint = " (possible proxy/filter)" if jitter and jitter > 50 else " (direct MTA)"
+                pp(f"Latency: avg {r.latency_avg_ms:.0f} ms{jitter_str}{proxy_hint}",
+                   bullet_type="TITLE", condition=show, indent=8)
+            if getattr(r, "cert_software_context", None):
+                pp(f"TLS cert context: {r.cert_software_context}", bullet_type="TEXT", condition=show, indent=8)
+            for d in getattr(r, "behavioral_discrepancies", None) or []:
+                pp(d, bullet_type="WARNING", condition=show, indent=8)
+        has_tls_cert = bool(
+            r.tls_cert_subject or r.tls_cert_issuer or (r.tls_cert_san and r.tls_cert_san)
+        )
+        pp("TLS Certificate Info:", bullet_type="TITLE", condition=show, indent=4)
+        if has_tls_cert:
+            if r.tls_cert_subject:
+                pp(f"Subject: {r.tls_cert_subject}", bullet_type="TITLE", condition=show, indent=8)
+            if r.tls_cert_san:
+                pp(f"SAN: {', '.join(r.tls_cert_san)}", bullet_type="TITLE", condition=show, indent=8)
+            if r.tls_cert_issuer:
+                pp(f"Issuer: {r.tls_cert_issuer}", bullet_type="TITLE", condition=show, indent=8)
+            if r.tls_cert_self_signed:
+                pp("Self-signed: yes", bullet_type="VULN", condition=show, indent=8)
             else:
-                transport_tls = getattr(r, "transport_tls", False)
-                starttls_adv = getattr(r, "starttls_advertised", False)
-                tls_up_fail = getattr(r, "tls_upgrade_failed", False)
-                dbg_tail = (
-                    f"; {r.tls_upgrade_error}"
-                    if self.args.debug and getattr(r, "tls_upgrade_error", None)
-                    else "; try -vv or --verbose"
+                pp("Self-signed: no", bullet_type="NOTVULN", condition=show, indent=8)
+            mx_msg = getattr(r, "mx_cert_message", None)
+            mx_st = getattr(r, "mx_cert_ok", None)
+            if mx_msg:
+                if mx_st is True:
+                    pp(mx_msg, bullet_type="NOTVULN", condition=show, indent=8)
+                elif mx_st is False:
+                    pp(mx_msg, bullet_type="WARNING", condition=show, indent=8)
+                else:
+                    pp(mx_msg, bullet_type="TITLE", condition=show, indent=8)
+            if getattr(r, "tls_policy", None) and r.tls_policy != "n/a":
+                pp(f"TLS policy: {r.tls_policy}", bullet_type="TEXT", condition=show, indent=8)
+            if getattr(r, "tls_downgrade_probed", False):
+                downgrade = getattr(r, "tls_downgrade_findings", None) or []
+                if downgrade:
+                    for w in downgrade:
+                        pp(f"TLS downgrade: {w}", bullet_type="WARNING", condition=show, indent=8)
+                else:
+                    pp("TLS downgrade: TLS 1.0/1.1 rejected (Good)", bullet_type="NOTVULN", condition=show, indent=8)
+            if getattr(r, "cert_domain_match", False):
+                pp("Cert domain match: SAN aligns with target", bullet_type="NOTVULN", condition=show, indent=8)
+            elif has_tls_cert and (r.tls_cert_subject or (r.tls_cert_san and len(r.tls_cert_san) > 0)):
+                pp("Cert domain match: no clear SAN/Subject tie to connection target",
+                   bullet_type="TITLE", condition=show, indent=8)
+            for w in getattr(r, "tls_cert_warnings", None) or []:
+                pp(w, bullet_type="WARNING", condition=show, indent=8)
+            for w in getattr(r, "tls_cipher_warnings", None) or []:
+                pp(w, bullet_type="WARNING", condition=show, indent=8)
+            if getattr(r, "os_hint", None):
+                pp(f"OS hint: {r.os_hint}", bullet_type="TITLE", condition=show, indent=8)
+        else:
+            transport_tls = getattr(r, "transport_tls", False)
+            starttls_adv = getattr(r, "starttls_advertised", False)
+            tls_up_fail = getattr(r, "tls_upgrade_failed", False)
+            dbg_tail = (
+                f"; {r.tls_upgrade_error}"
+                if self.args.debug and getattr(r, "tls_upgrade_error", None)
+                else "; try -vv or --verbose"
+            )
+            if tls_up_fail:
+                msg = (
+                    "TLS certificate could not be extracted (STARTTLS upgrade or cert parse failed"
+                    + dbg_tail
+                    + ")"
                 )
-                if tls_up_fail:
-                    msg = (
-                        "TLS certificate could not be extracted (STARTTLS upgrade or cert parse failed"
-                        + dbg_tail
-                        + ")"
+                pp(msg, bullet_type="VULN", condition=show, indent=8)
+            elif transport_tls:
+                msg = (
+                    "TLS certificate could not be extracted (TLS session; cert parse failed"
+                    + dbg_tail
+                    + ")"
+                )
+                pp(msg, bullet_type="VULN", condition=show, indent=8)
+            elif starttls_adv:
+                pp("TLS certificate could not be extracted", bullet_type="VULN", condition=show, indent=8)
+            else:
+                pp("STARTTLS not advertised", bullet_type="VULN", condition=show, indent=8)
+            if getattr(r, "tls_downgrade_probed", False):
+                downgrade = getattr(r, "tls_downgrade_findings", None) or []
+                if downgrade:
+                    for w in downgrade:
+                        pp(f"TLS downgrade: {w}", bullet_type="WARNING", condition=show, indent=8)
+                else:
+                    pp("TLS downgrade: TLS 1.0/1.1 rejected (Good)", bullet_type="NOTVULN", condition=show, indent=8)
+            if getattr(r, "os_hint", None):
+                pp(f"OS hint: {r.os_hint}", bullet_type="TITLE", condition=show, indent=8)
+        if r.scoring_matrix:
+            pp("Scoring Matrix", bullet_type="TITLE", condition=show, indent=4)
+            for s in r.scoring_matrix:
+                pts_fmt = f"{s.points:+d}%"
+                pp(f"{s.method}: {pts_fmt} {f'({s.detail})' if s.detail else ''}",
+                   bullet_type="TITLE", condition=show, indent=8)
+        pp("Identification Result", bullet_type="TITLE", condition=show, indent=4)
+        pp(f"Product:     {r.product or 'Unknown'}", bullet_type="TEXT", condition=show, indent=8)
+        _bh = getattr(r, "behavioral_hint", None)
+        if _bh and not str(_bh).rstrip().endswith("(0%)"):
+            pp(f"Behavioral hint: {_bh}", bullet_type="TEXT", condition=show, indent=8)
+        pp(f"Version:     {r.version or '—'}", bullet_type="TEXT", condition=show, indent=8)
+        pp(f"Confidence: {r.confidence_pct}% ({r.confidence_label})", bullet_type="TEXT", condition=show, indent=8)
+        if r.cpe:
+            pp(f"CPE:        {r.cpe}", bullet_type="TEXT", condition=show, indent=8)
+        if getattr(r, "discrepancy_detected", False) and getattr(
+            r, "discrepancy_banner_product", None
+        ) and getattr(r, "discrepancy_behavior_product", None):
+            pp(
+                f"Discrepancy: Banner claims '{r.discrepancy_banner_product}', "
+                f"behavior matches '{r.discrepancy_behavior_product}'",
+                bullet_type="TITLE", condition=show, indent=8,
+            )
+        elif r.anomalous_identity:
+            pp(
+                f"Discrepancy: Banner claims '{r.banner_claims}', "
+                f"behavior matches '{r.behavior_matches}'",
+                bullet_type="TITLE", condition=show, indent=8,
+            )
+        if r.integrity_note:
+            pp(f"Integrity: {r.integrity_note}", bullet_type="TITLE", condition=show, indent=8)
+        if r.recommendation:
+            pp(f"Recommendation: {r.recommendation}", bullet_type="TITLE", condition=show, indent=8)
+        leaks = getattr(r, "data_leakage_findings", None) or ()
+        if leaks:
+            pp("Data Leakage / Privacy", bullet_type="INFO", condition=show, indent=4)
+            for leak in leaks:
+                src = ", ".join(leak.sources)
+                _lk = getattr(leak, "kind", "email")
+                if _lk == "internal_hostname":
+                    if leak.risk == "high":
+                        pp(
+                            "Information exposure: Internal infrastructure naming leaked in "
+                            "TLS Certificate (Non-routable domain).",
+                            bullet_type="WARNING", condition=show, indent=8,
+                        )
+                        pp(f"Extracted: {leak.email} [High Risk]", bullet_type="WARNING", condition=show, indent=8)
+                    else:
+                        pp(
+                            "Information exposure: Internal infrastructure naming leaked in "
+                            "TLS Certificate (Non-routable domain).",
+                            bullet_type="WARNING", condition=show, indent=8,
+                        )
+                        pp(f"Extracted: {leak.email} [Medium Risk]", bullet_type="WARNING", condition=show, indent=8)
+                    continue
+                if leak.risk == "high":
+                    pp(
+                        f"Sensitive info: E-mail address found in {src} "
+                        f"(domain aligns with scan target).",
+                        bullet_type="WARNING", condition=show, indent=8,
                     )
-                    self.ptprint(f"        {bad_tls_icon} {msg}", Out.TEXT)
-                elif transport_tls:
-                    msg = (
-                        "TLS certificate could not be extracted (TLS session; cert parse failed"
-                        + dbg_tail
-                        + ")"
+                    pp(f"Extracted: {leak.email} [High Risk]", bullet_type="WARNING", condition=show, indent=8)
+                elif leak.risk == "medium":
+                    pp(
+                        f"Information exposure: Routable address in {src} "
+                        f"(domain does not match scan target).",
+                        bullet_type="WARNING", condition=show, indent=8,
                     )
-                    self.ptprint(f"        {bad_tls_icon} {msg}", Out.TEXT)
-                elif starttls_adv:
-                    self.ptprint(
-                        f"        {bad_tls_icon} TLS certificate could not be extracted",
-                        Out.TEXT,
+                    pp(f"Extracted: {leak.email} [Medium Risk]", bullet_type="WARNING", condition=show, indent=8)
+                else:
+                    pp(
+                        f"Information exposure: Generic, noreply, or non-routable "
+                        f"contact in {src}.",
+                        bullet_type="TITLE", condition=show, indent=8,
+                    )
+                    pp(f"Extracted: {leak.email} [Low Risk]", bullet_type="TITLE", condition=show, indent=8)
+            email_leaks = [x for x in leaks if getattr(x, "kind", "email") == "email"]
+            if email_leaks:
+                if any(x.risk == "high" for x in email_leaks):
+                    pp(
+                        f"Risk: Address domain matches the scanned host — strong signal for "
+                        f"organizational exposure; targeted phishing or brute-force against admin mailboxes is more "
+                        f"credible.",
+                        bullet_type="TITLE", condition=show, indent=8,
+                    )
+                elif any(x.risk == "medium" for x in email_leaks):
+                    pp(
+                        f"Risk: Routable address leaked but not aligned with scan target — "
+                        f"still information exposure (e.g. vendor or third-party identity in cert).",
+                        bullet_type="TITLE", condition=show, indent=8,
                     )
                 else:
-                    self.ptprint(f"        {bad_tls_icon} STARTTLS not advertised", Out.TEXT)
-                if getattr(r, "tls_downgrade_probed", False):
-                    downgrade = getattr(r, "tls_downgrade_findings", None) or []
-                    if downgrade:
-                        for w in downgrade:
-                            self.ptprint(f"        {warn_icon} TLS downgrade: {w}", Out.TEXT)
-                    else:
-                        self.ptprint(f"        {ok_icon} TLS downgrade: TLS 1.0/1.1 rejected (Good)", Out.TEXT)
-                if getattr(r, "os_hint", None):
-                    self.ptprint(f"        {id_detail_icon} OS hint: {r.os_hint}", Out.TEXT)
-            if r.scoring_matrix:
-                self.ptprint(f"    {get_colored_text('[*] Scoring Matrix', color='INFO')}", Out.TEXT)
-                for s in r.scoring_matrix:
-                    pts_fmt = f"{s.points:+d}%"
-                    self.ptprint(
-                        f"        {id_detail_icon} {s.method}: {pts_fmt} {f'({s.detail})' if s.detail else ''}",
-                        Out.TEXT,
+                    pp(
+                        f"Risk: Little direct phishing value for noreply / @localhost / "
+                        f"reserved domains, but may still indicate default or placeholder TLS/DN setup.",
+                        bullet_type="TITLE", condition=show, indent=8,
                     )
-            self.ptprint(f"    {get_colored_text('[*] Identification Result', color='INFO')}", Out.TEXT)
-            self.ptprint(f"        Product:     {r.product or 'Unknown'}", Out.TEXT)
-            _bh = getattr(r, "behavioral_hint", None)
-            if _bh and not str(_bh).rstrip().endswith("(0%)"):
-                self.ptprint(f"        Behavioral hint: {_bh}", Out.TEXT)
-            self.ptprint(f"        Version:     {r.version or '—'}", Out.TEXT)
-            self.ptprint(f"        Confidence: {r.confidence_pct}% ({r.confidence_label})", Out.TEXT)
-            if r.cpe:
-                self.ptprint(f"        CPE:        {r.cpe}", Out.TEXT)
-            if getattr(r, "discrepancy_detected", False) and getattr(
-                r, "discrepancy_banner_product", None
-            ) and getattr(r, "discrepancy_behavior_product", None):
-                self.ptprint(
-                    f"        {id_detail_icon} Discrepancy: Banner claims '{r.discrepancy_banner_product}', "
-                    f"behavior matches '{r.discrepancy_behavior_product}'",
-                    Out.TEXT,
+            if any(
+                getattr(x, "kind", "email") == "internal_hostname" and x.risk in ("medium", "high")
+                for x in leaks
+            ):
+                pp(
+                    f"Risk: Exposure of internal hostnames aids in network reconnaissance "
+                    f"and targeted internal attacks.",
+                    bullet_type="TITLE", condition=show, indent=8,
                 )
-            elif r.anomalous_identity:
-                self.ptprint(
-                    f"        {id_detail_icon} Discrepancy: Banner claims '{r.banner_claims}', "
-                    f"behavior matches '{r.behavior_matches}'",
-                    Out.TEXT,
-                )
-            if r.integrity_note:
-                self.ptprint(f"        {id_detail_icon} Integrity: {r.integrity_note}", Out.TEXT)
-            if r.recommendation:
-                self.ptprint(f"        {id_detail_icon} Recommendation: {r.recommendation}", Out.TEXT)
-            leaks = getattr(r, "data_leakage_findings", None) or ()
-            if leaks:
-                self.ptprint(f"    {get_colored_text('[+] Data Leakage / Privacy', color='INFO')}", Out.TEXT)
-                for leak in leaks:
-                    src = ", ".join(leak.sources)
-                    _lk = getattr(leak, "kind", "email")
-                    if _lk == "internal_hostname":
-                        if leak.risk == "high":
-                            self.ptprint(
-                                f"        {warn_icon} Information exposure: Internal infrastructure naming leaked in "
-                                f"TLS Certificate (Non-routable domain).",
-                                Out.TEXT,
-                            )
-                            self.ptprint(
-                                f"        {warn_icon} Extracted: {leak.email} [High Risk]",
-                                Out.TEXT,
-                            )
-                        else:
-                            self.ptprint(
-                                f"        {warn_icon} Information exposure: Internal infrastructure naming leaked in "
-                                f"TLS Certificate (Non-routable domain).",
-                                Out.TEXT,
-                            )
-                            self.ptprint(
-                                f"        {warn_icon} Extracted: {leak.email} [Medium Risk]",
-                                Out.TEXT,
-                            )
-                        continue
-                    if leak.risk == "high":
-                        self.ptprint(
-                            f"        {warn_icon} Sensitive info: E-mail address found in {src} "
-                            f"(domain aligns with scan target).",
-                            Out.TEXT,
-                        )
-                        self.ptprint(f"        {warn_icon} Extracted: {leak.email} [High Risk]", Out.TEXT)
-                    elif leak.risk == "medium":
-                        self.ptprint(
-                            f"        {warn_icon} Information exposure: Routable address in {src} "
-                            f"(domain does not match scan target).",
-                            Out.TEXT,
-                        )
-                        self.ptprint(f"        {warn_icon} Extracted: {leak.email} [Medium Risk]", Out.TEXT)
-                    else:
-                        self.ptprint(
-                            f"        {id_detail_icon} Information exposure: Generic, noreply, or non-routable "
-                            f"contact in {src}.",
-                            Out.TEXT,
-                        )
-                        self.ptprint(
-                            f"        {id_detail_icon} Extracted: {leak.email} [Low Risk]",
-                            Out.TEXT,
-                        )
-                email_leaks = [x for x in leaks if getattr(x, "kind", "email") == "email"]
-                if email_leaks:
-                    if any(x.risk == "high" for x in email_leaks):
-                        self.ptprint(
-                            f"        {id_detail_icon} Risk: Address domain matches the scanned host — strong signal for "
-                            f"organizational exposure; targeted phishing or brute-force against admin mailboxes is more "
-                            f"credible.",
-                            Out.TEXT,
-                        )
-                    elif any(x.risk == "medium" for x in email_leaks):
-                        self.ptprint(
-                            f"        {id_detail_icon} Risk: Routable address leaked but not aligned with scan target — "
-                            f"still information exposure (e.g. vendor or third-party identity in cert).",
-                            Out.TEXT,
-                        )
-                    else:
-                        self.ptprint(
-                            f"        {id_detail_icon} Risk: Little direct phishing value for noreply / @localhost / "
-                            f"reserved domains, but may still indicate default or placeholder TLS/DN setup.",
-                            Out.TEXT,
-                        )
-                if any(
-                    getattr(x, "kind", "email") == "internal_hostname" and x.risk in ("medium", "high")
-                    for x in leaks
-                ):
-                    self.ptprint(
-                        f"        {id_detail_icon} Risk: Exposure of internal hostnames aids in network reconnaissance "
-                        f"and targeted internal attacks.",
-                        Out.TEXT,
-                    )
+
+    @staticmethod
+    def _mail_probe_bullet_msg(
+        accepted: bool,
+        *,
+        indeterminate: bool = False,
+        detail: str | None = None,
+        sent_msg: str,
+    ) -> tuple[str, str]:
+        """Return (bullet_type, message) for manual-follow-up mail probes (same semantics as -br)."""
+        if accepted:
+            return "NOTVULN", sent_msg
+        if indeterminate:
+            return "TITLE", f"Indeterminate: {detail or 'Could not complete'}"
+        msg = (detail or "could not complete").replace("NOT VULNERABLE: ", "")
+        return "WARNING", f"Mail could not be sent: {msg}"
+
+    def _smtp_trace_reply(self, status: int, reply) -> str:
+        text = self.bytes_to_str(reply).strip().replace("\r\n", " ").replace("\n", " ")
+        return f"{status} {text}" if text else str(status)
+
+    @staticmethod
+    def _mail_variant_msg_summary(
+        smtp_trace: tuple[str, ...],
+        *,
+        accepted: int,
+        rejected: int,
+        error: int,
+    ) -> tuple[str, ...]:
+        """One-line outcome per variant (same style as -av message_summary)."""
+        if error and not accepted and not rejected:
+            for line in reversed(smtp_trace):
+                if line.startswith(("error:", "Connect:")):
+                    return (line,)
+            return ("error",)
+        if accepted:
+            for line in reversed(smtp_trace):
+                if line.startswith("DATA:"):
+                    parts = line.split(":", 1)[1].strip().split()
+                    if parts:
+                        return (f"DATA: {parts[0]} (accepted)",)
+        if rejected:
+            for line in reversed(smtp_trace):
+                if line.startswith("RCPT TO"):
+                    parts = line.split(":", 1)[1].strip().split()
+                    if parts:
+                        return (f"RCPT: {parts[0]} (rejected)",)
+                if line.startswith("MAIL FROM"):
+                    parts = line.split(":", 1)[1].strip().split()
+                    if parts and parts[0] not in ("250", "251"):
+                        return (f"MAIL FROM: {parts[0]} (rejected)",)
+                if line.startswith("DATA:"):
+                    parts = line.split(":", 1)[1].strip().split()
+                    if parts:
+                        return (f"DATA: {parts[0]} (rejected)",)
+        return ()
+
+    def _mail_test_trace_append(self, trace: list[str], line: str) -> None:
+        """Store SMTP trace line; with -vv print live via ptdebug (same as -av)."""
+        trace.append(line)
+        if self.args.debug and not self.use_json:
+            if line.startswith("---") and line.endswith("---"):
+                self.ptdebug(line.strip("- ").strip(), title=True)
+            else:
+                self.ptdebug(line, Out.TEXT)
+
+    def _mail_test_live_done(self, label: str, detail: str) -> None:
+        """Per-variant/category progress line during test when -vv (same as -av)."""
+        if not self.use_json and self.args.debug:
+            ptprinthelper.ptprint(
+                f"{label}: {detail}",
+                bullet_type="TITLE",
+                condition=True,
+                indent=4,
+            )
+
+    def _br_stream_probe_section_title(self, title: str) -> None:
+        """Probe subsection heading for -br (live under -vv, same indent as streamer)."""
+        if not self.use_json and self.args.debug:
+            self._bounce_replay_streamed_live = True
+            ptprinthelper.ptprint(title, bullet_type="TITLE", condition=True, indent=4)
+
+    def _br_stream_probe_verdict(
+        self,
+        *,
+        accepted: bool,
+        indeterminate: bool,
+        detail: str | None,
+        bounce_addr: str,
+        test_id: str = "",
+    ) -> None:
+        """Mail probe verdict line for -br (-vv live stream)."""
+        if self.use_json or not self.args.debug:
+            return
+        bt, msg = self._mail_probe_bullet_msg(
+            accepted,
+            indeterminate=indeterminate,
+            detail=detail,
+            sent_msg=f"Mail was sent - check {bounce_addr} for NDR within 2-5 min",
+        )
+        ptprinthelper.ptprint(msg, bullet_type=bt, condition=True, indent=4)
+        if accepted and test_id:
+            ptprinthelper.ptprint(
+                f"Test ID: {test_id} ({EMAIL_HDR_TEST_ID})",
+                bullet_type="TEXT",
+                condition=True,
+                indent=8,
+            )
+
+    def _stream_bounce_replay_trace_line(self, line: str) -> None:
+        """-vv SMTP trace for -br replay in streamer (ADDITIONS, same as -av)."""
+        if line.startswith("---") and line.endswith("---"):
+            label = line.strip("- ").strip()
+            label = label.replace("Probe 1: ", "").replace("Probe 2: ", "")
+            self.ptdebug(label, title=True)
+        else:
+            self.ptdebug(line, Out.TEXT)
+
+    def _pp_av_variant_row(
+        self,
+        pp,
+        show: bool,
+        label: str,
+        detail: str | None,
+        *,
+        sub_lines: tuple[str, ...] = (),
+    ) -> None:
+        """One variant/category row in terminal stream without -vv (same layout as -av)."""
+        pp(f"{label}: {detail or ''}", bullet_type="TITLE", condition=show, indent=4)
+        for line in sub_lines:
+            pp(line, bullet_type="TEXT", condition=show, indent=8)
+
+    def _pp_mail_probe_line(
+        self,
+        pp,
+        show: bool,
+        *,
+        accepted: bool,
+        indeterminate: bool = False,
+        detail: str | None = None,
+        sent_msg: str,
+        indent: int = 4,
+        follow_up: tuple[str, ...] = (),
+    ) -> None:
+        """Mail send result line — NOTVULN [✓] or WARNING [!], same semantics as -br."""
+        bt, msg = self._mail_probe_bullet_msg(
+            accepted,
+            indeterminate=indeterminate,
+            detail=detail,
+            sent_msg=sent_msg,
+        )
+        pp(msg, bullet_type=bt, condition=show, indent=indent)
+        if accepted:
+            for line in follow_up:
+                stripped = line.strip()
+                if stripped:
+                    pp(stripped, bullet_type="TEXT", condition=show, indent=indent + 4)
+
+    def _pp_mail_variant_probe_sections(
+        self,
+        pp,
+        show: bool,
+        *,
+        debug: bool,
+        rows: tuple[
+            tuple[
+                str,
+                str | None,
+                bool,
+                bool,
+                str | None,
+                str,
+                tuple[str, ...],
+                tuple[str, ...],
+                tuple[str, ...],
+            ],
+            ...,
+        ],
+    ) -> None:
+        """Variant row + optional mail probe bullet (AV layout + -br verdict).
+
+        With -vv, SMTP trace and per-variant/category verdict lines are already
+        streamed live during test (_mail_test_trace_append / _mail_test_live_done).
+        """
+        for (
+            label,
+            detail,
+            accepted,
+            indet,
+            probe_detail,
+            sent_msg,
+            follow_up,
+            smtp_trace,
+            msg_summary,
+        ) in rows:
+            if not debug:
+                self._pp_av_variant_row(pp, show, label, detail, sub_lines=msg_summary)
+            self._pp_mail_probe_line(
+                pp,
+                show,
+                accepted=accepted,
+                indeterminate=indet,
+                detail=probe_detail,
+                sent_msg=sent_msg,
+                follow_up=follow_up,
+            )
+
+    def _pp_av_summary_block(
+        self,
+        pp,
+        *,
+        show: bool,
+        detail: str | None,
+        elapsed_sec: float,
+        extra_lines: tuple[str, ...] = (),
+        verdict: tuple[str, str] | None = None,
+        mail_probe: tuple[bool, bool, str | None, str, tuple[str, ...]] | None = None,
+    ) -> None:
+        """Summary footer shared by -av-style streamers."""
+        pp("Summary", bullet_type="TITLE", condition=show, indent=4)
+        if detail:
+            pp(detail, bullet_type="TEXT", condition=show, indent=8)
+        for line in extra_lines:
+            stripped = line.strip()
+            if stripped:
+                pp(stripped, bullet_type="TEXT", condition=show, indent=8)
+        pp(f"Elapsed: {elapsed_sec:.1f} s", bullet_type="TEXT", condition=show, indent=8)
+        if mail_probe is not None:
+            accepted, indet, probe_detail, sent_msg, follow_up = mail_probe
+            self._pp_mail_probe_line(
+                pp,
+                show,
+                accepted=accepted,
+                indeterminate=indet,
+                detail=probe_detail,
+                sent_msg=sent_msg,
+                follow_up=follow_up,
+            )
+        if verdict is not None:
+            bt, text = verdict
+            pp(text, bullet_type=bt, condition=show, indent=4)
 
     def _stream_bounce_replay_result(self) -> None:
-        err_icon = get_colored_text("[✗]", color="VULN")
-        ok_icon = get_colored_text("[✓]", color="NOTVULN")
-        info_icon = get_colored_text("[*]", color="INFO")
-        warn_icon = get_colored_text("[!]", color="WARNING")
-        dbg_icon = get_colored_text("[i]", color="INFO")
+        # Terminal-only rendering via the shared bullet system (ptprinthelper + ptdefs):
+        # ``condition`` suppresses output in JSON mode, ``bullet_type`` picks the icon.
+        pp = ptprinthelper.ptprint
+        show = not self.use_json                       # finding/result lines
 
         if (err := self.results.bounce_replay_error) is not None:
-            self.ptprint(f"    {err_icon} Bounce replay test failed: {err}", Out.TEXT)
+            pp(f"Bounce replay test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         br = self.results.bounce_replay
-        if br is None:
+        if br is None or not show:
             return
 
-        def _probe_icon_msg(accepted: bool, indet: bool, detail: str | None) -> tuple:
-            """Return (icon, message) for a single probe outcome."""
-            if accepted:
-                return warn_icon, f"Mail was sent - check {br.bounce_addr} for NDR within 2-5 min"
-            if indet:
-                return info_icon, f"Indeterminate: {detail or 'Could not complete'}"
-            if not detail:
-                return info_icon, "Could not complete"
-            if "RCPT rejected in session" in detail:
-                return ok_icon, "Not vulnerable: RCPT rejected in session – no bounce expected"
-            if "NOT VULNERABLE:" in detail:
-                clean = detail.replace("NOT VULNERABLE: ", "")
-                if any(kw in clean for kw in ("RCPT unexpected", "DATA rejected")):
-                    return warn_icon, f"Mail could not be sent: {clean}"
-                return ok_icon, f"Not vulnerable: {clean}"
-            return warn_icon, f"Mail could not be sent: {detail}"
+        # With -vv, probe sections (debug trace + verdict) are streamed live from test_bounce_replay().
+        if self.args.debug and getattr(self, "_bounce_replay_streamed_live", False):
+            return
+
+        def _probe_bullet_msg(accepted: bool, indet: bool, detail: str | None) -> tuple[str, str]:
+            return self._mail_probe_bullet_msg(
+                accepted,
+                indeterminate=indet,
+                detail=detail,
+                sent_msg=f"Mail was sent - check {br.bounce_addr} for NDR within 2-5 min",
+            )
 
         def _split_trace(trace: tuple[str, ...]):
             """Split smtp_trace into pre-probe lines, Probe 1 label/lines, Probe 2 label/lines."""
@@ -15727,513 +16241,566 @@ class SMTP(BaseModule):
         has_probe1 = bool(p1_label or p1_lines)
         has_probe2 = bool(p2_label or p2_lines)
 
+        def _emit_trace(line: str) -> None:
+            if self.args.debug:
+                self._stream_bounce_replay_trace_line(line)
+
         # Pre-probe failure or missing args (no probe sections in trace)
         if not has_probe1:
             for line in pre_lines:
-                self.ptdebug(f"{dbg_icon} {line}")
-            icon, msg = _probe_icon_msg(False, br.indeterminate, br.detail)
-            self.ptprint(f"    {icon} {msg}", Out.TEXT)
+                _emit_trace(line)
+            bt, msg = _probe_bullet_msg(False, br.indeterminate, br.detail)
+            pp(msg, bullet_type=bt, condition=show, indent=4)
             return
 
         # --- Probe 1: From header without Return-Path ---
-        self.ptprint(f"    {info_icon} Test From header without Return-Path", Out.TEXT)
+        pp("Test From header without Return-Path", bullet_type="TITLE", condition=show, indent=4)
         for line in pre_lines:
-            self.ptdebug(f"{dbg_icon} {line}")
+            _emit_trace(line)
         if p1_label:
-            self.ptdebug(f"{dbg_icon} {p1_label.replace('Probe 1: ', '')}")
+            _emit_trace(f"--- {p1_label} ---")
         for line in p1_lines:
-            self.ptdebug(f"{dbg_icon} {line}")
-        p1_icon, p1_msg = _probe_icon_msg(
+            _emit_trace(line)
+        p1_bt, p1_msg = _probe_bullet_msg(
             br.message_accepted, br.probe1_indeterminate, br.probe1_detail
         )
-        self.ptprint(f"    {p1_icon} {p1_msg}", Out.TEXT)
+        pp(p1_msg, bullet_type=p1_bt, condition=show, indent=4)
         if br.message_accepted and br.test_id:
-            self.ptprint(f"        Test ID: {br.test_id} ({EMAIL_HDR_TEST_ID})", Out.TEXT)
+            pp(f"Test ID: {br.test_id} ({EMAIL_HDR_TEST_ID})", bullet_type="TEXT", condition=show, indent=8)
 
         # Probe 1 was indeterminate → Probe 2 never ran
         if br.probe1_indeterminate and not has_probe2:
             return
 
         # --- Probe 2: From + Return-Path headers ---
-        self.ptprint(f"    {info_icon} Test From headers and Return-Path", Out.TEXT)
+        pp("Test From headers and Return-Path", bullet_type="TITLE", condition=show, indent=4)
         if p2_label:
-            self.ptdebug(f"{dbg_icon} {p2_label.replace('Probe 2: ', '')}")
+            _emit_trace(f"--- {p2_label} ---")
         for line in p2_lines:
-            self.ptdebug(f"{dbg_icon} {line}")
+            _emit_trace(line)
         p2_accepted = getattr(br, "message_accepted_return_path", False)
-        p2_icon, p2_msg = _probe_icon_msg(
+        p2_bt, p2_msg = _probe_bullet_msg(
             p2_accepted, br.probe2_indeterminate, br.probe2_detail
         )
-        self.ptprint(f"    {p2_icon} {p2_msg}", Out.TEXT)
+        pp(p2_msg, bullet_type=p2_bt, condition=show, indent=4)
         if p2_accepted and getattr(br, "test_id_return_path", ""):
-            self.ptprint(f"        Test ID: {br.test_id_return_path} ({EMAIL_HDR_TEST_ID})", Out.TEXT)
+            pp(f"Test ID: {br.test_id_return_path} ({EMAIL_HDR_TEST_ID})", bullet_type="TEXT", condition=show, indent=8)
 
     def _stream_mail_bomb_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.mail_bomb_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Mail bomb test failed: {err}", Out.TEXT)
+            pp(f"Mail bomb test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         mb = self.results.mail_bomb
-        if mb is None:
+        if mb is None or not show:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
-        pmd = getattr(mb, "per_message_delivered", ()) or ()
-        progress_bar = ""
-        if pmd and not self.use_json:
-            progress_bar = "".join(
-                get_colored_text("█", "NOTVULN" if ok else "VULN") for ok in pmd
-            )
-        live_done = getattr(self, "_mail_bomb_live_progress_completed", False)
-
-        def _bomb_stats_lines() -> None:
-            if mb.detail:
-                self.ptprint(f"    {mb.detail}", Out.TEXT)
-            self.ptprint(
-                f"    sent={mb.sent} delivered={mb.delivered} "
-                f"rate_limited={mb.rate_limited} blocked={mb.blocked}",
-                Out.TEXT,
-            )
+        if not self.args.debug:
+            pp(f"bomb: {mb.detail or ''}", bullet_type="TITLE", condition=show, indent=4)
             if mb.last_error:
                 type_hint = f" [{mb.last_error_type}]" if mb.last_error_type else ""
-                self.ptprint(f"    Last connection error{type_hint}: {mb.last_error}", Out.TEXT)
+                pp(
+                    f"Last connection error{type_hint}: {mb.last_error}",
+                    bullet_type="TEXT",
+                    condition=show,
+                    indent=8,
+                )
             if mb.avg_rtt_ms is not None:
-                self.ptprint(f"    Avg response time: {mb.avg_rtt_ms:.0f} ms", Out.TEXT)
+                pp(f"Avg response time: {mb.avg_rtt_ms:.0f} ms", bullet_type="TEXT", condition=show, indent=8)
 
-        if mb.indeterminate:
-            if progress_bar and not live_done:
-                self.ptprint(f"    {info_icon} Progress: {progress_bar}", Out.TEXT)
-            self.ptprint(f"    {info_icon} Indeterminate: {mb.detail or 'Could not complete'}", Out.TEXT)
-            return
-        if progress_bar and not live_done:
-            self.ptprint(f"    {info_icon} Progress: {progress_bar}", Out.TEXT)
+        extra: tuple[str, ...] = ()
         if mb.vulnerable:
-            _bomb_stats_lines()
-            self.ptprint(f"    Server accepted large volume without rate limiting.", Out.TEXT)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} VULNERABLE", Out.TEXT)
+            extra = ("Server accepted large volume without rate limiting.",)
+        verdict: tuple[str, str] | None
+        if mb.indeterminate:
+            verdict = ("WARNING", "Indeterminate")
+        elif mb.vulnerable:
+            verdict = ("VULN", "VULNERABLE")
         elif mb.partial_protection:
-            _bomb_stats_lines()
-            warn_icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {warn_icon} PARTIAL PROTECTION", Out.TEXT)
+            verdict = ("WARNING", "PARTIAL PROTECTION")
         else:
-            _bomb_stats_lines()
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} NOT VULNERABLE", Out.TEXT)
+            verdict = ("NOTVULN", "NOT VULNERABLE")
+        mail_probe: tuple[bool, bool, str | None, str, tuple[str, ...]] | None = None
+        if mb.sent > 0 or mb.indeterminate:
+            mail_probe = (
+                mb.delivered > 0,
+                mb.indeterminate,
+                mb.detail,
+                f"Mail was sent — {mb.delivered}/{mb.sent} delivered",
+                (),
+            )
+        self._pp_av_summary_block(
+            pp,
+            show=show,
+            detail=mb.detail,
+            elapsed_sec=mb.elapsed_sec,
+            extra_lines=extra,
+            verdict=verdict,
+            mail_probe=mail_probe,
+        )
 
     def _stream_antivirus_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.antivirus_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Antivirus test failed: {err}", Out.TEXT)
+            pp(f"Antivirus test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         av = self.results.antivirus
         if av is None:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
-        if not self.use_json:
-            for cat in av.categories:
-                self.ptprint(f"    {info_icon} {cat.category}: {cat.detail or ''}", Out.TEXT)
-                for line in cat.smtp_trace[-10:]:
-                    self.ptprint(f"        {line}", Out.TEXT)
-
-        if self.use_json:
-            if av.indeterminate:
-                self.ptprint(f"    {info_icon} Indeterminate: {av.detail or 'Could not complete'}", Out.TEXT)
-            elif av.vulnerable:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} VULNERABLE", Out.TEXT)
-                self.ptprint(f"    {av.detail}", Out.TEXT)
-                self.ptprint(f"    Risky content was accepted at MTA.", Out.TEXT)
-            elif av.partial_protection:
-                warn_icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(f"    {warn_icon} PARTIAL PROTECTION", Out.TEXT)
-                self.ptprint(f"    {av.detail}", Out.TEXT)
-            else:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} NOT VULNERABLE", Out.TEXT)
-                self.ptprint(f"    {av.detail}", Out.TEXT)
+        if not show:
             return
+        # With -vv, test_antivirus() already prints each category verdict live after its trace.
+        if not self.args.debug:
+            for cat in av.categories:
+                pp(f"{cat.category}: {cat.detail or ''}", bullet_type="TITLE", condition=show, indent=4)
+                for line in cat.message_summary:
+                    pp(line, bullet_type="TEXT", condition=show, indent=8)
 
         if av.indeterminate:
-            self.ptprint(f"    {info_icon} Summary", Out.TEXT)
-            self.ptprint(f"        {av.detail or 'Could not complete'}", Out.TEXT)
-            self.ptprint(f"        Elapsed: {av.elapsed_sec:.1f} s", Out.TEXT)
+            pp("Summary", bullet_type="TITLE", condition=show, indent=4)
+            pp(av.detail or "Could not complete", bullet_type="TEXT", condition=show, indent=8)
+            pp(f"Elapsed: {av.elapsed_sec:.1f} s", bullet_type="TEXT", condition=show, indent=8)
+            pp("Indeterminate", bullet_type="WARNING", condition=show, indent=4)
         elif av.vulnerable:
-            self.ptprint(f"    {info_icon} Summary", Out.TEXT)
-            self.ptprint(f"        {av.detail}", Out.TEXT)
-            self.ptprint(f"        Risky content was accepted at MTA.", Out.TEXT)
-            self.ptprint(f"        Elapsed: {av.elapsed_sec:.1f} s", Out.TEXT)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} VULNERABLE", Out.TEXT)
+            pp("Summary", bullet_type="TITLE", condition=show, indent=4)
+            pp(av.detail, bullet_type="TEXT", condition=show, indent=8)
+            pp("Risky content was accepted at MTA.", bullet_type="TEXT", condition=show, indent=8)
+            pp(f"Elapsed: {av.elapsed_sec:.1f} s", bullet_type="TEXT", condition=show, indent=8)
+            pp("VULNERABLE", bullet_type="VULN", condition=show, indent=4)
         elif av.partial_protection:
-            self.ptprint(f"    {info_icon} Summary", Out.TEXT)
-            self.ptprint(f"        {av.detail}", Out.TEXT)
-            self.ptprint(f"        Elapsed: {av.elapsed_sec:.1f} s", Out.TEXT)
-            warn_icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {warn_icon} PARTIAL PROTECTION", Out.TEXT)
+            pp("Summary", bullet_type="TITLE", condition=show, indent=4)
+            pp(av.detail, bullet_type="TEXT", condition=show, indent=8)
+            pp(f"Elapsed: {av.elapsed_sec:.1f} s", bullet_type="TEXT", condition=show, indent=8)
+            pp("PARTIAL PROTECTION", bullet_type="WARNING", condition=show, indent=4)
         else:
-            self.ptprint(f"    {info_icon} Summary", Out.TEXT)
-            self.ptprint(f"        {av.detail}", Out.TEXT)
-            self.ptprint(f"        Elapsed: {av.elapsed_sec:.1f} s", Out.TEXT)
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} NOT VULNERABLE", Out.TEXT)
+            pp("Summary", bullet_type="TITLE", condition=show, indent=4)
+            pp(av.detail, bullet_type="TEXT", condition=show, indent=8)
+            pp(f"Elapsed: {av.elapsed_sec:.1f} s", bullet_type="TEXT", condition=show, indent=8)
+            pp("NOT VULNERABLE", bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_ssrf_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.ssrf_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} SSRF test failed: {err}", Out.TEXT)
+            pp(f"SSRF test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         sr = self.results.ssrf
-        if sr is None:
+        if sr is None or not show:
             return
-        if self.use_json:
-            return
-        info_icon = get_colored_text("[*]", color="INFO")
-        manual_icon = get_colored_text("[?]", color="WARNING")
         if sr.canary_url:
-            self.ptprint(f"    {info_icon} Canary URL: {sr.canary_url}", Out.TEXT)
+            self._pp_av_variant_row(pp, show, "Canary URL", sr.canary_url)
+        probe_rows: list[
+            tuple[str, str | None, bool, bool, str | None, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]
+        ] = []
         for v in sr.variants:
-            self.ptprint(
-                f"    {info_icon} {v.variant}: {v.accepted} accepted, {v.rejected} rejected, {v.error} error",
-                Out.TEXT,
+            accepted = v.accepted > 0
+            indet = v.error > 0 and v.accepted == 0 and v.rejected == 0
+            msg_summary = v.message_summary or self._mail_variant_msg_summary(
+                v.smtp_trace,
+                accepted=v.accepted,
+                rejected=v.rejected,
+                error=v.error,
             )
-            for line in v.smtp_trace[-10:]:
-                self.ptprint(f"        {line}", Out.TEXT)
-        self.ptprint(f"    {info_icon} Summary", Out.TEXT)
-        if sr.detail:
-            self.ptprint(f"        {sr.detail}", Out.TEXT)
-        for para in (sr.verification_instructions or "").split("\n"):
-            p = para.strip()
-            if p:
-                self.ptprint(f"        {p}", Out.TEXT)
-        self.ptprint(f"        Elapsed: {sr.elapsed_sec:.1f} s", Out.TEXT)
-        self.ptprint(
-            f"    {manual_icon} MANUAL VERIFICATION REQUIRED — check canary for HTTP callbacks from the MTA",
-            Out.TEXT,
+            probe_rows.append((
+                v.variant,
+                v.detail,
+                accepted,
+                indet,
+                v.detail,
+                (
+                    f"Mail was sent ({v.variant}) — monitor canary URL for 2–5 minutes "
+                    f"for HTTP/HTTPS callbacks from the MTA"
+                ),
+                (),
+                v.smtp_trace,
+                msg_summary,
+            ))
+        self._pp_mail_variant_probe_sections(
+            pp, show, debug=self.args.debug, rows=tuple(probe_rows),
+        )
+        mail_sent = any(r[2] for r in probe_rows)
+        extra = tuple(
+            p.strip()
+            for p in (sr.verification_instructions or "").split("\n")
+            if p.strip()
+        ) if mail_sent else ()
+        self._pp_av_summary_block(
+            pp,
+            show=show,
+            detail=sr.detail,
+            elapsed_sec=sr.elapsed_sec,
+            extra_lines=extra,
         )
 
     def _stream_flood_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.flood_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} FLOOD test failed: {err}", Out.TEXT)
+            pp(f"FLOOD test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         fr = self.results.flood
-        if fr is None:
+        if fr is None or not show:
             return
-        if self.use_json:
-            return
-        info_icon = get_colored_text("[*]", color="INFO")
-        size_lines = [x for x in fr.smtp_trace if x.startswith("SIZE_")]
-        queue_lines = [x for x in fr.smtp_trace if x.startswith("QUEUE_")]
-        other_lines = [
-            x
-            for x in fr.smtp_trace
-            if not (x.startswith("SIZE_") or x.startswith("QUEUE_"))
-        ]
-
-        if fr.indeterminate:
-            if other_lines:
-                self.ptprint(f"    {info_icon} Connection / setup", Out.TEXT)
-                for line in other_lines:
-                    self.ptprint(f"        {line}", Out.TEXT)
-            self.ptprint(f"    {info_icon} Summary", Out.TEXT)
-            self.ptprint(f"        {fr.detail or 'Could not complete'}", Out.TEXT)
-            self.ptprint(f"        Elapsed: {fr.elapsed_sec:.1f} s", Out.TEXT)
-            return
-
-        if fr.size_advertised:
-            lim = fr.size_limit_bytes
-            sz_desc = f"advertised ({lim} B limit)" if lim is not None else "advertised"
-        else:
-            sz_desc = "not advertised"
-        enf = fr.size_enforced
-        enf_s = "n/a" if enf is None else ("yes" if enf else "no")
-        self.ptprint(
-            f"    {info_icon} SIZE extension: {sz_desc}; enforced: {enf_s}",
-            Out.TEXT,
-        )
-        for line in size_lines:
-            self.ptprint(f"        {line}", Out.TEXT)
-
-        if fr.queue_attempts > 0:
-            self.ptprint(
-                f"    {info_icon} Attempts: {fr.queue_attempts} "
-                f"(includes connection failures, non-250 after DATA, and errors before DATA completion)",
-                Out.TEXT,
+        if not self.args.debug:
+            if fr.size_advertised:
+                lim = fr.size_limit_bytes
+                sz_desc = f"advertised ({lim} B limit)" if lim is not None else "advertised"
+            else:
+                sz_desc = "not advertised"
+            enf = fr.size_enforced
+            enf_s = "n/a" if enf is None else ("yes" if enf else "no")
+            self._pp_av_variant_row(
+                pp,
+                show,
+                "SIZE",
+                f"{sz_desc}; enforced: {enf_s}",
             )
-            self.ptprint(
-                f"    {info_icon} Delivered: {fr.messages_accepted} "
-                f"(successful DATA accepted by server, 250 OK)",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"    {info_icon} DATA completed (no TCP error): {fr.messages_sent}",
-                Out.TEXT,
-            )
-        else:
-            self.ptprint(
-                f"    {info_icon} Queue stress: skipped (no recipient or no attempts)",
-                Out.TEXT,
-            )
-        for line in queue_lines[-25:]:
-            self.ptprint(f"        {line}", Out.TEXT)
-        if fr.tarpitting_detected:
-            self.ptprint(f"    {info_icon} Tarpitting detected (defensive slowdown)", Out.TEXT)
+            if fr.queue_attempts > 0:
+                self._pp_av_variant_row(
+                    pp,
+                    show,
+                    "queue",
+                    (
+                        f"attempts={fr.queue_attempts}, delivered={fr.messages_accepted}, "
+                        f"data_completed={fr.messages_sent}, failed={fr.messages_rejected}"
+                    ),
+                )
+            elif fr.indeterminate:
+                other_lines = [
+                    x
+                    for x in fr.smtp_trace
+                    if not (x.startswith("SIZE_") or x.startswith("QUEUE_"))
+                ]
+                if other_lines:
+                    self._pp_av_variant_row(pp, show, "connection", other_lines[0])
 
-        self.ptprint(f"    {info_icon} Summary", Out.TEXT)
-        if fr.detail:
-            self.ptprint(f"        {fr.detail}", Out.TEXT)
+        extra: tuple[str, ...] = ()
         if fr.vulnerable and fr.flood_notes:
-            self.ptprint(
-                f"    {info_icon} Vulnerability based on missing SIZE limit, not delivery ratio",
-                Out.TEXT,
-            )
-        self.ptprint(f"        Elapsed: {fr.elapsed_sec:.1f} s", Out.TEXT)
-
-        if fr.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} VULNERABLE", Out.TEXT)
-            if fr.flood_notes:
-                warn_icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(f"    {warn_icon} {fr.flood_notes[0]}", Out.TEXT)
-                self.ptprint(f"    {info_icon} {fr.flood_notes[1]}", Out.TEXT)
+            extra = fr.flood_notes
+        if fr.tarpitting_detected:
+            extra = extra + ("Tarpitting detected (defensive slowdown).",)
+        verdict: tuple[str, str] | None
+        if fr.indeterminate:
+            verdict = ("WARNING", "Indeterminate")
+        elif fr.vulnerable:
+            verdict = ("VULN", "VULNERABLE")
         elif fr.partial_protection:
-            warn_icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {warn_icon} PARTIAL PROTECTION", Out.TEXT)
+            verdict = ("WARNING", "PARTIAL PROTECTION")
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} NOT VULNERABLE", Out.TEXT)
+            verdict = ("NOTVULN", "NOT VULNERABLE")
+        mail_probe: tuple[bool, bool, str | None, str, tuple[str, ...]] | None = None
+        if fr.queue_attempts > 0:
+            mail_probe = (
+                fr.messages_accepted > 0,
+                fr.indeterminate,
+                fr.detail,
+                (
+                    f"Mail was sent — {fr.messages_accepted}/{fr.queue_attempts} delivered "
+                    f"({fr.messages_sent} DATA completed)"
+                ),
+                (),
+            )
+        self._pp_av_summary_block(
+            pp,
+            show=show,
+            detail=fr.detail,
+            elapsed_sec=fr.elapsed_sec,
+            extra_lines=extra,
+            verdict=verdict,
+            mail_probe=mail_probe,
+        )
 
     def _stream_zipxxe_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.zipxxe_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} ZIPXXE test failed: {err}", Out.TEXT)
+            pp(f"ZIPXXE test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         zr = self.results.zipxxe
-        if zr is None:
+        if zr is None or not show:
             return
-        if self.use_json:
-            return
-        info_icon = get_colored_text("[*]", color="INFO")
-        manual_icon = get_colored_text("[?]", color="WARNING")
         if zr.canary_url:
-            self.ptprint(f"    {info_icon} Canary URL: {zr.canary_url}", Out.TEXT)
+            self._pp_av_variant_row(pp, show, "Canary URL", zr.canary_url)
+        probe_rows: list[
+            tuple[str, str | None, bool, bool, str | None, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]
+        ] = []
         for v in zr.variants:
-            self.ptprint(
-                f"    {info_icon} {v.variant}: {v.accepted} accepted, {v.rejected} rejected, {v.error} error",
-                Out.TEXT,
+            accepted = v.accepted > 0
+            indet = v.error > 0 and v.accepted == 0 and v.rejected == 0
+            msg_summary = v.message_summary or self._mail_variant_msg_summary(
+                v.smtp_trace,
+                accepted=v.accepted,
+                rejected=v.rejected,
+                error=v.error,
             )
-            for line in v.smtp_trace[-10:]:
-                self.ptprint(f"        {line}", Out.TEXT)
-        self.ptprint(f"    {info_icon} Summary", Out.TEXT)
-        if zr.detail:
-            self.ptprint(f"        {zr.detail}", Out.TEXT)
+            if zr.canary_url:
+                sent_msg = (
+                    f"Mail was sent ({v.variant}) — monitor server load and canary (XXE) "
+                    f"for 2–5 minutes"
+                )
+            else:
+                sent_msg = (
+                    f"Mail was sent ({v.variant}) — monitor server load after delivery"
+                )
+            probe_rows.append((
+                v.variant,
+                v.detail,
+                accepted,
+                indet,
+                v.detail,
+                sent_msg,
+                (),
+                v.smtp_trace,
+                msg_summary,
+            ))
+        self._pp_mail_variant_probe_sections(
+            pp, show, debug=self.args.debug, rows=tuple(probe_rows),
+        )
+        mail_sent = any(r[2] for r in probe_rows)
+        extra: tuple[str, ...] = ()
         if zr.all_rejected_at_rcpt:
-            self.ptprint(
-                f"    {info_icon} All variants rejected at RCPT phase — "
-                "content-level protection could not be assessed",
-                Out.TEXT,
+            extra = (
+                "All variants rejected at RCPT phase — content-level protection could not be assessed.",
             )
-        instr = (zr.verification_instructions or "").strip()
-        if instr:
-            wrapped_lines = textwrap.wrap(instr, width=80)
-            self.ptprint(f"    {info_icon} {wrapped_lines[0]}", Out.TEXT)
-            for line in wrapped_lines[1:]:
-                self.ptprint(f"        {line}", Out.TEXT)
-        self.ptprint(f"    Elapsed: {zr.elapsed_sec:.1f} s", Out.TEXT)
-        self.ptprint(
-            f"    {manual_icon} MANUAL VERIFICATION REQUIRED — monitor server load and canary (XXE)",
-            Out.TEXT,
+        if mail_sent:
+            extra = extra + tuple(
+                p.strip()
+                for p in (zr.verification_instructions or "").split("\n")
+                if p.strip()
+            )
+        self._pp_av_summary_block(
+            pp,
+            show=show,
+            detail=zr.detail,
+            elapsed_sec=zr.elapsed_sec,
+            extra_lines=extra,
         )
 
     def _stream_spoof_header_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.spoof_header_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Spoof header test failed: {err}", Out.TEXT)
+            pp(f"Spoof header test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         sh = self.results.spoof_header
         if sh is None:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
-        if not self.use_json:
-            for v in sh.variants:
-                self.ptprint(f"    {info_icon} {v.variant}: {v.detail or ''}", Out.TEXT)
-                if v.envelope_header_mismatch and v.accepted:
-                    warn_icon = get_colored_text("[!]", color="WARNING")
-                    self.ptprint(
-                        f"    {warn_icon} Rozpor obálka vs. hlavička: MAIL FROM (obálka) ≠ From (hlavička) – server akceptoval",
-                        Out.TEXT,
-                    )
-            self.ptprint(f"    {info_icon} {sh.detail}", Out.TEXT)
-            if sh.vulnerable and sh.vulnerable_note:
-                self.ptprint(f"    {info_icon} {sh.vulnerable_note}", Out.TEXT)
-            self.ptprint(f"    {info_icon} Elapsed: {sh.elapsed_sec:.1f} s", Out.TEXT)
+        for v in sh.variants:
+            pp(f"{v.variant}: {v.detail or ''}", bullet_type="TITLE", condition=show, indent=4)
+            if v.envelope_header_mismatch and v.accepted:
+                pp(
+                    "Rozpor obálka vs. hlavička: MAIL FROM (obálka) ≠ From (hlavička) – server akceptoval",
+                    bullet_type="WARNING", condition=show, indent=4,
+                )
+        pp(sh.detail, bullet_type="TITLE", condition=show, indent=4)
+        if sh.vulnerable and sh.vulnerable_note:
+            pp(sh.vulnerable_note, bullet_type="TITLE", condition=show, indent=4)
+        pp(f"Elapsed: {sh.elapsed_sec:.1f} s", bullet_type="TITLE", condition=show, indent=4)
         if sh.indeterminate:
-            self.ptprint(f"    {info_icon} Indeterminate: {sh.detail or 'Could not complete'}", Out.TEXT)
+            pp(f"Indeterminate: {sh.detail or 'Could not complete'}", bullet_type="TITLE", condition=show, indent=4)
         elif sh.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} VULNERABLE", Out.TEXT)
+            pp("VULNERABLE", bullet_type="VULN", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} SECURE", Out.TEXT)
+            pp("SECURE", bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_bcc_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.bcc_test_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} BCC test failed: {err}", Out.TEXT)
+            pp(f"BCC test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         bc = self.results.bcc_test
-        if bc is None:
+        if bc is None or not show:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
-        warn_icon = get_colored_text("[!]", color="WARNING")
-        ok_icon = get_colored_text("[✓]", color="NOTVULN")
-        vuln_icon = get_colored_text("[✗]", color="VULN")
-        manual_icon = get_colored_text("[?]", color="INFO")
-        if not self.use_json:
-            self.ptprint("    [*] Sending test email...", Out.TEXT)
-            mail_from = self.args.mail_from or f"bcctest@{self.fqdn}"
-            self.ptprint(f"    {info_icon} From: {mail_from}", Out.TEXT)
-            for r in bc.recipients_to:
-                self.ptprint(f"    {info_icon} To: {r}", Out.TEXT)
-            for r in bc.recipients_cc:
-                self.ptprint(f"    {info_icon} Cc: {r}", Out.TEXT)
-            for r in bc.recipients_bcc:
-                self.ptprint(f"    {info_icon} Bcc: {r}", Out.TEXT)
-            if bc.message_accepted:
-                self.ptprint("    " + warn_icon + " Message sent successfully.", Out.TEXT)
-                self.ptprint("", Out.TEXT)
-                self.ptprint(f"    {manual_icon} MANUAL VERIFICATION REQUIRED:", Out.TEXT)
-                to_cc = list(bc.recipients_to) + list(bc.recipients_cc)
-                to_cc_str = ", ".join(to_cc[:2]) if to_cc else "To/Cc"
-                if bc.recipients_bcc:
-                    bcc_example = bc.recipients_bcc[0]
-                else:
-                    bcc_example = "Bcc"
-                self.ptprint(f"    1. Log in to {to_cc_str} (To/Cc).", Out.TEXT)
-                self.ptprint('    2. View "Message Source" / "Original Header".', Out.TEXT)
-                self.ptprint(f'    3. SEARCH for the string "Bcc" or "{bcc_example}".', Out.TEXT)
-                self.ptprint("", Out.TEXT)
-                self.ptprint(f"    {ok_icon} If NOT FOUND: SECURE (Server correctly stripped BCC).", Out.TEXT)
-                self.ptprint(f"    {vuln_icon} If FOUND: VULNERABLE (BCC disclosure).", Out.TEXT)
-            else:
-                self.ptprint(f"    {info_icon} {bc.detail or 'Message not accepted.'}", Out.TEXT)
-            self.ptprint(f"    {info_icon} Elapsed: {bc.elapsed_sec:.1f} s", Out.TEXT)
+        to_cc = list(bc.recipients_to) + list(bc.recipients_cc)
+        to_cc_str = ", ".join(to_cc[:2]) if to_cc else "To/Cc"
+        bcc_example = bc.recipients_bcc[0] if bc.recipients_bcc else "Bcc"
+        bcc_detail = (
+            "1 accepted, 0 rejected, 0 error"
+            if bc.message_accepted
+            else (bc.detail or "0 accepted, 1 rejected, 0 error")
+        )
+        bcc_summary = self._mail_variant_msg_summary(
+            bc.smtp_trace,
+            accepted=1 if bc.message_accepted else 0,
+            rejected=0 if bc.message_accepted else 1,
+            error=0,
+        )
+        follow_up: tuple[str, ...] = ()
+        if bc.message_accepted:
+            follow_up = (
+                f"1. Log in to {to_cc_str} (To/Cc).",
+                '2. View "Message Source" / "Original Header".',
+                f'3. SEARCH for the string "Bcc" or "{bcc_example}".',
+                "If NOT FOUND: SECURE (Server correctly stripped BCC).",
+                "If FOUND: VULNERABLE (BCC disclosure).",
+            )
+        self._pp_mail_variant_probe_sections(
+            pp,
+            show,
+            debug=self.args.debug,
+            rows=(
+                (
+                    "bcc disclosure",
+                    bcc_detail,
+                    bc.message_accepted,
+                    False,
+                    bc.detail,
+                    (
+                        f"Mail was sent — log in to {to_cc_str} (To/Cc), open Message Source, "
+                        f"and search for 'Bcc' or '{bcc_example}'"
+                    ),
+                    follow_up,
+                    bc.smtp_trace,
+                    bcc_summary,
+                ),
+            ),
+        )
+        self._pp_av_summary_block(
+            pp,
+            show=show,
+            detail=bc.detail,
+            elapsed_sec=bc.elapsed_sec,
+        )
 
     def _stream_alias_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.alias_test_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Alias test failed: {err}", Out.TEXT)
+            pp(f"Alias test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         al = self.results.alias_test
-        if al is None:
+        if al is None or not show:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
-        warn_icon = get_colored_text("[!]", color="WARNING")
-        if not self.use_json:
-            self.ptprint(f"    {info_icon} Base recipient: {al.base_address}", Out.TEXT)
-            self.ptprint("", Out.TEXT)
-            for v in al.variants:
-                status_str = f"[{v.smtp_status}]" if v.smtp_status is not None else "[?]"
-                reply_snippet = (v.smtp_reply or "").strip()
-                line = f"    {info_icon} Variant '{v.variant}' ({v.address}): {status_str}"
-                if v.accepted:
-                    line += " OK"
-                    if v.uucp_warning:
-                        line += " (Warning: UUCP syntax accepted)"
-                elif v.rejected and reply_snippet:
-                    line += f" {reply_snippet}"
-                elif v.detail:
-                    line += f" {v.detail}"
-                self.ptprint(line, Out.TEXT)
-            self.ptprint("", Out.TEXT)
-            self.ptprint(f"    {warn_icon} MANUAL TASK:", Out.TEXT)
-            self.ptprint("    Verify if messages sent to '250 OK' addresses bypassed any security", Out.TEXT)
-            self.ptprint("    policies (rate limits, attachment filtering, content scanning).", Out.TEXT)
-            self.ptprint("", Out.TEXT)
-            self.ptprint(f"    {info_icon} Elapsed: {al.elapsed_sec:.1f} s", Out.TEXT)
+        if not self.args.debug:
+            self._pp_av_variant_row(pp, show, "base recipient", al.base_address)
+        probe_rows: list[
+            tuple[str, str | None, bool, bool, str | None, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]
+        ] = []
+        for v in al.variants:
+            mail_accepted = v.accepted and not (
+                v.detail and "DATA rejected" in v.detail
+            )
+            if mail_accepted:
+                row_detail = "1 accepted, 0 rejected, 0 error"
+            elif v.rejected:
+                row_detail = v.detail or "rejected"
+            elif v.error:
+                row_detail = v.detail or "error"
+            else:
+                row_detail = v.detail or "skipped"
+            msg_summary = self._mail_variant_msg_summary(
+                v.smtp_trace,
+                accepted=1 if mail_accepted else 0,
+                rejected=1 if v.rejected and not mail_accepted else 0,
+                error=1 if v.error else 0,
+            )
+            follow_up: tuple[str, ...] = ()
+            if v.uucp_warning and mail_accepted:
+                follow_up = ("Warning: UUCP syntax accepted",)
+            probe_rows.append((
+                f"{v.variant} ({v.address})",
+                row_detail,
+                mail_accepted,
+                v.error and not v.accepted and not v.rejected,
+                v.detail or v.smtp_reply,
+                (
+                    f"Mail was sent to {v.address} — verify whether delivery bypassed "
+                    f"policies (rate limits, attachment filtering, content scanning)"
+                ),
+                follow_up,
+                v.smtp_trace,
+                msg_summary,
+            ))
+        self._pp_mail_variant_probe_sections(
+            pp, show, debug=self.args.debug, rows=tuple(probe_rows),
+        )
+        mail_sent = any(r[2] for r in probe_rows)
+        extra = tuple(
+            p.strip()
+            for p in (al.verification_instructions or "").split("\n")
+            if p.strip()
+        ) if mail_sent else ()
+        self._pp_av_summary_block(
+            pp,
+            show=show,
+            detail=al.detail,
+            elapsed_sec=al.elapsed_sec,
+            extra_lines=extra,
+        )
 
     def _stream_auth_downgrade_result(self) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.auth_downgrade_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} AUTH downgrade test failed: {err}", Out.TEXT)
+            pp(f"AUTH downgrade test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         ad = self.results.auth_downgrade
         if ad is None:
             return
-        info_icon = get_colored_text("[*]", color="INFO")
-        warn_icon = get_colored_text("[!]", color="WARNING")
-        if not self.use_json:
-            self.ptprint(f"    {info_icon} Initial methods: {ad.methods_before}", Out.TEXT)
-            self.ptprint(f"    {info_icon} Attempting failed AUTH ({ad.auth_method_used})...", Out.TEXT)
-            if ad.server_response:
-                self.ptprint(f"    {info_icon} Server response: {ad.server_response}", Out.TEXT)
-            if ad.rset_ok is not None:
-                self.ptprint(f"    {info_icon} Resetting session state (RSET)...", Out.TEXT)
-                if ad.rset_ok:
-                    ok_icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {ok_icon} RSET OK", Out.TEXT)
-                    self.ptprint(f"    {info_icon} Post-failure methods: {ad.methods_after}", Out.TEXT)
-                else:
-                    self.ptprint(f"    {warn_icon} Connection closed after RSET", Out.TEXT)
-            elif ad.methods_after:
-                self.ptprint(f"    {info_icon} Post-failure methods: {ad.methods_after}", Out.TEXT)
+        pp(f"Initial methods: {ad.methods_before}", bullet_type="TITLE", condition=show, indent=4)
+        pp(f"Attempting failed AUTH ({ad.auth_method_used})...", bullet_type="TITLE", condition=show, indent=4)
+        if ad.server_response:
+            pp(f"Server response: {ad.server_response}", bullet_type="TITLE", condition=show, indent=4)
+        if ad.rset_ok is not None:
+            pp("Resetting session state (RSET)...", bullet_type="TITLE", condition=show, indent=4)
+            if ad.rset_ok:
+                pp("RSET OK", bullet_type="NOTVULN", condition=show, indent=4)
+                pp(f"Post-failure methods: {ad.methods_after}", bullet_type="TITLE", condition=show, indent=4)
+            else:
+                pp("Connection closed after RSET", bullet_type="WARNING", condition=show, indent=4)
+        elif ad.methods_after:
+            pp(f"Post-failure methods: {ad.methods_after}", bullet_type="TITLE", condition=show, indent=4)
         if ad.indeterminate:
-            self.ptprint(f"    {info_icon} Indeterminate: {ad.detail or 'Could not determine'}", Out.TEXT)
+            pp(f"Indeterminate: {ad.detail or 'Could not determine'}", bullet_type="TITLE", condition=show, indent=4)
             return
         if ad.info_defensive:
-            self.ptprint(f"    {info_icon} {ad.detail}", Out.TEXT)
+            pp(ad.detail, bullet_type="TITLE", condition=show, indent=4)
             return
         if ad.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} VULNERABLE: {ad.detail}", Out.TEXT)
-            self.ptprint(f"        Before: {ad.methods_before}", Out.TEXT)
-            self.ptprint(f"        After:  {ad.methods_after}", Out.TEXT)
-            self.ptprint(f"    {info_icon} Risk: Server may be susceptible to forced credential sniffing.", Out.TEXT)
+            pp(f"VULNERABLE: {ad.detail}", bullet_type="VULN", condition=show, indent=4)
+            pp(f"Before: {ad.methods_before}", bullet_type="TEXT", condition=show, indent=8)
+            pp(f"After:  {ad.methods_after}", bullet_type="TEXT", condition=show, indent=8)
+            pp("Risk: Server may be susceptible to forced credential sniffing.", bullet_type="TITLE", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} {ad.detail}", Out.TEXT)
+            pp(ad.detail, bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_rate_limit_result(self) -> None:
         # Per-phase verdicts are emitted inline by the test itself (next to each
         # measured value). This hook only handles the top-level failure case
         # (e.g. nothing could be connected at all).
         if (err := self.results.rate_limit_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Rate limiting test failed: {err}", Out.TEXT)
+            ptprinthelper.ptprint(f"Rate limiting test failed: {err}", bullet_type="VULN",
+                                  condition=not self.use_json, indent=4)
 
     def _stream_noop_flood1_result(self) -> None:
         """Render verdicts for -nf1 (NOOP Flooding, single connection)."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.noop_flood1_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} NOOP flood test failed: {err}", Out.TEXT)
+            pp(f"NOOP flood test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
 
         r = self.results.noop_flood1
         if r is None:
             return
 
-        vuln_icon = get_colored_text("[✗]", color="VULN")
-        ok_icon = get_colored_text("[✓]", color="NOTVULN")
-
         # 1) Disconnect behaviour.
         if r.disconnected and r.disconnect_after is not None:
             if r.disconnect_after <= NOOP_FLOOD_DISCONNECT_OK_MAX:
-                self.ptprint(
-                    f"    {ok_icon} Server disconnect after {r.disconnect_after} NOOP commands",
-                    Out.TEXT,
-                )
+                pp(f"Server disconnect after {r.disconnect_after} NOOP commands",
+                   bullet_type="NOTVULN", condition=show, indent=4)
             else:
-                self.ptprint(
-                    f"    {vuln_icon} Server disconnects after {r.disconnect_after} "
+                pp(
+                    f"Server disconnects after {r.disconnect_after} "
                     f"NOOP commands (more than {NOOP_FLOOD_DISCONNECT_OK_MAX} accepted)",
-                    Out.TEXT,
+                    bullet_type="VULN", condition=show, indent=4,
                 )
         else:
             suffix = " (hit time cap)" if r.hit_time_cap else " (hit command cap)"
-            self.ptprint(
-                f"    {vuln_icon} No disconnect after {r.commands_sent} NOOP commands{suffix}",
-                Out.TEXT,
-            )
+            pp(f"No disconnect after {r.commands_sent} NOOP commands{suffix}",
+               bullet_type="VULN", condition=show, indent=4)
 
         # 2) Time-trolling / tarpitting.
         if r.baseline_avg_seconds is not None and r.last_window_avg_seconds is not None:
@@ -16241,60 +16808,44 @@ class SMTP(BaseModule):
             max_d = _noop_rt_window_display(r.max_rt_seconds)
             avg_d = _noop_rt_window_display(r.avg_rt_seconds)
             if r.slowdown_detected:
-                self.ptprint(
-                    f"    {ok_icon} Time between two commands ({min_d} - {max_d}, avg {avg_d})",
-                    Out.TEXT,
-                )
-                self.ptprint(
-                    f"    {ok_icon} Time trolting is configured "
+                pp(f"Time between two commands ({min_d} - {max_d}, avg {avg_d})",
+                   bullet_type="NOTVULN", condition=show, indent=4)
+                pp(
+                    f"Time trolting is configured "
                     f"(baseline {_noop_rt_window_display(r.baseline_avg_seconds)} → "
                     f"last {_noop_rt_window_display(r.last_window_avg_seconds)})",
-                    Out.TEXT,
+                    bullet_type="NOTVULN", condition=show, indent=4,
                 )
             else:
-                self.ptprint(
-                    f"    {ok_icon} Time between two commands ({min_d} - {max_d}, avg {avg_d})",
-                    Out.TEXT,
-                )
-                self.ptprint(
-                    f"    {vuln_icon} No time trolting is configured",
-                    Out.TEXT,
-                )
+                pp(f"Time between two commands ({min_d} - {max_d}, avg {avg_d})",
+                   bullet_type="NOTVULN", condition=show, indent=4)
+                pp("No time trolting is configured", bullet_type="VULN", condition=show, indent=4)
         else:
-            self.ptprint(
-                f"    {vuln_icon} No time trolting is configured (not enough samples)",
-                Out.TEXT,
-            )
+            pp("No time trolting is configured (not enough samples)",
+               bullet_type="VULN", condition=show, indent=4)
 
         # 3) Error rate.
         err_rate = r.error_rate_pct
         if err_rate <= NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:
-            self.ptprint(
-                f"    {ok_icon} Error rate: {err_rate:.0f}%",
-                Out.TEXT,
-            )
+            pp(f"Error rate: {err_rate:.0f}%", bullet_type="NOTVULN", condition=show, indent=4)
         else:
-            self.ptprint(
-                f"    {vuln_icon} Error rate: {err_rate:.0f}% "
+            pp(
+                f"Error rate: {err_rate:.0f}% "
                 f"(over {NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:.0f}%)",
-                Out.TEXT,
+                bullet_type="VULN", condition=show, indent=4,
             )
 
     def _stream_noop_flood2_result(self) -> None:
         """Render verdicts for -nf2 (NOOP Flooding DoS test, parallel connections)."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if (err := self.results.noop_flood2_error) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} NOOP DoS flood test failed: {err}", Out.TEXT)
+            pp(f"NOOP DoS flood test failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
 
         r = self.results.noop_flood2
         if r is None:
             return
-
-        vuln_icon = get_colored_text("[✗]", color="VULN")
-        ok_icon = get_colored_text("[✓]", color="NOTVULN")
-        warn_icon = get_colored_text("[!]", color="VULN")
-        info_icon = get_colored_text("[*]", color="INFO")
 
         # 1) Time between two commands (average reaction time under load).
         if r.avg_rt_seconds is not None:
@@ -16302,35 +16853,30 @@ class SMTP(BaseModule):
             max_d = _noop_rt_window_display(r.max_rt_seconds)
             avg_d = _noop_rt_window_display(r.avg_rt_seconds)
             if r.avg_rt_seconds > NOOP_FLOOD2_AVG_TIME_OK_MAX_SECONDS:
-                self.ptprint(
-                    f"    {vuln_icon} Time between two commands ({min_d} - {max_d}, avg {avg_d}) "
+                pp(
+                    f"Time between two commands ({min_d} - {max_d}, avg {avg_d}) "
                     f"— over {NOOP_FLOOD2_AVG_TIME_OK_MAX_SECONDS:.0f}s avg under load",
-                    Out.TEXT,
+                    bullet_type="VULN", condition=show, indent=4,
                 )
             else:
-                self.ptprint(
-                    f"    {ok_icon} Time between two commands ({min_d} - {max_d}, avg {avg_d})",
-                    Out.TEXT,
-                )
+                pp(f"Time between two commands ({min_d} - {max_d}, avg {avg_d})",
+                   bullet_type="NOTVULN", condition=show, indent=4)
         else:
-            self.ptprint(
-                f"    {vuln_icon} Time between two commands: no successful replies "
+            pp(
+                f"Time between two commands: no successful replies "
                 f"({r.commands_sent} sent)",
-                Out.TEXT,
+                bullet_type="VULN", condition=show, indent=4,
             )
 
         # 2) Error rate under load.
         err_rate = r.error_rate_pct
         if err_rate <= NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:
-            self.ptprint(
-                f"    {ok_icon} Error rate: {err_rate:.0f}%",
-                Out.TEXT,
-            )
+            pp(f"Error rate: {err_rate:.0f}%", bullet_type="NOTVULN", condition=show, indent=4)
         else:
-            self.ptprint(
-                f"    {vuln_icon} Error rate: {err_rate:.0f}% "
+            pp(
+                f"Error rate: {err_rate:.0f}% "
                 f"(over {NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT:.0f}%)",
-                Out.TEXT,
+                bullet_type="VULN", condition=show, indent=4,
             )
 
         # 3) Connection survival summary — informs the analyst whether the
@@ -16339,23 +16885,21 @@ class SMTP(BaseModule):
             # The server actively cut every socket before our time-budget
             # expired — that's effectively a successful disconnect-storm DoS,
             # so flag it as a warning rather than a neutral note.
-            self.ptprint(
-                f"    {warn_icon} Server disconnected all connections before test time limit",
-                Out.TEXT,
-            )
+            pp("Server disconnected all connections before test time limit",
+               bullet_type="VULN", condition=show, indent=4)
         storm_base = r.storm_pool_connections or r.established_connections
         if storm_base > 0 and r.disconnected_during_test > 0:
             pct = 100.0 * r.disconnected_during_test / storm_base
-            self.ptprint(
-                f"    {info_icon} Disconnected connections during test: "
+            pp(
+                f"Disconnected connections during test: "
                 f"{r.disconnected_during_test} from {storm_base} "
                 f"({pct:.0f}%)",
-                Out.TEXT,
+                bullet_type="TITLE", condition=show, indent=4,
             )
             # Per-connection breakdown (ADDITIONS colour, same as -vv debug output).
             for idx, reason, detail in r.terminated_connections:
-                line = f"        Connection #{idx} terminated — {reason} ({detail})"
-                self.ptprint(get_colored_text(line, color="ADDITIONS"), Out.TEXT)
+                pp(get_colored_text(f"Connection #{idx} terminated — {reason} ({detail})", color="ADDITIONS"),
+                   bullet_type="TEXT", condition=show, indent=8)
 
     def _on_brute_success(self, cred: Creds) -> None:
         """Callback for real-time streaming of found credentials (thread-safe)."""
@@ -16366,8 +16910,9 @@ class SMTP(BaseModule):
         creds = self.results.creds
         if creds is None:
             return
-        if not self.use_json and len(creds) > 0:
-            self.ptprint(f"    Found {len(creds)} valid credentials", Out.INFO)
+        if len(creds) > 0:
+            ptprinthelper.ptprint(f"Found {len(creds)} valid credentials", bullet_type="INFO",
+                                  condition=not self.use_json, indent=4)
 
     # endregion
 
@@ -17165,8 +17710,8 @@ class SMTP(BaseModule):
         if (info_error := getattr(self.results, "info_error", None)) is not None:
             if self.use_json:
                 self.ptjsonlib.end_error(info_error, self.use_json)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} {info_error}", Out.TEXT)
+            ptprinthelper.ptprint(info_error, bullet_type="VULN",
+                                  condition=not self.use_json, indent=4)
             return
 
         # ── Flat output: no nodes, global properties + global vulnerabilities ──
@@ -17375,6 +17920,7 @@ class SMTP(BaseModule):
                             "rejected": c.rejected,
                             "error": c.error,
                             "smtpTrace": list(c.smtp_trace),
+                            "messageSummary": list(c.message_summary),
                             "detail": c.detail,
                         }
                         for c in av.categories
@@ -17416,6 +17962,7 @@ class SMTP(BaseModule):
                     "elapsedSec": round(bc.elapsed_sec, 2),
                     "detail": bc.detail,
                     "verificationInstructions": bc.verification_instructions,
+                    "smtpTrace": list(bc.smtp_trace),
                 }
             elif (bc_err := self.results.bcc_test_error) is not None:
                 props["bccTestError"] = bc_err
@@ -17436,6 +17983,7 @@ class SMTP(BaseModule):
                             "smtpReply": v.smtp_reply,
                             "detail": v.detail,
                             "uucpWarning": v.uucp_warning,
+                            "smtpTrace": list(v.smtp_trace),
                         }
                         for v in al.variants
                     ],
@@ -17996,6 +18544,7 @@ class SMTP(BaseModule):
                             "rejected": c.rejected,
                             "error": c.error,
                             "smtpTrace": list(c.smtp_trace),
+                            "messageSummary": list(c.message_summary),
                             "detail": c.detail,
                         }
                         for c in av.categories
@@ -18149,6 +18698,7 @@ class SMTP(BaseModule):
                     "elapsedSec": round(bc.elapsed_sec, 2),
                     "detail": bc.detail,
                     "verificationInstructions": bc.verification_instructions,
+                    "smtpTrace": list(bc.smtp_trace),
                 }
             })
 
@@ -18173,6 +18723,7 @@ class SMTP(BaseModule):
                             "smtpReply": v.smtp_reply,
                             "detail": v.detail,
                             "uucpWarning": v.uucp_warning,
+                            "smtpTrace": list(v.smtp_trace),
                         }
                         for v in al.variants
                     ],

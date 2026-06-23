@@ -8,7 +8,7 @@ from string import ascii_letters
 from typing import NamedTuple
 
 from ptlibs.ptjsonlib import PtJsonLib
-from ptlibs.ptprinthelper import get_colored_text
+from .utils import ptprinthelper
 from ..ptntlmauth.ptntlmauth import NTLMInfo, get_NegotiateMessage_data, decode_ChallengeMessage_blob
 
 from ._base import BaseModule, BaseArgs, Out
@@ -138,6 +138,14 @@ def _parse_capability_commands(capability_list: list[str]) -> list[tuple[str, st
         result.append(("STARTTLS (is not allowed)", "ERROR"))
 
     return result
+
+
+def _capa_level_bullet(level: str) -> str:
+    if level == "ERROR":
+        return "VULN"
+    if level == "WARNING":
+        return "WARNING"
+    return "NOTVULN"
 
 
 # region data classes
@@ -1012,22 +1020,6 @@ class IMAP(BaseModule):
         self._usrenum_progress_lock = threading.Lock()
         self._usrenum_mt_progress_line_active = False
         self._usrenum_progress_start: float | None = None
-        self._streamed_banner = False
-        self._streamed_capa = False
-        self._streamed_encryption = False
-        self._streamed_sniffable = False
-        self._streamed_inv_comm = False
-        self._streamed_catch_all = False
-        self._streamed_anonymous = False
-        self._streamed_ntlm = False
-        self._streamed_brute = False
-        self._streamed_conn_limits = False
-        self._streamed_eicar = False
-        self._streamed_usrenum_login = False
-        self._streamed_usrenum_plain = False
-        self._streamed_resource_load = False
-        self._streamed_mailbox_iso = False
-        self._streamed_tls_audit = False
         self._ntlm_transient_init_emitted = False
 
         if (_usrenum_on or getattr(args, "imap_resource_load", False) or getattr(args, "imap_mailbox_iso", False)) and not self.use_json and hasattr(
@@ -1066,22 +1058,29 @@ class IMAP(BaseModule):
         with self._output_lock:
             self.ptprint(title, Out.INFO)
 
+    def _tprint(self, msg: str, bullet: str = "TEXT", indent: int = 4) -> None:
+        ptprinthelper.ptprint(msg, bullet_type=bullet, condition=not self.use_json, indent=indent)
+
     def _emit_imap_connect_pending_hint(self) -> None:
         """Early terminal line before opening TCP (avoids silent stalls on slow targets)."""
-        if self.use_json:
-            return
         with self._output_lock:
-            icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(f"    {icon} Initializing IMAP session...", Out.TEXT)
+            ptprinthelper.ptprint(
+                "Initializing IMAP session...",
+                bullet_type="TITLE",
+                condition=not self.use_json,
+                indent=4,
+            )
 
     def _emit_ntlm_transient_init_line(self) -> None:
         """Progress line under [+] NTLM information; erased on TTY before verdict lines."""
-        if self.use_json:
-            return
         with self._output_lock:
             self._ntlm_transient_init_emitted = True
-            icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(f"    {icon} Initializing IMAP session...", Out.TEXT)
+            ptprinthelper.ptprint(
+                "Initializing IMAP session...",
+                bullet_type="TITLE",
+                condition=not self.use_json,
+                indent=4,
+            )
 
     def _clear_ntlm_transient_init_line(self) -> None:
         if self.use_json or not self._ntlm_transient_init_emitted:
@@ -1151,15 +1150,11 @@ class IMAP(BaseModule):
             return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
 
         def _print_verdict(is_vuln: bool, text: str) -> None:
-            if is_vuln:
-                icon = get_colored_text("[✗]", color="VULN")
-            else:
-                icon = get_colored_text("[OK]", color="NOTVULN")
-            self.ptprint(f"        {icon} {text}", Out.TEXT)
+            bullet = "VULN" if is_vuln else "NOTVULN"
+            ptprinthelper.ptprint(text, bullet_type=bullet, condition=_show_progress, indent=8)
 
         def _print_info(text: str) -> None:
-            icon = get_colored_text("[*]", color="INFO")
-            self.ptprint(f"        {icon} {text}", Out.TEXT)
+            ptprinthelper.ptprint(text, bullet_type="TITLE", condition=_show_progress, indent=8)
 
         def _watch_imap_disconnect(
             imap: imaplib.IMAP4 | imaplib.IMAP4_SSL,
@@ -1270,11 +1265,12 @@ class IMAP(BaseModule):
         if banned and connected >= CONN_LIMIT_CONN_IP_THRESHOLD:
             _print_info(f"Further connections refused after {connected} sessions (possible rate / concurrency limit).")
         elif not banned:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(
-                f"        {icon} No refusal observed while raising concurrent sessions "
+            ptprinthelper.ptprint(
+                f"No refusal observed while raising concurrent sessions "
                 f"({connected}/{max_attempts} established)",
-                Out.TEXT,
+                bullet_type="VULN",
+                condition=_show_progress,
+                indent=8,
             )
 
         if not banned and connected >= CONN_LIMIT_CONN_GLOB_THRESHOLD:
@@ -2795,6 +2791,7 @@ class IMAP(BaseModule):
 
         if self._is_default_mode():
             self.results.info = self.info(get_commands=True)
+            self._emit_section_heading("Banner")
             self._stream_banner_result()
             self._stream_capa_result()
             if self.args.target.port == 993:
@@ -2830,6 +2827,8 @@ class IMAP(BaseModule):
                 info.capability if do_commands else None,
                 getattr(info, "capability_starttls", None) if do_commands else None,
             )
+            if do_banner:
+                self._emit_section_heading("Banner")
             self._stream_banner_result()
             self._stream_capa_result()
 
@@ -2948,6 +2947,7 @@ class IMAP(BaseModule):
                     self.results.info = silent
                     self.results.banner_requested = True
                     self.results.commands_requested = True
+                    self._emit_section_heading("Banner")
                     self._stream_banner_result()
                     self._stream_capa_result()
 
@@ -2955,8 +2955,7 @@ class IMAP(BaseModule):
             self.results.catch_all = self._test_catch_all()
             self._stream_catch_all_result()
 
-            if not self.use_json:
-                self.ptprint("Login bruteforce", Out.INFO)
+            self._emit_section_heading("Login bruteforce")
             self.results.creds = simple_bruteforce(
                 self._try_login,
                 self.args.user,
@@ -4484,78 +4483,76 @@ class IMAP(BaseModule):
     def _on_brute_success(self, cred: Creds) -> None:
         """Callback for real-time streaming of found credentials (thread-safe)."""
         with self._output_lock:
-            self.ptprint(f"    user: {cred.user}, password: {cred.passw}", Out.TEXT)
+            ptprinthelper.ptprint(
+                f"user: {cred.user}, password: {cred.passw}",
+                bullet_type="TEXT",
+                condition=not self.use_json,
+                indent=4,
+            )
 
     def _stream_banner_result(self) -> None:
-        if self.use_json or not (info := self.results.info) or info.banner is None:
+        """Stream banner + Service Identification immediately (thread-safe)."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
+        if not (info := self.results.info) or info.banner is None:
             return
         with self._output_lock:
-            self.ptprint("Banner", Out.INFO)
             sid = identify_service(info.banner)
             if sid is None:
-                icon = get_colored_text("[✓]", color="NOTVULN")
+                banner_bullet = "NOTVULN"
             elif sid.version is not None:
-                icon = get_colored_text("[✗]", color="VULN")
+                banner_bullet = "VULN"
             else:
-                icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
+                banner_bullet = "WARNING"
+            pp(info.banner, bullet_type=banner_bullet, condition=show, indent=4)
             if sid is not None:
                 self.ptprint("Service Identification", Out.INFO)
-                self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
-                self.ptprint(
-                    f"    Version:  {sid.version if sid.version else 'unknown'}",
-                    Out.TEXT,
+                pp(f"Product:  {sid.product}", bullet_type="TEXT", condition=show, indent=4)
+                pp(
+                    f"Version:  {sid.version if sid.version else 'unknown'}",
+                    bullet_type="TEXT",
+                    condition=show,
+                    indent=4,
                 )
-                self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
-        self._streamed_banner = True
+                pp(f"CPE:      {sid.cpe}", bullet_type="TEXT", condition=show, indent=4)
+
+    def _emit_capa_section(self, title: str, capa: list[str]) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
+        self.ptprint(title, Out.INFO)
+        for display_str, level in _parse_capability_commands(capa):
+            pp(display_str, bullet_type=_capa_level_bullet(level), condition=show, indent=4)
 
     def _stream_capa_result(self) -> None:
-        if self.use_json or not (info := self.results.info):
+        """Stream CAPABILITY capabilities immediately (thread-safe)."""
+        if not (info := self.results.info):
             return
         capa = info.capability or getattr(info, "capability_starttls", None)
         if not capa and not info.id:
             return
         with self._output_lock:
+            pp = ptprinthelper.ptprint
+            show = not self.use_json
             if info.id is not None:
                 self.ptprint("ID command", Out.INFO)
-                self.ptprint(f"    {info.id}", Out.TEXT)
+                pp(info.id, bullet_type="TEXT", condition=show, indent=4)
             if capa:
                 capa_stls = getattr(info, "capability_starttls", None)
                 if capa_stls is not None:
-                    self.ptprint("CAPABILITY command (PLAIN)", Out.INFO)
-                    for display_str, level in _parse_capability_commands(info.capability or []):
-                        icon = get_colored_text("[✗]", color="VULN") if level == "ERROR" else (
-                            get_colored_text("[!]", color="WARNING") if level == "WARNING"
-                            else get_colored_text("[✓]", color="NOTVULN")
-                        )
-                        self.ptprint(f"    {icon} {display_str}", Out.TEXT)
-                    self.ptprint("CAPABILITY command (STARTTLS)", Out.INFO)
-                    for display_str, level in _parse_capability_commands(capa_stls):
-                        icon = get_colored_text("[✗]", color="VULN") if level == "ERROR" else (
-                            get_colored_text("[!]", color="WARNING") if level == "WARNING"
-                            else get_colored_text("[✓]", color="NOTVULN")
-                        )
-                        self.ptprint(f"    {icon} {display_str}", Out.TEXT)
+                    self._emit_capa_section("CAPABILITY command (PLAIN)", info.capability or [])
+                    self._emit_capa_section("CAPABILITY command (STARTTLS)", capa_stls)
                 else:
                     encrypted = self.args.target.port == 993 or self.args.tls
                     title = "CAPABILITY command (TLS)" if encrypted else "CAPABILITY command (PLAIN)"
-                    self.ptprint(title, Out.INFO)
-                    for display_str, level in _parse_capability_commands(capa):
-                        icon = get_colored_text("[✗]", color="VULN") if level == "ERROR" else (
-                            get_colored_text("[!]", color="WARNING") if level == "WARNING"
-                            else get_colored_text("[✓]", color="NOTVULN")
-                        )
-                        self.ptprint(f"    {icon} {display_str}", Out.TEXT)
-        self._streamed_capa = True
+                    self._emit_capa_section(title, capa)
 
     def _stream_encryption_result(self) -> None:
-        if self.use_json:
-            return
+        """Stream encryption test result to terminal (thread-safe)."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         with self._output_lock:
             if (err := self.results.encryption_error) is not None:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Encryption test failed: {err}", Out.TEXT)
-                self._streamed_encryption = True
+                pp(f"Encryption test failed: {err}", bullet_type="VULN", condition=show, indent=4)
                 return
             enc = self.results.encryption
             if enc is None:
@@ -4563,311 +4560,292 @@ class IMAP(BaseModule):
             plaintext_only = enc.plaintext_ok and not enc.starttls_ok and not enc.tls_ok
             any_ok = enc.plaintext_ok or enc.starttls_ok or enc.tls_ok
             if plaintext_only:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Plaintext only", Out.TEXT)
+                pp("Plaintext only", bullet_type="VULN", condition=show, indent=4)
             elif any_ok:
                 if enc.plaintext_ok:
-                    icon = (
-                        get_colored_text("[!]", color="WARNING")
-                        if (enc.starttls_ok or enc.tls_ok)
-                        else get_colored_text("[✓]", color="NOTVULN")
-                    )
-                    self.ptprint(f"    {icon} Plaintext", Out.TEXT)
+                    bullet = "WARNING" if (enc.starttls_ok or enc.tls_ok) else "NOTVULN"
+                    pp("Plaintext", bullet_type=bullet, condition=show, indent=4)
                 if enc.starttls_ok:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} STARTTLS", Out.TEXT)
+                    pp("STARTTLS", bullet_type="NOTVULN", condition=show, indent=4)
                 if enc.tls_ok:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} TLS", Out.TEXT)
+                    pp("TLS", bullet_type="NOTVULN", condition=show, indent=4)
             else:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(
-                    f"    {icon} No connection mode available (plaintext, STARTTLS, TLS failed)",
-                    Out.TEXT,
+                pp(
+                    "No connection mode available (plaintext, STARTTLS, TLS failed)",
+                    bullet_type="VULN",
+                    condition=show,
+                    indent=4,
                 )
-        self._streamed_encryption = True
 
     def _stream_sniffable_result(self) -> None:
-        if self.use_json:
-            return
+        """Stream cleartext IMAP sniffable probe result (thread-safe)."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         with self._output_lock:
             if (err := getattr(self.results, "sniffable_error", None)) is not None:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Probe failed: {err}", Out.TEXT)
-                self._streamed_sniffable = True
+                pp(f"Probe failed: {err}", bullet_type="VULN", condition=show, indent=4)
                 return
             sn = self.results.sniffable
             if sn is None:
                 return
             if sn.skipped:
-                icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(f"    {icon} Skipped: {sn.skip_reason or 'n/a'}", Out.TEXT)
-                self._streamed_sniffable = True
+                pp(f"Skipped: {sn.skip_reason or 'n/a'}", bullet_type="WARNING", condition=show, indent=4)
                 return
             if not sn.plain_ok:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} Plain IMAP TCP session not available on target", Out.TEXT)
-                self._streamed_sniffable = True
+                pp("Plain IMAP TCP session not available on target", bullet_type="NOTVULN", condition=show, indent=4)
                 return
             if sn.starttls_advertised:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} STARTTLS advertised on cleartext port", Out.TEXT)
+                pp("STARTTLS advertised on cleartext port", bullet_type="NOTVULN", condition=show, indent=4)
             else:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} STARTTLS not advertised on cleartext port", Out.TEXT)
-            info_icon = get_colored_text("[i]", color="INFO")
+                pp("STARTTLS not advertised on cleartext port", bullet_type="VULN", condition=show, indent=4)
             if sn.auth_methods:
-                self.ptprint(
-                    f"    {info_icon} Credential-bearing AUTH mechanisms seen: {', '.join(sn.auth_methods)}",
-                    Out.TEXT,
+                pp(
+                    f"Credential-bearing AUTH mechanisms seen: {', '.join(sn.auth_methods)}",
+                    bullet_type="TITLE",
+                    condition=show,
+                    indent=4,
                 )
             else:
-                self.ptprint(
-                    f"    {info_icon} No credential-bearing AUTH= mechanisms advertised pre-TLS",
-                    Out.TEXT,
+                pp(
+                    "No credential-bearing AUTH= mechanisms advertised pre-TLS",
+                    bullet_type="TITLE",
+                    condition=show,
+                    indent=4,
                 )
             for method, outcome in sn.probes:
                 if outcome == "continuation":
-                    icon = get_colored_text("[✗]", color="VULN")
+                    bullet = "VULN"
                     label = "server sent continuation (+) — cleartext SASL exchange possible"
                 elif outcome == "tagged_no":
-                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    bullet = "NOTVULN"
                     label = "AUTHENTICATE rejected (NO)"
                 elif outcome == "tagged_bad":
-                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    bullet = "NOTVULN"
                     label = "AUTHENTICATE rejected (BAD)"
                 elif outcome == "io_error":
-                    icon = get_colored_text("[!]", color="WARNING")
+                    bullet = "WARNING"
                     label = "probe I/O error"
                 else:
-                    icon = get_colored_text("[!]", color="WARNING")
+                    bullet = "WARNING"
                     label = outcome
-                self.ptprint(f"    {icon} {method}: {label}", Out.TEXT)
+                pp(f"{method}: {label}", bullet_type=bullet, condition=show, indent=4)
             if sn.vulnerable:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(
-                    f"    {icon} Verdict: cleartext IMAP allows sniffable traffic or credentials",
-                    Out.TEXT,
+                pp(
+                    "Verdict: cleartext IMAP allows sniffable traffic or credentials",
+                    bullet_type="VULN",
+                    condition=show,
+                    indent=4,
                 )
             else:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(
-                    f"    {icon} Verdict: no cleartext-only policy detected by this probe",
-                    Out.TEXT,
+                pp(
+                    "Verdict: no cleartext-only policy detected by this probe",
+                    bullet_type="NOTVULN",
+                    condition=show,
+                    indent=4,
                 )
-        self._streamed_sniffable = True
 
     def _inv_comm_emit_terminal(self, ic: InvCommImapResult) -> None:
         """Shared text layout for invalid-command audit (stream + output replay)."""
-        info_icon = get_colored_text("[i]", color="INFO")
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         tagged_outcomes = frozenset({"OK", "NO", "BAD"})
         for t in ic.tests:
             time_str = f" ({t.response_time_sec:.2f}s)" if t.response_time_sec is not None else ""
             if t.probe_vulnerable:
                 msg = f"VULNERABLE / UNSTABLE: {t.command_display} → {t.outcome}{time_str}"
-                self.ptprint(f"    {info_icon} {msg}", Out.TEXT)
             else:
-                self.ptprint(
-                    f"    {info_icon} {t.command_display}: {t.outcome}{time_str}",
-                    Out.TEXT,
-                )
+                msg = f"{t.command_display}: {t.outcome}{time_str}"
+            pp(msg, bullet_type="TITLE", condition=show, indent=4)
             if t.reply_snippet and (t.info_leak or t.probe_vulnerable):
-                self.ptprint(f"        {t.reply_snippet}", Out.TEXT)
+                pp(t.reply_snippet, bullet_type="TEXT", condition=show, indent=8)
             if t.info_leak:
-                self.ptprint(f"        {info_icon} Verbose error (possible info leak)", Out.TEXT)
+                pp("Verbose error (possible info leak)", bullet_type="TITLE", condition=show, indent=8)
             if t.slow_response:
-                self.ptprint(f"        {info_icon} Slow response (possible parser / DoS)", Out.TEXT)
+                pp("Slow response (possible parser / DoS)", bullet_type="TITLE", condition=show, indent=8)
             if (
                 t.session_ok_after is False
                 and t.outcome in tagged_outcomes
                 and not t.probe_vulnerable
             ):
-                self.ptprint(
-                    f"        {info_icon} CAPABILITY follow-up failed (session unstable)",
-                    Out.TEXT,
-                )
+                pp("CAPABILITY follow-up failed (session unstable)", bullet_type="TITLE", condition=show, indent=8)
 
         if ic.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} {ic.detail}", Out.TEXT)
+            pp(ic.detail, bullet_type="VULN", condition=show, indent=4)
         elif ic.weakness:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} WEAKNESS: {ic.detail}", Out.TEXT)
+            pp(f"WEAKNESS: {ic.detail}", bullet_type="WARNING", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} {ic.detail}", Out.TEXT)
+            pp(ic.detail, bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_inv_comm_result(self) -> None:
         """Terminal output for invalid IMAP command audit (align with SMTP -iv: [i] per line)."""
-        if self.use_json:
-            return
-        info_icon = get_colored_text("[i]", color="INFO")
         with self._output_lock:
             if (err := getattr(self.results, "inv_comm_error", None)) is not None:
-                self.ptprint(f"    {info_icon} Test failed: {err}", Out.TEXT)
-                self._streamed_inv_comm = True
+                ptprinthelper.ptprint(
+                    f"Test failed: {err}",
+                    bullet_type="TITLE",
+                    condition=not self.use_json,
+                    indent=4,
+                )
                 return
             ic = self.results.inv_comm
             if ic is None:
-                self._streamed_inv_comm = True
                 return
             self._inv_comm_emit_terminal(ic)
-        self._streamed_inv_comm = True
 
     def _stream_catch_all_result(self) -> None:
-        if self.use_json or (catch_all := getattr(self.results, "catch_all", None)) is None:
+        """Stream catch-all test result immediately (thread-safe)."""
+        catch_all = getattr(self.results, "catch_all", None)
+        if catch_all is None:
             return
         with self._output_lock:
             if catch_all == "indeterminate":
-                icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(
-                    f"    {icon} Server accepted invalid credentials (indeterminate). Results may be false positives.",
-                    Out.TEXT,
+                self._tprint(
+                    "Server accepted invalid credentials (indeterminate). Results may be false positives.",
+                    bullet="WARNING",
                 )
             else:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} Not configured (server rejects invalid creds)", Out.TEXT)
-        self._streamed_catch_all = True
+                self._tprint("Not configured (server rejects invalid creds)", bullet="NOTVULN")
 
     def _anonymous_emit_terminal(self, ar: AnonymousAccessResult) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if ar.auth_anonymous_advertised:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(
-                f"    {icon} AUTH=ANONYMOUS offered in pre-login CAPABILITY (or banner)",
-                Out.TEXT,
+            pp(
+                "AUTH=ANONYMOUS offered in pre-login CAPABILITY (or banner)",
+                bullet_type="WARNING",
+                condition=show,
+                indent=4,
             )
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} AUTH=ANONYMOUS not advertised", Out.TEXT)
+            pp("AUTH=ANONYMOUS not advertised", bullet_type="NOTVULN", condition=show, indent=4)
 
         if ar.authenticate_anonymous_ok:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} AUTHENTICATE ANONYMOUS: accepted (OK)", Out.TEXT)
+            pp("AUTHENTICATE ANONYMOUS: accepted (OK)", bullet_type="VULN", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} AUTHENTICATE ANONYMOUS: not accepted", Out.TEXT)
+            pp("AUTHENTICATE ANONYMOUS: not accepted", bullet_type="NOTVULN", condition=show, indent=4)
 
         if ar.login_anonymous_empty_ok:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} LOGIN anonymous with empty password: accepted", Out.TEXT)
+            pp("LOGIN anonymous with empty password: accepted", bullet_type="VULN", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} LOGIN anonymous with empty password: rejected", Out.TEXT)
+            pp("LOGIN anonymous with empty password: rejected", bullet_type="NOTVULN", condition=show, indent=4)
 
         for w in ar.weak_credentials_ok:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} LOGIN accepted: {w}", Out.TEXT)
+            pp(f"LOGIN accepted: {w}", bullet_type="VULN", condition=show, indent=4)
 
         if ar.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(
-                f"    {icon} Verdict: anonymous or weak default access — PTL-SVC-IMAP-ANONYMOUS",
-                Out.TEXT,
+            pp(
+                "Verdict: anonymous or weak default access — PTL-SVC-IMAP-ANONYMOUS",
+                bullet_type="VULN",
+                condition=show,
+                indent=4,
             )
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} Verdict: {ar.detail}", Out.TEXT)
+            pp(f"Verdict: {ar.detail}", bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_anonymous_result(self) -> None:
-        if self.use_json or (ar := self.results.anonymous) is None:
+        """Stream anonymous auth result immediately (thread-safe)."""
+        if (ar := self.results.anonymous) is None:
             return
         with self._output_lock:
             self._anonymous_emit_terminal(ar)
-        self._streamed_anonymous = True
 
     def _eicar_emit_terminal(self, er: EicarAppendResult) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if er.skipped:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} Skipped: {er.skip_reason or 'n/a'}", Out.TEXT)
+            pp(f"Skipped: {er.skip_reason or 'n/a'}", bullet_type="WARNING", condition=show, indent=4)
             return
         if er.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(
-                "    "
-                + icon
-                + " APPEND accepted EICAR test message — inbound AV may be missing or ineffective (PTV-SVC-IMAP-EICAR); "
-                + f"server: {er.append_typ}",
-                Out.TEXT,
+            pp(
+                "APPEND accepted EICAR test message — inbound AV may be missing or ineffective "
+                f"(PTV-SVC-IMAP-EICAR); server: {er.append_typ}",
+                bullet_type="VULN",
+                condition=show,
+                indent=4,
             )
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
             snippet = (er.append_detail or "n/a").replace("\r\n", " ")[:200]
-            self.ptprint(
-                f"    {icon} APPEND rejected or failed ({er.append_typ}): {snippet}",
-                Out.TEXT,
+            pp(
+                f"APPEND rejected or failed ({er.append_typ}): {snippet}",
+                bullet_type="NOTVULN",
+                condition=show,
+                indent=4,
             )
 
     def _stream_eicar_result(self) -> None:
-        if self.use_json or (er := self.results.eicar) is None:
+        """Stream EICAR probe result immediately (thread-safe)."""
+        if (er := self.results.eicar) is None:
             return
         with self._output_lock:
             self._eicar_emit_terminal(er)
-        self._streamed_eicar = True
 
     def _imap_resource_load_emit_terminal(self, lr: ImapResourceLoadResult) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if lr.skipped:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} Skipped: {lr.skip_reason or lr.detail}", Out.TEXT)
+            pp(f"Skipped: {lr.skip_reason or lr.detail}", bullet_type="WARNING", condition=show, indent=4)
             return
-        info = get_colored_text("[i]", color="INFO")
         if lr.append is not None:
             ap = lr.append
-            self.ptprint(
-                f"    {info} APPEND: attempted={ap.attempted} ok={ap.ok} failed={ap.failed} "
+            pp(
+                f"APPEND: attempted={ap.attempted} ok={ap.ok} failed={ap.failed} "
                 f"disconnect={ap.disconnected} err_rate={ap.error_rate_pct:.1f}% "
                 f"slowdown={ap.slowdown}",
-                Out.TEXT,
+                bullet_type="TITLE",
+                condition=show,
+                indent=4,
             )
         if lr.search is not None:
             sp = lr.search
-            self.ptprint(
-                f"    {info} UID SEARCH ALL: attempted={sp.attempted} ok={sp.ok} failed={sp.failed} "
+            pp(
+                f"UID SEARCH ALL: attempted={sp.attempted} ok={sp.ok} failed={sp.failed} "
                 f"disconnect={sp.disconnected} err_rate={sp.error_rate_pct:.1f}% "
                 f"slowdown={sp.slowdown}",
-                Out.TEXT,
+                bullet_type="TITLE",
+                condition=show,
+                indent=4,
             )
         if lr.search_skipped_reason:
-            self.ptprint(f"    {info} SEARCH note: {lr.search_skipped_reason}", Out.TEXT)
+            pp(f"SEARCH note: {lr.search_skipped_reason}", bullet_type="TITLE", condition=show, indent=4)
         if lr.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Bounded load showed weak limits or instability: {lr.detail}", Out.TEXT)
+            pp(
+                f"Bounded load showed weak limits or instability: {lr.detail}",
+                bullet_type="VULN",
+                condition=show,
+                indent=4,
+            )
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} {lr.detail}", Out.TEXT)
+            pp(lr.detail, bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_imap_resource_load_result(self) -> None:
-        if self.use_json:
-            return
+        """Stream IMAP resource load probe result (thread-safe)."""
         if (err := getattr(self.results, "imap_resource_load_error", None)) is not None:
             with self._output_lock:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Resource load probe failed: {err}", Out.TEXT)
-            self._streamed_resource_load = True
+                ptprinthelper.ptprint(
+                    f"Resource load probe failed: {err}",
+                    bullet_type="VULN",
+                    condition=not self.use_json,
+                    indent=4,
+                )
             return
         if (lr := self.results.imap_resource_load) is None:
             return
         with self._output_lock:
             self._imap_resource_load_emit_terminal(lr)
-        self._streamed_resource_load = True
 
     def _imap_tls_audit_emit_terminal(self, tr: ImapTlsAuditResult) -> None:
-        info = get_colored_text("[i]", color="INFO")
-        ok_i = get_colored_text("[✓]", color="NOTVULN")
-        bad_i = get_colored_text("[✗]", color="VULN")
-        warn_i = get_colored_text("[!]", color="WARNING")
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
 
         def line_level(level: str, text: str) -> None:
-            if level == "ok":
-                icon = ok_i
-            elif level == "bad":
-                icon = bad_i
-            else:
-                icon = warn_i
-            self.ptprint(f"    {icon} {text}", Out.TEXT)
+            bullet = {"ok": "NOTVULN", "bad": "VULN"}.get(level, "WARNING")
+            pp(text, bullet_type=bullet, condition=show, indent=4)
 
-        self.ptprint(
-            f"    {info} Target {tr.host!r}:{tr.port} (implicit TLS path: {tr.implicit_tls_intended})",
-            Out.TEXT,
+        pp(
+            f"Target {tr.host!r}:{tr.port} (implicit TLS path: {tr.implicit_tls_intended})",
+            bullet_type="TITLE",
+            condition=show,
+            indent=4,
         )
         for p in tr.probes:
             mode_label = (
@@ -4875,20 +4853,18 @@ class IMAP(BaseModule):
                 if p.mode == "implicit_tls"
                 else f"STARTTLS (Port {tr.port})"
             )
-            self.ptprint(f"    {info} Connection mode: {mode_label}", Out.TEXT)
+            pp(f"Connection mode: {mode_label}", bullet_type="TITLE", condition=show, indent=4)
             if p.handshake_ok:
                 tls_l = p.tls_version or "n/a"
                 ciph = p.cipher_name or "n/a"
-                self.ptprint(f"    {info} TLS Version: {tls_l} | Cipher: {ciph}", Out.TEXT)
-
-            self.ptprint("\n", Out.TEXT)
+                pp(f"TLS Version: {tls_l} | Cipher: {ciph}", bullet_type="TITLE", condition=show, indent=4)
 
             if p.handshake_ok and (p.peer_subject or p.peer_issuer or p.san_dns or p.not_after):
-                self.ptprint(f"    {info} Certificate Information:", Out.TEXT)
+                pp("Certificate Information:", bullet_type="TITLE", condition=show, indent=4)
                 if p.peer_subject:
-                    self.ptprint(f"        - Subject:  {p.peer_subject}", Out.TEXT)
+                    pp(f"- Subject:  {p.peer_subject}", bullet_type="TEXT", condition=show, indent=8)
                 if p.peer_issuer:
-                    self.ptprint(f"        - Issuer:   {p.peer_issuer}", Out.TEXT)
+                    pp(f"- Issuer:   {p.peer_issuer}", bullet_type="TEXT", condition=show, indent=8)
                 nb_d = self._imap_tls_audit_terminal_fmt_cert_date(p.not_before)
                 na_d = self._imap_tls_audit_terminal_fmt_cert_date(p.not_after)
                 days = p.days_until_expiry
@@ -4900,31 +4876,33 @@ class IMAP(BaseModule):
                     days_s = f"({days} days remaining)"
                 else:
                     days_s = ""
-                validity_line = f"        - Validity: {nb_d} to {na_d} {days_s}".rstrip()
-                self.ptprint(validity_line, Out.TEXT)
+                validity_line = f"- Validity: {nb_d} to {na_d} {days_s}".rstrip()
+                pp(validity_line, bullet_type="TEXT", condition=show, indent=8)
                 if p.san_dns:
-                    self.ptprint(f"        - SAN:      {', '.join(p.san_dns)}", Out.TEXT)
+                    pp(f"- SAN:      {', '.join(p.san_dns)}", bullet_type="TEXT", condition=show, indent=8)
                 key_bits: list[str] = []
                 if p.peer_key_summary:
                     key_bits.append(p.peer_key_summary)
                 if p.peer_signature_hash:
                     key_bits.append(f"Hash: {p.peer_signature_hash}")
                 if key_bits:
-                    self.ptprint(f"        - Key:      {' | '.join(key_bits)}", Out.TEXT)
+                    pp(f"- Key:      {' | '.join(key_bits)}", bullet_type="TEXT", condition=show, indent=8)
             elif p.attempted and not p.handshake_ok:
-                self.ptprint(f"    {info} Certificate Information:", Out.TEXT)
-                self.ptprint(
-                    "        - (Leaf certificate details unavailable — TLS handshake did not complete)",
-                    Out.TEXT,
+                pp("Certificate Information:", bullet_type="TITLE", condition=show, indent=4)
+                pp(
+                    "- (Leaf certificate details unavailable — TLS handshake did not complete)",
+                    bullet_type="TEXT",
+                    condition=show,
+                    indent=8,
                 )
             else:
-                self.ptprint(f"    {info} Certificate Information:", Out.TEXT)
-                self.ptprint(
-                    f"        - (Not evaluated: {p.skipped_reason or 'n/a'})",
-                    Out.TEXT,
+                pp("Certificate Information:", bullet_type="TITLE", condition=show, indent=4)
+                pp(
+                    f"- (Not evaluated: {p.skipped_reason or 'n/a'})",
+                    bullet_type="TEXT",
+                    condition=show,
+                    indent=8,
                 )
-
-            self.ptprint("\n", Out.TEXT)
 
             tl, tm = self._imap_tls_audit_terminal_trust_level_msg(p)
             line_level(tl, f"Trust: {tm}")
@@ -4952,190 +4930,203 @@ class IMAP(BaseModule):
             for w in warn_parts:
                 line_level("warn", f"Warning: {w}")
 
-            self.ptprint("\n", Out.TEXT)
             vl, vm = self._imap_tls_audit_terminal_verdict_level_msg(tr, p)
             line_level(vl, f"Verdict: {vm}")
 
     def _stream_imap_tls_audit_result(self) -> None:
-        if self.use_json:
-            return
+        """Stream IMAP TLS audit result (thread-safe)."""
         if (err := getattr(self.results, "imap_tls_audit_error", None)) is not None:
             with self._output_lock:
-                info = get_colored_text("[i]", color="INFO")
+                pp = ptprinthelper.ptprint
+                show = not self.use_json
                 implicit = bool(self.args.tls or int(self.args.target.port) == 993)
-                self.ptprint(
-                    f"    {info} Target {self.args.target.ip!r}:{int(self.args.target.port)} "
+                pp(
+                    f"Target {self.args.target.ip!r}:{int(self.args.target.port)} "
                     f"(implicit TLS path: {implicit})",
-                    Out.TEXT,
+                    bullet_type="TITLE",
+                    condition=show,
+                    indent=4,
                 )
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} TLS audit failed: {err}", Out.TEXT)
-            self._streamed_tls_audit = True
+                pp(f"TLS audit failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         if (tr := self.results.imap_tls_audit) is None:
             return
         with self._output_lock:
             self._imap_tls_audit_emit_terminal(tr)
-        self._streamed_tls_audit = True
 
     def _imap_mailbox_iso_emit_terminal(self, mr: ImapMailboxIsoResult) -> None:
-        info = get_colored_text("[i]", color="INFO")
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if mr.skipped:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} Skipped: {mr.skip_reason or mr.detail}", Out.TEXT)
+            pp(f"Skipped: {mr.skip_reason or mr.detail}", bullet_type="WARNING", condition=show, indent=4)
             return
-        self.ptprint(
-            f"    {info} Baseline mailbox: {mr.own_mailbox!r}; foreign token: {mr.foreign_user_token!r}; "
+        pp(
+            f"Baseline mailbox: {mr.own_mailbox!r}; foreign token: {mr.foreign_user_token!r}; "
             f"login: {mr.login_username!r}",
-            Out.TEXT,
+            bullet_type="TITLE",
+            condition=show,
+            indent=4,
         )
-        self.ptprint(
-            f"    {info} NAMESPACE: {mr.namespace_typ or 'n/a'}; GETACL: {mr.get_acl_typ or 'n/a'} "
+        pp(
+            f"NAMESPACE: {mr.namespace_typ or 'n/a'}; GETACL: {mr.get_acl_typ or 'n/a'} "
             f"(ACL in CAPABILITY: {mr.acl_in_capability})",
-            Out.TEXT,
+            bullet_type="TITLE",
+            condition=show,
+            indent=4,
         )
-        self.ptprint(
-            f"    {info} LIST \"\" \"*\": {mr.list_root_typ or 'n/a'} count≈{mr.list_root_count}"
+        pp(
+            f"LIST \"\" \"*\": {mr.list_root_typ or 'n/a'} count≈{mr.list_root_count}"
             f"{'+' if mr.list_root_truncated else ''}",
-            Out.TEXT,
+            bullet_type="TITLE",
+            condition=show,
+            indent=4,
         )
         if mr.list_root_sample:
             for s in mr.list_root_sample[:6]:
-                self.ptprint(f"        sample: {s}", Out.TEXT)
+                pp(f"sample: {s}", bullet_type="TEXT", condition=show, indent=8)
         for r in mr.select_probes:
-            if r.ok_selected:
-                icon = get_colored_text("[✗]", color="VULN")
-            else:
-                icon = get_colored_text("[✓]", color="NOTVULN")
+            bullet = "VULN" if r.ok_selected else "NOTVULN"
             snip = (r.detail or "").replace("\r\n", " ")[:120]
-            self.ptprint(
-                f"        {icon} EXAMINE [{r.probe_id}] {r.mailbox!r} → {r.typ or 'n/a'} {snip}",
-                Out.TEXT,
+            pp(
+                f"EXAMINE [{r.probe_id}] {r.mailbox!r} → {r.typ or 'n/a'} {snip}",
+                bullet_type=bullet,
+                condition=show,
+                indent=8,
             )
-        self.ptprint(
-            f"    {info} LIST dictionary: {mr.list_dictionary_nonzero_patterns} patterns with hits, "
+        pp(
+            f"LIST dictionary: {mr.list_dictionary_nonzero_patterns} patterns with hits, "
             f"{mr.list_dictionary_total_listed} total LIST rows",
-            Out.TEXT,
+            bullet_type="TITLE",
+            condition=show,
+            indent=4,
         )
         if mr.acl_anyone_rights or mr.acl_anonymous_rights or mr.acl_authenticated_rights:
-            self.ptprint(
-                f"    {info} ACL identifiers — anyone: {mr.acl_anyone_rights!r} anonymous: {mr.acl_anonymous_rights!r} "
+            pp(
+                f"ACL identifiers — anyone: {mr.acl_anyone_rights!r} anonymous: {mr.acl_anonymous_rights!r} "
                 f"authenticated: {mr.acl_authenticated_rights!r}",
-                Out.TEXT,
+                bullet_type="TITLE",
+                condition=show,
+                indent=4,
             )
         if mr.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} {mr.detail}", Out.TEXT)
+            pp(mr.detail, bullet_type="VULN", condition=show, indent=4)
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} {mr.detail}", Out.TEXT)
+            pp(mr.detail, bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_imap_mailbox_iso_result(self) -> None:
-        if self.use_json:
-            return
+        """Stream mailbox isolation probe result (thread-safe)."""
         if (err := getattr(self.results, "imap_mailbox_iso_error", None)) is not None:
             with self._output_lock:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Mailbox isolation probe failed: {err}", Out.TEXT)
-            self._streamed_mailbox_iso = True
+                ptprinthelper.ptprint(
+                    f"Mailbox isolation probe failed: {err}",
+                    bullet_type="VULN",
+                    condition=not self.use_json,
+                    indent=4,
+                )
             return
         if (mr := self.results.imap_mailbox_iso) is None:
             return
         with self._output_lock:
             self._imap_mailbox_iso_emit_terminal(mr)
-        self._streamed_mailbox_iso = True
 
     def _imap_usrenum_emit_terminal(self, ur: ImapUserEnumResult) -> None:
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         if ur.enumeration_method == "LOGIN" and ur.login_disabled_advertised:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(
-                f"    {icon} CAPABILITY: LOGINDISABLED — plaintext LOGIN is disabled (RFC 3501). "
+            pp(
+                "CAPABILITY: LOGINDISABLED — plaintext LOGIN is disabled (RFC 3501). "
                 "This probe still uses LOGIN; interpret results with caution (real clients should use SASL).",
-                Out.TEXT,
+                bullet_type="WARNING",
+                condition=show,
+                indent=4,
             )
         elif ur.enumeration_method == "AUTHENTICATE PLAIN" and not ur.auth_plain_advertised:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(
-                f"    {icon} CAPABILITY did not list AUTH=PLAIN — AUTHENTICATE PLAIN may fail or be unsupported; "
+            pp(
+                "CAPABILITY did not list AUTH=PLAIN — AUTHENTICATE PLAIN may fail or be unsupported; "
                 "interpret results with caution.",
-                Out.TEXT,
+                bullet_type="WARNING",
+                condition=show,
+                indent=4,
             )
         if ur.indeterminate:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} Indeterminate: {ur.detail}", Out.TEXT)
+            pp(f"Indeterminate: {ur.detail}", bullet_type="WARNING", condition=show, indent=4)
             return
         tag = "LOGIN" if ur.enumeration_method == "LOGIN" else "AUTHENTICATE PLAIN"
         if ur.vulnerable:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(
-                f"    {icon} {tag} differentiates accounts without valid password: {ur.detail}",
-                Out.TEXT,
+            pp(
+                f"{tag} differentiates accounts without valid password: {ur.detail}",
+                bullet_type="VULN",
+                condition=show,
+                indent=4,
             )
             for u in ur.enumerated_usernames:
-                self.ptprint(f"        differentiated: {u}", Out.TEXT)
+                pp(f"differentiated: {u}", bullet_type="TEXT", condition=show, indent=8)
         else:
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} {ur.detail}", Out.TEXT)
+            pp(ur.detail, bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_imap_usrenum_login_result(self) -> None:
-        if self.use_json:
-            return
+        """Stream LOGIN user enumeration result (thread-safe)."""
         if (err := getattr(self.results, "imap_usrenum_error", None)) is not None:
             with self._output_lock:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} LOGIN user enumeration failed: {err}", Out.TEXT)
-            self._streamed_usrenum_login = True
+                ptprinthelper.ptprint(
+                    f"LOGIN user enumeration failed: {err}",
+                    bullet_type="VULN",
+                    condition=not self.use_json,
+                    indent=4,
+                )
             return
         if (ur := self.results.imap_usrenum) is None:
             return
         with self._output_lock:
             self._imap_usrenum_emit_terminal(ur)
-        self._streamed_usrenum_login = True
 
     def _stream_imap_usrenum_plain_result(self) -> None:
-        if self.use_json:
-            return
+        """Stream AUTHENTICATE PLAIN user enumeration result (thread-safe)."""
         if (err := getattr(self.results, "imap_usrenum_plain_error", None)) is not None:
             with self._output_lock:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} AUTHENTICATE PLAIN user enumeration failed: {err}", Out.TEXT)
-            self._streamed_usrenum_plain = True
+                ptprinthelper.ptprint(
+                    f"AUTHENTICATE PLAIN user enumeration failed: {err}",
+                    bullet_type="VULN",
+                    condition=not self.use_json,
+                    indent=4,
+                )
             return
         if (ur := self.results.imap_usrenum_plain) is None:
             return
         with self._output_lock:
             self._imap_usrenum_emit_terminal(ur)
-        self._streamed_usrenum_plain = True
 
     def _stream_ntlm_result(self) -> None:
-        if self.use_json or (ntlm := self.results.ntlm) is None:
+        """Stream NTLM info result immediately (thread-safe)."""
+        if (ntlm := self.results.ntlm) is None:
             return
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         with self._output_lock:
             if ntlm.auth_ntlm_advertised:
-                icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(
-                    f"    {icon} Pre-login CAPABILITY lists AUTH=NTLM",
-                    Out.TEXT,
-                )
+                pp("Pre-login CAPABILITY lists AUTH=NTLM", bullet_type="WARNING", condition=show, indent=4)
             else:
-                icon = get_colored_text("[i]", color="INFO")
-                self.ptprint(
-                    f"    {icon} AUTH=NTLM not seen in merged pre-login CAPABILITY (still probing AUTHENTICATE)",
-                    Out.TEXT,
+                pp(
+                    "AUTH=NTLM not seen in merged pre-login CAPABILITY (still probing AUTHENTICATE)",
+                    bullet_type="TITLE",
+                    condition=show,
+                    indent=4,
                 )
             if not ntlm.success:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(
-                    f"    {icon} AUTHENTICATE NTLM did not yield a decodable Challenge",
-                    Out.TEXT,
+                pp(
+                    "AUTHENTICATE NTLM did not yield a decodable Challenge",
+                    bullet_type="NOTVULN",
+                    condition=show,
+                    indent=4,
                 )
             elif ntlm.ntlm is not None:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(
-                    f"    {icon} NTLM Challenge decoded — infrastructure identifiers disclosed",
-                    Out.TEXT,
+                pp(
+                    "NTLM Challenge decoded — infrastructure identifiers disclosed",
+                    bullet_type="VULN",
+                    condition=show,
+                    indent=4,
                 )
-                for line in [
+                for line in (
                     f"Target name: {ntlm.ntlm.target_name}",
                     f"NetBios domain name: {ntlm.ntlm.netbios_domain}",
                     f"NetBios computer name: {ntlm.ntlm.netbios_computer}",
@@ -5143,30 +5134,38 @@ class IMAP(BaseModule):
                     f"DNS computer name: {ntlm.ntlm.dns_computer}",
                     f"DNS tree: {ntlm.ntlm.dns_tree}",
                     f"OS version: {ntlm.ntlm.os_version}",
-                ]:
-                    self.ptprint(f"    {line}", Out.TEXT)
-        self._streamed_ntlm = True
+                ):
+                    for part in (line or "").replace("\r", "").splitlines():
+                        pp(part, bullet_type="TEXT", condition=show, indent=8)
 
     def _stream_brute_result(self) -> None:
+        """Stream brute-force summary (credentials already streamed via on_success) (thread-safe)."""
         creds = self.results.creds
-        if creds is None:
+        if creds is None or len(creds) == 0:
             return
-        if not self.use_json and len(creds) > 0:
-            with self._output_lock:
-                self.ptprint(f"    Found {len(creds)} valid credentials", Out.INFO)
-        self._streamed_brute = True
+        with self._output_lock:
+            ptprinthelper.ptprint(
+                f"Found {len(creds)} valid credentials",
+                bullet_type="INFO",
+                condition=not self.use_json,
+                indent=4,
+            )
 
     def _stream_conn_limits_result(self) -> None:
         """Inline verdicts are printed during the probe; this handles hard failures only."""
         if (err := getattr(self.results, "conn_limits_error", None)) is not None:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Connection limits test failed: {err}", Out.TEXT)
-        self._streamed_conn_limits = True
+            with self._output_lock:
+                ptprinthelper.ptprint(
+                    f"Connection limits test failed: {err}",
+                    bullet_type="VULN",
+                    condition=not self.use_json,
+                    indent=4,
+                )
 
     # region output
 
     def output(self) -> None:
-        """Formats and outputs module results. Skips streamed sections in text mode; JSON always complete."""
+        """Build JSON node(s). Terminal output is streamed from run()."""
         properties = {
             "software_type": None,
             "name": "imap",
@@ -5180,16 +5179,7 @@ class IMAP(BaseModule):
         if (info_error := getattr(self.results, "info_error", None)) is not None:
             if self.use_json:
                 self.ptjsonlib.end_error(info_error, self.use_json)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-            properties.update({"infoError": info_error})
-            imap_node = self.ptjsonlib.create_node_object("software", None, None, properties)
-            self.ptjsonlib.add_node(imap_node)
-            node_key = imap_node["key"]
-            for v in deferred_vulns:
-                self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
-            self.ptjsonlib.set_status("finished", "")
-            self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+            ptprinthelper.ptprint(info_error, bullet_type="VULN", condition=not self.use_json, indent=4)
             return
 
         # Banner (skip terminal if streamed; always add to properties for JSON)
@@ -5208,24 +5198,6 @@ class IMAP(BaseModule):
                 if sid.version is not None:
                     deferred_vulns.append({"vuln_code": "PTV-SVC-BANNER"})
                 properties.update({"cpe": sid.cpe})
-            if not self.use_json and not self._streamed_banner:
-                self.ptprint("Banner", Out.INFO)
-                if sid is None:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                elif sid.version is not None:
-                    icon = get_colored_text("[✗]", color="VULN")
-                else:
-                    icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
-                if sid is not None:
-                    self.ptprint("Service Identification", Out.INFO)
-                    self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
-                    self.ptprint(
-                        f"    Version:  {sid.version if sid.version else 'unknown'}",
-                        Out.TEXT,
-                    )
-                    self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
-
         # ID and CAPABILITY (skip terminal if streamed; always add to properties for JSON)
         if (info := self.results.info) and (info.id is not None or info.capability or getattr(info, "capability_starttls", None)):
             capa = info.capability or []
@@ -5240,44 +5212,9 @@ class IMAP(BaseModule):
                 else:
                     json_lines = _capa_to_lines(capa)
                 properties.update({"capabilityCommand": "\n".join(json_lines)})
-            if not self.use_json and not self._streamed_capa:
-                if info.id is not None:
-                    self.ptprint("ID command", Out.INFO)
-                    self.ptprint(f"    {info.id}", Out.TEXT)
-                if capa or capa_stls:
-                    if capa_stls is not None:
-                        self.ptprint("CAPABILITY command (PLAIN)", Out.INFO)
-                        for display_str, level in _parse_capability_commands(capa):
-                            icon = get_colored_text("[✗]", color="VULN") if level == "ERROR" else (
-                                get_colored_text("[!]", color="WARNING") if level == "WARNING"
-                                else get_colored_text("[✓]", color="NOTVULN")
-                            )
-                            self.ptprint(f"    {icon} {display_str}", Out.TEXT)
-                        self.ptprint("CAPABILITY command (STARTTLS)", Out.INFO)
-                        for display_str, level in _parse_capability_commands(capa_stls):
-                            icon = get_colored_text("[✗]", color="VULN") if level == "ERROR" else (
-                                get_colored_text("[!]", color="WARNING") if level == "WARNING"
-                                else get_colored_text("[✓]", color="NOTVULN")
-                            )
-                            self.ptprint(f"    {icon} {display_str}", Out.TEXT)
-                    else:
-                        encrypted = self.args.target.port == 993 or self.args.tls
-                        title = "CAPABILITY command (TLS)" if encrypted else "CAPABILITY command (PLAIN)"
-                        self.ptprint(title, Out.INFO)
-                        for display_str, level in _parse_capability_commands(capa):
-                            icon = get_colored_text("[✗]", color="VULN") if level == "ERROR" else (
-                                get_colored_text("[!]", color="WARNING") if level == "WARNING"
-                                else get_colored_text("[✓]", color="NOTVULN")
-                            )
-                            self.ptprint(f"    {icon} {display_str}", Out.TEXT)
-
         # Encryption (skip terminal if streamed; always add to properties for JSON)
         if (encryption_error := self.results.encryption_error) is not None:
             properties.update({"encryptionError": encryption_error})
-            if not self.use_json and not self._streamed_encryption:
-                self.ptprint("Encryption", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Encryption test failed: {encryption_error}", Out.TEXT)
         elif (enc := self.results.encryption) is not None:
             properties.update(
                 {
@@ -5288,41 +5225,9 @@ class IMAP(BaseModule):
                     }
                 }
             )
-            if not self.use_json and not self._streamed_encryption:
-                self.ptprint("Encryption", Out.INFO)
-                plaintext_only = enc.plaintext_ok and not enc.starttls_ok and not enc.tls_ok
-                any_ok = enc.plaintext_ok or enc.starttls_ok or enc.tls_ok
-                if plaintext_only:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(f"    {icon} Plaintext only", Out.TEXT)
-                elif any_ok:
-                    if enc.plaintext_ok:
-                        icon = (
-                            get_colored_text("[!]", color="WARNING")
-                            if (enc.starttls_ok or enc.tls_ok)
-                            else get_colored_text("[✓]", color="NOTVULN")
-                        )
-                        self.ptprint(f"    {icon} Plaintext", Out.TEXT)
-                    if enc.starttls_ok:
-                        icon = get_colored_text("[✓]", color="NOTVULN")
-                        self.ptprint(f"    {icon} STARTTLS", Out.TEXT)
-                    if enc.tls_ok:
-                        icon = get_colored_text("[✓]", color="NOTVULN")
-                        self.ptprint(f"    {icon} TLS", Out.TEXT)
-                else:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(
-                        f"    {icon} No connection mode available (plaintext, STARTTLS, TLS failed)",
-                        Out.TEXT,
-                    )
-
         # Cleartext / sniffable IMAP probe (PTV-SVC-SNIFFABLE)
         if (sniff_err := getattr(self.results, "sniffable_error", None)) is not None:
             properties.update({"sniffableError": sniff_err})
-            if not self.use_json and not self._streamed_sniffable:
-                self.ptprint("Cleartext IMAP (sniffable probe)", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Probe failed: {sniff_err}", Out.TEXT)
         elif (sn := self.results.sniffable) is not None:
             probe_lines: list[str] = []
             if sn.skipped:
@@ -5357,70 +5262,9 @@ class IMAP(BaseModule):
                         "vuln_response": "\n".join(probe_lines),
                     }
                 )
-            if not self.use_json and not self._streamed_sniffable:
-                self.ptprint("Cleartext IMAP (sniffable probe)", Out.INFO)
-                if sn.skipped:
-                    icon = get_colored_text("[!]", color="WARNING")
-                    self.ptprint(f"    {icon} Skipped: {sn.skip_reason or 'n/a'}", Out.TEXT)
-                elif not sn.plain_ok:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} Plain IMAP TCP session not available on target", Out.TEXT)
-                else:
-                    if sn.starttls_advertised:
-                        icon = get_colored_text("[✓]", color="NOTVULN")
-                        self.ptprint(f"    {icon} STARTTLS advertised on cleartext port", Out.TEXT)
-                    else:
-                        icon = get_colored_text("[✗]", color="VULN")
-                        self.ptprint(f"    {icon} STARTTLS not advertised on cleartext port", Out.TEXT)
-                    info_icon = get_colored_text("[i]", color="INFO")
-                    if sn.auth_methods:
-                        self.ptprint(
-                            f"    {info_icon} Credential-bearing AUTH mechanisms seen: "
-                            + ", ".join(sn.auth_methods),
-                            Out.TEXT,
-                        )
-                    else:
-                        self.ptprint(
-                            f"    {info_icon} No credential-bearing AUTH= mechanisms advertised pre-TLS",
-                            Out.TEXT,
-                        )
-                    for method, outcome in sn.probes:
-                        if outcome == "continuation":
-                            icon = get_colored_text("[✗]", color="VULN")
-                            label = "server sent continuation (+) — cleartext SASL exchange possible"
-                        elif outcome == "tagged_no":
-                            icon = get_colored_text("[✓]", color="NOTVULN")
-                            label = "AUTHENTICATE rejected (NO)"
-                        elif outcome == "tagged_bad":
-                            icon = get_colored_text("[✓]", color="NOTVULN")
-                            label = "AUTHENTICATE rejected (BAD)"
-                        elif outcome == "io_error":
-                            icon = get_colored_text("[!]", color="WARNING")
-                            label = "probe I/O error"
-                        else:
-                            icon = get_colored_text("[!]", color="WARNING")
-                            label = outcome
-                        self.ptprint(f"    {icon} {method}: {label}", Out.TEXT)
-                    if sn.vulnerable:
-                        icon = get_colored_text("[✗]", color="VULN")
-                        self.ptprint(
-                            f"    {icon} Verdict: cleartext IMAP allows sniffable traffic or credentials",
-                            Out.TEXT,
-                        )
-                    else:
-                        icon = get_colored_text("[✓]", color="NOTVULN")
-                        self.ptprint(
-                            f"    {icon} Verdict: no cleartext-only policy detected by this probe",
-                            Out.TEXT,
-                        )
-
         # Invalid / non-standard commands (PTV-SVC-IMAP-INVCOMM)
         if (ic_err := getattr(self.results, "inv_comm_error", None)) is not None:
             properties.update({"invalidCommandsError": ic_err})
-            if not self.use_json and not self._streamed_inv_comm:
-                self.ptprint("Invalid / non-standard commands", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {ic_err}", Out.TEXT)
         elif (ic := self.results.inv_comm) is not None:
             properties.update(
                 {
@@ -5454,17 +5298,9 @@ class IMAP(BaseModule):
                         "vuln_response": ic.detail,
                     }
                 )
-            if not self.use_json and not self._streamed_inv_comm:
-                self.ptprint("Invalid / non-standard commands", Out.INFO)
-                self._inv_comm_emit_terminal(ic)
-
         # Connection limits / rate / idle (PTV-SVC-IMAP-CONN*)
         if (cl_err := getattr(self.results, "conn_limits_error", None)) is not None:
             properties.update({"connLimitsError": cl_err})
-            if not self.use_json and not self._streamed_conn_limits:
-                self.ptprint("Connection limits", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Test failed: {cl_err}", Out.TEXT)
         elif (cl := self.results.conn_limits) is not None:
             properties.update(
                 {
@@ -5571,18 +5407,6 @@ class IMAP(BaseModule):
         if (catch_all := getattr(self.results, "catch_all", None)) is not None:
             if catch_all == "indeterminate":
                 properties.update({"catchAll": "indeterminate"})
-            if not self.use_json and not self._streamed_catch_all:
-                self.ptprint("Catch-all test", Out.INFO)
-                if catch_all == "indeterminate":
-                    icon = get_colored_text("[!]", color="WARNING")
-                    self.ptprint(
-                        f"    {icon} Server accepted invalid credentials (indeterminate). Results may be false positives.",
-                        Out.TEXT,
-                    )
-                else:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} Not configured (server rejects invalid creds)", Out.TEXT)
-
         # Anonymous / weak default access (PTL-SVC-IMAP-ANONYMOUS)
         if (ar := self.results.anonymous) is not None:
             properties.update(
@@ -5605,10 +5429,6 @@ class IMAP(BaseModule):
                         "vuln_response": ar.detail,
                     }
                 )
-            if not self.use_json and not self._streamed_anonymous:
-                self.ptprint("Anonymous access", Out.INFO)
-                self._anonymous_emit_terminal(ar)
-
         # EICAR APPEND / antivirus ingress (PTV-SVC-IMAP-EICAR)
         if (er := self.results.eicar) is not None:
             properties.update(
@@ -5631,10 +5451,6 @@ class IMAP(BaseModule):
                         "vuln_response": er.append_detail or er.append_typ or "OK",
                     }
                 )
-            if not self.use_json and not self._streamed_eicar:
-                self.ptprint("EICAR / APPEND (antivirus probe)", Out.INFO)
-                self._eicar_emit_terminal(er)
-
         def _rl_phase_dict(ph: ImapResourceLoadPhase) -> dict:
             return {
                 "label": ph.label,
@@ -5655,10 +5471,6 @@ class IMAP(BaseModule):
 
         if (rl_err := getattr(self.results, "imap_resource_load_error", None)) is not None:
             properties.update({"resourceLoadProbeError": rl_err})
-            if not self.use_json and not self._streamed_resource_load:
-                self.ptprint("IMAP resource load (APPEND / SEARCH)", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {rl_err}", Out.TEXT)
         elif (rl := self.results.imap_resource_load) is not None:
             rl_props: dict = {
                 "skipped": rl.skipped,
@@ -5688,16 +5500,8 @@ class IMAP(BaseModule):
                         "vuln_response": rl.detail,
                     }
                 )
-            if not self.use_json and not self._streamed_resource_load:
-                self.ptprint("IMAP resource load (APPEND / SEARCH)", Out.INFO)
-                self._imap_resource_load_emit_terminal(rl)
-
         if (miso_err := getattr(self.results, "imap_mailbox_iso_error", None)) is not None:
             properties.update({"mailboxIsolationProbeError": miso_err})
-            if not self.use_json and not self._streamed_mailbox_iso:
-                self.ptprint("IMAP mailbox isolation (SELECT / LIST / ACL)", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {miso_err}", Out.TEXT)
         elif (miso := self.results.imap_mailbox_iso) is not None:
             miso_props: dict = {
                 "skipped": miso.skipped,
@@ -5760,23 +5564,8 @@ class IMAP(BaseModule):
                         "vuln_response": miso.detail,
                     }
                 )
-            if not self.use_json and not self._streamed_mailbox_iso:
-                self.ptprint("IMAP mailbox isolation (SELECT / LIST / ACL)", Out.INFO)
-                self._imap_mailbox_iso_emit_terminal(miso)
-
         if (tls_err := getattr(self.results, "imap_tls_audit_error", None)) is not None:
             properties.update({"tlsCertificateProbeError": tls_err})
-            if not self.use_json and not self._streamed_tls_audit:
-                self.ptprint(_IMAP_TLS_AUDIT_SECTION_TITLE, Out.INFO)
-                info = get_colored_text("[i]", color="INFO")
-                implicit = bool(self.args.tls or int(self.args.target.port) == 993)
-                self.ptprint(
-                    f"    {info} Target {self.args.target.ip!r}:{int(self.args.target.port)} "
-                    f"(implicit TLS path: {implicit})",
-                    Out.TEXT,
-                )
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} TLS audit failed: {tls_err}", Out.TEXT)
         elif (ta := self.results.imap_tls_audit) is not None:
             ta_props = {
                 "host": ta.host,
@@ -5823,17 +5612,9 @@ class IMAP(BaseModule):
                         "vuln_response": ta.detail,
                     }
                 )
-            if not self.use_json and not self._streamed_tls_audit:
-                self.ptprint(_IMAP_TLS_AUDIT_SECTION_TITLE, Out.INFO)
-                self._imap_tls_audit_emit_terminal(ta)
-
         # LOGIN user enumeration (PTV-SVC-IMAP-USRENUM)
         if (ue_err := getattr(self.results, "imap_usrenum_error", None)) is not None:
             properties.update({"loginUserEnumError": ue_err})
-            if not self.use_json and not self._streamed_usrenum_login:
-                self.ptprint("LOGIN user enumeration", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {ue_err}", Out.TEXT)
         elif (ur := self.results.imap_usrenum) is not None:
             properties.update(
                 {
@@ -5874,17 +5655,9 @@ class IMAP(BaseModule):
                         "vuln_response": resp_extra,
                     }
                 )
-            if not self.use_json and not self._streamed_usrenum_login:
-                self.ptprint("LOGIN user enumeration", Out.INFO)
-                self._imap_usrenum_emit_terminal(ur)
-
         # AUTHENTICATE PLAIN user enumeration (PTV-SVC-IMAP-USRENUM)
         if (uep_err := getattr(self.results, "imap_usrenum_plain_error", None)) is not None:
             properties.update({"authenticatePlainUserEnumError": uep_err})
-            if not self.use_json and not self._streamed_usrenum_plain:
-                self.ptprint("AUTHENTICATE PLAIN user enumeration", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {uep_err}", Out.TEXT)
         elif (urp := self.results.imap_usrenum_plain) is not None:
             properties.update(
                 {
@@ -5927,10 +5700,6 @@ class IMAP(BaseModule):
                         "vuln_response": resp_plain,
                     }
                 )
-            if not self.use_json and not self._streamed_usrenum_plain:
-                self.ptprint("AUTHENTICATE PLAIN user enumeration", Out.INFO)
-                self._imap_usrenum_emit_terminal(urp)
-
         # NTLM info disclosure (PTL-SVC-IMAP-NTLMINFO)
         if ntlm := self.results.ntlm:
             ntlm_props: dict = {
@@ -5970,43 +5739,8 @@ class IMAP(BaseModule):
                         "vuln_response": "\n".join(out_lines),
                     }
                 )
-            if not self.use_json and not self._streamed_ntlm:
-                self.ptprint("NTLM information", Out.INFO)
-                if not ntlm.success:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(
-                        f"    {icon} AUTHENTICATE NTLM did not yield a decodable Challenge",
-                        Out.TEXT,
-                    )
-                elif ntlm.ntlm is not None:
-                    if ntlm.auth_ntlm_advertised:
-                        icon_w = get_colored_text("[!]", color="WARNING")
-                        self.ptprint(
-                            f"    {icon_w} Pre-login CAPABILITY lists AUTH=NTLM",
-                            Out.TEXT,
-                        )
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(
-                        f"    {icon} NTLM Challenge decoded — infrastructure identifiers disclosed",
-                        Out.TEXT,
-                    )
-                    for line in [
-                        f"Target name: {ntlm.ntlm.target_name}",
-                        f"NetBios domain name: {ntlm.ntlm.netbios_domain}",
-                        f"NetBios computer name: {ntlm.ntlm.netbios_computer}",
-                        f"DNS domain name: {ntlm.ntlm.dns_domain}",
-                        f"DNS computer name: {ntlm.ntlm.dns_computer}",
-                        f"DNS tree: {ntlm.ntlm.dns_tree}",
-                        f"OS version: {ntlm.ntlm.os_version}",
-                    ]:
-                        self.ptprint(f"    {line}", Out.TEXT)
-
         # Login bruteforce (skip terminal output if streamed; always add to deferred for JSON)
         if (creds := self.results.creds) is not None and len(creds) > 0:
-            if not self.use_json and not self._streamed_brute:
-                self.ptprint(f"Login bruteforce: {len(creds)} valid credentials", Out.INFO)
-                for cred in creds:
-                    self.ptprint(f"    user: {cred.user}, password: {cred.passw}", Out.TEXT)
             json_lines = [f"user: {cred.user}, password: {cred.passw}" for cred in creds]
             if self.args.user is not None:
                 user_str = f"username: {self.args.user}"

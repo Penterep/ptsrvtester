@@ -11,7 +11,7 @@ from typing import NamedTuple
 from ptlibs.ptjsonlib import PtJsonLib
 
 from ._base import BaseModule, BaseArgs, Out
-from ptlibs.ptprinthelper import get_colored_text
+from .utils import ptprinthelper
 from ptlibs.threads import ptthreads
 
 from .utils.helpers import (
@@ -1334,11 +1334,6 @@ class FTP(BaseModule):
         self.results: FTPResults
         self.ftp: ftplib.FTP
         self._output_lock = threading.Lock()
-        self._streamed_banner = False
-        self._streamed_encryption = False
-        self._streamed_anonymous = False
-        self._streamed_brute = False
-        self._streamed_access = False
 
     def _is_run_all_mode(self) -> bool:
         """True when only target is given (no test switches). Run all tests in sequence."""
@@ -1373,6 +1368,9 @@ class FTP(BaseModule):
             return
         with self._output_lock:
             self.ptprint(title, Out.INFO)
+
+    def _tprint(self, msg: str, bullet: str = "TEXT", indent: int = 4) -> None:
+        ptprinthelper.ptprint(msg, bullet_type=bullet, condition=not self.use_json, indent=indent)
 
     def _ftp_any_primary_action(self) -> bool:
         """True if any test flag is set other than standalone -eu (used for user-enum-only fast path)."""
@@ -1421,6 +1419,7 @@ class FTP(BaseModule):
                 self.results.user_enum = self.test_user_enumeration()
             except Exception as e:
                 self.results.user_enum_error = str(e)
+            self._stream_user_enum_result()
             return
 
         # -ie only mode: encryption test and return
@@ -1463,16 +1462,13 @@ class FTP(BaseModule):
         if self.args.anonymous:
             self._emit_section_heading("Anonymous authentication")
             self.results.anonymous = self.anonymous()
-            if not self.use_json:
-                self._stream_anonymous_result()
+            self._stream_anonymous_result()
 
         # Bruteforce (info/STAT may need creds for STAT when anonymous disabled)
         if self.do_brute:
-            if not self.use_json:
-                self.ptprint(
-                    "FTP login (known account)" if self._ftp_is_single_known_login() else "Login bruteforce",
-                    Out.INFO,
-                )
+            self._emit_section_heading(
+                "FTP login (known account)" if self._ftp_is_single_known_login() else "Login bruteforce"
+            )
             self.results.creds = simple_bruteforce(
                 self._try_login,
                 self.args.user,
@@ -1501,6 +1497,8 @@ class FTP(BaseModule):
                     info.stat if do_commands else None,
                 )
                 self._stream_banner_result()
+                if do_commands:
+                    self._stream_commands_result()
             except Exception as e:
                 self.results.info_error = str(e)
 
@@ -1519,9 +1517,11 @@ class FTP(BaseModule):
             self.results.access = self.access_check()
             if self.args.bounce:
                 self.results.bounce = self.bounce()
-
-        if self.args.access and not self.use_json:
             self._stream_access_check_terminal()
+            if self.args.access_list:
+                self._stream_directory_listing_result()
+            if self.args.bounce:
+                self._stream_bounce_result()
 
         # Path enumeration (dictionary attack)
         if getattr(self.args, "enum_paths", False):
@@ -1536,6 +1536,7 @@ class FTP(BaseModule):
                     self.results.path_enum_error = str(e)
             else:
                 self.results.path_enum_error = "No valid credentials for path enumeration"
+            self._stream_path_enum_result()
 
         # Data mode (passive/active) test
         if getattr(self.args, "modes", False):
@@ -1548,6 +1549,7 @@ class FTP(BaseModule):
                     self.results.modes_error = str(e)
             else:
                 self.results.modes_error = "No credentials for mode test (use --anonymous or -u/-p known account or wordlists)"
+            self._stream_modes_result()
 
         # Passive data port spread (PTL-SVC-FTP-PASIVE)
         if getattr(self.args, "pasv_port_audit", False):
@@ -1563,6 +1565,7 @@ class FTP(BaseModule):
                 self.results.pasv_port_range_error = (
                     "No credentials for passive port audit (use --anonymous or -u/-p known account or wordlists)"
                 )
+            self._stream_pasv_port_range_result()
 
         # Connection / rate / idle limits (PTL-SVC-FTP-CONN)
         if getattr(self.args, "conn_limits_audit", False):
@@ -1571,6 +1574,7 @@ class FTP(BaseModule):
                 self.results.conn_limits = self.test_connection_limits_audit(creds_post)
             except Exception as e:
                 self.results.conn_limits_error = str(e)
+            self._stream_conn_limits_result()
 
         # User isolation / chroot-style audit (PTL-SVC-FTP-CHROOT)
         if getattr(self.args, "chroot_audit", False):
@@ -1584,6 +1588,7 @@ class FTP(BaseModule):
                 self.results.chroot_audit_error = (
                     "No credentials for chroot audit (use --anonymous or -u/-p known account or wordlists)"
                 )
+            self._stream_chroot_audit_result()
 
         # PORT/PASV policy audit (PTL-SVC-FTP-ACTIVE)
         if getattr(self.args, "active_audit_full", False) or getattr(self.args, "active_audit", False):
@@ -1596,6 +1601,7 @@ class FTP(BaseModule):
                     self.results.active_audit = self.test_active_audit_quick(creds)
             except Exception as e:
                 self.results.active_audit_error = str(e)
+            self._stream_active_audit_result()
 
         # HELP/FEAT/SITE command surface (PTL-SVC-FTP-CMD)
         if getattr(self.args, "cmd_audit", False) or getattr(self.args, "cmd_audit_active", False):
@@ -1621,6 +1627,9 @@ class FTP(BaseModule):
                         )
                     except Exception as e:
                         self.results.cmd_audit_active_error = str(e)
+            self._stream_cmd_audit_result()
+            if getattr(self.args, "cmd_audit_active", False):
+                self._stream_cmd_audit_active_result()
 
         # Invalid / non-standard control-channel lines (PTL-SVC-FTP-INVCOMM)
         if getattr(self.args, "invalid_cmd_audit", False):
@@ -1629,24 +1638,28 @@ class FTP(BaseModule):
                 self.results.invalid_cmd_audit = self.test_invalid_command_audit(creds)
             except Exception as e:
                 self.results.invalid_cmd_audit_error = str(e)
+            self._stream_invalid_cmd_audit_result()
 
         if getattr(self.args, "user_enum", False):
             try:
                 self.results.user_enum = self.test_user_enumeration()
             except Exception as e:
                 self.results.user_enum_error = str(e)
+            self._stream_user_enum_result()
 
         if getattr(self.args, "eicar_probe", False):
             try:
                 self.results.eicar_audit = self.test_eicar_antivirus_probe()
             except Exception as e:
                 self.results.eicar_audit_error = str(e)
+            self._stream_eicar_audit_result()
 
         if getattr(self.args, "ftp_dos_probes", False):
             try:
                 self.results.dos_audit = self.test_ftp_processing_resilience_probes()
             except Exception as e:
                 self.results.dos_audit_error = str(e)
+            self._stream_dos_audit_result()
 
     def _ftp_is_single_known_login(self) -> bool:
         """True when CLI supplies one username and one password (no -U/-P wordlists)."""
@@ -1674,6 +1687,7 @@ class FTP(BaseModule):
             self._emit_section_heading("Banner")
             self.results.info = self.info(get_commands=True)
             self._stream_banner_result()
+            self._stream_commands_result()
         except TestFailedError as e:
             self.results.info_error = str(e)
             return
@@ -1690,8 +1704,7 @@ class FTP(BaseModule):
         except Exception as e:
             self.results.anonymous_error = str(e)
         else:
-            if not self.use_json:
-                self._stream_anonymous_result()
+            self._stream_anonymous_result()
 
         # 3. Access check (only if anonymous is enabled)
         if self.results.anonymous:
@@ -1703,7 +1716,7 @@ class FTP(BaseModule):
             except Exception as e:
                 self.results.access_error = str(e)
 
-        if self.results.access is not None and not self.use_json:
+        if self.results.access is not None:
             self._stream_access_check_terminal()
 
         # 4. Data mode test (passive/active + PASV IP leakage; requires creds)
@@ -1718,6 +1731,7 @@ class FTP(BaseModule):
                 self.results.modes_error = str(e)
         else:
             self.results.modes_error = "No credentials for mode test (use --anonymous or -u/-p known account or wordlists)"
+        self._stream_modes_result()
 
     def connect(self) -> ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit:
         """
@@ -2411,7 +2425,12 @@ class FTP(BaseModule):
         """Callback for real-time streaming of found credentials (thread-safe).
         Streams login success immediately; permissions come from access_check() in output()."""
         with self._output_lock:
-            self.ptprint(f"    user: {cred.user}, password: {cred.passw}", Out.TEXT)
+            ptprinthelper.ptprint(
+                f"user: {cred.user}, password: {cred.passw}",
+                bullet_type="TEXT",
+                condition=not self.use_json,
+                indent=4,
+            )
 
     def _path_enum_worker(self, chunk: list[str], creds: Creds) -> list[PathEnumResult]:
         """Worker for path enumeration. Processes a chunk of paths with one FTP connection.
@@ -4043,8 +4062,6 @@ class FTP(BaseModule):
 
     def _print_active_audit_terminal(self, aa: ActiveAuditResult) -> None:
         """Structured terminal output for active mode policy audit (aligned with other FTP sections)."""
-        fk = get_colored_text
-        star_h = fk("[*]", color="INFO")
         bounce_header = False
         printed_pre = False
         post_header = False
@@ -4081,46 +4098,38 @@ class FTP(BaseModule):
 
             v_col, v_msg = self._active_audit_step_verdict(s, aa)
             if v_msg and v_col:
-                icon = fk(
-                    "[✓]" if v_col == "NOTVULN" else ("[✗]" if v_col == "VULN" else "[!]"),
-                    color=v_col,
-                )
-                self.ptprint(f"        {icon} {v_msg}", Out.TEXT)
+                self._tprint(v_msg, v_col, indent=8)
             elif s.interpretation:
                 self.ptprint(f"        hint: {s.interpretation}", Out.TEXT)
             if s.note and not (cmd_s == "(skipped)" and v_msg):
                 self.ptprint(f"        note: {s.note}", Out.TEXT)
 
         if not aa.post_auth_ran:
-            warn = fk("[!]", color="WARNING")
-            self.ptprint(
-                f"    {warn} Post-login steps skipped (no credentials); use --anonymous or -u USER -p PASS (or wordlists)",
-                Out.TEXT,
+            self._tprint(
+                "Post-login steps skipped (no credentials); use --anonymous or -u USER -p PASS (or wordlists)",
+                "WARNING",
             )
 
         doc_net_ip = "192.0.2.1"
         if aa.foreign_ip_accepted:
-            icon = fk("[✗]", color="VULN")
-            self.ptprint(
-                f"    {icon} PORT accepted for non-client IP (bounce risk; tested {doc_net_ip})",
-                Out.TEXT,
+            self._tprint(
+                f"PORT accepted for non-client IP (bounce risk; tested {doc_net_ip})",
+                "VULN",
             )
             self.ptprint(
                 "    Verify with a packet capture whether the server opens TCP to the stated IP:port.",
                 Out.TEXT,
             )
         if aa.low_port_accepted:
-            icon = fk("[✗]", color="VULN")
             lp = ", ".join(str(p) for p in aa.low_ports_accepted) if aa.low_ports_accepted else "<1000"
-            self.ptprint(
-                f"    {icon} PORT accepted for low data port(s): {lp} (RFC 2577: suggest reject < 1024)",
-                Out.TEXT,
+            self._tprint(
+                f"PORT accepted for low data port(s): {lp} (RFC 2577: suggest reject < 1024)",
+                "VULN",
             )
         if aa.list_after_own_port_ok is False:
-            warn = fk("[!]", color="WARNING")
-            self.ptprint(
-                f"    {warn} Active-mode LIST failed; may be NAT/firewall on tester side",
-                Out.TEXT,
+            self._tprint(
+                "Active-mode LIST failed; may be NAT/firewall on tester side",
+                "WARNING",
             )
 
         self.ptprint("Summary", Out.INFO)
@@ -4132,17 +4141,11 @@ class FTP(BaseModule):
         passive_txt = (
             "Available / data transfer OK" if passive_ok else "Not verified or failed in this run"
         )
-        self.ptprint(f"    {star_h} Passive mode:    {passive_txt}", Out.TEXT)
+        self._tprint(f"Passive mode:    {passive_txt}", "TITLE")
 
         if not aa.post_auth_ran:
-            self.ptprint(
-                f"    {star_h} Active mode:     {fk('[!]', color='WARNING')} Not assessed (no post-login audit)",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"    {star_h} Overall status:  {fk('[!]', color='WARNING')} Incomplete audit",
-                Out.TEXT,
-            )
+            self._tprint("Active mode:     Not assessed (no post-login audit)", "WARNING")
+            self._tprint("Overall status:  Incomplete audit", "WARNING")
             return
 
         active_vuln = aa.foreign_ip_accepted or aa.low_port_accepted
@@ -4157,24 +4160,23 @@ class FTP(BaseModule):
         )
 
         if active_vuln:
-            active_txt = f"{fk('[✗]', color='VULN')} PORT policy risk (foreign or low port accepted)"
+            self._tprint("Active mode:     PORT policy risk (foreign or low port accepted)", "VULN")
         elif ipv4_skip:
-            active_txt = f"{fk('[!]', color='WARNING')} Not fully assessed (IPv4 required for PORT probes)"
+            self._tprint("Active mode:     Not fully assessed (IPv4 required for PORT probes)", "WARNING")
         elif port_rejected and not aa.foreign_ip_accepted:
-            active_txt = f"{fk('[✓]', color='NOTVULN')} Disabled / rejected (no 200 on bounce/low-port probes in this run)"
+            self._tprint(
+                "Active mode:     Disabled / rejected (no 200 on bounce/low-port probes in this run)",
+                "NOTVULN",
+            )
         else:
-            active_txt = f"{fk('[✓]', color='NOTVULN')} No bounce/low-port PORT acceptance (200) observed"
-
-        self.ptprint(f"    {star_h} Active mode:     {active_txt}", Out.TEXT)
+            self._tprint("Active mode:     No bounce/low-port PORT acceptance (200) observed", "NOTVULN")
 
         if active_vuln:
-            overall = f"{fk('[✗]', color='VULN')} Review PORT policy (bounce / low port)"
+            self._tprint("Overall status:  Review PORT policy (bounce / low port)", "VULN")
         elif ipv4_skip:
-            overall = f"{fk('[!]', color='WARNING')} Inconclusive (partial audit)"
+            self._tprint("Overall status:  Inconclusive (partial audit)", "WARNING")
         else:
-            overall = f"{fk('[✓]', color='NOTVULN')} No bounce/low-port finding from this run"
-
-        self.ptprint(f"    {star_h} Overall status:  {overall}", Out.TEXT)
+            self._tprint("Overall status:  No bounce/low-port finding from this run", "NOTVULN")
 
     def _raw_list_without_pasv_port(self, ftp: ftplib.FTP) -> tuple[str, int | None]:
         """Send LIST on control channel without ftplib issuing PASV/PORT first (D0)."""
@@ -4987,49 +4989,38 @@ class FTP(BaseModule):
 
     def _print_cmd_audit_terminal(self, ca: CommandAuditResult) -> None:
         """Structured command-surface audit output (HELP/FEAT/SITE), aligned with other FTP sections."""
-        fk = get_colored_text
-        warn_b = fk("[!]", color="WARNING")
         # Same yellow as section headings (Out.INFO); detail lines are informational [i].
-        head_style = fk("[*]", color="INFO")
-        info_icon = fk("[i]", color="INFO")
 
         self.ptprint("Command surface audit", Out.INFO)
         if ca.response_truncated:
-            self.ptprint(f"    {warn_b} At least one response was truncated (64 KiB cap)", Out.TEXT)
+            self._tprint("At least one response was truncated (64 KiB cap)", "WARNING")
         if ca.site_help_all_pre_error:
-            self.ptprint(
-                f"    {warn_b} SITE HELP ALL (pre-auth): {ca.site_help_all_pre_error}",
-                Out.TEXT,
-            )
+            self._tprint(f"SITE HELP ALL (pre-auth): {ca.site_help_all_pre_error}", "WARNING")
         if ca.site_help_all_post_error:
-            self.ptprint(
-                f"    {warn_b} SITE HELP ALL (post-auth): {ca.site_help_all_post_error}",
-                Out.TEXT,
-            )
+            self._tprint(f"SITE HELP ALL (post-auth): {ca.site_help_all_post_error}", "WARNING")
 
         if not ca.matched_risks:
-            self.ptprint(
-                f"    {fk('[✓]', color='NOTVULN')} No high-risk SITE / EXEC patterns in captured HELP/FEAT/SITE output",
-                Out.TEXT,
+            self._tprint(
+                "No high-risk SITE / EXEC patterns in captured HELP/FEAT/SITE output",
+                "NOTVULN",
             )
             return
 
         for r in ca.matched_risks:
             col = "VULN" if r.tier in ("critical", "high") else "WARNING"
-            head_icon = fk("[✗]" if r.tier in ("critical", "high") else "[!]", color=col)
             src_label = self._CMD_AUDIT_SOURCE_LABEL.get(r.source, r.source)
-            self.ptprint(f"    {head_icon} [{r.tier}] {r.token} — {src_label}", Out.TEXT)
+            self._tprint(f"[{r.tier}] {r.token} — {src_label}", col)
 
             snippet = self._cmd_audit_snippet_for_risk(ca, r)
-            self.ptprint(f"        {head_style} Response: {snippet}", Out.TEXT)
+            self._tprint(f"Response: {snippet}", "TITLE", indent=8)
 
             vuln_t, risk_t, info_t = self._cmd_audit_risk_explain(r)
 
             if vuln_t and r.tier in ("critical", "high"):
-                self.ptprint(f"        {info_icon} VULNERABLE: {vuln_t}", Out.TEXT)
-            self.ptprint(f"        {info_icon} RISK: {risk_t}", Out.TEXT)
+                self._tprint(f"VULNERABLE: {vuln_t}", "TITLE", indent=8)
+            self._tprint(f"RISK: {risk_t}", "TITLE", indent=8)
             if info_t:
-                self.ptprint(f"        {info_icon} INFO: {info_t}", Out.TEXT)
+                self._tprint(f"INFO: {info_t}", "TITLE", indent=8)
 
     def _inv_payload_terminal(self, p: InvalidCmdProbeResult) -> str:
         prev = p.line_sent_preview
@@ -5049,15 +5040,9 @@ class FTP(BaseModule):
 
     def _inv_probe_detail_lines(self, p: InvalidCmdProbeResult, post_auth: bool) -> None:
         """Print one probe block for invalid-command audit (aligned with cmd/active terminal style)."""
-        fk = get_colored_text
-        star_h = fk("[*]", color="INFO")
-        info_i = fk("[i]", color="INFO")
-        ok_i = fk("[✓]", color="NOTVULN")
-        bad_i = fk("[✗]", color="VULN")
-        warn_i = fk("[!]", color="WARNING")
 
         self.ptprint(f"    [{p.probe_id}] {p.intent_label}", Out.TEXT)
-        self.ptprint(f"        {star_h} Payload: {self._inv_payload_terminal(p)}", Out.TEXT)
+        self._tprint(f"Payload: {self._inv_payload_terminal(p)}", "TITLE", indent=8)
 
         code_s = str(p.reply_code) if p.reply_code is not None else "—"
         resp_summary = f"{code_s} | {p.classification}"
@@ -5065,40 +5050,46 @@ class FTP(BaseModule):
 
         cls = p.classification
         if cls in ("no_reply_code", "connection_lost", "reply_timeout"):
-            self.ptprint(f"        {bad_i} Verdict: {self._inv_verdict_label(cls)}", Out.TEXT)
+            self._tprint(f"Verdict: {self._inv_verdict_label(cls)}", "VULN", indent=8)
             if cls == "no_reply_code":
-                self.ptprint(
-                    f"        {info_i} RISK: No standard numeric FTP reply; server may have stalled or dropped the line.",
-                    Out.TEXT,
+                self._tprint(
+                    f"RISK: No standard numeric FTP reply; server may have stalled or dropped the line.",
+                    "TITLE",
+                    indent=8,
                 )
             elif cls == "connection_lost":
-                self.ptprint(
-                    f"        {info_i} RISK: Connection closed or reset after probe (service instability).",
-                    Out.TEXT,
+                self._tprint(
+                    f"RISK: Connection closed or reset after probe (service instability).",
+                    "TITLE",
+                    indent=8,
                 )
-                self.ptprint(
-                    f"        {info_i} INFO: Possible Denial of Service (DoS) via malformed or oversized input.",
-                    Out.TEXT,
+                self._tprint(
+                    f"INFO: Possible Denial of Service (DoS) via malformed or oversized input.",
+                    "TITLE",
+                    indent=8,
                 )
             else:
-                self.ptprint(
-                    f"        {info_i} RISK: Reply timed out; control channel may be slow or stuck.",
-                    Out.TEXT,
+                self._tprint(
+                    f"RISK: Reply timed out; control channel may be slow or stuck.",
+                    "TITLE",
+                    indent=8,
                 )
         elif cls == "positive_2xx_unexpected":
-            self.ptprint(f"        {bad_i} Verdict: UNEXPECTED_2XX", Out.TEXT)
-            self.ptprint(
-                f"        {info_i} RISK: Server accepted garbage or probe with a success class reply (review manually).",
-                Out.TEXT,
-            )
+            self._tprint("Verdict: UNEXPECTED_2XX", "VULN", indent=8)
+            self._tprint(
+                    f"RISK: Server accepted garbage or probe with a success class reply (review manually).",
+                    "TITLE",
+                    indent=8,
+                )
         elif cls == "null_byte_possible_login_230":
-            self.ptprint(f"        {bad_i} Verdict: NULL_BYTE_POSSIBLE_LOGIN", Out.TEXT)
-            self.ptprint(
-                f"        {info_i} RISK: USER with null byte may have produced login success (230); verify PWD/session.",
-                Out.TEXT,
-            )
+            self._tprint("Verdict: NULL_BYTE_POSSIBLE_LOGIN", "VULN", indent=8)
+            self._tprint(
+                    f"RISK: USER with null byte may have produced login success (230); verify PWD/session.",
+                    "TITLE",
+                    indent=8,
+                )
         else:
-            self.ptprint(f"        {ok_i} Response: {resp_summary}", Out.TEXT)
+            self._tprint(f"Response: {resp_summary}", "NOTVULN", indent=8)
             # Informational "Result" for common benign cases
             if cls == "server_error_5xx":
                 if p.probe_id == "unknown_hello":
@@ -5119,39 +5110,37 @@ class FTP(BaseModule):
                 msg = "Server replied to double-CRLF smuggle probe; check for response splitting."
             else:
                 msg = f"Classification: {cls} ({auth_note})."
-            self.ptprint(f"        {info_i} Result: {msg}", Out.TEXT)
+            self._tprint(f"Result: {msg}", "TITLE", indent=8)
 
         if p.null_byte_outcome:
-            self.ptprint(f"        {warn_i} nullByteOutcome: {p.null_byte_outcome}", Out.TEXT)
+            self._tprint(f"nullByteOutcome: {p.null_byte_outcome}", "WARNING", indent=8)
         if p.error:
-            self.ptprint(f"        {warn_i} error: {p.error}", Out.TEXT)
+            self._tprint(f"error: {p.error}", "WARNING", indent=8)
         if p.follow_up_command:
             fc = str(p.follow_up_reply_code) if p.follow_up_reply_code is not None else "—"
             sn = (p.follow_up_reply_snippet or "")[:180]
             if p.follow_up_reply_snippet and len(p.follow_up_reply_snippet) > 180:
                 sn += "…"
-            self.ptprint(
-                f"        {info_i} follow-up {p.follow_up_command} → {fc}: {sn}",
-                Out.TEXT,
-            )
+            self._tprint(
+                    f"follow-up {p.follow_up_command} → {fc}: {sn}",
+                    "TITLE",
+                    indent=8,
+                )
 
     def _print_invalid_cmd_audit_terminal(self, inv: InvalidCmdAuditResult) -> None:
         """Structured invalid-command (INVCOMM) terminal output."""
-        fk = get_colored_text
-        warn_b = fk("[!]", color="WARNING")
-        vuln_b = fk("[!]", color="VULN")
 
         self.ptprint("Invalid command resilience (raw socket)", Out.INFO)
 
         if inv.setup_error:
-            self.ptprint(f"    {fk('[✗]', color='VULN')} {inv.setup_error}", Out.TEXT)
+            self._tprint(inv.setup_error, "VULN")
             if inv.tls_handshake_hint:
-                self.ptprint(f"    {warn_b} tlsHandshakeHint: {inv.tls_handshake_hint}", Out.TEXT)
+                self._tprint(f"tlsHandshakeHint: {inv.tls_handshake_hint}", "WARNING")
             if inv.obsolete_tls_suspected:
-                self.ptprint(
-                    f"    {fk('[✗]', color='VULN')} Obsolete TLS: server likely requires obsolete TLS (<1.2); "
+                self._tprint(
+                    "Obsolete TLS: server likely requires obsolete TLS (<1.2); "
                     "see JSON tlsHandshakeHint / setupError.",
-                    Out.TEXT,
+                    "VULN",
                 )
             return
 
@@ -5159,26 +5148,23 @@ class FTP(BaseModule):
         ru = rating.upper()
         if rating == "Vulnerable":
             rb = "Unexpected 2xx, null-byte login suspicion, or no recovery after probe (see JSON)."
-            ricon = vuln_b
+            rb_bullet = "VULN"
         elif rating == "Degraded":
             rb = "Server stability issues during fuzzing (timeouts, drops, or suspicious replies)."
-            ricon = warn_b
+            rb_bullet = "WARNING"
         else:
             rb = "Replies largely within expected error handling for this run."
-            ricon = fk("[✓]", color="NOTVULN")
+            rb_bullet = "NOTVULN"
 
-        self.ptprint(f"    {ricon} Rating: {ru} — {rb}", Out.TEXT)
+        self._tprint(f"Rating: {ru} — {rb}", rb_bullet)
         if inv.null_byte_truncation_suspected:
-            self.ptprint(f"    {warn_b} nullByteTruncationSuspected=true", Out.TEXT)
+            self._tprint("nullByteTruncationSuspected=true", "WARNING")
         if inv.post_auth_login_error:
-            self.ptprint(f"    {warn_b} post-auth login: {inv.post_auth_login_error}", Out.TEXT)
+            self._tprint(f"post-auth login: {inv.post_auth_login_error}", "WARNING")
         if inv.tls_handshake_hint:
-            self.ptprint(f"    {warn_b} tlsHandshakeHint: {inv.tls_handshake_hint}", Out.TEXT)
+            self._tprint(f"tlsHandshakeHint: {inv.tls_handshake_hint}", "WARNING")
         if inv.obsolete_tls_suspected:
-            self.ptprint(
-                f"    {fk('[✗]', color='VULN')} Obsolete TLS: post-auth TLS suggests obsolete protocol.",
-                Out.TEXT,
-            )
+            self._tprint("Obsolete TLS: post-auth TLS suggests obsolete protocol.", "VULN")
 
         for label, sess, title_fn in (
             (
@@ -5196,9 +5182,9 @@ class FTP(BaseModule):
                 continue
             self.ptprint(title_fn(sess), Out.INFO)
             if sess.null_byte_truncation_suspected:
-                self.ptprint(f"    {warn_b} nullByteTruncationSuspected in {label}", Out.TEXT)
+                self._tprint(f"nullByteTruncationSuspected in {label}", "WARNING")
             if sess.had_connection_drop:
-                self.ptprint(f"    {warn_b} Connection drop observed in {label}", Out.TEXT)
+                self._tprint(f"Connection drop observed in {label}", "WARNING")
             post_auth = label == "postAuth"
             for p in sess.probes:
                 self._inv_probe_detail_lines(p, post_auth)
@@ -6074,91 +6060,107 @@ class FTP(BaseModule):
         return EncryptionResult(plaintext_ok, auth_tls_ok, tls_ok)
 
     def _stream_banner_result(self) -> None:
-        if self.use_json or not (info := self.results.info) or info.banner is None:
+        """Stream banner + Service Identification immediately (thread-safe)."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
+        if not (info := self.results.info) or info.banner is None:
             return
         with self._output_lock:
             sid = identify_service(info.banner)
             if sid is None:
-                icon = get_colored_text("[✓]", color="NOTVULN")
+                banner_bullet = "NOTVULN"
             elif sid.version is not None:
-                icon = get_colored_text("[✗]", color="VULN")
+                banner_bullet = "VULN"
             else:
-                icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
+                banner_bullet = "WARNING"
+            pp(info.banner, bullet_type=banner_bullet, condition=show, indent=4)
             if sid is not None:
                 self.ptprint("Service Identification", Out.INFO)
-                self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
-                self.ptprint(
-                    f"    Version:  {sid.version if sid.version else 'unknown'}",
-                    Out.TEXT,
+                pp(f"Product:  {sid.product}", bullet_type="TEXT", condition=show, indent=4)
+                pp(
+                    f"Version:  {sid.version if sid.version else 'unknown'}",
+                    bullet_type="TEXT",
+                    condition=show,
+                    indent=4,
                 )
-                self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
-        self._streamed_banner = True
+                pp(f"CPE:      {sid.cpe}", bullet_type="TEXT", condition=show, indent=4)
 
-    def _stream_encryption_result(self) -> None:
-        if self.use_json:
+    def _stream_commands_result(self) -> None:
+        """Stream HELP/SYST/STAT immediately after info (thread-safe)."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
+        if not self.results.commands_requested:
+            return
+        if not (info := self.results.info):
+            return
+        if info.help_response is None and info.syst is None and info.stat is None:
             return
         with self._output_lock:
-            if (err := self.results.encryption_error) is not None:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Encryption test failed: {err}", Out.TEXT)
-                self._streamed_encryption = True
+            if info.help_response is not None:
+                self.ptprint("HELP command", Out.INFO)
+                for line in info.help_response.splitlines():
+                    pp(line, bullet_type="TEXT", condition=show, indent=4)
+            if info.syst is not None:
+                self.ptprint("SYST command", Out.INFO)
+                pp(info.syst, bullet_type="TEXT", condition=show, indent=4)
+            if info.stat is not None:
+                self.ptprint("STAT command", Out.INFO)
+                pp(info.stat, bullet_type="TEXT", condition=show, indent=4)
+
+    def _stream_encryption_result(self) -> None:
+        """Stream encryption test result to terminal (thread-safe)."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
+        with self._output_lock:
+            if (encryption_error := self.results.encryption_error) is not None:
+                pp(f"Encryption test failed: {encryption_error}", bullet_type="VULN", condition=show, indent=4)
                 return
             enc = self.results.encryption
             if enc is None:
-                self._streamed_encryption = True
                 return
             plaintext_only = enc.plaintext_ok and not enc.auth_tls_ok and not enc.tls_ok
             any_ok = enc.plaintext_ok or enc.auth_tls_ok or enc.tls_ok
             if plaintext_only:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Plaintext only", Out.TEXT)
+                pp("Plaintext only", bullet_type="VULN", condition=show, indent=4)
             elif any_ok:
                 if enc.plaintext_ok:
-                    icon = (
-                        get_colored_text("[!]", color="WARNING")
-                        if (enc.auth_tls_ok or enc.tls_ok)
-                        else get_colored_text("[✓]", color="NOTVULN")
-                    )
-                    self.ptprint(f"    {icon} Plaintext", Out.TEXT)
+                    bullet = "WARNING" if (enc.auth_tls_ok or enc.tls_ok) else "NOTVULN"
+                    pp("Plaintext", bullet_type=bullet, condition=show, indent=4)
                 if enc.auth_tls_ok:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} AUTH TLS", Out.TEXT)
+                    pp("AUTH TLS", bullet_type="NOTVULN", condition=show, indent=4)
                 if enc.tls_ok:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} Implicit TLS", Out.TEXT)
+                    pp("Implicit TLS", bullet_type="NOTVULN", condition=show, indent=4)
             else:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(
-                    f"    {icon} No connection mode available (plaintext, AUTH TLS, implicit TLS failed)",
-                    Out.TEXT,
+                pp(
+                    "No connection mode available (plaintext, AUTH TLS, implicit TLS failed)",
+                    bullet_type="VULN",
+                    condition=show,
+                    indent=4,
                 )
-        self._streamed_encryption = True
 
     def _stream_anonymous_result(self) -> None:
-        if self.use_json or (anonymous := self.results.anonymous) is None:
+        """Stream anonymous auth result immediately (thread-safe)."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
+        if (anonymous := self.results.anonymous) is None:
             return
         with self._output_lock:
             if anonymous:
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Enabled", Out.TEXT)
+                pp("Enabled", bullet_type="VULN", condition=show, indent=4)
             else:
-                icon = get_colored_text("[✓]", color="NOTVULN")
-                self.ptprint(f"    {icon} Disabled", Out.TEXT)
-        self._streamed_anonymous = True
+                pp("Disabled", bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_access_check_terminal(self) -> None:
-        """Print --access results under [+] Access check. Avoid duplicating in output() brute lines."""
-        if self.use_json:
-            return
+        """Print --access results under [+] Access check."""
+        pp = ptprinthelper.ptprint
+        show = not self.use_json
         access = self.results.access
         if access is None:
             return
         with self._output_lock:
-            warn = get_colored_text("[!]", color="WARNING")
             if access.errors:
                 for e in access.errors:
-                    self.ptprint(f"    {warn} {e}", Out.TEXT)
+                    pp(e, bullet_type="WARNING", condition=show, indent=4)
             if access.results:
                 for p in access.results:
                     cred_str = f"user: {p.creds.user}, password: {p.creds.passw}"
@@ -6166,22 +6168,233 @@ class FTP(BaseModule):
                         f" (Directory listing: {p.dirlist is not None}, "
                         f"Write: {p.write}, Read: {p.read}, Delete: {p.delete})"
                     )
-                    self.ptprint(f"    {cred_str + perm_str}", Out.TEXT)
+                    pp(cred_str + perm_str, bullet_type="TEXT", condition=show, indent=4)
             if access.errors and self.results.anonymous is not True:
-                self.ptprint(
-                    f"    {warn} Use --anonymous (-A), or -u USER -p PASS, or wordlists (-U/-P).",
-                    Out.TEXT,
+                pp(
+                    "Use --anonymous (-A), or -u USER -p PASS, or wordlists (-U/-P).",
+                    bullet_type="WARNING",
+                    condition=show,
+                    indent=4,
                 )
-        self._streamed_access = True
 
     def _stream_brute_result(self) -> None:
+        """Stream brute-force summary (credentials already streamed via on_success) (thread-safe)."""
         creds = self.results.creds
-        if creds is None:
+        if creds is None or len(creds) == 0:
             return
-        if not self.use_json and len(creds) > 0:
-            with self._output_lock:
-                self.ptprint(f"    Found {len(creds)} valid credentials", Out.INFO)
-        self._streamed_brute = True
+        with self._output_lock:
+            ptprinthelper.ptprint(
+                f"Found {len(creds)} valid credentials",
+                bullet_type="INFO",
+                condition=not self.use_json,
+                indent=4,
+            )
+
+    def _stream_directory_listing_result(self) -> None:
+        if self.use_json or not self.args.access_list:
+            return
+        access = self.results.access
+        if access is None or access.results is None:
+            return
+        with self._output_lock:
+            try:
+                p = next(p for p in access.results if p.dirlist is not None and len(p.dirlist) > 0)
+                self.ptprint("Directory listing", Out.INFO)
+                for line in "\n".join(p.dirlist).splitlines():
+                    self._tprint(line, "TEXT", indent=4)
+            except StopIteration:
+                self.ptprint("Directory listing failed (no access or empty listing)", Out.INFO)
+
+    def _stream_path_enum_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "path_enum_error", None)) is not None:
+                self._tprint(err, "VULN")
+            elif (path_list := getattr(self.results, "path_enum", None)) is not None and len(path_list) > 0:
+                self._tprint(f"Found {len(path_list)} path(s)", "TITLE")
+                for p in path_list:
+                    kind = "dir" if p.is_directory else "file"
+                    size_str = f" ({p.size} B)" if p.size is not None else ""
+                    self._tprint(f"[{kind}] {p.path}{size_str}", "TEXT", indent=8)
+
+    def _stream_modes_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "modes_error", None)) is not None:
+                self._tprint(err, "VULN")
+            elif (modes := getattr(self.results, "modes", None)) is not None:
+                self._tprint(
+                    f"Passive: {'available' if modes.passive_ok else 'not available'}",
+                    "NOTVULN" if modes.passive_ok else "VULN",
+                )
+                self._tprint(
+                    f"Active: {'available' if modes.active_ok else 'not available'}",
+                    "NOTVULN" if modes.active_ok else "VULN",
+                )
+                if not modes.active_ok:
+                    self._tprint(
+                        "If active failed: tester may be behind NAT/firewall, not necessarily server error. "
+                        "For 100% objective result, tester needs public IP and no local firewall.",
+                        "WARNING",
+                    )
+                if modes.pasv_ip_leak:
+                    self._tprint(
+                        f"PASV Internal IP Leak: server advertised {modes.pasv_ip_leak}",
+                        "VULN",
+                    )
+
+    def _stream_pasv_port_range_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "pasv_port_range_error", None)) is not None:
+                self.ptprint("Passive port range audit", Out.INFO)
+                self._tprint(err, "VULN")
+            elif (ppr := getattr(self.results, "pasv_port_range", None)) is not None:
+                self._print_pasv_port_range_terminal(ppr)
+
+    def _stream_conn_limits_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "conn_limits_error", None)) is not None:
+                self.ptprint("Connection limits audit", Out.INFO)
+                self._tprint(f"Audit failed: {err}", "VULN")
+            elif (cl := getattr(self.results, "conn_limits", None)) is not None:
+                self._print_conn_limits_audit_terminal(cl)
+
+    def _stream_chroot_audit_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "chroot_audit_error", None)) is not None:
+                self.ptprint("User isolation audit", Out.INFO)
+                self._tprint(err, "VULN")
+            elif (ch := getattr(self.results, "chroot_audit", None)) is not None:
+                self._print_chroot_audit_terminal(ch)
+
+    def _stream_active_audit_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "active_audit_error", None)) is not None:
+                self.ptprint("Active mode policy", Out.INFO)
+                self._tprint(err, "VULN")
+            elif (aa := getattr(self.results, "active_audit", None)) is not None:
+                self._print_active_audit_terminal(aa)
+
+    def _stream_cmd_audit_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "cmd_audit_error", None)) is not None:
+                self.ptprint("Command surface audit", Out.INFO)
+                self._tprint(err, "VULN")
+            elif (ca := getattr(self.results, "cmd_audit", None)) is not None:
+                self._print_cmd_audit_terminal(ca)
+
+    def _stream_cmd_audit_active_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "cmd_audit_active_error", None)) is not None:
+                self.ptprint("Command surface audit (active SITE probes)", Out.INFO)
+                self._tprint(err, "VULN")
+            elif (caa := getattr(self.results, "cmd_audit_active", None)) is not None:
+                self.ptprint("Command surface audit (active SITE probes)", Out.INFO)
+                if caa.setup_error:
+                    self._tprint(f"Setup failed: {caa.setup_error}", "VULN")
+                else:
+                    if caa.probe_file:
+                        self._tprint(f"Probe file (cleaned up): {caa.probe_file}", "TEXT", indent=4)
+                    self._tprint(
+                        "Cleanup (DELE): " + ("ok" if caa.cleanup_ok else (caa.cleanup_error or "failed")),
+                        "NOTVULN" if caa.cleanup_ok else "WARNING",
+                    )
+                    for p in caa.probes:
+                        code_s = str(p.reply_code) if p.reply_code is not None else "—"
+                        self._tprint(
+                            f"[{p.probe_id}] {p.command_sent!r} → {code_s} | {p.classification}"
+                            + (
+                                f" | passive_advertised={p.advertised_in_passive_audit}"
+                                if p.advertised_in_passive_audit
+                                else ""
+                            ),
+                            "TEXT",
+                            indent=4,
+                        )
+                        if p.reply_line and p.error is None:
+                            snippet = p.reply_line[:200] + ("…" if len(p.reply_line) > 200 else "")
+                            self._tprint(snippet, "TEXT", indent=8)
+                        if p.error:
+                            self._tprint(f"error: {p.error}", "WARNING", indent=8)
+
+    def _stream_invalid_cmd_audit_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "invalid_cmd_audit_error", None)) is not None:
+                self.ptprint("Invalid command resilience (raw socket)", Out.INFO)
+                self._tprint(err, "VULN")
+            elif (inv := getattr(self.results, "invalid_cmd_audit", None)) is not None:
+                self._print_invalid_cmd_audit_terminal(inv)
+
+    def _stream_user_enum_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "user_enum_error", None)) is not None:
+                self.ptprint("Username enumeration audit (-eu / PTL-SVC-FTP-USRENUM)", Out.INFO)
+                self._tprint(err, "VULN")
+            elif (ue := getattr(self.results, "user_enum", None)) is not None:
+                self._print_user_enum_terminal(ue)
+
+    def _stream_eicar_audit_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "eicar_audit_error", None)) is not None:
+                self.ptprint("Antivirus probe (EICAR)", Out.INFO)
+                self._tprint(err, "VULN")
+            elif (ea := getattr(self.results, "eicar_audit", None)) is not None:
+                self._print_eicar_audit_terminal(ea)
+
+    def _stream_dos_audit_result(self) -> None:
+        if self.use_json:
+            return
+        with self._output_lock:
+            if (err := getattr(self.results, "dos_audit_error", None)) is not None:
+                self.ptprint("FTP Processing Resilience (DoS Probes)", Out.INFO)
+                self._tprint(err, "VULN")
+            elif (dos := getattr(self.results, "dos_audit", None)) is not None:
+                self._print_ftp_dos_audit_terminal(dos)
+
+    def _stream_bounce_result(self) -> None:
+        if self.use_json or (bounce := self.results.bounce) is None:
+            return
+        with self._output_lock:
+            if (creds := bounce.used_creds) is None:
+                self.ptprint("Bounce attack failed (no valid credentials)", Out.INFO)
+                return
+            self.ptprint("Bounce attack", Out.INFO)
+            self._tprint(f"Creds used: {creds.user}:{creds.passw}", "TEXT")
+            if bounce.bounce_accepted:
+                self._tprint("Bounce is allowed", "VULN")
+            else:
+                self._tprint("Bounce is denied", "NOTVULN")
+            if not bounce.bounce_accepted:
+                return
+            if (r := bounce.request) is None:
+                self._tprint(f"Target port reachable: {bounce.port_accessible}", "TEXT", indent=8)
+            else:
+                res = f"Yes ({r.ftpserver_filepath})" if r.stored else "No"
+                self._tprint(f"Stored on FTP server: {res}", "TEXT", indent=8)
+                res = "Yes" if r.uploaded else "No"
+                self._tprint(f"Sent to bounce target: {res}", "TEXT", indent=8)
+                res = "Yes" if r.cleaned else "No"
+                self._tprint(f"Cleaned up: {res}", "TEXT", indent=8)
 
     def _try_login(self, creds: Creds) -> Creds | None:
         """Login attempt function for bruteforce
@@ -6341,254 +6554,277 @@ class FTP(BaseModule):
         Icon semantics: [*] = block titles; [i] = neutral facts; [✓] / [✗] = verdicts (RISK lines use [✗]).
         Audit summary: one primary verdict line + one [i] caveat (heuristic / not DoS).
         """
-        fk = get_colored_text
-        d1 = "    "
-        d2 = "        "
-        d3 = "            "  # Under each PASV "Phase:" — metrics & verdicts visually nested under the phase line.
-        star = fk("[*]", color="INFO")
-        info_i = fk("[i]", color="INFO")
-        tick = fk("[✓]", color="NOTVULN")
-        cross = fk("[✗]", color="VULN")
 
         self.ptprint("Connection limits audit", Out.INFO)
 
-        self.ptprint(f"{d1}{star} Connectivity & session burst", Out.TEXT)
-        self.ptprint(
-            f"{d2}{info_i} Setup: cryptoMode={cl.crypto_mode} | parallel {cl.parallel.succeeded}/{cl.parallel.attempted}"
+        self._tprint("Connectivity & session burst", "TITLE", indent=4)
+        self._tprint(
+            f"Setup: cryptoMode={cl.crypto_mode} | parallel {cl.parallel.succeeded}/{cl.parallel.attempted}"
             f" | sequential {cl.sequential.succeeded}/{cl.sequential.attempts}",
-            Out.TEXT,
+            "TITLE",
+            indent=8,
         )
         if cl.parallel.error_samples:
-            self.ptprint(
-                f"{d2}{info_i} Parallel errors (sample): {cl.parallel.error_samples[0][:120]}",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Parallel errors (sample): {cl.parallel.error_samples[0][:120]}",
+            "TITLE",
+            indent=8,
+        )
         if cl.sequential.error_samples and cl.sequential.failed:
-            self.ptprint(
-                f"{d2}{info_i} Sequential errors (sample): {cl.sequential.error_samples[0][:120]}",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Sequential errors (sample): {cl.sequential.error_samples[0][:120]}",
+            "TITLE",
+            indent=8,
+        )
 
         if _conn_limits_parallel_suspect(cl.parallel):
-            self.ptprint(
-                f"{d2}{info_i} Parallel burst: All {cl.parallel.attempted} simultaneous control sessions completed "
-                f"(220 + QUIT) with no refusal.",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"{d2}{cross} RISK: No observed concurrency cap on this probe; many simultaneous clients could stress resources.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Parallel burst: All {cl.parallel.attempted} simultaneous control sessions completed "
+            f"(220 + QUIT) with no refusal.",
+            "TITLE",
+            indent=8,
+        )
+            self._tprint(
+            f"RISK: No observed concurrency cap on this probe; many simultaneous clients could stress resources.",
+            "VULN",
+            indent=8,
+        )
         elif cl.parallel.attempted >= 10 and (cl.parallel.failed > 0 or cl.parallel.succeeded < cl.parallel.attempted):
-            self.ptprint(
-                f"{d2}{tick} Parallel burst: {cl.parallel.succeeded}/{cl.parallel.attempted} sessions completed; "
-                f"{cl.parallel.failed} failed or refused — possible concurrency or policy limits.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Parallel burst: {cl.parallel.succeeded}/{cl.parallel.attempted} sessions completed; "
+            f"{cl.parallel.failed} failed or refused — possible concurrency or policy limits.",
+            "NOTVULN",
+            indent=8,
+        )
         else:
-            self.ptprint(
-                f"{d2}{info_i} Parallel burst: {cl.parallel.succeeded}/{cl.parallel.attempted} sessions completed "
-                f"(probe volume below the N≥10 parallel heuristic threshold).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Parallel burst: {cl.parallel.succeeded}/{cl.parallel.attempted} sessions completed "
+            f"(probe volume below the N≥10 parallel heuristic threshold).",
+            "TITLE",
+            indent=8,
+        )
 
         if cl.sequential.attempts <= 0:
-            self.ptprint(f"{d2}{info_i} Sequential rapid connect: skipped (0 attempts)", Out.TEXT)
+            self._tprint("Sequential rapid connect: skipped (0 attempts)", "TITLE", indent=8)
         elif _conn_limits_sequential_suspect(cl.sequential):
-            self.ptprint(
-                f"{d2}{info_i} Sequential rapid connect: {cl.sequential.succeeded} back-to-back control sessions "
-                f"succeeded without visible throttle.",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"{d2}{cross} RISK: No visible new-connection throttle in this rapid series.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Sequential rapid connect: {cl.sequential.succeeded} back-to-back control sessions "
+            f"succeeded without visible throttle.",
+            "TITLE",
+            indent=8,
+        )
+            self._tprint(
+            f"RISK: No visible new-connection throttle in this rapid series.",
+            "VULN",
+            indent=8,
+        )
         elif cl.sequential.attempts >= 20 and (
             cl.sequential.failed > 0 or cl.sequential.succeeded < cl.sequential.attempts
         ):
-            self.ptprint(
-                f"{d2}{tick} Sequential rapid connect: {cl.sequential.succeeded}/{cl.sequential.attempts} succeeded; "
-                f"{cl.sequential.failed} failed — possible rate or policy limiting.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Sequential rapid connect: {cl.sequential.succeeded}/{cl.sequential.attempts} succeeded; "
+            f"{cl.sequential.failed} failed — possible rate or policy limiting.",
+            "NOTVULN",
+            indent=8,
+        )
         else:
-            self.ptprint(
-                f"{d2}{info_i} Sequential rapid connect: {cl.sequential.succeeded}/{cl.sequential.attempts} sessions "
-                f"(probe volume below the N≥20 sequential heuristic threshold).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Sequential rapid connect: {cl.sequential.succeeded}/{cl.sequential.attempts} sessions "
+            f"(probe volume below the N≥20 sequential heuristic threshold).",
+            "TITLE",
+            indent=8,
+        )
 
-        self.ptprint(f"{d1}{star} Idle & control timing (optional probes)", Out.TEXT)
+        self._tprint("Idle & control timing (optional probes)", "TITLE", indent=4)
         ipr = cl.idle_pre_auth
         if not ipr.performed:
-            self.ptprint(
-                f"{d2}{info_i} Idle pre-login: not probed (set --conn-limits-idle-pre-auth > 0)",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Idle pre-login: not probed (set --conn-limits-idle-pre-auth > 0)",
+            "TITLE",
+            indent=8,
+        )
         elif _conn_limits_idle_pre_suspect(ipr):
-            self.ptprint(
-                f"{d2}{info_i} Idle pre-login ~{ipr.wait_seconds:.0f}s: no 421/426/close observed — weak pre-auth idle limit suspected.",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"{d2}{cross} RISK: Long-lived anonymous control sessions may be possible before login.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Idle pre-login ~{ipr.wait_seconds:.0f}s: no 421/426/close observed — weak pre-auth idle limit suspected.",
+            "TITLE",
+            indent=8,
+        )
+            self._tprint(
+            f"RISK: Long-lived anonymous control sessions may be possible before login.",
+            "VULN",
+            indent=8,
+        )
         elif ipr.kick_observed:
-            self.ptprint(
-                f"{d2}{tick} Idle pre-login ~{ipr.wait_seconds:.0f}s: server closed or sent kick — {ipr.note[:120]}",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Idle pre-login ~{ipr.wait_seconds:.0f}s: server closed or sent kick — {ipr.note[:120]}",
+            "NOTVULN",
+            indent=8,
+        )
         else:
-            self.ptprint(
-                f"{d2}{info_i} Idle pre-login ~{ipr.wait_seconds:.0f}s: no kick in window — {ipr.note[:120]}",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Idle pre-login ~{ipr.wait_seconds:.0f}s: no kick in window — {ipr.note[:120]}",
+            "TITLE",
+            indent=8,
+        )
 
         sa = cl.slow_auth
         if not sa.performed:
-            self.ptprint(
-                f"{d2}{info_i} Slow USER→PASS gap: not probed (set --conn-limits-slow-auth-gap > 0)",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Slow USER→PASS gap: not probed (set --conn-limits-slow-auth-gap > 0)",
+            "TITLE",
+            indent=8,
+        )
         elif _conn_limits_slow_auth_suspect(sa):
-            self.ptprint(
-                f"{d2}{info_i} Slow authentication: {sa.gap_seconds:.0f}s gap before PASS did not drop the session before reply.",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"{d2}{cross} RISK: Slowloris-style pacing on the control channel may be tolerated.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Slow authentication: {sa.gap_seconds:.0f}s gap before PASS did not drop the session before reply.",
+            "TITLE",
+            indent=8,
+        )
+            self._tprint(
+            f"RISK: Slowloris-style pacing on the control channel may be tolerated.",
+            "VULN",
+            indent=8,
+        )
         elif sa.still_connected_after_pass is False:
-            self.ptprint(
-                f"{d2}{tick} Slow USER→PASS gap {sa.gap_seconds:.0f}s: connection dropped or hard-failed — possible anti-slow-auth policy.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Slow USER→PASS gap {sa.gap_seconds:.0f}s: connection dropped or hard-failed — possible anti-slow-auth policy.",
+            "NOTVULN",
+            indent=8,
+        )
         else:
-            self.ptprint(
-                f"{d2}{info_i} Slow USER→PASS gap {sa.gap_seconds:.0f}s: still_connected_after_pass={sa.still_connected_after_pass}",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Slow USER→PASS gap {sa.gap_seconds:.0f}s: still_connected_after_pass={sa.still_connected_after_pass}",
+            "TITLE",
+            indent=8,
+        )
 
         ipo = cl.idle_post_auth
         if ipo is None:
-            self.ptprint(
-                f"{d2}{info_i} Idle post-login: skipped (no credentials or --conn-limits-idle-post-auth=0)",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Idle post-login: skipped (no credentials or --conn-limits-idle-post-auth=0)",
+            "TITLE",
+            indent=8,
+        )
         elif not ipo.performed:
-            self.ptprint(f"{d2}{info_i} Idle post-login: not probed", Out.TEXT)
+            self._tprint("Idle post-login: not probed", "TITLE", indent=8)
         elif _conn_limits_idle_post_suspect(ipo):
-            self.ptprint(
-                f"{d2}{info_i} Idle post-login ~{ipo.wait_seconds:.0f}s: NOOP still succeeded — weak authenticated idle timeout suspected.",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"{d2}{cross} RISK: Authenticated sessions may linger without timely disconnect.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Idle post-login ~{ipo.wait_seconds:.0f}s: NOOP still succeeded — weak authenticated idle timeout suspected.",
+            "TITLE",
+            indent=8,
+        )
+            self._tprint(
+            f"RISK: Authenticated sessions may linger without timely disconnect.",
+            "VULN",
+            indent=8,
+        )
         elif ipo.kick_observed:
-            self.ptprint(
-                f"{d2}{tick} Idle post-login ~{ipo.wait_seconds:.0f}s: kick observed — {ipo.note[:120]}",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Idle post-login ~{ipo.wait_seconds:.0f}s: kick observed — {ipo.note[:120]}",
+            "NOTVULN",
+            indent=8,
+        )
         else:
-            self.ptprint(
-                f"{d2}{info_i} Idle post-login ~{ipo.wait_seconds:.0f}s: {ipo.note[:120]}",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Idle post-login ~{ipo.wait_seconds:.0f}s: {ipo.note[:120]}",
+            "TITLE",
+            indent=8,
+        )
 
-        self.ptprint(f"{d1}{star} Passive port allocation (PASV spam)", Out.TEXT)
+        self._tprint("Passive port allocation (PASV spam)", "TITLE", indent=4)
         pp = cl.pasv_pre_auth
-        self.ptprint(f"{d2}{star} Phase: Pre-authentication", Out.TEXT)
+        self._tprint("Phase: Pre-authentication", "TITLE", indent=8)
         err_bit = f" | err: {pp.error}" if pp.error else ""
-        self.ptprint(
-            f"{d3}{info_i} 227 (Ready): {pp.reply227} | 530 (Rejected): {pp.reply530} | Other: {pp.reply_other}{err_bit}",
-            Out.TEXT,
+        self._tprint(
+            f"227 (Ready): {pp.reply227} | 530 (Rejected): {pp.reply530} | Other: {pp.reply_other}{err_bit}",
+            "TITLE",
+            indent=12,
         )
         if _conn_limits_pasv_pre_suspect(pp):
-            self.ptprint(
-                f"{d3}{cross} Pre-auth PASV: high 227 rate — passive data ports may be allocated before authentication.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Pre-auth PASV: high 227 rate — passive data ports may be allocated before authentication.",
+            "VULN",
+            indent=12,
+        )
         elif pp.error and pp.reply227 > 0:
-            self.ptprint(
-                f"{d3}{info_i} Result: PASV phase ended with an error after some 227 replies — inconclusive for pre-auth spam.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: PASV phase ended with an error after some 227 replies — inconclusive for pre-auth spam.",
+            "TITLE",
+            indent=12,
+        )
         elif pp.error:
-            self.ptprint(
-                f"{d3}{tick} Result: No pre-login 227 flood observed; session ended early ({pp.error[:100]}).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: No pre-login 227 flood observed; session ended early ({pp.error[:100]}).",
+            "NOTVULN",
+            indent=12,
+        )
         elif pp.reply227 == 0:
-            self.ptprint(
-                f"{d3}{tick} Result: Server rejects or gates PASV before login (no 227 Ready flood in this run).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: Server rejects or gates PASV before login (no 227 Ready flood in this run).",
+            "NOTVULN",
+            indent=12,
+        )
         else:
-            self.ptprint(
-                f"{d3}{info_i} Result: PASV pre-auth replies did not match the high–227 spam heuristic.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: PASV pre-auth replies did not match the high–227 spam heuristic.",
+            "TITLE",
+            indent=12,
+        )
 
         po = cl.pasv_post_auth
         if po is None:
-            self.ptprint(f"{d2}{star} Phase: Post-authentication — skipped (no credentials)", Out.TEXT)
+            self._tprint("Phase: Post-authentication — skipped (no credentials)", "TITLE", indent=8)
         else:
-            self.ptprint(f"{d2}{star} Phase: Post-authentication", Out.TEXT)
+            self._tprint("Phase: Post-authentication", "TITLE", indent=8)
             err_po = f" | err: {po.error}" if po.error else ""
-            self.ptprint(
-                f"{d3}{info_i} 227 (Ready): {po.reply227} | 530 (Rejected): {po.reply530} | Other: {po.reply_other}{err_po}",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"227 (Ready): {po.reply227} | 530 (Rejected): {po.reply530} | Other: {po.reply_other}{err_po}",
+            "TITLE",
+            indent=12,
+        )
             if _conn_limits_pasv_post_suspect(po):
-                self.ptprint(
-                    f"{d3}{cross} Post-auth PASV: high 227 rate on one session — passive allocations may be unbounded "
-                    f"or weakly capped.",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Post-auth PASV: high 227 rate on one session — passive allocations may be unbounded "
+            f"or weakly capped.",
+            "VULN",
+            indent=12,
+        )
             elif po.error:
-                self.ptprint(
-                    f"{d3}{info_i} Result: PASV phase ended with an error — inconclusive for post-auth spam.",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Result: PASV phase ended with an error — inconclusive for post-auth spam.",
+            "TITLE",
+            indent=12,
+        )
             else:
-                self.ptprint(
-                    f"{d3}{info_i} Result: PASV post-auth replies did not match the unbounded-227 heuristic.",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Result: PASV post-auth replies did not match the unbounded-227 heuristic.",
+            "TITLE",
+            indent=12,
+        )
 
-        self.ptprint(f"{d1}{star} Audit summary & heuristics", Out.TEXT)
+        self._tprint("Audit summary & heuristics", "TITLE", indent=4)
         if cl.limits_insufficient_suspected:
-            self.ptprint(
-                f"{d2}{cross} LIMITS_INSUFFICIENT — bounded probes matched patterns associated with weak FTP limits "
-                f"(connections, rate, PASV, and/or idle).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"LIMITS_INSUFFICIENT — bounded probes matched patterns associated with weak FTP limits "
+            f"(connections, rate, PASV, and/or idle).",
+            "VULN",
+            indent=8,
+        )
         else:
-            self.ptprint(
-                f"{d2}{tick} LIMITS_OK — bounded probes did not match insufficient-limit patterns in this run.",
-                Out.TEXT,
-            )
-        self.ptprint(
-            f"{d2}{info_i} Heuristic-only ({cl.parallel.attempted} parallel / {cl.sequential.attempts} sequential); "
+            self._tprint(
+            f"LIMITS_OK — bounded probes did not match insufficient-limit patterns in this run.",
+            "NOTVULN",
+            indent=8,
+        )
+        self._tprint(
+            f"Heuristic-only ({cl.parallel.attempted} parallel / {cl.sequential.attempts} sequential); "
             f"tune --conn-limits-* on a lab target — not a full DoS test; confirm in a controlled, authorized environment.",
-            Out.TEXT,
+            "TITLE",
+            indent=8,
         )
 
     def _print_pasv_port_range_terminal(self, ppr: PasvPortRangeResult) -> None:
         """Structured terminal report for passive port spread audit (aligned with connection limits / SMTP-style nesting)."""
-        fk = get_colored_text
-        d1 = "    "
-        d2 = "        "
-        star = fk("[*]", color="INFO")
-        info_i = fk("[i]", color="INFO")
-        warn_bang = fk("[!]", color="WARNING")
-        tick = fk("[✓]", color="NOTVULN")
-        cross = fk("[✗]", color="VULN")
 
         if self.args.tls:
             crypto_mode = "implicit_tls"
@@ -6599,93 +6835,99 @@ class FTP(BaseModule):
 
         self.ptprint("Passive port range audit", Out.INFO)
 
-        self.ptprint(f"{d1}{star} Port sampling & analysis", Out.TEXT)
-        self.ptprint(
-            f"{d2}{info_i} Setup: samples {len(ppr.probes)} | threshold {ppr.max_span_threshold} | cryptoMode={crypto_mode}",
-            Out.TEXT,
+        self._tprint("Port sampling & analysis", "TITLE", indent=4)
+        self._tprint(
+            f"Setup: samples {len(ppr.probes)} | threshold {ppr.max_span_threshold} | cryptoMode={crypto_mode}",
+            "TITLE",
+            indent=8,
         )
         n_ok = len(ppr.successful_ports)
         n_all = len(ppr.probes)
         if n_ok < n_all:
-            self.ptprint(f"{d2}{info_i} Successful data channels: {n_ok}/{n_all}", Out.TEXT)
+            self._tprint(f"Successful data channels: {n_ok}/{n_all}", "TITLE", indent=8)
 
         ports_csv = ", ".join(str(p) for p in ppr.successful_ports) if ppr.successful_ports else "(none)"
-        self.ptprint(f"{d2}{info_i} Collected ports: {ports_csv}", Out.TEXT)
+        self._tprint(f"Collected ports: {ports_csv}", "TITLE", indent=8)
 
         if ppr.min_port is not None and ppr.max_port is not None and ppr.observed_span is not None:
-            self.ptprint(
-                f"{d2}{info_i} Observed range: {ppr.min_port} - {ppr.max_port} (span: {ppr.observed_span})",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Observed range: {ppr.min_port} - {ppr.max_port} (span: {ppr.observed_span})",
+            "TITLE",
+            indent=8,
+        )
         elif ppr.min_port is not None and ppr.max_port is not None:
-            self.ptprint(
-                f"{d2}{info_i} Observed range: {ppr.min_port} - {ppr.max_port}",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Observed range: {ppr.min_port} - {ppr.max_port}",
+            "TITLE",
+            indent=8,
+        )
         else:
-            self.ptprint(
-                f"{d2}{info_i} Observed range: n/a (insufficient data ports for min/max)",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Observed range: n/a (insufficient data ports for min/max)",
+            "TITLE",
+            indent=8,
+        )
 
         if ppr.inconclusive:
-            self.ptprint(
-                f"{d2}{warn_bang} Result: Inconclusive (need ≥{ppr.min_samples_for_verdict} successful passive LIST samples).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: Inconclusive (need ≥{ppr.min_samples_for_verdict} successful passive LIST samples).",
+            "WARNING",
+            indent=8,
+        )
         elif ppr.wide_passive_range:
-            self.ptprint(
-                f"{d2}{cross} Result: Wide passive range detected (span {ppr.observed_span} > {ppr.max_span_threshold}).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: Wide passive range detected (span {ppr.observed_span} > {ppr.max_span_threshold}).",
+            "VULN",
+            indent=8,
+        )
         else:
-            self.ptprint(
-                f"{d2}{tick} Result: Narrow passive range detected (span {ppr.observed_span} <= {ppr.max_span_threshold}).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: Narrow passive range detected (span {ppr.observed_span} <= {ppr.max_span_threshold}).",
+            "NOTVULN",
+            indent=8,
+        )
 
-        self.ptprint(f"{d1}{star} Audit summary & heuristics", Out.TEXT)
+        self._tprint("Audit summary & heuristics", "TITLE", indent=4)
         if ppr.inconclusive:
-            self.ptprint(f"{d2}{info_i} Status: PASSIVE_RANGE_INCONCLUSIVE", Out.TEXT)
-            self.ptprint(
-                f"{d2}{info_i} Finding: Not enough successful samples to judge passive port spread against threshold.",
-                Out.TEXT,
-            )
-            self.ptprint(f"{d2}{info_i} Note: {ppr.detail}", Out.TEXT)
+            self._tprint("Status: PASSIVE_RANGE_INCONCLUSIVE", "TITLE", indent=8)
+            self._tprint(
+            f"Finding: Not enough successful samples to judge passive port spread against threshold.",
+            "TITLE",
+            indent=8,
+        )
+            self._tprint(f"Note: {ppr.detail}", "TITLE", indent=8)
         elif ppr.wide_passive_range:
-            self.ptprint(f"{d2}{cross} Status: PASSIVE_RANGE_WIDE", Out.TEXT)
-            self.ptprint(
-                f"{d2}{cross} Finding: Wide passive port range detected.",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"{d2}{cross} RISK: Excessive port exposure complicates firewall filtering and increases attack surface.",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"{d2}{info_i} Note: Configure 'pasv_min_port' and 'pasv_max_port' to a smaller range (e.g., 100-200 ports).",
-                Out.TEXT,
-            )
+            self._tprint("Status: PASSIVE_RANGE_WIDE", "VULN", indent=8)
+            self._tprint(
+            f"Finding: Wide passive port range detected.",
+            "VULN",
+            indent=8,
+        )
+            self._tprint(
+            f"RISK: Excessive port exposure complicates firewall filtering and increases attack surface.",
+            "VULN",
+            indent=8,
+        )
+            self._tprint(
+            f"Note: Configure 'pasv_min_port' and 'pasv_max_port' to a smaller range (e.g., 100-200 ports).",
+            "TITLE",
+            indent=8,
+        )
         else:
-            self.ptprint(f"{d2}{tick} Status: PASSIVE_RANGE_OK", Out.TEXT)
-            self.ptprint(
-                f"{d2}{tick} Finding: Server appears to use a restricted passive port range.",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"{d2}{info_i} Note: Observed span ({ppr.observed_span}) is well within the security threshold ({ppr.max_span_threshold}).",
-                Out.TEXT,
-            )
+            self._tprint("Status: PASSIVE_RANGE_OK", "NOTVULN", indent=8)
+            self._tprint(
+            f"Finding: Server appears to use a restricted passive port range.",
+            "NOTVULN",
+            indent=8,
+        )
+            self._tprint(
+            f"Note: Observed span ({ppr.observed_span}) is well within the security threshold ({ppr.max_span_threshold}).",
+            "TITLE",
+            indent=8,
+        )
 
     def _print_chroot_audit_terminal(self, ch: ChrootAuditResult) -> None:
         """Structured user-isolation report (aggregate CWD stats + highlighted breaches; matches pasv/conn-limits style)."""
-        fk = get_colored_text
-        d1 = "    "
-        d2 = "        "
-        star = fk("[*]", color="INFO")
-        info_i = fk("[i]", color="INFO")
-        tick = fk("[✓]", color="NOTVULN")
-        cross = fk("[✗]", color="VULN")
 
         dd = ch.dotdot
         pwd0n = self._chroot_norm_pwd(ch.pwd_initial)
@@ -6697,93 +6939,105 @@ class FTP(BaseModule):
 
         self.ptprint("User isolation audit", Out.INFO)
 
-        self.ptprint(f"{d1}{star} Path traversal & system access probes", Out.TEXT)
-        self.ptprint(f"{d2}{info_i} Login PWD: {ch.pwd_initial!r}", Out.TEXT)
+        self._tprint("Path traversal & system access probes", "TITLE", indent=4)
+        self._tprint(f"Login PWD: {ch.pwd_initial!r}", "TITLE", indent=8)
 
         paths = [r.path for r in ch.cwd_probes]
         n = len(paths)
         preview_n = 5
         paths_preview = ", ".join(paths[:preview_n]) + (", ..." if n > preview_n else "")
-        self.ptprint(f"{d2}{info_i} System paths: {n} tested ({paths_preview})", Out.TEXT)
+        self._tprint(f"System paths: {n} tested ({paths_preview})", "TITLE", indent=8)
 
         allowed_rows = [r for r in ch.cwd_probes if r.success]
         n_ok = len(allowed_rows)
         n_rej = n - n_ok
         allowed_q = ", ".join(repr(r.path) for r in allowed_rows) if allowed_rows else "(none)"
-        self.ptprint(
-            f"{d2}{info_i} Path results: {n_rej}/{n} rejected, {n_ok}/{n} allowed ({allowed_q})",
-            Out.TEXT,
+        self._tprint(
+            f"Path results: {n_rej}/{n} rejected, {n_ok}/{n} allowed ({allowed_q})",
+            "TITLE",
+            indent=8,
         )
 
         for r in ch.cwd_probes:
             if r.success and r.path in self._CHROOT_STRONG_CWD_PATHS:
                 pwd_bit = f" (PWD: {r.pwd_after!r})" if r.pwd_after else ""
-                self.ptprint(
-                    f"{d2}{cross} Critical path accessible: CWD {r.path!r} succeeded{pwd_bit}",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Critical path accessible: CWD {r.path!r} succeeded{pwd_bit}",
+            "VULN",
+            indent=8,
+        )
         if home_sibling:
-            self.ptprint(
-                f"{d2}{cross} Cross-user exposure: CWD '/home' succeeded while login PWD is under '/home/<account>' "
+            self._tprint(
+                "Cross-user exposure: CWD '/home' succeeded while login PWD is under '/home/<account>' "
                 "(possible sibling home access).",
-                Out.TEXT,
+                "VULN",
+                indent=8,
             )
         if ch.dotdot_parent_escape_suspected:
-            self.ptprint(
-                f"{d2}{cross} Directory traversal: '..' chain suggests escape above the post-login directory root.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Directory traversal: '..' chain suggests escape above the post-login directory root.",
+            "VULN",
+            indent=8,
+        )
         if ch.passwd_size_ok:
             sz = ch.passwd_size_bytes
             sz_bit = f" ({sz} bytes)" if sz is not None else ""
-            self.ptprint(f"{d2}{cross} Sensitive file found: SIZE '/etc/passwd'{sz_bit}", Out.TEXT)
+            self._tprint(f"Sensitive file found: SIZE '/etc/passwd'{sz_bit}", "VULN", indent=8)
         if ch.shadow_size_ok:
             sz = ch.shadow_size_bytes
             sz_bit = f" ({sz} bytes)" if sz is not None else ""
-            self.ptprint(f"{d2}{cross} Sensitive file found: SIZE '/etc/shadow'{sz_bit}", Out.TEXT)
+            self._tprint(f"Sensitive file found: SIZE '/etc/shadow'{sz_bit}", "VULN", indent=8)
 
-        self.ptprint(
-            f"{d2}{info_i} Directory traversal: up to {self._CHROOT_DOTDOT_MAX_STEPS} × '..' attempted "
+        self._tprint(
+            f"Directory traversal: up to {self._CHROOT_DOTDOT_MAX_STEPS} × '..' attempted "
             f"({dd.steps_ok} successful step(s); final PWD ~ {dd.pwd_final!r}, {dd.stopped_reason})",
-            Out.TEXT,
+            "TITLE",
+            indent=8,
         )
 
         if ch.isolation_broken_suspected:
-            self.ptprint(
-                f"{d2}{cross} Result: Isolation breach suspected; host paths visible.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: Isolation breach suspected; host paths visible.",
+            "VULN",
+            indent=8,
+        )
         else:
-            self.ptprint(
-                f"{d2}{tick} Result: No host filesystem breakout detected.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: No host filesystem breakout detected.",
+            "NOTVULN",
+            indent=8,
+        )
 
-        self.ptprint(f"{d1}{star} Audit summary & heuristics", Out.TEXT)
+        self._tprint("Audit summary & heuristics", "TITLE", indent=4)
         if ch.isolation_broken_suspected:
-            self.ptprint(f"{d2}{cross} Status: CHROOT_BROKEN_SUSPECTED", Out.TEXT)
-            self.ptprint(
-                f"{d2}{cross} Finding: Insecure configuration; account can access host system paths.",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"{d2}{info_i} Note: {ch.detail}",
-                Out.TEXT,
-            )
+            self._tprint("Status: CHROOT_BROKEN_SUSPECTED", "VULN", indent=8)
+            self._tprint(
+            f"Finding: Insecure configuration; account can access host system paths.",
+            "VULN",
+            indent=8,
+        )
+            self._tprint(
+            f"Note: {ch.detail}",
+            "TITLE",
+            indent=8,
+        )
         else:
-            self.ptprint(f"{d2}{tick} Status: CHROOT_OK", Out.TEXT)
-            self.ptprint(
-                f"{d2}{tick} Finding: Account appears properly isolated within a chroot/jail.",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"{d2}{info_i} Note: No obvious host-level path breakout; chroot may still use a synthetic '/'.",
-                Out.TEXT,
-            )
-            self.ptprint(
-                f"{d2}{info_i} Note: Heuristic check only — confirm manually in critical environments.",
-                Out.TEXT,
-            )
+            self._tprint("Status: CHROOT_OK", "NOTVULN", indent=8)
+            self._tprint(
+            f"Finding: Account appears properly isolated within a chroot/jail.",
+            "NOTVULN",
+            indent=8,
+        )
+            self._tprint(
+            f"Note: No obvious host-level path breakout; chroot may still use a synthetic '/'.",
+            "TITLE",
+            indent=8,
+        )
+            self._tprint(
+            f"Note: Heuristic check only — confirm manually in critical environments.",
+            "TITLE",
+            indent=8,
+        )
 
     def _user_enum_probe_signature(self, r: FtpUserEnumProbeRow) -> tuple[int | None, str]:
         """Comparable (code, normalized text) for USER/PASS outcome (wordlist vs control probes)."""
@@ -6808,14 +7062,6 @@ class FTP(BaseModule):
 
     def _print_user_enum_terminal(self, ue: FtpUserEnumResult) -> None:
         """Structured username enumeration report (aggregate responses + highlighted outliers; RFC 2577)."""
-        fk = get_colored_text
-        d1 = "    "
-        d2 = "        "
-        star = fk("[*]", color="INFO")
-        info_i = fk("[i]", color="INFO")
-        warn_bang = fk("[!]", color="WARNING")
-        tick = fk("[✓]", color="NOTVULN")
-        cross = fk("[✗]", color="VULN")
 
         do_timing = bool(getattr(self.args, "user_enum_timing", False))
         keep_alive = bool(getattr(self.args, "user_enum_keep_alive", False))
@@ -6833,25 +7079,26 @@ class FTP(BaseModule):
 
         self.ptprint("Username enumeration audit (-eu / PTL-SVC-FTP-USRENUM)", Out.INFO)
 
-        self.ptprint(f"{d1}{star} Probe configuration & heuristics", Out.TEXT)
+        self._tprint("Probe configuration & heuristics", "TITLE", indent=4)
         strat = (
             "USER then wrong PASS (timing-aware, RFC 2577)"
             if do_timing
             else "USER then fixed bad PASS (RFC 2577)"
         )
-        self.ptprint(f"{d2}{info_i} Strategy: {strat}", Out.TEXT)
-        self.ptprint(
-            f"{d2}{info_i} Wordlist: {n_word} entries + {n_ctrl} controls | threads: {threads} | mode: {mode}",
-            Out.TEXT,
+        self._tprint(f"Strategy: {strat}", "TITLE", indent=8)
+        self._tprint(
+            f"Wordlist: {n_word} entries + {n_ctrl} controls | threads: {threads} | mode: {mode}",
+            "TITLE",
+            indent=8,
         )
         analysis_bits = "Response codes, fuzzy text matching, sequence behavior"
         if do_timing:
             analysis_bits += ", PASS-phase latency (--user-enum-timing)"
-        self.ptprint(f"{d2}{info_i} Analysis: {analysis_bits}", Out.TEXT)
+        self._tprint(f"Analysis: {analysis_bits}", "TITLE", indent=8)
         if n_err:
-            self.ptprint(f"{d2}{info_i} Probes with errors: {n_err} (see JSON)", Out.TEXT)
+            self._tprint(f"Probes with errors: {n_err} (see JSON)", "TITLE", indent=8)
 
-        self.ptprint(f"{d1}{star} Enumeration findings", Out.TEXT)
+        self._tprint("Enumeration findings", "TITLE", indent=4)
 
         wl_ok = [r for r in ue.probes if r.probe_kind == "wordlist" and r.error is None]
         ctr = collections.Counter()
@@ -6865,366 +7112,398 @@ class FTP(BaseModule):
             dom_code, _norm_dom = dominant_sig
             n_wl = len(wl_ok)
             if len(ctr) == 1:
-                self.ptprint(
-                    f"{d2}{info_i} Response consistency: {n_wl}/{n_wl} wordlist probes share code {dom_code} "
-                    f"with identical normalized message.",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Response consistency: {n_wl}/{n_wl} wordlist probes share code {dom_code} "
+            f"with identical normalized message.",
+            "TITLE",
+            indent=8,
+        )
             else:
                 n_diff = n_wl - dom_count
-                self.ptprint(
-                    f"{d2}{info_i} Response consistency: {dom_count}/{n_wl} wordlist probes share the dominant pattern "
-                    f"(code {dom_code}); {n_diff} differ.",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Response consistency: {dom_count}/{n_wl} wordlist probes share the dominant pattern "
+            f"(code {dom_code}); {n_diff} differ.",
+            "TITLE",
+            indent=8,
+        )
             dom_row = next((r for r in wl_ok if self._user_enum_probe_signature(r) == dominant_sig), None)
             dominant_phrase = self._user_enum_format_probe_reply(dom_row) if dom_row else "n/a"
             for r in wl_ok:
                 if self._user_enum_probe_signature(r) != dominant_sig:
-                    self.ptprint(
-                        f"{d2}{cross} Differentiation: User {r.username!r} returned "
-                        f"{self._user_enum_format_probe_reply(r)!r} instead of {dominant_phrase!r}",
-                        Out.TEXT,
-                    )
+                    self._tprint(
+            f"Differentiation: User {r.username!r} returned "
+            f"{self._user_enum_format_probe_reply(r)!r} instead of {dominant_phrase!r}",
+            "VULN",
+            indent=8,
+        )
         elif n_word:
-            self.ptprint(
-                f"{d2}{info_i} Response consistency: no successful wordlist probes (all had errors).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Response consistency: no successful wordlist probes (all had errors).",
+            "TITLE",
+            indent=8,
+        )
 
         ctrl_ok = [r for r in ue.probes if r.probe_kind.startswith("control") and r.error is None]
         if ctrl_ok and wl_ok and len(ctr) == 1 and dominant_sig is not None and dom_row is not None:
             ctrl_match = sum(1 for r in ctrl_ok if self._user_enum_probe_signature(r) == dominant_sig)
-            self.ptprint(
-                f"{d2}{info_i} Control probes: {ctrl_match}/{len(ctrl_ok)} matched the wordlist response pattern.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Control probes: {ctrl_match}/{len(ctrl_ok)} matched the wordlist response pattern.",
+            "TITLE",
+            indent=8,
+        )
             for r in ctrl_ok:
                 if self._user_enum_probe_signature(r) != dominant_sig:
-                    self.ptprint(
-                        f"{d2}{cross} Differentiation: Control user {r.username!r} returned "
+                    self._tprint(
+                        f"Differentiation: Control user {r.username!r} returned "
                         f"{self._user_enum_format_probe_reply(r)!r} instead of "
                         f"{self._user_enum_format_probe_reply(dom_row)!r}",
-                        Out.TEXT,
+                        "VULN",
+                        indent=8,
                     )
 
         if do_timing:
             if ue.timing_control_median_ms is not None:
-                self.ptprint(
-                    f"{d2}{info_i} Control baseline: median {ue.timing_control_median_ms:.1f} ms "
-                    f"for control usernames (PASS phase, post-warmup cohort where applicable).",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Control baseline: median {ue.timing_control_median_ms:.1f} ms "
+            f"for control usernames (PASS phase, post-warmup cohort where applicable).",
+            "TITLE",
+            indent=8,
+        )
                 if ue.timing_wordlist_median_ms is not None:
-                    self.ptprint(
-                        f"{d2}{info_i} Wordlist cohort median: {ue.timing_wordlist_median_ms:.1f} ms.",
-                        Out.TEXT,
-                    )
+                    self._tprint(
+            f"Wordlist cohort median: {ue.timing_wordlist_median_ms:.1f} ms.",
+            "TITLE",
+            indent=8,
+        )
             else:
-                self.ptprint(
-                    f"{d2}{info_i} Timing: insufficient PASS timings for median comparison "
-                    f"(need ≥2 wordlist and ≥1 control with 331/332).",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Timing: insufficient PASS timings for median comparison "
+            f"(need ≥2 wordlist and ≥1 control with 331/332).",
+            "TITLE",
+            indent=8,
+        )
             if ue.timing_slow_usernames_ms:
                 parts = ", ".join(f"{u!r} ({ms:.1f}ms)" for u, ms in ue.timing_slow_usernames_ms[:12])
                 if len(ue.timing_slow_usernames_ms) > 12:
                     parts += ", …"
-                self.ptprint(
-                    f"{d2}{warn_bang} Timing anomaly (per user vs control threshold): {parts}",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Timing anomaly (per user vs control threshold): {parts}",
+            "WARNING",
+            indent=8,
+        )
             if "timingSuppressedSuspectedTarpitting" in ue.timing_notes:
-                self.ptprint(
-                    f"{d2}{info_i} Timing: cohort comparison suppressed (possible tarpitting / delay policy in keep-alive run).",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Timing: cohort comparison suppressed (possible tarpitting / delay policy in keep-alive run).",
+            "TITLE",
+            indent=8,
+        )
 
         if ue.enumeration_suspected:
-            self.ptprint(
-                f"{d2}{cross} Result: Response differentiation suggests a username enumeration oracle (RFC 2577).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: Response differentiation suggests a username enumeration oracle (RFC 2577).",
+            "VULN",
+            indent=8,
+        )
         elif ue.timing_anomaly_suspected:
-            self.ptprint(
-                f"{d2}{tick} Result: No obvious code/message leakage detected.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: No obvious code/message leakage detected.",
+            "NOTVULN",
+            indent=8,
+        )
         else:
-            self.ptprint(
-                f"{d2}{tick} Result: No differentiation in server responses detected.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Result: No differentiation in server responses detected.",
+            "NOTVULN",
+            indent=8,
+        )
 
-        self.ptprint(f"{d1}{star} Audit summary & heuristics", Out.TEXT)
+        self._tprint("Audit summary & heuristics", "TITLE", indent=4)
         if ue.enumeration_suspected and ue.timing_anomaly_suspected:
-            self.ptprint(f"{d2}{cross} Status: USER_ENUM_SUSPECTED", Out.TEXT)
-            self.ptprint(
-                f"{d2}{cross} Finding: Server responses and/or timing differ in ways that may enable username guessing.",
-                Out.TEXT,
-            )
+            self._tprint("Status: USER_ENUM_SUSPECTED", "VULN", indent=8)
+            self._tprint(
+            f"Finding: Server responses and/or timing differ in ways that may enable username guessing.",
+            "VULN",
+            indent=8,
+        )
         elif ue.enumeration_suspected:
-            self.ptprint(f"{d2}{cross} Status: USER_ENUM_SUSPECTED", Out.TEXT)
-            self.ptprint(
-                f"{d2}{cross} Finding: Server responses appear to differentiate between tested usernames.",
-                Out.TEXT,
-            )
+            self._tprint("Status: USER_ENUM_SUSPECTED", "VULN", indent=8)
+            self._tprint(
+            f"Finding: Server responses appear to differentiate between tested usernames.",
+            "VULN",
+            indent=8,
+        )
         elif ue.timing_anomaly_suspected:
-            self.ptprint(f"{d2}{warn_bang} Status: USER_ENUM_SUSPECTED (via timing)", Out.TEXT)
-            self.ptprint(
-                f"{d2}{cross} Finding: Server timing differs significantly for certain usernames.",
-                Out.TEXT,
-            )
+            self._tprint("Status: USER_ENUM_SUSPECTED (via timing)", "WARNING", indent=8)
+            self._tprint(
+            f"Finding: Server timing differs significantly for certain usernames.",
+            "VULN",
+            indent=8,
+        )
         else:
-            self.ptprint(f"{d2}{tick} Status: USER_ENUM_OK", Out.TEXT)
-            self.ptprint(
-                f"{d2}{tick} Finding: Server responses appear consistent for all tested usernames.",
-                Out.TEXT,
-            )
+            self._tprint("Status: USER_ENUM_OK", "NOTVULN", indent=8)
+            self._tprint(
+            f"Finding: Server responses appear consistent for all tested usernames.",
+            "NOTVULN",
+            indent=8,
+        )
 
         codes_s = ", ".join(str(c) for c in ue.distinct_user_reply_codes) if ue.distinct_user_reply_codes else "n/a"
         if not ue.enumeration_suspected and not ue.timing_anomaly_suspected:
             if wl_ok and len(ctr) == 1 and dominant_sig is not None:
                 dc = dominant_sig[0]
-                self.ptprint(
-                    f"{d2}{info_i} Note: Response codes ({codes_s}) and messages were uniform across "
-                    f"{len(wl_ok)} wordlist probes (terminal code {dc}).",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Note: Response codes ({codes_s}) and messages were uniform across "
+            f"{len(wl_ok)} wordlist probes (terminal code {dc}).",
+            "TITLE",
+            indent=8,
+        )
             elif wl_ok:
-                self.ptprint(
-                    f"{d2}{info_i} Note: USER-stage code set: {codes_s}; see differentiation lines and JSON.",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Note: USER-stage code set: {codes_s}; see differentiation lines and JSON.",
+            "TITLE",
+            indent=8,
+        )
 
         if not do_timing:
-            self.ptprint(
-                f"{d2}{info_i} Note: Timing analysis was skipped (use --user-enum-timing for latency audit).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Note: Timing analysis was skipped (use --user-enum-timing for latency audit).",
+            "TITLE",
+            indent=8,
+        )
         elif ue.timing_control_median_ms is not None and ue.timing_slow_usernames_ms:
             slow = ue.timing_slow_usernames_ms[0]
-            self.ptprint(
-                f"{d2}{info_i} Note: Control median was {ue.timing_control_median_ms:.1f} ms; "
-                f"example slow candidate {slow[0]!r} took {slow[1]:.1f} ms.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Note: Control median was {ue.timing_control_median_ms:.1f} ms; "
+            f"example slow candidate {slow[0]!r} took {slow[1]:.1f} ms.",
+            "TITLE",
+            indent=8,
+        )
         elif do_timing and ue.timing_control_median_ms is not None and not ue.timing_anomaly_suspected:
-            self.ptprint(
-                f"{d2}{info_i} Note: PASS-phase medians within expected range for this sample (no timing flag).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Note: PASS-phase medians within expected range for this sample (no timing flag).",
+            "TITLE",
+            indent=8,
+        )
 
         if ue.enumeration_suspected or ue.timing_anomaly_suspected:
-            self.ptprint(f"{d2}{info_i} Note: {ue.detail}", Out.TEXT)
+            self._tprint(f"Note: {ue.detail}", "TITLE", indent=8)
 
     def _print_ftp_dos_audit_terminal(self, da: FtpDosAuditResult) -> None:
-        fk = get_colored_text
-        d1 = "    "
-        d2 = "        "
-        plus = fk("[+]", color="NOTVULN")
-        star = fk("[*]", color="INFO")
-        info_i = fk("[i]", color="INFO")
-        tick = fk("[✓]", color="NOTVULN")
-        cross = fk("[✗]", color="VULN")
-        warn_bang = fk("[!]", color="WARNING")
 
-        self.ptprint(f"{plus} FTP Processing Resilience (DoS Probes)", Out.INFO)
-        self.ptprint(f"{d1}{star} Methodology & Safety", Out.TEXT)
-        self.ptprint(
-            f"{d2}{info_i} Targets: XML Entity Expansion & Decompression Bombs.",
-            Out.TEXT,
+        self.ptprint("FTP Processing Resilience (DoS Probes)", Out.INFO)
+        self._tprint("Methodology & Safety", "TITLE", indent=4)
+        self._tprint(
+            f"Targets: XML Entity Expansion & Decompression Bombs.",
+            "TITLE",
+            indent=8,
         )
-        self.ptprint(
-            f"{d2}{info_i} Goal: Detect if backend processing (AV/Indexer) delays or stalls after file storage.",
-            Out.TEXT,
+        self._tprint(
+            f"Goal: Detect if backend processing (AV/Indexer) delays or stalls after file storage.",
+            "TITLE",
+            indent=8,
         )
-        self.ptprint(
-            f"{d2}{info_i} ZIP payload mode: {da.zip_mode} (--ftp-dos-force-large swaps minimal → full bomb).",
-            Out.TEXT,
+        self._tprint(
+            f"ZIP payload mode: {da.zip_mode} (--ftp-dos-force-large swaps minimal → full bomb).",
+            "TITLE",
+            indent=8,
         )
         if da.zip_mode == "full":
-            self.ptprint(
-                f"{d2}{warn_bang} Large zip bomb mode ENABLED — isolate the target; heavy expansion if extracted server-side.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Large zip bomb mode ENABLED — isolate the target; heavy expansion if extracted server-side.",
+            "WARNING",
+            indent=8,
+        )
 
         for r in da.probes:
-            self.ptprint(f"{d1}{star} Probe: {r.probe_label}", Out.TEXT)
+            self._tprint(f"Probe: {r.probe_label}", "TITLE", indent=4)
             if r.timed_out:
-                self.ptprint(
-                    f"{d2}{cross} STOR did not finish within socket timeout "
-                    f"({da.timeout_seconds}s) — control or data hung (high risk synchronous scanner).",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"STOR did not finish within socket timeout "
+            f"({da.timeout_seconds}s) — control or data hung (high risk synchronous scanner).",
+            "VULN",
+            indent=8,
+        )
                 continue
             if not r.stor_ok:
                 if r.blocked_by_policy:
-                    self.ptprint(
-                        f"{d2}{tick} STOR denied / rejected (protection signal): "
-                        f"{r.stor_error or r.stor_reply_snippet or 'n/a'}",
-                        Out.TEXT,
-                    )
+                    self._tprint(
+            f"STOR denied / rejected (protection signal): "
+            f"{r.stor_error or r.stor_reply_snippet or 'n/a'}",
+            "NOTVULN",
+            indent=8,
+        )
                 else:
-                    self.ptprint(
-                        f"{d2}{cross} STOR failed: {r.stor_error or 'unknown'}",
-                        Out.TEXT,
-                    )
+                    self._tprint(
+            f"STOR failed: {r.stor_error or 'unknown'}",
+            "VULN",
+            indent=8,
+        )
                 continue
 
-            stor_show = warn_bang if r.background_processing_suspected else tick
             line_m = r.stor_reply_snippet or "226 Transfer complete"
-            self.ptprint(
-                f"{d2}{stor_show} STOR command accepted ({line_m})",
-                Out.TEXT,
+            self._tprint(
+                f"STOR command accepted ({line_m})",
+                "WARNING" if r.background_processing_suspected else "NOTVULN",
+                indent=8,
             )
 
             if r.total_transfer_seconds is not None:
                 tot = r.total_transfer_seconds
                 speed = "Normal" if tot < 5.0 else "Slow"
-                self.ptprint(
-                    f"{d2}{info_i} Transfer time: {tot:.2f}s ({speed})",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Transfer time: {tot:.2f}s ({speed})",
+            "TITLE",
+            indent=8,
+        )
             if r.delta_last_byte_to_226_seconds is not None:
                 d226 = r.delta_last_byte_to_226_seconds
-                self.ptprint(
-                    f"{d2}{info_i} Control reply delay after last byte: {d226:.2f}s",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Control reply delay after last byte: {d226:.2f}s",
+            "TITLE",
+            indent=8,
+        )
                 if d226 >= FTP_DOS_DELTA_WARN_SEC:
-                    self.ptprint(
-                        f"{d2}{warn_bang} Warning: server response delayed by {d226:.1f}s after upload "
-                        f"(possible background parsing / decompression).",
-                        Out.TEXT,
-                    )
+                    self._tprint(
+            f"Warning: server response delayed by {d226:.1f}s after upload "
+            f"(possible background parsing / decompression).",
+            "WARNING",
+            indent=8,
+        )
 
             if r.noop_ok is True:
-                self.ptprint(
-                    f"{d2}{info_i} Post-transfer stability: Server responding (OK)",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Post-transfer stability: Server responding (OK)",
+            "TITLE",
+            indent=8,
+        )
             elif r.noop_ok is False:
-                self.ptprint(
-                    f"{d2}{warn_bang} Post-transfer stability: control channel unhealthy after STOR "
-                    f"({r.noop_error or 'NOOP/PWD failed'})",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"Post-transfer stability: control channel unhealthy after STOR "
+            f"({r.noop_error or 'NOOP/PWD failed'})",
+            "WARNING",
+            indent=8,
+        )
 
             if r.delete_ok:
-                self.ptprint(f"{d2}{tick} DELE cleanup attempted: OK", Out.TEXT)
+                self._tprint("DELE cleanup attempted: OK", "NOTVULN", indent=8)
             elif r.delete_error:
-                self.ptprint(f"{d2}{info_i} DELE: {r.delete_error}", Out.TEXT)
+                self._tprint(f"DELE: {r.delete_error}", "TITLE", indent=8)
 
-        self.ptprint(f"{d1}{star} Summary", Out.TEXT)
+        self._tprint("Summary", "TITLE", indent=4)
         any_accepted = any(p.stor_ok and not p.blocked_by_policy for p in da.probes)
         if da.all_blocked_by_policy:
-            self.ptprint(
-                f"{d2}{tick} Uploads rejected by policy — positive signal if denials map to content/type inspection.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Uploads rejected by policy — positive signal if denials map to content/type inspection.",
+            "NOTVULN",
+            indent=8,
+        )
         elif da.post_processing_dos_suspected:
-            self.ptprint(
-                f"{d2}{warn_bang} Delay, timeout, or post-STOR instability observed — treat as post-processing DoS risk "
-                f"if AV/EDR or indexers touch uploads asynchronously.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Delay, timeout, or post-STOR instability observed — treat as post-processing DoS risk "
+            f"if AV/EDR or indexers touch uploads asynchronously.",
+            "WARNING",
+            indent=8,
+        )
         elif any_accepted:
-            self.ptprint(
-                f"{d2}{info_i} Files accepted without obvious delay in this black-box view; "
-                f"still monitor CPU/RAM/disk for asynchronous backend work.",
-                Out.TEXT,
-            )
-        self.ptprint(f"{d2}{info_i} {da.detail}", Out.TEXT)
+            self._tprint(
+            f"Files accepted without obvious delay in this black-box view; "
+            f"still monitor CPU/RAM/disk for asynchronous backend work.",
+            "TITLE",
+            indent=8,
+        )
+        self._tprint(f"{da.detail}", "TITLE", indent=8)
 
     def _print_eicar_audit_terminal(self, ea: FtpEicarAuditResult) -> None:
-        fk = get_colored_text
-        d1 = "    "
-        d2 = "        "
-        star = fk("[*]", color="INFO")
-        info_i = fk("[i]", color="INFO")
-        tick = fk("[✓]", color="NOTVULN")
-        cross = fk("[✗]", color="VULN")
-        warn = fk("[!]", color="WARNING")
 
         self.ptprint("Antivirus probe (EICAR)", Out.INFO)
-        self.ptprint(f"{d1}{star} Setup & methodology", Out.TEXT)
-        self.ptprint(
-            f"{d2}{info_i} Post-STOR delay before SIZE/RETR: {ea.post_stor_delay_seconds}s "
+        self._tprint("Setup & methodology", "TITLE", indent=4)
+        self._tprint(
+            f"Post-STOR delay before SIZE/RETR: {ea.post_stor_delay_seconds}s "
             f"(allows on-access scanners to react after transfer complete).",
-            Out.TEXT,
+            "TITLE",
+            indent=8,
         )
-        self.ptprint(
-            f"{d2}{info_i} Default filename uses .com (classic EICAR); if upload succeeds unchanged, "
+        self._tprint(
+            f"Default filename uses .com (classic EICAR); if upload succeeds unchanged, "
             f"policy may still be extension-driven — interpret with care.",
-            Out.TEXT,
+            "TITLE",
+            indent=8,
         )
 
         for i, r in enumerate(ea.rows, 1):
-            self.ptprint(f"{d1}{star} Account {i}: {r.creds.user!r}", Out.TEXT)
-            self.ptprint(f"{d2}{info_i} Credentials: {r.creds.user!r} / {r.creds.passw!r}", Out.TEXT)
+            self._tprint(f"Account {i}: {r.creds.user!r}", "TITLE", indent=4)
+            self._tprint(f"Credentials: {r.creds.user!r} / {r.creds.passw!r}", "TITLE", indent=8)
             if not r.stor_ok:
-                self.ptprint(f"{d2}{cross} STOR failed: {r.stor_error or 'unknown'}", Out.TEXT)
+                self._tprint(f"STOR failed: {r.stor_error or 'unknown'}", "VULN", indent=8)
                 continue
-            self.ptprint(f"{d2}{tick} STOR completed: {r.remote_path}", Out.TEXT)
+            self._tprint(f"STOR completed: {r.remote_path}", "NOTVULN", indent=8)
             if r.size_error:
                 su = self._eicar_size_unsupported(r.size_error)
                 hint = " (SIZE unsupported — relied on RETR)" if su else ""
-                self.ptprint(
-                    f"{d2}{info_i} SIZE: "
-                    f"{r.size_bytes if r.size_bytes is not None else 'n/a'} — {r.size_error}{hint}",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"SIZE: "
+            f"{r.size_bytes if r.size_bytes is not None else 'n/a'} — {r.size_error}{hint}",
+            "TITLE",
+            indent=8,
+        )
             elif r.size_bytes is not None:
-                self.ptprint(
-                    f"{d2}{info_i} SIZE: {r.size_bytes} bytes (expected {len(EICAR_STANDARD_TEST_FILE)})",
-                    Out.TEXT,
-                )
+                self._tprint(
+            f"SIZE: {r.size_bytes} bytes (expected {len(EICAR_STANDARD_TEST_FILE)})",
+            "TITLE",
+            indent=8,
+        )
 
             if r.retr_ok:
-                icon = tick if r.retr_payload_match else cross
-                self.ptprint(
-                    f"{d2}{icon} RETR payload matches EICAR: {r.retr_payload_match}",
-                    Out.TEXT,
+                self._tprint(
+                    f"RETR payload matches EICAR: {r.retr_payload_match}",
+                    "NOTVULN" if r.retr_payload_match else "VULN",
+                    indent=8,
                 )
             elif r.retr_error:
                 missing = self._eicar_reply_suggests_missing(r.retr_error)
-                icon = warn if missing else cross
                 tag = " — file likely gone (on-access AV?)" if missing else ""
-                self.ptprint(f"{d2}{icon} RETR failed: {r.retr_error}{tag}", Out.TEXT)
-
-            if r.vanished_after_stor_suspected:
-                self.ptprint(
-                    f"{d2}{warn} Signal: file missing or altered after STOR + delay — "
-                    f"hints at on-access scanning or quarantine.",
-                    Out.TEXT,
+                self._tprint(
+                    f"RETR failed: {r.retr_error}{tag}",
+                    "WARNING" if missing else "VULN",
+                    indent=8,
                 )
 
-            if r.delete_ok:
-                self.ptprint(f"{d2}{tick} DELE cleanup succeeded.", Out.TEXT)
-            elif r.delete_note:
-                self.ptprint(f"{d2}{info_i} DELE: {r.delete_note}", Out.TEXT)
-            elif r.delete_error:
-                self.ptprint(f"{d2}{warn} DELE failed: {r.delete_error}", Out.TEXT)
+            if r.vanished_after_stor_suspected:
+                self._tprint(
+            f"Signal: file missing or altered after STOR + delay — "
+            f"hints at on-access scanning or quarantine.",
+            "WARNING",
+            indent=8,
+        )
 
-        self.ptprint(f"{d1}{star} Summary", Out.TEXT)
-        self.ptprint(f"{d2}{info_i} {ea.detail}", Out.TEXT)
+            if r.delete_ok:
+                self._tprint("DELE cleanup succeeded.", "NOTVULN", indent=8)
+            elif r.delete_note:
+                self._tprint(f"DELE: {r.delete_note}", "TITLE", indent=8)
+            elif r.delete_error:
+                self._tprint(f"DELE failed: {r.delete_error}", "WARNING", indent=8)
+
+        self._tprint("Summary", "TITLE", indent=4)
+        self._tprint(f"{ea.detail}", "TITLE", indent=8)
         if ea.risky_content_reachable:
-            self.ptprint(
-                f"{d2}{cross} Verdict: EICAR stayed retrievable after the delay — no on-access removal "
-                f"observed on this path (policy / AV gap possible).",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Verdict: EICAR stayed retrievable after the delay — no on-access removal "
+            f"observed on this path (policy / AV gap possible).",
+            "VULN",
+            indent=8,
+        )
         elif ea.upload_blocked_all:
-            self.ptprint(
-                f"{d2}{tick} Verdict: STOR failed for every tested account.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Verdict: STOR failed for every tested account.",
+            "NOTVULN",
+            indent=8,
+        )
         else:
-            self.ptprint(
-                f"{d2}{tick} Verdict: No account left unchanged EICAR downloadable after the window.",
-                Out.TEXT,
-            )
+            self._tprint(
+            f"Verdict: No account left unchanged EICAR downloadable after the window.",
+            "NOTVULN",
+            indent=8,
+        )
 
     # region output
 
@@ -7239,20 +7518,10 @@ class FTP(BaseModule):
         }
         deferred_vulns = []
 
-        # Connection error: use unified error format (status=error, empty nodes)
         if (info_error := getattr(self.results, "info_error", None)) is not None:
             if self.use_json:
                 self.ptjsonlib.end_error(info_error, self.use_json)
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} {info_error}", Out.TEXT)
-            properties.update({"infoError": info_error})
-            ftp_node = self.ptjsonlib.create_node_object("software", None, None, properties)
-            self.ptjsonlib.add_node(ftp_node)
-            node_key = ftp_node["key"]
-            for v in deferred_vulns:
-                self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
-            self.ptjsonlib.set_status("finished", "")
-            self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+            ptprinthelper.ptprint(info_error, bullet_type="VULN", condition=not self.use_json, indent=4)
             return
 
         # Banner (skip terminal if streamed; always add to properties for JSON)
@@ -7271,48 +7540,20 @@ class FTP(BaseModule):
                 if sid.version is not None:
                     deferred_vulns.append({"vuln_code": "PTV-SVC-BANNER"})
                 properties.update({"cpe": sid.cpe})
-            if not self.use_json and not self._streamed_banner:
-                self.ptprint("Banner", Out.INFO)
-                if sid is None:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                elif sid.version is not None:
-                    icon = get_colored_text("[✗]", color="VULN")
-                else:
-                    icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(f"    {icon} {info.banner}", Out.TEXT)
-                if sid is not None:
-                    self.ptprint("Service Identification", Out.INFO)
-                    self.ptprint(f"    Product:  {sid.product}", Out.TEXT)
-                    self.ptprint(
-                        f"    Version:  {sid.version if sid.version else 'unknown'}",
-                        Out.TEXT,
-                    )
-                    self.ptprint(f"    CPE:      {sid.cpe}", Out.TEXT)
-
-        # HELP, SYST and STAT commands (separate section)
         if self.results.commands_requested:
-            if (info := self.results.info) and (info.help_response is not None or info.syst is not None or info.stat is not None):
+            if (info := self.results.info) and (
+                info.help_response is not None or info.syst is not None or info.stat is not None
+            ):
                 if info.help_response is not None:
-                    self.ptprint("HELP command", Out.INFO)
-                    for line in info.help_response.splitlines():
-                        self.ptprint(f"    {line}", Out.TEXT)
                     properties.update({"helpCommand": info.help_response})
                 if info.syst is not None:
-                    self.ptprint("SYST command", Out.INFO)
-                    self.ptprint(f"    {info.syst}")
                     properties.update({"systCommand": info.syst})
                 if info.stat is not None:
-                    self.ptprint("STAT command", Out.INFO)
-                    self.ptprint(f"    {info.stat}")
                     properties.update({"statCommand": info.stat})
 
         # Encryption (skip terminal if streamed; always add to properties for JSON)
         if (encryption_error := self.results.encryption_error) is not None:
             properties.update({"encryptionError": encryption_error})
-            if not self.use_json and not self._streamed_encryption:
-                self.ptprint("Encryption", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Encryption test failed: {encryption_error}", Out.TEXT)
         elif (enc := self.results.encryption) is not None:
             properties.update(
                 {
@@ -7323,57 +7564,12 @@ class FTP(BaseModule):
                     }
                 }
             )
-            if not self.use_json and not self._streamed_encryption:
-                self.ptprint("Encryption", Out.INFO)
-                plaintext_only = enc.plaintext_ok and not enc.auth_tls_ok and not enc.tls_ok
-                any_ok = enc.plaintext_ok or enc.auth_tls_ok or enc.tls_ok
-                if plaintext_only:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(f"    {icon} Plaintext only", Out.TEXT)
-                elif any_ok:
-                    if enc.plaintext_ok:
-                        icon = (
-                            get_colored_text("[!]", color="WARNING")
-                            if (enc.auth_tls_ok or enc.tls_ok)
-                            else get_colored_text("[✓]", color="NOTVULN")
-                        )
-                        self.ptprint(f"    {icon} Plaintext", Out.TEXT)
-                    if enc.auth_tls_ok:
-                        icon = get_colored_text("[✓]", color="NOTVULN")
-                        self.ptprint(f"    {icon} AUTH TLS", Out.TEXT)
-                    if enc.tls_ok:
-                        icon = get_colored_text("[✓]", color="NOTVULN")
-                        self.ptprint(f"    {icon} Implicit TLS", Out.TEXT)
-                else:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(
-                        f"    {icon} No connection mode available (plaintext, AUTH TLS, implicit TLS failed)",
-                        Out.TEXT,
-                    )
-
         # Anonymous authentication and access permissions (skip terminal if streamed)
         if (anonymous_error := self.results.anonymous_error) is not None:
             properties.update({"anonymousError": anonymous_error})
-            if not self.use_json and not self._streamed_anonymous:
-                self.ptprint("Anonymous authentication", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Anonymous test failed: {anonymous_error}", Out.TEXT)
         elif (access_error := self.results.access_error) is not None:
             properties.update({"accessError": access_error})
-            if not self.use_json and not self._streamed_anonymous:
-                self.ptprint("Anonymous authentication", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} Anonymous authentication is enabled", Out.TEXT)
-                self.ptprint(f"    {icon} Access check failed: {access_error}", Out.TEXT)
         elif (anon := self.results.anonymous) is not None:
-            if not self.use_json and not self._streamed_anonymous:
-                self.ptprint("Anonymous authentication", Out.INFO)
-                if anon:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(f"    {icon} Anonymous authentication is enabled", Out.TEXT)
-                else:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} Anonymous authentication is disabled", Out.TEXT)
             if anon:
                 response_str = ""
                 if (access := self.results.access) is not None:
@@ -7386,16 +7582,10 @@ class FTP(BaseModule):
                                 + f"Read: {anon_p.read}, "
                                 + f"Delete: {anon_p.delete})"
                             )
-                            if not self.use_json and not self._streamed_anonymous:
-                                self.ptprint(f"    {response_str}", Out.TEXT)
                         except StopIteration:
                             pass
                     else:
                         response_str = "Encountered errors during access enumeration:"
-                        if not self.use_json and not self._streamed_anonymous:
-                            self.ptprint(f"    {response_str}", Out.ERROR)
-                            for e in access.errors or []:
-                                self.ptprint(f"        {e}", Out.ERROR)
                         if access.errors:
                             response_str += "\n" + "\n".join(access.errors)
 
@@ -7410,32 +7600,14 @@ class FTP(BaseModule):
         # --access without working anonymous: access_check still ran but UI above skipped (anonymous unset or False)
         if (
             self.args.access
-            and not self._streamed_access
             and (access := self.results.access) is not None
             and access.errors
             and self.results.anonymous is not True
         ):
             properties.update({"accessCheckErrors": list(access.errors)})
-            if not self.use_json:
-                self.ptprint("Access check", Out.INFO)
-                warn = get_colored_text("[!]", color="WARNING")
-                for e in access.errors:
-                    self.ptprint(f"    {warn} {e}", Out.TEXT)
-                self.ptprint(
-                    f"    {warn} Use --anonymous (-A), or -u USER -p PASS, or wordlists (-U/-P).",
-                    Out.TEXT,
-                )
 
         # Bruteforced credentials and their access permissions (skip terminal if streamed)
         if (creds := self.results.creds) is not None:
-            if not self.use_json and not self._streamed_brute and len(creds) > 0:
-                login_label = (
-                    "FTP login (known account)"
-                    if self._ftp_is_single_known_login() and len(creds) == 1
-                    else "Login bruteforce"
-                )
-                self.ptprint(f"{login_label}: {len(creds)} valid credentials", Out.INFO)
-
             if len(creds) > 0:
                 json_lines: list[str] = []
                 for cred in creds:
@@ -7455,19 +7627,14 @@ class FTP(BaseModule):
                                 perm_str = ""
                         else:
                             perm_str = " Encountered errors during access enumeration:"
-                            if not self.use_json and not self._streamed_brute:
-                                self.ptprint(f"    {perm_str}", Out.ERROR)
                             for e in access.errors or []:
-                                if not self.use_json and not self._streamed_brute:
-                                    self.ptprint(f"        {e}", Out.ERROR)
+                                pass
                                 perm_str += f"\n{e}"
                     else:
                         perm_str = ""
 
-                    show_perm_terminal = perm_str if not self._streamed_access else ""
+                    show_perm_terminal = ""
 
-                    if not self.use_json and not self._streamed_brute:
-                        self.ptprint(f"    {cred_str + show_perm_terminal}", Out.TEXT)
                     json_lines.append(cred_str + perm_str)
 
                 if self.args.user is not None:
@@ -7496,22 +7663,14 @@ class FTP(BaseModule):
         ):
             try:
                 p = next(p for p in access.results if p.dirlist is not None and len(p.dirlist) > 0)
-                self.ptprint("Directory listing", Out.INFO)
-
                 out_str = "\n".join(p.dirlist)
-                self.ptprint(f"    {out_str}")
                 properties.update({"directoryListing": out_str})
             except StopIteration:
-                self.ptprint("Directory listing failed (no access or empty listing)", Out.INFO)
                 properties.update({"directoryListing": "no access or empty"})
 
         # Path enumeration (dictionary attack results)
         if path_enum_error := getattr(self.results, "path_enum_error", None):
             properties.update({"pathEnumError": path_enum_error})
-            if not self.use_json:
-                self.ptprint("Path enumeration", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {path_enum_error}", Out.TEXT)
         elif (path_list := getattr(self.results, "path_enum", None)) is not None:
             path_enum_json = [
                 {
@@ -7523,50 +7682,19 @@ class FTP(BaseModule):
                 for p in path_list
             ]
             properties.update({"pathEnum": path_enum_json})
-            if not self.use_json and len(path_list) > 0:
-                self.ptprint("Path enumeration", Out.INFO)
-                self.ptprint(f"    Found {len(path_list)} path(s)", Out.TEXT)
-                for p in path_list:
-                    kind = "dir" if p.is_directory else "file"
-                    size_str = f" ({p.size} B)" if p.size is not None else ""
-                    self.ptprint(f"    [{kind}] {p.path}{size_str}", Out.TEXT)
 
         # Data mode (passive/active)
         if modes_error := getattr(self.results, "modes_error", None):
             properties.update({"dataModesError": modes_error})
-            if not self.use_json:
-                self.ptprint("Data mode", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {modes_error}", Out.TEXT)
         elif (modes := getattr(self.results, "modes", None)) is not None:
             modes_json: dict = {"passive": modes.passive_ok, "active": modes.active_ok}
             if modes.pasv_ip_leak:
                 modes_json["pasvIpLeak"] = modes.pasv_ip_leak
             properties.update({"dataModes": modes_json})
-            if not self.use_json:
-                self.ptprint("Data mode", Out.INFO)
-                icon_p = get_colored_text("[✓]", color="NOTVULN") if modes.passive_ok else get_colored_text("[✗]", color="VULN")
-                icon_a = get_colored_text("[✓]", color="NOTVULN") if modes.active_ok else get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon_p} Passive: {'available' if modes.passive_ok else 'not available'}", Out.TEXT)
-                self.ptprint(f"    {icon_a} Active: {'available' if modes.active_ok else 'not available'}", Out.TEXT)
-                if not modes.active_ok:
-                    warn_icon = get_colored_text("[!]", color="WARNING")
-                    self.ptprint(
-                        f"    {warn_icon} If active failed: tester may be behind NAT/firewall, not necessarily server error. "
-                        "For 100% objective result, tester needs public IP and no local firewall.",
-                        Out.TEXT,
-                    )
-                if modes.pasv_ip_leak:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(f"    {icon} PASV Internal IP Leak: server advertised {modes.pasv_ip_leak}", Out.TEXT)
 
         # Passive data port spread (PTL-SVC-FTP-PASIVE)
         if ppr_err := getattr(self.results, "pasv_port_range_error", None):
             properties.update({"ftpPasvPortRangeError": ppr_err})
-            if not self.use_json:
-                self.ptprint("Passive port range audit", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {ppr_err}", Out.TEXT)
         elif (ppr := getattr(self.results, "pasv_port_range", None)) is not None:
             ppr_json = {
                 "sampleCount": len(ppr.probes),
@@ -7590,8 +7718,6 @@ class FTP(BaseModule):
                 ],
             }
             properties.update({"ftpPasvPortRange": ppr_json})
-            if not self.use_json:
-                self._print_pasv_port_range_terminal(ppr)
             if ppr.wide_passive_range and not ppr.inconclusive:
                 deferred_vulns.append(
                     {
@@ -7604,10 +7730,6 @@ class FTP(BaseModule):
         # Connection limits audit (PTL-SVC-FTP-CONN)
         if cl_err := getattr(self.results, "conn_limits_error", None):
             properties.update({"ftpConnLimitsError": cl_err})
-            if not self.use_json:
-                self.ptprint("Connection limits audit", Out.INFO)
-                ii = get_colored_text("[i]", color="INFO")
-                self.ptprint(f"    {ii} Audit failed: {cl_err}", Out.TEXT)
         elif (cl := getattr(self.results, "conn_limits", None)) is not None:
             pp = cl.pasv_pre_auth
             po = cl.pasv_post_auth
@@ -7670,8 +7792,6 @@ class FTP(BaseModule):
                 "detail": cl.detail,
             }
             properties.update({"ftpConnLimitsAudit": cl_json})
-            if not self.use_json:
-                self._print_conn_limits_audit_terminal(cl)
             if cl.limits_insufficient_suspected:
                 deferred_vulns.append(
                     {
@@ -7684,10 +7804,6 @@ class FTP(BaseModule):
         # Chroot / user isolation audit (PTL-SVC-FTP-CHROOT)
         if ch_err := getattr(self.results, "chroot_audit_error", None):
             properties.update({"ftpChrootAuditError": ch_err})
-            if not self.use_json:
-                self.ptprint("User isolation audit", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {ch_err}", Out.TEXT)
         elif (ch := getattr(self.results, "chroot_audit", None)) is not None:
             dd = ch.dotdot
             ch_json = {
@@ -7719,8 +7835,6 @@ class FTP(BaseModule):
                 "shadowSizeBytes": ch.shadow_size_bytes,
             }
             properties.update({"ftpChrootAudit": ch_json})
-            if not self.use_json:
-                self._print_chroot_audit_terminal(ch)
             if ch.isolation_broken_suspected:
                 deferred_vulns.append(
                     {
@@ -7733,10 +7847,6 @@ class FTP(BaseModule):
         # Active mode policy audit (PTL-SVC-FTP-ACTIVE)
         if active_audit_error := getattr(self.results, "active_audit_error", None):
             properties.update({"activeAuditError": active_audit_error})
-            if not self.use_json:
-                self.ptprint("Active mode policy", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {active_audit_error}", Out.TEXT)
         elif (aa := getattr(self.results, "active_audit", None)) is not None:
             doc_net_ip = "192.0.2.1"
             steps_json = [
@@ -7764,8 +7874,6 @@ class FTP(BaseModule):
             if aa.low_ports_accepted:
                 audit_props["lowPortsAccepted"] = list(aa.low_ports_accepted)
             properties.update({"activeAudit": audit_props})
-            if not self.use_json:
-                self._print_active_audit_terminal(aa)
 
             if aa.foreign_ip_accepted or aa.low_port_accepted:
                 parts = []
@@ -7792,10 +7900,6 @@ class FTP(BaseModule):
         # Command surface audit (PTL-SVC-FTP-CMD)
         if cmd_audit_error := getattr(self.results, "cmd_audit_error", None):
             properties.update({"ftpCommandAuditError": cmd_audit_error})
-            if not self.use_json:
-                self.ptprint("Command surface audit", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {cmd_audit_error}", Out.TEXT)
         elif (ca := getattr(self.results, "cmd_audit", None)) is not None:
             audit_json = {
                 "helpPreAuth": ca.help_pre_auth,
@@ -7813,8 +7917,6 @@ class FTP(BaseModule):
                 "responseTruncated": ca.response_truncated,
             }
             properties.update({"ftpCommandAudit": audit_json})
-            if not self.use_json:
-                self._print_cmd_audit_terminal(ca)
             vuln_risks = [r for r in ca.matched_risks if r.tier in ("critical", "high")]
             if vuln_risks:
                 parts = [f"{r.tier}: {r.token} ({r.source})" for r in vuln_risks]
@@ -7833,10 +7935,6 @@ class FTP(BaseModule):
         # Active SITE probes (--cmd-audit-active)
         if cmd_audit_active_error := getattr(self.results, "cmd_audit_active_error", None):
             properties.update({"ftpCommandAuditActiveError": cmd_audit_active_error})
-            if not self.use_json:
-                self.ptprint("Command surface audit (active SITE probes)", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {cmd_audit_active_error}", Out.TEXT)
         elif (caa := getattr(self.results, "cmd_audit_active", None)) is not None:
             active_json = {
                 "probeTimeoutSeconds": caa.probe_timeout_seconds,
@@ -7858,39 +7956,10 @@ class FTP(BaseModule):
                 ],
             }
             properties.update({"ftpCommandAuditActive": active_json})
-            if not self.use_json:
-                self.ptprint("Command surface audit (active SITE probes)", Out.INFO)
-                if caa.setup_error:
-                    self.ptprint(f"    [✗] Setup failed: {caa.setup_error}", Out.TEXT)
-                else:
-                    if caa.probe_file:
-                        self.ptprint(f"    Probe file (cleaned up): {caa.probe_file}", Out.TEXT)
-                    ok_icon = get_colored_text("[✓]", color="NOTVULN")
-                    bad_icon = get_colored_text("[!]", color="WARNING")
-                    self.ptprint(
-                        f"    {ok_icon if caa.cleanup_ok else bad_icon} Cleanup (DELE): "
-                        + ("ok" if caa.cleanup_ok else (caa.cleanup_error or "failed")),
-                        Out.TEXT,
-                    )
-                    for p in caa.probes:
-                        code_s = str(p.reply_code) if p.reply_code is not None else "—"
-                        self.ptprint(
-                            f"    [{p.probe_id}] {p.command_sent!r} → {code_s} | {p.classification}"
-                            + (f" | passive_advertised={p.advertised_in_passive_audit}" if p.advertised_in_passive_audit else ""),
-                            Out.TEXT,
-                        )
-                        if p.reply_line and p.error is None:
-                            self.ptprint(f"        {p.reply_line[:200]}{'…' if len(p.reply_line) > 200 else ''}", Out.TEXT)
-                        if p.error:
-                            self.ptprint(f"        error: {p.error}", Out.TEXT)
 
         # Invalid / non-standard command audit (PTL-SVC-FTP-INVCOMM)
         if inv_err := getattr(self.results, "invalid_cmd_audit_error", None):
             properties.update({"ftpInvalidCommandAuditError": inv_err})
-            if not self.use_json:
-                self.ptprint("Invalid command resilience (raw socket)", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {inv_err}", Out.TEXT)
         elif (inv := getattr(self.results, "invalid_cmd_audit", None)) is not None:
             def _inv_session_to_json(sess: InvalidCmdSessionResult | None) -> dict | None:
                 if sess is None:
@@ -7942,8 +8011,6 @@ class FTP(BaseModule):
                 "postAuth": _inv_session_to_json(inv.post_auth),
             }
             properties.update({"ftpInvalidCommandAudit": inv_json})
-            if not self.use_json:
-                self._print_invalid_cmd_audit_terminal(inv)
             if inv.overall_resilience_rating == "Vulnerable":
                 vuln_extra = ""
                 if _inv_null_byte_critical(inv):
@@ -7982,10 +8049,6 @@ class FTP(BaseModule):
         # Username enumeration (PTL-SVC-FTP-USRENUM)
         if ue_err := getattr(self.results, "user_enum_error", None):
             properties.update({"ftpUserEnumerationError": ue_err})
-            if not self.use_json:
-                self.ptprint("Username enumeration audit (-eu / PTL-SVC-FTP-USRENUM)", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {ue_err}", Out.TEXT)
         elif (ue := getattr(self.results, "user_enum", None)) is not None:
             ue_json = {
                 "fixedPasswordMarker": ue.fixed_password_marker,
@@ -8017,8 +8080,6 @@ class FTP(BaseModule):
                 ],
             }
             properties.update({"ftpUserEnumeration": ue_json})
-            if not self.use_json:
-                self._print_user_enum_terminal(ue)
             if ue.enumeration_suspected or ue.timing_anomaly_suspected:
                 deferred_vulns.append(
                     {
@@ -8034,10 +8095,6 @@ class FTP(BaseModule):
         # EICAR / on-access antivirus probe (PTL-SVC-FTP-ANTIVIRUS)
         if ea_err := getattr(self.results, "eicar_audit_error", None):
             properties.update({"ftpEicarError": ea_err})
-            if not self.use_json:
-                self.ptprint("Antivirus probe (EICAR)", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {ea_err}", Out.TEXT)
         elif (ea := getattr(self.results, "eicar_audit", None)) is not None:
             ea_json = {
                 "postStorDelaySeconds": ea.post_stor_delay_seconds,
@@ -8066,8 +8123,6 @@ class FTP(BaseModule):
                 ],
             }
             properties.update({"ftpEicar": ea_json})
-            if not self.use_json:
-                self._print_eicar_audit_terminal(ea)
             if ea.risky_content_reachable:
                 deferred_vulns.append(
                     {
@@ -8084,10 +8139,6 @@ class FTP(BaseModule):
         # FTP processing resilience / STOR timing (PTL-SVC-FTP-PROC-DOS)
         if d_err := getattr(self.results, "dos_audit_error", None):
             properties.update({"ftpProcessingResilienceError": d_err})
-            if not self.use_json:
-                self.ptprint("FTP Processing Resilience (DoS Probes)", Out.INFO)
-                icon = get_colored_text("[✗]", color="VULN")
-                self.ptprint(f"    {icon} {d_err}", Out.TEXT)
         elif (dos := getattr(self.results, "dos_audit", None)) is not None:
             dos_json = {
                 "timeoutSeconds": dos.timeout_seconds,
@@ -8120,8 +8171,6 @@ class FTP(BaseModule):
                 ],
             }
             properties.update({"ftpProcessingResilience": dos_json})
-            if not self.use_json:
-                self._print_ftp_dos_audit_terminal(dos)
             if dos.post_processing_dos_suspected:
                 deferred_vulns.append(
                     {
@@ -8140,19 +8189,8 @@ class FTP(BaseModule):
         # Bounce attack
         if bounce := self.results.bounce:
             if (creds := bounce.used_creds) is None:
-                self.ptprint(f"Bounce attack failed (no valid credentials)", Out.INFO)
                 properties.update({"bounceStatus": "no valid credentials"})
             else:
-                self.ptprint("Bounce attack", Out.INFO)
-                self.ptprint(f"    Creds used: {creds.user}:{creds.passw}", Out.INFO)
-
-                if bounce.bounce_accepted:
-                    icon = get_colored_text("[✗]", color="VULN")
-                    self.ptprint(f"    {icon} Bounce is allowed", Out.TEXT)
-                else:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"    {icon} Bounce is denied", Out.TEXT)
-
                 if not bounce.bounce_accepted:
                     properties.update({"bounceStatus": "rejected"})
                 else:
@@ -8160,7 +8198,6 @@ class FTP(BaseModule):
 
                     if (r := bounce.request) is None:
                         out_str = f"Target port reachable: {bounce.port_accessible}"
-                        self.ptprint(f"        {out_str}", Out.INFO)
                         deferred_vulns.append(
                             {
                                 "vuln_code": VULNS.Bounce.value,
@@ -8171,15 +8208,10 @@ class FTP(BaseModule):
                     else:
                         res = f"Yes ({r.ftpserver_filepath})" if r.stored else "No"
                         stored_str = "Stored on FTP server: " + res
-                        self.ptprint(f"        {stored_str}", Out.INFO)
-
                         res = "Yes" if r.uploaded else "No"
                         sent_str = "Sent to bounce target: " + res
-                        self.ptprint(f"        {sent_str}", Out.INFO)
-
                         res = "Yes" if r.cleaned else "No"
                         clean_str = "Cleaned up: " + res
-                        self.ptprint(f"        {clean_str}", Out.INFO)
 
                         deferred_vulns.append(
                             {

@@ -78,16 +78,21 @@ _SMTP_HELP_PATTERNS: Final[list[tuple[re.Pattern[str], str, bool]]] = [
     (re.compile(r"\bPostfix\b", re.I), "Postfix", False),
     (re.compile(r"This\s+server\s+supports\s+the\s+following\s+commands", re.I), "Microsoft Exchange Server", False),
     (re.compile(r"Exim\s+(\d+\.\d+)", re.I), "Exim", True),
+    (re.compile(r"\bExim\b", re.I), "Exim", False),
 ]
 
 # Error syntax: (regex, product) - for "User unknown" style messages
 _SMTP_ERROR_SYNTAX: Final[list[tuple[re.Pattern[str], str]]] = [
     (re.compile(r"\.\.\.\s+User\s+unknown", re.I), "Sendmail"),  # three dots
-    (re.compile(r"\.\.\.\s+User\s+unknown", re.I), "Sendmail"),
+    (re.compile(r"Recipient\s+address\s+rejected", re.I), "Postfix"),
     (re.compile(r":\s*Recipient\s+address\s+rejected", re.I), "Postfix"),  # colon
+    (re.compile(r"User\s+unknown\s+in\s+", re.I), "Postfix"),
     (re.compile(r"command\s+not\s+recognized", re.I), "Postfix"),  # 502 5.5.2
-    (re.compile(r"Command\s+unrecognized", re.I), "Sendmail"),  # 500 5.5.1
     (re.compile(r"5\.5\.2\s+Error", re.I), "Postfix"),
+    (re.compile(r"[Uu]nrecogni[sz]ed address", re.I), "Exim"),
+    (re.compile(r"[Uu]nrecogni[sz]ed recipient", re.I), "Exim"),
+    (re.compile(r"unknown\s+user", re.I), "Exim"),
+    (re.compile(r"Command\s+unrecognized", re.I), "Sendmail"),  # 500 5.5.1
     (re.compile(r"5\.5\.1\s+Command", re.I), "Sendmail"),
     (re.compile(r"5\.3\.3\s+Unrecognized", re.I), "Microsoft Exchange Server"),
 ]
@@ -828,6 +833,9 @@ def _identify_from_ehlo(
     for keywords, order_prefix, product, cpe in _SMTP_EHLO_FINGERPRINTS:
         matched_keywords = keywords & ext_set
         if not matched_keywords:
+            continue
+        # CHUNKING alone matches Postfix/MailStore/Exchange — require a co-occurring keyword.
+        if product == "Postfix" and matched_keywords == {"CHUNKING"}:
             continue
         points = WEIGHT_EHLO_KEYWORDS
         if order_prefix and order_tuple and order_tuple[: len(order_prefix)] == order_prefix:

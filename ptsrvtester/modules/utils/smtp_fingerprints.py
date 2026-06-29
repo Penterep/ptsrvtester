@@ -1333,7 +1333,7 @@ def identify_smtp_server(
                 lacks_str = f"; lacks {', '.join(beh_missing[:3])}" if beh_missing else ""
                 beh_detail = f"{sample}{lacks_str}"
                 break
-        # If no suitable fallback (shoda < 35 %), ponechat původní beh_product – uživatel vždy vidí EHLO analýzu
+        # If no suitable fallback (match < 35%), keep the original beh_product — EHLO analysis is always shown
     # Variant B: when os_hint suggests Cisco/network appliance (TTL 255) and Enterprise Cloud Gateway match is weak,
     # prefer Network-Appliance profile (avoids wrong attribution for Chinese/appliance servers)
     if (

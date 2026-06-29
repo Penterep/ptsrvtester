@@ -1172,6 +1172,7 @@ class AntivirusResult(NamedTuple):
     partial_protection: bool
     categories: tuple[AntivirusCategoryResult, ...]
     elapsed_sec: float
+    auth_used: bool
     detail: str | None
 
 
@@ -1193,6 +1194,7 @@ class SsrfResult(NamedTuple):
     canary_url: str
     variants: tuple[SsrfVariantResult, ...]
     elapsed_sec: float
+    auth_used: bool
     detail: str | None
     verification_instructions: str
 
@@ -1215,6 +1217,7 @@ class ZipxxeResult(NamedTuple):
     canary_url: str
     variants: tuple[ZipxxeVariantResult, ...]
     elapsed_sec: float
+    auth_used: bool
     detail: str | None
     verification_instructions: str
     all_rejected_at_rcpt: bool
@@ -1297,6 +1300,7 @@ class FloodResult(NamedTuple):
     smtp_trace: tuple[str, ...]
     queue_attempts: int
     flood_notes: tuple[str, ...]
+    auth_used: bool
     detail: str | None
 
 
@@ -1320,6 +1324,7 @@ class BombResult(NamedTuple):
     per_message_delivered: tuple[bool, ...]  # one entry per completed attempt, in message order (1..sent)
     aborted_on_smtp_500: bool
     abort_at_message: int | None
+    auth_used: bool
     detail: str | None
 
 
@@ -1571,7 +1576,7 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-c", "--commands", "", "Grab EHLO (alias for -A, different JSON)"],
                 ["-A", "--authentications", "", "Grab EHLO (alias for -c, different JSON)"],
                 ["-af", "--auth-format", "", "AUTH LOGIN identity shape probe (username vs e-mail vs NetBIOS)"],
-                ["-ae", "--auth-enum", "", "AUTH enumeration: 2 synthetic baselines + -u/-U or default_logins"],
+                ["-ae", "--auth-enum", "", "AUTH enumeration: 2 synthetic baselines per advertised LOGIN / PLAIN / NTLM"],
                 ["-ad", "--auth-downgrade", "", "Test AUTH downgrade after failed authentication"],
                 ["-he", "--helo-validation", "", "Test HELO/EHLO hostname validation"],
                 ["-iv", "--invalid-commands", "", "Test invalid/non-standard SMTP commands"],
@@ -1612,7 +1617,7 @@ class SMTPArgs(ArgsWithBruteforce):
                 ["-U", "--users", "<wordlist>", "Username file: bruteforce with -p/-P; also names for -e, -ae, -rl"],
                 ["-p", "--password", "<password>", "Single password for bruteforce"],
                 ["-P", "--passwords", "<wordlist>", "File with passwords"],
-                ["-br", "--bounce-replay", "", "Bounce/backscatter test; requires -m (MAIL FROM) and -r (RCPT TO); optional -u/-p for AUTH before probes (587/submission)"],
+                ["-br", "--bounce-replay", "", "Bounce/backscatter test; requires -m (MAIL FROM) and -r (RCPT TO)"],
                 ["-sh", "--spoof-headers", "", "Test header spoofing (From, Reply-To, Return-Path); requires -r"],
                 ["", "--spoofhdr-variants", "<v1,v2,...>", "Variants: from,reply_to,return_path (default: all)"],
                 ["", "--spoofhdr-timeout", "<sec>", "Timeout per message for Spoof headers test (default: 30)"],
@@ -1740,7 +1745,7 @@ class SMTPArgs(ArgsWithBruteforce):
             action="store_true",
             help=(
                 "AUTH user enumeration: test each advertised LOGIN / PLAIN / NTLM; "
-                "2 synthetic invalid baselines plus -u/-U or built-in default_logins when no names are given"
+                "2 synthetic invalid baselines per method"
             ),
         )
         direct.add_argument(
@@ -1832,7 +1837,7 @@ class SMTPArgs(ArgsWithBruteforce):
             dest="bounce_replay",
             help=(
                 "Bounce/backscatter test; requires -m (controlled MAIL FROM) and -r (RCPT TO); "
-                "two probes on one connection; optional -u/-p (or first line of -U/-P) for AUTH before probes"
+                "two probes on one connection"
             ),
         )
         direct.add_argument(
@@ -1840,7 +1845,7 @@ class SMTPArgs(ArgsWithBruteforce):
             "--spoof-headers",
             action="store_true",
             dest="spoof_headers",
-            help="Test header spoofing (From, Reply-To, Return-Path); -r recipient (required); -m envelope (MAIL FROM); -u/-p for port 587",
+            help="Test header spoofing (From, Reply-To, Return-Path); -r recipient (required); -m envelope (MAIL FROM)",
         )
         direct.add_argument(
             "--spoofhdr-variants",
@@ -1865,7 +1870,7 @@ class SMTPArgs(ArgsWithBruteforce):
             metavar="<emails>",
             dest="bcc_test",
             default=None,
-            help="BCC disclosure test; BCC emails comma-separated; -r and --cc required; -m envelope; -u/-p for port 587",
+            help="BCC disclosure test; BCC emails comma-separated; -r and --cc required; -m envelope",
         )
         direct.add_argument(
             "--bcc-timeout",
@@ -1880,7 +1885,7 @@ class SMTPArgs(ArgsWithBruteforce):
             "--alias-test",
             action="store_true",
             dest="alias_test",
-            help="Alias & addressing bypass; -r required; -m envelope; -u/-p for port 587",
+            help="Alias & addressing bypass; -r required; -m envelope",
         )
         direct.add_argument(
             "--alias-variants",
@@ -2078,7 +2083,7 @@ class SMTPArgs(ArgsWithBruteforce):
 
         stress = parser.add_argument_group(
             "BOMB / ANTIVIRUS / SSRF / FLOOD / ZIPXXE",
-            "Stress and content tests; combine flags (order: BOMB → ANTIVIRUS → SSRF → FLOOD → ZIPXXE)",
+            "Stress and content tests; combine flags (order: BOMB → ANTIVIRUS → SSRF → FLOOD → ZIPXXE).",
         )
         stress.add_argument(
             "-bomb",
@@ -12055,6 +12060,7 @@ class SMTP(BaseModule):
         self._bomb_rt_outcomes = outcomes
         self._bomb_rt_count = bomb_count
         self._mail_bomb_live_progress_completed = False
+        auth_used_ref = [False]
         if not self.use_json:
             self._bomb_progress_line_rt()
 
@@ -12128,6 +12134,12 @@ class SMTP(BaseModule):
                 ehlo_s, _ = smtp.docmd("EHLO", self.fqdn or "bomb-test.local")
                 if ehlo_s == 500:
                     return ("fatal_500", 500, "")
+                used_auth, auth_err = self._mail_test_auth_login(smtp, smtp_trace)
+                if auth_err:
+                    return ("blocked", auth_err, "auth_failed")
+                if used_auth:
+                    with lock:
+                        auth_used_ref[0] = True
                 mail_s, _ = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
                 if mail_s == 500:
                     return ("fatal_500", 500, "")
@@ -12327,6 +12339,7 @@ class SMTP(BaseModule):
             per_message_delivered=per_message_delivered,
             aborted_on_smtp_500=aborted_500,
             abort_at_message=abort_at_ref[0],
+            auth_used=auth_used_ref[0],
             detail=bomb_detail,
         )
 
@@ -12373,6 +12386,7 @@ class SMTP(BaseModule):
         from_hdr = f'"{from_name}" <{mail_from}>' if from_name else f"<{mail_from}>"
         recipients = [rcpt] + cc_list
         start_time = time.perf_counter()
+        auth_used = False
         cat_results: list[AntivirusCategoryResult] = []
         # Categories where accepted > 0 yields VULNERABLE: evasion, recursive decompression,
         # encoded content (AV must decode before scan), HTML/XSS, XXE, malformed MIME
@@ -12406,8 +12420,7 @@ class SMTP(BaseModule):
             _av_debug_vv(line)
 
         def _connect_av() -> tuple[smtplib.SMTP | smtplib.SMTP_SSL | None, str]:
-            """Connect to SMTP. No AUTH – suitable for port 25 (MTA). For port 587 (Submission),
-            AUTH is typically required; future enhancement could add -u/-p support."""
+            """Connect to SMTP. Optional AUTH LOGIN after EHLO when -u/-p (or -U/-P) are set."""
             try:
                 if use_tls:
                     try:
@@ -12580,6 +12593,22 @@ class SMTP(BaseModule):
                     _av_trace_append(smtp_trace, f"--- {mf.name} ---")
                     ehlo_status, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "av-test.local")
                     _av_trace_append(smtp_trace, f"EHLO: {_av_smtp_reply(ehlo_status, ehlo_reply)}")
+                    used_auth, auth_err = self._mail_test_auth_login(
+                        smtp,
+                        smtp_trace,
+                        trace_append=lambda line: _av_trace_append(smtp_trace, line),
+                    )
+                    if auth_err:
+                        err_count += 1
+                        _av_fail_line(smtp_trace, f"{mf.name}: {auth_err}")
+                        msg_summaries.append(_av_msg_summary(mf.name, None, "error"))
+                        try:
+                            smtp.quit()
+                        except Exception:
+                            pass
+                        continue
+                    if used_auth:
+                        auth_used = True
                     mail_status, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
                     _av_trace_append(smtp_trace, f"MAIL FROM: {_av_smtp_reply(mail_status, mail_reply)}")
                     if mail_status not in (250, 251):
@@ -12693,6 +12722,7 @@ class SMTP(BaseModule):
             partial_protection=partial_protection,
             categories=tuple(cat_results),
             elapsed_sec=elapsed,
+            auth_used=auth_used,
             detail=detail,
         )
 
@@ -13131,6 +13161,24 @@ class SMTP(BaseModule):
             else (detail or "0 accepted, 1 rejected, 0 error")
         )
         self._mail_test_live_done("bcc disclosure", bcc_row_detail)
+        if message_accepted:
+            to_cc = [to_addr] + cc_addrs
+            to_cc_str = ", ".join(to_cc[:2]) if to_cc else "To/Cc"
+            bcc_example = bcc_addrs[0] if bcc_addrs else "Bcc"
+            self._mail_test_stream_probe_verdict(
+                accepted=True,
+                sent_msg=(
+                    f"Mail was sent — log in to {to_cc_str} (To/Cc), open Message Source, "
+                    f"and search for 'Bcc' or '{bcc_example}'"
+                ),
+                follow_up=(
+                    f"1. Log in to {to_cc_str} (To/Cc).",
+                    '2. View "Message Source" / "Original Header".',
+                    f'3. SEARCH for the string "Bcc" or "{bcc_example}".',
+                    "If NOT FOUND: SECURE (Server correctly stripped BCC).",
+                    "If FOUND: VULNERABLE (BCC disclosure).",
+                ),
+            )
 
         return BccTestResult(
             message_accepted=message_accepted,
@@ -13409,6 +13457,7 @@ class SMTP(BaseModule):
         from_hdr = f'"{from_name}" <{mail_from}>' if from_name else f"<{mail_from}>"
         recipients = [rcpt] + cc_list
         start_time = time.perf_counter()
+        auth_used = False
         var_results: list[SsrfVariantResult] = []
         VERIFICATION_INSTRUCTIONS = (
             "Monitor your canary URL for 2–5 minutes. If HTTP/HTTPS request arrives from MTA IP, verdict is VULNERABLE (SSRF)."
@@ -13567,39 +13616,46 @@ class SMTP(BaseModule):
                 try:
                     ehlo_st, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "ssrf-test.local")
                     self._mail_test_trace_append(smtp_trace, f"EHLO: {self._smtp_trace_reply(ehlo_st, ehlo_reply)}")
-                    mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                    self._mail_test_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
-                    if mail_st not in (250, 251):
-                        rejected = 1
-                        sent = 1
-                    else:
-                        status, reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
-                        self._mail_test_trace_append(
-                            smtp_trace,
-                            f"RCPT TO <{rcpt}>: {self._smtp_trace_reply(status, reply)}",
-                        )
-                        if status not in (250, 251):
+                    used_auth, auth_err = self._mail_test_auth_login(smtp, smtp_trace)
+                    if auth_err:
+                        err_count = 1
+                        self._mail_test_trace_append(smtp_trace, auth_err)
+                    elif used_auth:
+                        auth_used = True
+                    if not auth_err:
+                        mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
+                        self._mail_test_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                        if mail_st not in (250, 251):
                             rejected = 1
                             sent = 1
                         else:
-                            for c in cc_list:
-                                s, cc_reply = smtp.docmd("RCPT", f"TO:<{c}>")
-                                self._mail_test_trace_append(
-                                    smtp_trace,
-                                    f"RCPT TO <{c}>: {self._smtp_trace_reply(s, cc_reply)}",
-                                )
-                                if s not in (250, 251):
-                                    break
-                            data_status, data_reply = smtp.data(raw_msg)
-                            sent = 1
+                            status, reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
                             self._mail_test_trace_append(
                                 smtp_trace,
-                                f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                                f"RCPT TO <{rcpt}>: {self._smtp_trace_reply(status, reply)}",
                             )
-                            if data_status == 250:
-                                accepted = 1
-                            else:
+                            if status not in (250, 251):
                                 rejected = 1
+                                sent = 1
+                            else:
+                                for c in cc_list:
+                                    s, cc_reply = smtp.docmd("RCPT", f"TO:<{c}>")
+                                    self._mail_test_trace_append(
+                                        smtp_trace,
+                                        f"RCPT TO <{c}>: {self._smtp_trace_reply(s, cc_reply)}",
+                                    )
+                                    if s not in (250, 251):
+                                        break
+                                data_status, data_reply = smtp.data(raw_msg)
+                                sent = 1
+                                self._mail_test_trace_append(
+                                    smtp_trace,
+                                    f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                                )
+                                if data_status == 250:
+                                    accepted = 1
+                                else:
+                                    rejected = 1
                     try:
                         smtp.quit()
                     except Exception:
@@ -13638,6 +13694,14 @@ class SMTP(BaseModule):
                 )
             )
             self._mail_test_live_done(var_name, detail)
+            if accepted:
+                self._mail_test_stream_probe_verdict(
+                    accepted=True,
+                    sent_msg=(
+                        f"Mail was sent ({var_name}) — monitor canary URL for 2–5 minutes "
+                        f"for HTTP/HTTPS callbacks from the MTA"
+                    ),
+                )
 
         if incl_internal:
             for internal_url, label in [
@@ -13714,6 +13778,14 @@ class SMTP(BaseModule):
                     )
                 )
                 self._mail_test_live_done(label, int_detail)
+                if accepted:
+                    self._mail_test_stream_probe_verdict(
+                        accepted=True,
+                        sent_msg=(
+                            f"Mail was sent ({label}) — monitor canary URL for 2–5 minutes "
+                            f"for HTTP/HTTPS callbacks from the MTA"
+                        ),
+                    )
 
         elapsed = time.perf_counter() - start_time
         total_accepted = sum(v.accepted for v in var_results)
@@ -13726,6 +13798,7 @@ class SMTP(BaseModule):
             canary_url=canary_url,
             variants=tuple(var_results),
             elapsed_sec=elapsed,
+            auth_used=auth_used,
             detail=detail,
             verification_instructions=VERIFICATION_INSTRUCTIONS,
         )
@@ -13747,6 +13820,7 @@ class SMTP(BaseModule):
         skip_size_test = getattr(self.args, "flood_skip_size_test", False)
         start_time = time.perf_counter()
         smtp_trace: list[str] = []
+        auth_used = False
         _ssl_ctx = ssl._create_unverified_context()
         use_tls = self.args.tls or port == 465
         use_starttls = self.args.starttls and not use_tls
@@ -13803,12 +13877,29 @@ class SMTP(BaseModule):
                 smtp_trace=("connection failed: " + conn_err,),
                 queue_attempts=0,
                 flood_notes=(),
+                auth_used=False,
                 detail=f"Connection failed: {conn_err}",
             )
 
         try:
             _, ehlo_raw = smtp.ehlo(self.fqdn or "flood-test.local")
             ehlo_str = ehlo_raw.decode(errors="replace") if isinstance(ehlo_raw, bytes) else str(ehlo_raw or "")
+            used_auth, auth_err = self._mail_test_auth_login(smtp, smtp_trace)
+            if auth_err:
+                elapsed = time.perf_counter() - start_time
+                return FloodResult(
+                    vulnerable=False, indeterminate=True, partial_protection=False,
+                    size_advertised=False, size_limit_bytes=None, size_enforced=None,
+                    messages_sent=0, messages_accepted=0, messages_rejected=0,
+                    first_rejection_at=None, tarpitting_detected=False, elapsed_sec=elapsed,
+                    smtp_trace=tuple(smtp_trace),
+                    queue_attempts=0,
+                    flood_notes=(),
+                    auth_used=False,
+                    detail=auth_err,
+                )
+            if used_auth:
+                auth_used = True
             size_limit_bytes = _parse_size_from_ehlo(ehlo_str)
         except Exception:
             ehlo_str = ""
@@ -13863,6 +13954,7 @@ class SMTP(BaseModule):
                 smtp_trace=tuple(smtp_trace),
                 queue_attempts=0,
                 flood_notes=no_size_notes,
+                auth_used=auth_used,
                 detail=f"SIZE {'advertised' if size_advertised else 'not advertised'}; "
                       f"{'enforced' if size_enforced else 'not enforced'}. No -r, QUEUE_STRESS skipped.",
             )
@@ -13896,6 +13988,18 @@ class SMTP(BaseModule):
                 break
             try:
                 smtp2.docmd("EHLO", self.fqdn or "flood-test.local")
+                used_auth, auth_err = self._mail_test_auth_login(smtp2, smtp_trace)
+                if auth_err:
+                    rejected += 1
+                    if first_rejection_at is None:
+                        first_rejection_at = idx + 1
+                    try:
+                        smtp2.quit()
+                    except Exception:
+                        pass
+                    continue
+                if used_auth:
+                    auth_used = True
                 smtp2.docmd("MAIL", f"FROM:<{mail_from}>")
                 smtp2.docmd("RCPT", f"TO:<{rcpt}>")
                 t0 = time.perf_counter()
@@ -13997,6 +14101,7 @@ class SMTP(BaseModule):
             elapsed_sec=elapsed, smtp_trace=tuple(smtp_trace),
             queue_attempts=queue_attempts,
             flood_notes=flood_notes,
+            auth_used=auth_used,
             detail="; ".join(detail_parts),
         )
 
@@ -14069,6 +14174,7 @@ class SMTP(BaseModule):
         use_starttls = self.args.starttls and not use_tls
         from_hdr = f'"{from_name}" <{mail_from}>' if from_name else f"<{mail_from}>"
         start_time = time.perf_counter()
+        auth_used = False
         var_results: list[ZipxxeVariantResult] = []
         VERIFICATION_INSTRUCTIONS = (
             "Monitor server CPU, memory, disk, SMTP responsiveness. For XXE variants, check canary for HTTP requests. "
@@ -14197,31 +14303,38 @@ class SMTP(BaseModule):
                         continue
                     ehlo_st, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "zipxxe-test.local")
                     self._mail_test_trace_append(smtp_trace, f"EHLO: {self._smtp_trace_reply(ehlo_st, ehlo_reply)}")
-                    mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                    self._mail_test_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
-                    if mail_st not in (250, 251):
-                        rejected = 1
-                        sent = 1
-                    else:
-                        status, reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
-                        self._mail_test_trace_append(
-                            smtp_trace,
-                            f"RCPT TO <{rcpt}>: {self._smtp_trace_reply(status, reply)}",
-                        )
-                        if status not in (250, 251):
+                    used_auth, auth_err = self._mail_test_auth_login(smtp, smtp_trace)
+                    if auth_err:
+                        err_count = 1
+                        self._mail_test_trace_append(smtp_trace, auth_err)
+                    elif used_auth:
+                        auth_used = True
+                    if not auth_err:
+                        mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
+                        self._mail_test_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                        if mail_st not in (250, 251):
                             rejected = 1
                             sent = 1
                         else:
-                            data_status, data_reply = smtp.data(raw_msg)
-                            sent = 1
+                            status, reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
                             self._mail_test_trace_append(
                                 smtp_trace,
-                                f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                                f"RCPT TO <{rcpt}>: {self._smtp_trace_reply(status, reply)}",
                             )
-                            if data_status == 250:
-                                accepted = 1
-                            else:
+                            if status not in (250, 251):
                                 rejected = 1
+                                sent = 1
+                            else:
+                                data_status, data_reply = smtp.data(raw_msg)
+                                sent = 1
+                                self._mail_test_trace_append(
+                                    smtp_trace,
+                                    f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                                )
+                                if data_status == 250:
+                                    accepted = 1
+                                else:
+                                    rejected = 1
                     try:
                         smtp.quit()
                     except Exception:
@@ -14261,6 +14374,20 @@ class SMTP(BaseModule):
                 )
             )
             self._mail_test_live_done(var_name, detail)
+            if accepted:
+                if canary_url:
+                    zip_sent_msg = (
+                        f"Mail was sent ({var_name}) — monitor server load and canary (XXE) "
+                        f"for 2–5 minutes"
+                    )
+                else:
+                    zip_sent_msg = (
+                        f"Mail was sent ({var_name}) — monitor server load after delivery"
+                    )
+                self._mail_test_stream_probe_verdict(
+                    accepted=True,
+                    sent_msg=zip_sent_msg,
+                )
 
         elapsed = time.perf_counter() - start_time
         total_accepted = sum(v.accepted for v in var_results)
@@ -14287,6 +14414,7 @@ class SMTP(BaseModule):
             canary_url=canary_url or "",
             variants=tuple(var_results),
             elapsed_sec=elapsed,
+            auth_used=auth_used,
             detail=detail,
             verification_instructions=VERIFICATION_INSTRUCTIONS,
             all_rejected_at_rcpt=all_rejected_at_rcpt,
@@ -16136,6 +16264,39 @@ class SMTP(BaseModule):
             else:
                 self.ptdebug(line, Out.TEXT)
 
+    def _mail_test_auth_login(
+        self,
+        smtp,
+        trace: list[str],
+        *,
+        trace_append: Callable[[str], None] | None = None,
+    ) -> tuple[bool, str | None]:
+        """AUTH LOGIN when ``-u``/``-p`` or first line of ``-U``/``-P`` is set (Submission / port 587).
+
+        Returns ``(auth_used, error_detail)``. ``auth_used`` is True on success; ``error_detail`` is set
+        when credentials were provided but login failed; both are false/None when no creds were given.
+        """
+        user, passwd = self._rl_first_creds()
+        if not user or not passwd:
+            return False, None
+
+        def _append(line: str) -> None:
+            if trace_append is not None:
+                trace_append(line)
+            else:
+                self._mail_test_trace_append(trace, line)
+
+        try:
+            smtp.login(user, passwd)
+            _append(f"AUTH LOGIN: OK ({user})")
+            return True, None
+        except smtplib.SMTPAuthenticationError as e:
+            _append(f"AUTH LOGIN: failed ({e})")
+            return False, f"AUTH LOGIN failed for {user}: {e}"
+        except (socket.timeout, smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as e:
+            _append(f"AUTH LOGIN: error ({e})")
+            return False, f"AUTH LOGIN error for {user}: {e}"
+
     def _mail_test_live_done(self, label: str, detail: str) -> None:
         """Per-variant/category progress line during test when -vv (same as -av)."""
         if not self.use_json and self.args.debug:
@@ -16146,6 +16307,28 @@ class SMTP(BaseModule):
                 condition=True,
                 indent=4,
             )
+
+    def _mail_test_stream_probe_verdict(
+        self,
+        *,
+        accepted: bool,
+        indeterminate: bool = False,
+        detail: str | None = None,
+        sent_msg: str,
+        follow_up: tuple[str, ...] = (),
+    ) -> None:
+        """Live [✓]/[!] mail verdict during -vv (same lines as non-debug streamer)."""
+        if self.use_json or not self.args.debug:
+            return
+        self._pp_mail_probe_line(
+            ptprinthelper.ptprint,
+            True,
+            accepted=accepted,
+            indeterminate=indeterminate,
+            detail=detail,
+            sent_msg=sent_msg,
+            follow_up=follow_up,
+        )
 
     def _br_stream_probe_section_title(self, title: str) -> None:
         """Probe subsection heading for -br (live under -vv, same indent as streamer)."""
@@ -18069,6 +18252,7 @@ class SMTP(BaseModule):
                     "perMessageDelivered": list(getattr(mb, "per_message_delivered", ()) or ()),
                     "abortedOnSmtp500": getattr(mb, "aborted_on_smtp_500", False),
                     "abortAtMessage": getattr(mb, "abort_at_message", None),
+                    "authUsed": mb.auth_used,
                     "detail": mb.detail,
                 }
             elif (mb_err := self.results.mail_bomb_error) is not None:
@@ -18079,6 +18263,7 @@ class SMTP(BaseModule):
                     "indeterminate": av.indeterminate,
                     "partialProtection": av.partial_protection,
                     "elapsedSec": round(av.elapsed_sec, 2),
+                    "authUsed": av.auth_used,
                     "detail": av.detail,
                     "categories": [
                         {
@@ -18177,6 +18362,7 @@ class SMTP(BaseModule):
                     "tarpittingDetected": fr.tarpitting_detected,
                     "elapsedSec": round(fr.elapsed_sec, 2),
                     "smtpTrace": list(fr.smtp_trace),
+                    "authUsed": fr.auth_used,
                     "detail": fr.detail,
                 }
             elif (flood_err := self.results.flood_error) is not None:
@@ -18683,6 +18869,7 @@ class SMTP(BaseModule):
                 "perMessageDelivered": list(getattr(mb, "per_message_delivered", ()) or ()),
                 "abortedOnSmtp500": getattr(mb, "aborted_on_smtp_500", False),
                 "abortAtMessage": getattr(mb, "abort_at_message", None),
+                "authUsed": mb.auth_used,
                 "detail": mb.detail,
             }
             properties.update({"mailBomb": mb_props})
@@ -18705,6 +18892,7 @@ class SMTP(BaseModule):
                     "indeterminate": av.indeterminate,
                     "partialProtection": av.partial_protection,
                     "elapsedSec": round(av.elapsed_sec, 2),
+                    "authUsed": av.auth_used,
                     "detail": av.detail,
                     "categories": [
                         {
@@ -18739,6 +18927,7 @@ class SMTP(BaseModule):
                     "manualVerificationRequired": sr.manual_verification_required,
                     "canaryUrl": sr.canary_url,
                     "elapsedSec": round(sr.elapsed_sec, 2),
+                    "authUsed": sr.auth_used,
                     "detail": sr.detail,
                     "verificationInstructions": sr.verification_instructions,
                     "variants": [
@@ -18778,6 +18967,7 @@ class SMTP(BaseModule):
                     "tarpittingDetected": fr.tarpitting_detected,
                     "elapsedSec": round(fr.elapsed_sec, 2),
                     "smtpTrace": list(fr.smtp_trace),
+                    "authUsed": fr.auth_used,
                     "detail": fr.detail,
                 }
             })
@@ -18799,6 +18989,7 @@ class SMTP(BaseModule):
                     "manualVerificationRequired": zr.manual_verification_required,
                     "canaryUrl": zr.canary_url or None,
                     "elapsedSec": round(zr.elapsed_sec, 2),
+                    "authUsed": zr.auth_used,
                     "detail": zr.detail,
                     "allRejectedAtRcpt": zr.all_rejected_at_rcpt,
                     "verificationInstructions": zr.verification_instructions,

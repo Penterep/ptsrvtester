@@ -291,11 +291,16 @@ def parse_args() -> BaseArgs:
             elif error_msg and "the following arguments are required:" in error_msg:
                 # "required: target" is misleading when user typed invalid option (e.g. -dfsdfs)
                 # Only flag as invalid if option looks suspicious: -xxx with >2 letters (not -i, -sd)
+                # and is not a registered module option (e.g. -zipxxe, -bomb, -flood).
                 invalid_arg = None
                 if len(sys.argv) >= 3 and sys.argv[1] in MODULES:
+                    subp = subparsers.choices[sys.argv[1]]
+                    known_opts = set()
+                    for a in subp._actions:
+                        known_opts.update(getattr(a, "option_strings", ()))
                     for arg in sys.argv[2:]:
                         if arg.startswith("-") and not arg.startswith("--"):
-                            if len(arg) > 4:
+                            if len(arg) > 4 and arg not in known_opts:
                                 invalid_arg = arg
                                 break
                 if invalid_arg:

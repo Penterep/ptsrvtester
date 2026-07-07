@@ -61,6 +61,7 @@ from .modules.pop3 import POP3
 from .modules.imap import IMAP
 from .modules.dhcp import DHCP
 from .modules.xrdp import XRDP
+from .modules.smb import SMB
 
 SCRIPTNAME = "ptsrvtester"
 
@@ -76,6 +77,7 @@ MODULES = {
     "imap": IMAP,
     "dhcp": DHCP,
     "xrdp": XRDP,
+    "smb": SMB,
 }
 
 
@@ -114,6 +116,7 @@ def get_help():
             ["imap", "<options>", "", "IMAP testing module"],
             ["dhcp", "<options>", "", "DHCP testing module"],
             ["xrdp", "<options>", "", "XRDP testing module"],
+            ["smb", "<options>", "", "SMB testing module"],
             ["", " ", "", ""],
             ["-v", "--version", "", "Show script version and exit"],
             ["-h", "--help", "", "Show this help message and exit"],

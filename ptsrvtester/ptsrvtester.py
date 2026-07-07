@@ -123,6 +123,32 @@ def get_help():
         }]
 
 
+def _extract_test_help(module_args, argv):
+    """Return per-test help object for `-ts <TEST> -h`, or None to fall back to module help."""
+    get_test_help = getattr(module_args, "get_test_help", None)
+    if get_test_help is None:
+        return None
+    codes = None
+    tokens = argv[2:]
+    for i, tok in enumerate(tokens):
+        if tok in ("-ts", "--tests"):
+            if i + 1 < len(tokens):
+                codes = tokens[i + 1]
+            break
+        if tok.startswith("-ts="):
+            codes = tok[len("-ts="):]
+            break
+        if tok.startswith("--tests="):
+            codes = tok[len("--tests="):]
+            break
+    if not codes:
+        return None
+    parsed = [c.strip().upper() for c in codes.split(",") if c.strip()]
+    if not parsed or parsed == ["ALL"]:
+        return None
+    return get_test_help(parsed)
+
+
 def parse_args() -> BaseArgs:
     """Processes command line arguments
 
@@ -161,7 +187,13 @@ def parse_args() -> BaseArgs:
         if len(sys.argv) >= 2 and sys.argv[1] in MODULES:
             # Show module-specific help
             module_name = sys.argv[1]
-            module_help = MODULES[module_name].module_args().get_help()
+            module_args = MODULES[module_name].module_args()
+            # Per-test help: `smtp -ts <TEST> -h` shows options for that test only
+            test_help = _extract_test_help(module_args, sys.argv)
+            if test_help is not None:
+                ptprinthelper.help_print(test_help, f"{SCRIPTNAME} {module_name}", __version__)
+                sys.exit(0)
+            module_help = module_args.get_help()
             ptprinthelper.help_print(module_help, f"{SCRIPTNAME} {module_name}", __version__)
             sys.exit(0)
         else:

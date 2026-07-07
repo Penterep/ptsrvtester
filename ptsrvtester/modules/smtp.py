@@ -1598,7 +1598,453 @@ def _normalize_smtp_role(value: str) -> str:
     return role
 
 
+# region -ts test registry (single source of truth for `-ts/--tests`)
+
+# Common outbound message options (shown in per-test help for tests that send mail)
+_TS_COMMON_MSG: list[list[str]] = [
+    ["-r", "--rcpt-to", "<email>", "Recipient (To)"],
+    ["-m", "--mail-from", "<email>", "Envelope sender (MAIL FROM)"],
+    ["-cc", "--cc", "<emails>", "CC recipients (comma-separated)"],
+    ["-fn", "--from-name", "<name>", "Display name in From header"],
+    ["", "--subject", "<text>", "Message subject"],
+    ["", "--data", "<text>", "Message body"],
+]
+
+# Ordered groups for the main help table
+SMTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
+    ("Recon & fingerprint", ["BANNER", "IDENTIFY", "IDAGG", "EHLO", "AUTHLIST", "ROLE", "ENCRYPT", "NTLM"]),
+    ("Authentication", ["AUTHFMT", "AUTHENUM", "AUTHDN"]),
+    ("Protocol & validation", ["HELOVAL", "HELOONLY", "HELOBYP", "INVCMD"]),
+    ("Relay & addressing", ["OPENREL", "PROBEDOM", "ALIAS", "BCC", "SPOOF", "BOUNCE"]),
+    ("Enumeration & credentials", ["ENUM", "BRUTE"]),
+    ("Rate limiting & stress", ["RATELIM", "RCPTLIM", "RCPTLS", "RCPTDUP", "NOOP1", "NOOP2", "BOMB", "FLOOD"]),
+    ("Content security", ["AV", "SSRF", "ZIPXXE"]),
+    ("Indirect (no direct SMTP connection)", ["BLACKLIST", "SPF"]),
+    ("Utility", ["INTERACT"]),
+]
+
+# Per-test definitions:
+#   desc      one-line description for the main -ts table
+#   long      list of <=3 lines describing what the test does (per-test help)
+#   flags     dict dest->value applied to the args namespace when selected
+#   value     (dest, default) for tests whose flag carries a value (default set if None)
+#   requires  human-readable prerequisite strings (per-test help)
+#   common    True -> append common outbound message options to per-test help
+#   mods      test-specific option rows [short, long, metavar, help] (per-test help)
+SMTP_TESTS: dict[str, dict] = {
+    "BANNER": {
+        "desc": "Grab banner and service identification",
+        "long": ["Connect and read the greeting banner, then identify the product,",
+                 "version and CPE from the advertised software string."],
+        "flags": {"banner": True},
+    },
+    "IDENTIFY": {
+        "desc": "Identify server software from responses",
+        "long": ["Fingerprint the SMTP server from typical responses (banner, EHLO,",
+                 "HELP, RCPT error syntax, TLS) without intrusive probing."],
+        "flags": {"identify": True},
+    },
+    "IDAGG": {
+        "desc": "Aggressive fingerprinting (VRFY, unknown commands)",
+        "long": ["Enhanced identification via VRFY/EXPN, unknown commands (FOOBAR)",
+                 "and RFC-edge probing. More accurate but may trigger WAF/IDS."],
+        "flags": {"identify": True, "id_aggressive": True},
+    },
+    "EHLO": {
+        "desc": "Grab EHLO extensions (commands JSON)",
+        "long": ["Send EHLO and list advertised extensions and AUTH mechanisms."],
+        "flags": {"commands": True},
+    },
+    "AUTHLIST": {
+        "desc": "Grab EHLO AUTH mechanisms (auth JSON)",
+        "long": ["Same EHLO probe as EHLO but with an authentication-focused JSON",
+                 "output shape listing the advertised AUTH mechanisms."],
+        "flags": {"authentications": True},
+    },
+    "ROLE": {
+        "desc": "Identify server role (MTA / Submission / Hybrid)",
+        "long": ["Determine whether the server behaves as an MTA, a Submission",
+                 "service, or a hybrid, based on ports and policy responses."],
+        "flags": {"role_identify": True},
+    },
+    "ENCRYPT": {
+        "desc": "Check encryption methods (TLS / STARTTLS)",
+        "long": ["Inspect supported transport encryption: implicit TLS and STARTTLS."],
+        "flags": {"isencrypt": True},
+    },
+    "NTLM": {
+        "desc": "Inspect NTLM authentication",
+        "long": ["Probe NTLM (NTLMSSP) authentication and decode the server challenge",
+                 "for leaked domain / host information."],
+        "flags": {"ntlm": True},
+    },
+    "AUTHFMT": {
+        "desc": "Probe AUTH LOGIN identity format",
+        "long": ["Determine the identity shape the server expects for AUTH LOGIN",
+                 "(bare username vs e-mail vs NetBIOS) using passive probes."],
+        "flags": {"auth_format": True},
+    },
+    "AUTHENUM": {
+        "desc": "Enumerate users via AUTH",
+        "long": ["User enumeration through advertised AUTH LOGIN / PLAIN / NTLM,",
+                 "using synthetic invalid baselines to spot differing responses."],
+        "flags": {"auth_enum": True},
+        "requires": ["-u/--user or -U/--users (candidate names)"],
+        "mods": [
+            ["-u", "--user", "<name> …", "Candidate username(s)"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+        ],
+    },
+    "AUTHDN": {
+        "desc": "Test AUTH downgrade after failed authentication",
+        "long": ["Check whether advertised AUTH mechanisms change (weaken) after a",
+                 "failed authentication attempt."],
+        "flags": {"auth_downgrade": True},
+    },
+    "HELOVAL": {
+        "desc": "Test HELO/EHLO hostname validation",
+        "long": ["Test how strictly the server validates the HELO/EHLO hostname."],
+        "flags": {"helo_validation": True},
+    },
+    "HELOONLY": {
+        "desc": "Test HELO-only without EHLO extensions",
+        "long": ["Check whether the server accepts plain HELO without EHLO",
+                 "extensions (legacy / downgrade behaviour)."],
+        "flags": {"helo_only": True},
+    },
+    "HELOBYP": {
+        "desc": "Test HELO/EHLO bypass of restrictions",
+        "long": ["Try HELO/EHLO values that may bypass security restrictions",
+                 "(relay / policy checks)."],
+        "flags": {"helo_bypass": True},
+    },
+    "INVCMD": {
+        "desc": "Test invalid or non-standard commands",
+        "long": ["Send invalid / non-standard SMTP commands and observe robustness,",
+                 "information leaks and tarpitting behaviour."],
+        "flags": {"invalid_commands": True},
+    },
+    "OPENREL": {
+        "desc": "Test open relay",
+        "long": ["Check whether the server relays mail for non-local recipients",
+                 "(open relay)."],
+        "flags": {"open_relay": True},
+    },
+    "PROBEDOM": {
+        "desc": "Probe which recipient domains are accepted as local",
+        "long": ["Probe which recipient domain the server's RCPT TO treats as local."],
+        "flags": {"probe_accepted_domain": True},
+    },
+    "ALIAS": {
+        "desc": "Test alias and addressing bypass",
+        "long": ["Test address normalization / alias bypass variants (case, dotted,",
+                 "plus, percent, UUCP bang paths) against a base recipient."],
+        "flags": {"alias_test": True},
+        "requires": ["-r/--rcpt-to (base recipient)"],
+        "common": True,
+        "mods": [
+            ["", "--alias-variants", "<v1,v2,...>", "case,case_domain,dotted,plus,percent,bang_simple,bang_nested (default: all)"],
+            ["", "--alias-timeout", "<sec>", "Timeout per variant (default: 30)"],
+        ],
+    },
+    "BCC": {
+        "desc": "Test BCC header disclosure",
+        "long": ["Send a message with To, Cc and Bcc; verify the server strips the",
+                 "Bcc header so hidden recipients are not disclosed to To/Cc."],
+        "value": ("bcc_test", None),
+        "requires": ["-bcc/--bcc <emails> (Bcc addresses)", "-r/--rcpt-to (To)", "-cc/--cc (Cc)"],
+        "common": True,
+        "mods": [
+            ["-bcc", "--bcc", "<emails>", "Bcc recipients (comma-separated)"],
+            ["", "--bcc-timeout", "<sec>", "Timeout for BCC test (default: 30)"],
+        ],
+    },
+    "SPOOF": {
+        "desc": "Test header spoofing (From, Reply-To, Return-Path)",
+        "long": ["Send messages with spoofed From / Reply-To / Return-Path headers",
+                 "and report whether the server accepts them (phishing risk)."],
+        "flags": {"spoof_headers": True},
+        "requires": ["-r/--rcpt-to (recipient)"],
+        "common": True,
+        "mods": [
+            ["", "--spoof-variants", "<v1,v2,...>", "from,reply_to,return_path (default: all)"],
+            ["", "--spoof-timeout", "<sec>", "Timeout per message (default: 30)"],
+        ],
+    },
+    "BOUNCE": {
+        "desc": "Test bounce / backscatter replay",
+        "long": ["Two-probe bounce/backscatter test on one connection to detect",
+                 "servers that generate backscatter to a controlled address."],
+        "flags": {"bounce_replay": True},
+        "requires": ["-m/--mail-from (controlled bounce address)", "-r/--rcpt-to (recipient)"],
+        "common": True,
+    },
+    "ENUM": {
+        "desc": "Enumerate users (VRFY / EXPN / RCPT)",
+        "long": ["Enumerate valid users via VRFY, EXPN and/or RCPT. Defaults to all",
+                 "methods; narrow with --enum-methods and feed names via -u/-U."],
+        "value": ("enumerate", "ALL"),
+        "mods": [
+            ["-e", "--enum-methods", "[VRFY/EXPN/RCPT/ALL]", "Methods to use (default: ALL)"],
+            ["-u", "--user", "<name> …", "Candidate username(s)"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-t", "--threads", "<n>", "Enumeration threads (default: 1)"],
+            ["-sd", "--slow-down", "", "Test slow-down / tarpitting protection"],
+            ["", "--enum-reconnect-after", "<n>", "Reconnect after n consecutive failures"],
+        ],
+    },
+    "BRUTE": {
+        "desc": "Bruteforce credentials",
+        "long": ["Bruteforce SMTP AUTH using username(s) and password(s).",
+                 "Requires credentials via -u/-p or -U/-P."],
+        "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
+        "mods": [
+            ["-u", "--user", "<name> …", "Username(s)"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "<password>", "Single password"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+        ],
+    },
+    "RATELIM": {
+        "desc": "Test connection rate limiting",
+        "long": ["Open many connections to measure whether the server enforces",
+                 "connection rate limiting / banning."],
+        "value": ("rate_limit", RATE_LIMIT_DEFAULT_ATTEMPTS),
+        "mods": [
+            ["-rt", "--rate-limit", "<n>", f"Max simultaneous connections to attempt (default: {RATE_LIMIT_DEFAULT_ATTEMPTS})"],
+        ],
+    },
+    "RCPTLIM": {
+        "desc": "Test RCPT TO recipient limit",
+        "long": ["Storm RCPT TO in one message to find the per-message recipient",
+                 "limit. Without -u/-U generates random recipients."],
+        "value": ("rcpt_limit", RCPT_LIMIT_DEFAULT_ATTEMPTS),
+        "mods": [
+            ["-rl", "--recipient-limit", "<n>", f"Max RCPT attempts per session (default: {RCPT_LIMIT_DEFAULT_ATTEMPTS})"],
+            ["", "--rl-no-precheck", "", "Skip role/open-relay/AUTH pre-check"],
+            ["-d", "--domain", "<domain>", "Recipient domain for the probe"],
+            ["-m", "--mail-from", "<email>", "Envelope MAIL FROM (default <>)"],
+        ],
+    },
+    "RCPTLS": {
+        "desc": "RCPT limit with DATA submission",
+        "long": ["Like RCPTLIM but submits one message (DATA) after the RCPT storm",
+                 "to test whether multi-recipient delivery actually succeeds."],
+        "value": ("rcpt_limit_send", RCPT_LIMIT_DEFAULT_ATTEMPTS),
+        "requires": ["-m/--mail-from (envelope MAIL FROM for delivery)"],
+        "mods": [
+            ["-rls", "--recipient-limit-send", "<n>", f"Max RCPT attempts per session (default: {RCPT_LIMIT_DEFAULT_ATTEMPTS})"],
+        ],
+    },
+    "RCPTDUP": {
+        "desc": "Test duplicate RCPT TO for one address",
+        "long": ["Send RCPT TO repeatedly for the same recipient in one transaction.",
+                 "SMTP acceptance does not prove N deliveries — use --rdd-send + manual check."],
+        "value": ("rcpt_duplicate", RCPT_DUP_DEFAULT),
+        "requires": ["-r/--rcpt-to (probed address)"],
+        "mods": [
+            ["-rdd", "--rcpt-duplicate", "<n>", f"Repeats (default {RCPT_DUP_DEFAULT}, max {RCPT_DUP_MAX})"],
+            ["", "--rdd-send", "", "Submit minimal DATA after RCPT for manual verification"],
+        ],
+    },
+    "NOOP1": {
+        "desc": "NOOP flood on a single connection",
+        "long": ["Send NOOPs as fast as possible on one connection; report how many",
+                 "the server accepts, response-time growth and error rate."],
+        "flags": {"noop_flood1": True},
+    },
+    "NOOP2": {
+        "desc": "NOOP flood on parallel connections",
+        "long": ["NOOP flooding DoS across N parallel connections; reports per-command",
+                 "reaction time and error rate under load."],
+        "value": ("noop_flood2", NOOP_FLOOD2_DEFAULT_CONNECTIONS),
+        "mods": [
+            ["-nf2", "--noop-flood2", "<n>", f"Parallel connections (default: {NOOP_FLOOD2_DEFAULT_CONNECTIONS})"],
+        ],
+    },
+    "BOMB": {
+        "desc": "Mail flooding / rate limiting",
+        "long": ["Send many messages to test mail flooding and rate limiting."],
+        "flags": {"bomb": True},
+        "requires": ["-r/--rcpt-to (recipient)"],
+        "common": True,
+        "mods": [
+            ["", "--bomb-count", "<n>", "Messages to send (default: 100)"],
+            ["", "--bomb-timeout", "<sec>", "Max time for the whole test (default: 60)"],
+            ["", "--bomb-delay", "<sec>", "Delay between messages (default: 0)"],
+            ["", "--bomb-threads", "<n>", "Parallel threads (default: 1)"],
+            ["", "--bomb-randomize", "", "Add unique ID to each message"],
+        ],
+    },
+    "FLOOD": {
+        "desc": "Queue overload via SIZE and volume",
+        "long": ["Test the SIZE extension and queue overload; may delay production",
+                 "mail. Stops on 421 (panic)."],
+        "flags": {"flood": True},
+        "requires": ["-r/--rcpt-to (recipient)"],
+        "common": True,
+        "mods": [
+            ["", "--flood-count", "<n>", "Messages for queue stress (default: 150, max 500)"],
+            ["", "--flood-timeout", "<sec>", "Max time for queue stress (default: 90)"],
+            ["", "--flood-skip-size-test", "", "Skip MAIL FROM SIZE=oversized test"],
+        ],
+    },
+    "AV": {
+        "desc": "Antivirus / antispam filters",
+        "long": ["Send benign malware-signature samples (EICAR, double extensions,",
+                 "XXE, ...) to test antivirus / antispam filtering."],
+        "flags": {"antivirus": True},
+        "requires": ["-r/--rcpt-to (recipient)"],
+        "common": True,
+        "mods": [
+            ["", "--av-categories", "<cat,...>", "eicar,double_ext,executable,nested_archive,encoded_content,html_sanitization,xxe,mime_malformed (default: all except zip_bomb)"],
+            ["", "--av-zip-bomb", "", "Include zip_bomb category (DoS risk!)"],
+            ["", "--av-timeout", "<sec>", "Per-message timeout (default: 30)"],
+            ["", "--av-skip-absent", "", "Skip categories with no definition files"],
+        ],
+    },
+    "SSRF": {
+        "desc": "Server-side link fetching (SSRF)",
+        "long": ["Embed canary URLs in messages to detect whether the server fetches",
+                 "links (SSRF). Requires a canary/callback URL."],
+        "flags": {"ssrf": True},
+        "requires": ["-r/--rcpt-to (recipient)", "--ssrf-canary-url <URL>"],
+        "common": True,
+        "mods": [
+            ["", "--ssrf-canary-url", "<URL>", "Canary/callback URL (Interactsh, ngrok, ...)"],
+            ["", "--ssrf-variants", "<v1,v2,...>", "plain,html_link,html_img,html_iframe,multipart,ssrf_malformed,ssrf_nested (default: all)"],
+            ["", "--ssrf-internal-urls", "", "Also test internal URLs (127.0.0.1, localhost)"],
+            ["", "--ssrf-timeout", "<sec>", "Per-message timeout (default: 30)"],
+        ],
+    },
+    "ZIPXXE": {
+        "desc": "Zip bomb, Billion Laughs, XXE",
+        "long": ["Send Zip bomb, Billion Laughs and XXE payloads to test archive /",
+                 "XML handling. XXE variants require a canary URL."],
+        "flags": {"zipxxe": True},
+        "requires": ["-r/--rcpt-to (recipient)", "--zipxxe-canary-url for xxe_* variants"],
+        "common": True,
+        "mods": [
+            ["", "--zipxxe-canary-url", "<URL>", "Canary URL for xxe_zip / xxe_docx / xxe_body"],
+            ["", "--zipxxe-variants", "<v1,v2,...>", "billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx,xxe_body (default: all)"],
+            ["", "--zipxxe-zip-bomb", "", "Include zip_bomb (minimal ~200KB; DoS risk!)"],
+            ["", "--zipxxe-zip-bomb-full", "", "Include zip_bomb_full (~100KB→~100MB; extreme DoS risk!)"],
+            ["", "--zipxxe-timeout", "<sec>", "Per-message timeout (default: 30)"],
+        ],
+    },
+    "BLACKLIST": {
+        "desc": "Check target against blacklists",
+        "long": ["Look up the target (domain + public IP) against DNS blacklists.",
+                 "No direct SMTP connection is made."],
+        "flags": {"blacklist_test": True},
+    },
+    "SPF": {
+        "desc": "Check SPF records (requires domain target)",
+        "long": ["Fetch and evaluate SPF records for the target domain.",
+                 "Requires a domain name (not a bare IP)."],
+        "flags": {"spf_test": True},
+    },
+    "INTERACT": {
+        "desc": "Interactive SMTP CLI",
+        "long": ["Open an interactive SMTP session for manual command entry."],
+        "flags": {"interactive": True},
+    },
+}
+
+
+def _smtp_parse_test_codes(raw: str | None) -> list[str]:
+    """Split and upper-case a raw -ts value into a list of codes."""
+    if not raw:
+        return []
+    return [c.strip().upper() for c in str(raw).split(",") if c.strip()]
+
+
+def _apply_smtp_tests(args) -> None:
+    """Translate ``-ts/--tests`` codes into the internal per-test dest flags.
+
+    ``ALL`` (or no ``-ts``) leaves every flag at default -> run-all mode.
+    """
+    codes = _smtp_parse_test_codes(getattr(args, "tests", None))
+    if not codes:
+        return
+    if "ALL" in codes:
+        # Explicit full scan: apply nothing so _is_run_all_mode() stays True.
+        return
+    unknown = [c for c in codes if c not in SMTP_TESTS]
+    if unknown:
+        available = ", ".join(sorted(SMTP_TESTS))
+        raise argparse.ArgumentError(
+            None,
+            f"Unknown test(s): {', '.join(unknown)}. Available: ALL, {available}",
+        )
+    for code in codes:
+        spec = SMTP_TESTS[code]
+        for dest, val in spec.get("flags", {}).items():
+            setattr(args, dest, val)
+        value = spec.get("value")
+        if value is not None:
+            dest, default = value
+            if getattr(args, dest, None) is None and default is not None:
+                setattr(args, dest, default)
+
+    # Every explicitly selected test must actually activate; otherwise report what is
+    # missing instead of silently falling back to run-all mode.
+    inactive: list[tuple[str, list[str]]] = []
+    for code in codes:
+        spec = SMTP_TESTS[code]
+        if code == "BRUTE":
+            active = check_if_brute(args)
+        elif "flags" in spec:
+            active = all(getattr(args, dest, None) for dest in spec["flags"])
+        elif "value" in spec:
+            active = getattr(args, spec["value"][0], None) is not None
+        else:
+            active = True
+        if not active:
+            inactive.append((code, list(spec.get("requires", []))))
+    if inactive:
+        parts = [
+            f"{code} requires {'; '.join(req)}" if req else f"{code} could not be activated"
+            for code, req in inactive
+        ]
+        raise argparse.ArgumentError(None, "; ".join(parts))
+
+
+def _smtp_test_help(codes: list[str]):
+    """Build a help object (for ptprinthelper.help_print) describing given test codes."""
+    if not codes:
+        return None
+    valid = [c for c in codes if c in SMTP_TESTS]
+    if not valid:
+        available = ", ".join(sorted(SMTP_TESTS))
+        return [
+            {"unknown_test": [f"Unknown test: {', '.join(codes)}"]},
+            {"available_tests": [f"ALL, {available}"]},
+        ]
+    out: list[dict] = []
+    for code in valid:
+        spec = SMTP_TESTS[code]
+        header = f"{code} — {spec.get('desc', '')}"
+        out.append({"test": [header, *spec.get("long", [])]})
+        req = spec.get("requires")
+        if req:
+            out.append({"requires": list(req)})
+        rows: list[list[str]] = list(spec.get("mods", []))
+        if spec.get("common"):
+            rows = rows + _TS_COMMON_MSG
+        if rows:
+            out.append({"test_options": rows})
+        has_opts = bool(rows or req)
+        usage = f"ptsrvtester smtp -ts {code} " + ("<options> <target>" if has_opts else "<target>")
+        out.append({"usage": [usage]})
+    return out
+
+
+# endregion
+
+
 class SMTPArgs(ArgsWithBruteforce):
+    tests: str | None
     target: Target
     tls: bool
     starttls: bool
@@ -1626,130 +2072,87 @@ class SMTPArgs(ArgsWithBruteforce):
 
     @staticmethod
     def get_help():
+        # Test selection table (-ts): one code + one-line description per test.
+        options: list[list[str]] = [
+            ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,AV); ALL runs everything:"],
+        ]
+        for group_title, codes in SMTP_TEST_GROUPS:
+            options.append(["", "", "", ""])
+            options.append(["", "", "", group_title])
+            for code in codes:
+                options.append(["", "", code, SMTP_TESTS[code]["desc"]])
+
+        # Global options (test-specific modifiers live in `smtp -ts <TEST> -h`).
+        options += [
+            ["", "", "", ""],
+            ["", "", "", "Connection"],
+            ["", "--tls", "", "Use implicit SSL/TLS (default port 465)"],
+            ["", "--starttls", "", "Use explicit STARTTLS (default port 587)"],
+            ["-f", "--fqdn", "<fqdn>", "FQDN for EHLO/HELO (default: from target or hostname)"],
+            ["", "", "", ""],
+            ["", "", "", "Message (outbound tests)"],
+            ["-m", "--mail-from", "<email>", "Envelope sender (MAIL FROM)"],
+            ["-r", "--rcpt-to", "<email>", "Recipient (To)"],
+            ["-cc", "--cc", "<emails>", "CC recipients (comma-separated)"],
+            ["-fn", "--from-name", "<name>", "Display name in From header"],
+            ["", "--subject", "<text>", f"Message subject (default: {DEFAULT_SMTP_SUBJECT!r})"],
+            ["", "--data", "<text>", f"Message body (default: {DEFAULT_SMTP_DATA!r})"],
+            ["", "", "", ""],
+            ["", "", "", "Credentials"],
+            ["-u", "--user", "<name> …", "Username(s) for BRUTE / ENUM"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "<password>", "Password for BRUTE"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "", "", ""],
+            ["", "", "", "Targeting & misc"],
+            ["-t", "--threads", "<n>", "Threads for enumeration (default: 1)"],
+            ["-d", "--domain", "<domain>", "Recipient domain for RCPT limit tests"],
+            ["-R", "--role", "<mta|submission>", "Expected server role"],
+            ["", "", "", ""],
+            ["", "", "", "Output"],
+            ["-j", "--json", "", "Output in JSON format"],
+            ["-vv", "--verbose", "", "Enable verbose mode"],
+            ["-v", "--version", "", "Show version and exit"],
+            ["-h", "--help", "", "Show this help; 'smtp -ts <TEST> -h' for test options"],
+        ]
+
         return [
             {"description": ["SMTP Testing Module"]},
-            {"usage": ["ptsrvtester smtp <options> <target>"]},
+            {"usage": ["ptsrvtester smtp -ts <test>[,<test>...] <options> <target>"]},
             {"usage_example": [
-                "ptsrvtester smtp -e ALL -sd -U wordlist.txt mail.example.com:25",
-                "ptsrvtester smtp -b -c --ntlm 127.0.0.1",
-                "ptsrvtester smtp -id mail.example.com:25",
-                "ptsrvtester smtp -id --id-aggressive smtp.example.com:25",
-                "ptsrvtester smtp -br -m attacker@example.com -r foo@foo.com smtp.example.com:25",
-                "ptsrvtester smtp -br -m attacker@example.com -r foo@foo.com -u user -p pass smtp.example.com:587",
-                "ptsrvtester smtp -bomb -r victim@example.com smtp.example.com:587",
-                "ptsrvtester smtp -av -r victim@example.com smtp.example.com:587",
-                "ptsrvtester smtp -bomb -av -r victim@example.com smtp.example.com:25",
-                "ptsrvtester smtp -ssrf -r victim@example.com --ssrf-canary-url https://xyz.oast.fun/ssrf smtp.example.com:587",
-                "ptsrvtester smtp -flood -r victim@example.com smtp.example.com:587",
-                "ptsrvtester smtp -bomb -flood -r victim@example.com smtp.example.com:25",
-                "ptsrvtester smtp -sh -r victim@example.com smtp.example.com:25",
-                "ptsrvtester smtp -sh -r victim@example.com -u user -p pass smtp.example.com:587",
-                "ptsrvtester smtp -bcc bcc@example.com -r to@example.com --cc cc@example.com smtp.example.com:25",
-                "ptsrvtester smtp -pd mail.example.com:25",
+                "ptsrvtester smtp -ts BANNER,EHLO mail.example.com:25",
+                "ptsrvtester smtp -ts ALL mail.example.com:25",
+                "ptsrvtester smtp -ts OPENREL mail.example.com:25",
+                "ptsrvtester smtp -ts BOUNCE -m attacker@example.com -r foo@foo.com smtp.example.com:25",
+                "ptsrvtester smtp -ts BOMB -r victim@example.com smtp.example.com:587",
+                "ptsrvtester smtp -ts AV,SSRF,ZIPXXE -r victim@example.com --ssrf-canary-url http://cb --zipxxe-canary-url http://cb smtp.example.com:25",
+                "ptsrvtester smtp -ts ENUM -e ALL -U wordlist.txt mail.example.com:25",
+                "ptsrvtester smtp -ts SPOOF -r victim@example.com smtp.example.com:25",
+                "ptsrvtester smtp -ts BCC -r to@example.com --cc cc@example.com --bcc bcc@example.com smtp.example.com:25",
+                "ptsrvtester smtp -ts AV -h",
             ]},
-            {"options": [
-                ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
-                ["-id", "--identify", "", "Identify SMTP server software from typical responses (banner, EHLO, HELP, RCPT error syntax, TLS)"],
-                ["", "--id-aggressive", "", "Enhanced fingerprinting via VRFY, unknown commands (FOOBAR), and RFC-edge probing (may trigger WAF/IDS)"],
-                ["-c", "--commands", "", "Grab EHLO (alias for -A, different JSON)"],
-                ["-A", "--authentications", "", "Grab EHLO (alias for -c, different JSON)"],
-                ["-af", "--auth-format", "", "AUTH LOGIN identity shape probe (username vs e-mail vs NetBIOS)"],
-                ["-ae", "--auth-enum", "", "AUTH enumeration: 2 synthetic baselines per advertised LOGIN / PLAIN / NTLM"],
-                ["-ad", "--auth-downgrade", "", "Test AUTH downgrade after failed authentication"],
-                ["-he", "--helo-validation", "", "Test HELO/EHLO hostname validation"],
-                ["-iv", "--invalid-commands", "", "Test invalid/non-standard SMTP commands"],
-                ["-ho", "--helo-only", "", "Test if server supports only HELO without EHLO extensions"],
-                ["-hb", "--helo-bypass", "", "Test HELO/EHLO value for bypassing security restrictions"],
-                ["-m", "--mail-from", "<email>", "Sender address (MAIL FROM)"],
-                ["-r", "--rcpt-to", "<email>", "Recipient (To); required for -bomb, -av, -ssrf, -zipxxe, -sh, -bcc, -al, -br, -rdd"],
-                ["-fn", "--from-name", "<name>", "Sender display name in From header"],
-                ["-cc", "--cc", "<emails>", "CC recipients, comma-separated; used by -bomb, -av, -ssrf; required for -bcc"],
-                ["", "--subject", "<text>", f"Subject for outbound test messages (default: {DEFAULT_SMTP_SUBJECT!r})"],
-                ["", "--data", "<text>", f"Plain-text body for outbound test messages (default: {DEFAULT_SMTP_DATA!r})"],
-                ["-ie", "--is-encrypt", "", "Check encryption methods"],
-                ["", "--ntlm", "", "Inspect NTLM authentication"],
-                ["-e", "--enumerate", "[VRFY/EXPN/RCPT/ALL]", "User enumeration (default: ALL)"],
-                ["-t", "--threads", "<threads>", "Threads for enumeration (default: 1)"],
-                ["", "--enum-reconnect-after", "<n>", "Reconnect after n consecutive failures during enum (default: 4)"],
-                ["-sd", "--slow-down", "", "Test slow-down protection (requires -e)"],
-                ["-rt", "--rate-limit", "<n>", f"Rate limiting test (default: {RATE_LIMIT_DEFAULT_ATTEMPTS} attempts)"],
-                ["-nf1", "--noop-flood1", "", "NOOP flooding test (1 connection, rapid NOOP commands)"],
-                ["-nf2", "--noop-flood2", "<n>", f"NOOP flooding DoS test (default: {NOOP_FLOOD2_DEFAULT_CONNECTIONS} parallel connections)"],
-                ["-rl", "--recipient-limit", "<n>", "Test RCPT TO limit (without -u/-U is generated 1000 random recipients; optional -m sets envelope MAIL FROM)"],
-                ["-rls", "--recipient-limit-send", "<n>", "Like -rl but submits DATA after RCPT storm (requires -m); tests whether multi-recipient delivery succeeds"],
-                ["-rdd", "--rcpt-duplicate", "<n>", f"Probe N duplicate RCPT TO for same address in one MAIL (default {RCPT_DUP_DEFAULT}, max {RCPT_DUP_MAX}; requires -r)"],
-                ["", "--rdd-send", "", "With -rdd: send minimal DATA after RCPT so analyst can verify mailbox copies manually"],
-                ["", "--rl-no-precheck", "", "Skip role/open-relay/auth pre-check for -rl (run RCPT TO probe directly)"],
-                ["-d", "--domain", "<domain>", "Recipient domain for RCPT TO limit test"],
-                ["-pd", "--probe-accepted-domain", "", "Probe which recipient domain RCPT treats as local"],
-                ["-or", "--open-relay", "", "Test open relay"],
-                ["-ri", "--role-identify", "", "Identify server role (MTA / Submission / Hybrid)"],
-                ["-R", "--role", "<mta|submission>", "Role of SMTP server (MTA or Submission)"],
-                ["-I", "--interactive", "", "Interactive SMTP CLI"],
-                ["-bl", "--blacklist-test", "", "Test against blacklists"],
-                ["-s", "--spf-test", "", "Test SPF records (requires domain name)"],
-                ["-f", "--fqdn", "<fqdn>", "FQDN for EHLO/HELO (default: from target or system hostname)"],
-                ["", "--tls", "", "Use implicit SSL/TLS"],
-                ["", "--starttls", "", "Use explicit SSL/TLS"],
-                ["-u", "--user", "<name> …", "Username(s); bruteforce and/or -e targets (combine with -U file)"],
-                ["-U", "--users", "<wordlist>", "Username file: bruteforce with -p/-P; also names for -e, -ae, -rl"],
-                ["-p", "--password", "<password>", "Single password for bruteforce"],
-                ["-P", "--passwords", "<wordlist>", "File with passwords"],
-                ["-br", "--bounce-replay", "", "Bounce/backscatter test; requires -m (MAIL FROM) and -r (RCPT TO)"],
-                ["-sh", "--spoof-headers", "", "Test header spoofing (From, Reply-To, Return-Path); requires -r"],
-                ["", "--spoofhdr-variants", "<v1,v2,...>", "Variants: from,reply_to,return_path (default: all)"],
-                ["", "--spoofhdr-timeout", "<sec>", "Timeout per message for Spoof headers test (default: 30)"],
-                ["-bcc", "--bcc-test", "<emails>", "BCC disclosure test; requires -r and --cc"],
-                ["", "--bcc-timeout", "<sec>", "Timeout for BCC test (default: 30)"],
-                ["-al", "--alias-test", "", "Alias & addressing bypass; requires -r"],
-                ["", "--alias-variants", "<v1,v2,...>", "Variants: case,case_domain,dotted,plus,percent,bang_simple,bang_nested (default: all)"],
-                ["", "--alias-timeout", "<sec>", "Timeout per variant (default: 30)"],
-                ["-bomb", "--bomb", "", "Test mail flooding / rate limiting"],
-                ["", "--bomb-count", "<n>", "Number of messages to send (default: 100)"],
-                ["", "--bomb-timeout", "<sec>", "Max time for entire test (default: 60)"],
-                ["", "--bomb-delay", "<sec>", "Delay between messages (default: 0)"],
-                ["", "--bomb-threads", "<n>", "Parallel threads for flooding (default: 1)"],
-                ["", "--bomb-randomize", "", "Add unique ID to each message"],
-                ["-av", "--antivirus", "", "Test antivirus/antispam protection; requires -r"],
-                ["", "--antivirus-categories", "<cat1,cat2,...>", "Categories: eicar,double_ext,executable,nested_archive,encoded_content,html_sanitization,xxe,mime_malformed (default: all except zip_bomb)"],
-                ["", "--antivirus-zip-bomb", "", "Include zip_bomb category (DoS risk!)"],
-                ["", "--antivirus-timeout", "<sec>", "Timeout per message (default: 30)"],
-                ["", "--antivirus-skip-absent", "", "Skip categories with no definition files"],
-                ["-ssrf", "--ssrf", "", "Test SSRF – server fetches links; requires -r and --ssrf-canary-url"],
-                ["", "--ssrf-canary-url", "<URL>", "Canary URL for SSRF test (Interactsh, ngrok, etc.)"],
-                ["", "--ssrf-variants", "<v1,v2,...>", "Variants: plain,html_link,html_img,html_iframe,multipart,ssrf_malformed,ssrf_nested (default: all)"],
-                ["", "--ssrf-internal-urls", "", "Also test internal URLs (127.0.0.1, localhost)"],
-                ["", "--ssrf-timeout", "<sec>", "Timeout per message (default: 30)"],
-                ["-flood", "--flood", "", "Test queue flood – SIZE extension, queue overload"],
-                ["", "--flood-count", "<n>", "Messages for queue stress (default: 150, max 500)"],
-                ["", "--flood-timeout", "<sec>", "Max time for queue stress (default: 90)"],
-                ["", "--flood-skip-size-test", "", "Skip MAIL FROM SIZE=oversized test"],
-                ["-zipxxe", "--zipxxe", "", "Test Zip Bomb, Billion Laughs, XXE; requires -r"],
-                ["", "--zipxxe-canary-url", "<URL>", "Canary URL for XXE variants (xxe_zip, xxe_docx; Interactsh, ngrok, etc.)"],
-                ["", "--zipxxe-variants", "<v1,v2,...>", "Variants: billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx,xxe_body (default: all); zip_bomb/zip_bomb_full via flags"],
-                ["", "--zipxxe-zip-bomb", "", "Include zip_bomb variant (minimal ~200KB; DoS risk!)"],
-                ["", "--zipxxe-zip-bomb-full", "", "Include zip_bomb_full (~100KB→~100MB; extreme DoS risk!)"],
-                ["", "--zipxxe-timeout", "<sec>", "Timeout per message (default: 30)"],
-                ["-h", "--help", "", "Show this help message and exit"],
-                ["-vv", "--verbose", "", "Enable verbose mode"],
-            ]}
+            {"options": options},
         ]
+
+    @staticmethod
+    def get_test_help(codes):
+        """Per-test help object (used by `smtp -ts <TEST> -h`)."""
+        return _smtp_test_help(codes)
 
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """example usage:
   ptsrvtester smtp -h
-  ptsrvtester smtp -e ALL -sd -U wordlist.txt mail.example.com:25
-  ptsrvtester smtp -br -m attacker@example.com -r foo@foo.com smtp.example.com:25
-  ptsrvtester smtp -bomb -r victim@example.com smtp.example.com:587
-  ptsrvtester smtp -av -r victim@example.com smtp.example.com:587
-  ptsrvtester smtp -ssrf -r victim@example.com --ssrf-canary-url https://xyz.oast.fun/ssrf smtp.example.com:587
-  ptsrvtester smtp -flood -r victim@example.com smtp.example.com:587
-  ptsrvtester smtp -bomb -av -ssrf -flood -zipxxe -r victim@example.com --ssrf-canary-url http://cb --zipxxe-canary-url http://cb smtp.example.com:25
-  ptsrvtester smtp -sh -r victim@example.com smtp.example.com:25
-  ptsrvtester smtp -sh -r victim@example.com -u user -p pass smtp.example.com:587
-  ptsrvtester smtp -bcc bcc@example.com -r to@example.com --cc cc@example.com smtp.example.com:25
-  ptsrvtester smtp -al -r admin@example.com smtp.example.com:25
-  ptsrvtester smtp -pd mail.example.com:25"""
+  ptsrvtester smtp -ts BANNER,EHLO mail.example.com:25
+  ptsrvtester smtp -ts ALL mail.example.com:25
+  ptsrvtester smtp -ts ENUM -e ALL -U wordlist.txt mail.example.com:25
+  ptsrvtester smtp -ts BOUNCE -m attacker@example.com -r foo@foo.com smtp.example.com:25
+  ptsrvtester smtp -ts BOMB -r victim@example.com smtp.example.com:587
+  ptsrvtester smtp -ts AV -r victim@example.com smtp.example.com:587
+  ptsrvtester smtp -ts SSRF -r victim@example.com --ssrf-canary-url https://xyz.oast.fun/ssrf smtp.example.com:587
+  ptsrvtester smtp -ts AV,SSRF,ZIPXXE -r victim@example.com --ssrf-canary-url http://cb --zipxxe-canary-url http://cb smtp.example.com:25
+  ptsrvtester smtp -ts SPOOF -r victim@example.com -u user -p pass smtp.example.com:587
+  ptsrvtester smtp -ts BCC -r to@example.com --cc cc@example.com --bcc bcc@example.com smtp.example.com:25
+  ptsrvtester smtp -ts AV -h"""
 
         parser = subparsers.add_parser(
             name,
@@ -1782,6 +2185,15 @@ class SMTPArgs(ArgsWithBruteforce):
 
         direct = parser.add_argument_group(
             "DIRECT SCANNING", "Operations that communicate directly with the target server"
+        )
+        direct.add_argument(
+            "-ts",
+            "--tests",
+            type=str,
+            default=None,
+            metavar="<test>",
+            dest="tests",
+            help="Comma-separated test codes (e.g. BANNER,AV) or ALL; 'smtp -ts <TEST> -h' for test options",
         )
         direct.add_argument("-b", "--banner", action="store_true", help="Grab banner + Service Identification (product, version, CPE)")
         direct.add_argument(
@@ -1890,7 +2302,7 @@ class SMTPArgs(ArgsWithBruteforce):
             metavar="emails",
             dest="cc",
             default=None,
-            help="CC recipients, comma-separated; used by -bomb, -av, -ssrf; required for -bcc (no validation)",
+            help="Cc recipients, comma-separated; used by -bomb, -av, -ssrf; required for -ts BCC (no validation)",
         )
         direct.add_argument(
             "--subject",
@@ -1926,7 +2338,7 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Test header spoofing (From, Reply-To, Return-Path); -r recipient (required); -m envelope (MAIL FROM)",
         )
         direct.add_argument(
-            "--spoofhdr-variants",
+            "--spoof-variants",
             type=str,
             metavar="v1,v2,...",
             dest="spoofhdr_variants",
@@ -1934,7 +2346,7 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Spoof headers variants: from,reply_to,return_path (default: all); -r recipient, -m envelope (MAIL FROM)",
         )
         direct.add_argument(
-            "--spoofhdr-timeout",
+            "--spoof-timeout",
             type=float,
             default=30.0,
             metavar="sec",
@@ -1943,12 +2355,12 @@ class SMTPArgs(ArgsWithBruteforce):
         )
         direct.add_argument(
             "-bcc",
-            "--bcc-test",
+            "--bcc",
             type=str,
             metavar="<emails>",
             dest="bcc_test",
             default=None,
-            help="BCC disclosure test; BCC emails comma-separated; -r and --cc required; -m envelope",
+            help="Bcc recipients, comma-separated (used by -ts BCC)",
         )
         direct.add_argument(
             "--bcc-timeout",
@@ -2011,11 +2423,13 @@ class SMTPArgs(ArgsWithBruteforce):
         direct.add_argument(
             "-e",
             "--enumerate",
+            "--enum-methods",
             type=str,
             choices=["VRFY", "EXPN", "RCPT", "ALL"],
             nargs="?",
             const="ALL",
             default=None,
+            dest="enumerate",
             help="User enumeration [VRFY/EXPN/RCPT/ALL] (default: ALL)",
         )
         direct.add_argument(
@@ -2216,21 +2630,21 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Test antivirus/antispam protection; requires -r",
         )
         stress.add_argument(
-            "--antivirus-categories",
+            "--av-categories",
             type=str,
             metavar="cat1,cat2,...",
             dest="antivirus_categories",
             default=None,
-            help="Comma-separated categories (default: all except zip_bomb). Available: eicar, double_ext, executable, nested_archive, encoded_content, html_sanitization, xxe, mime_malformed. Use --antivirus-zip-bomb for zip_bomb.",
+            help="Comma-separated categories (default: all except zip_bomb). Available: eicar, double_ext, executable, nested_archive, encoded_content, html_sanitization, xxe, mime_malformed. Use --av-zip-bomb for zip_bomb.",
         )
         stress.add_argument(
-            "--antivirus-zip-bomb",
+            "--av-zip-bomb",
             action="store_true",
             dest="antivirus_zip_bomb",
             help="Include zip_bomb category (DoS risk! Use with caution)",
         )
         stress.add_argument(
-            "--antivirus-timeout",
+            "--av-timeout",
             type=float,
             default=30.0,
             metavar="sec",
@@ -2238,7 +2652,7 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Timeout per message for antivirus test in seconds (default: 30)",
         )
         stress.add_argument(
-            "--antivirus-skip-absent",
+            "--av-skip-absent",
             action="store_true",
             dest="antivirus_skip_absent",
             help="Skip categories that have no definition files",
@@ -2370,6 +2784,9 @@ class SMTP(BaseModule):
                 None, f'module "{args.module}" received wrong arguments namespace'
             )
 
+        # Translate -ts/--tests codes into the internal per-test dest flags before validation.
+        _apply_smtp_tests(args)
+
         if args.slow_down and args.enumerate == None:
             raise argparse.ArgumentError(None, "--slow-down requires also --enumerate")
 
@@ -2396,12 +2813,12 @@ class SMTP(BaseModule):
         bcc_test_requested = getattr(args, "bcc_test", None)
         if bcc_test_requested:
             if not args.rcpt_to or not str(args.rcpt_to).strip():
-                raise argparse.ArgumentError(None, "-bcc requires -r/--rcpt-to (To recipient)")
+                raise argparse.ArgumentError(None, "-ts BCC requires -r/--rcpt-to (To recipient)")
             cc_val = getattr(args, "cc", None) or ""
             if not cc_val.strip():
-                raise argparse.ArgumentError(None, "-bcc requires --cc (Cc recipient)")
+                raise argparse.ArgumentError(None, "-ts BCC requires -cc/--cc (Cc recipient)")
             if not str(bcc_test_requested).strip():
-                raise argparse.ArgumentError(None, "-bcc requires BCC email addresses as argument")
+                raise argparse.ArgumentError(None, "-ts BCC requires -bcc/--bcc <emails> (Bcc addresses)")
         alias_test_requested = getattr(args, "alias_test", False)
         if alias_test_requested and (not args.rcpt_to or not str(args.rcpt_to).strip()):
             raise argparse.ArgumentError(None, "-al/--alias-test requires -r/--rcpt-to (base recipient)")

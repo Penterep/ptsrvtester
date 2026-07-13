@@ -69,7 +69,6 @@ some kind of example"""
             "target",
             type=valid_target_smb,
             help="""IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 445 is default""",
-            required=True,
         )
         
         tests = parser.add_argument_group(
@@ -80,7 +79,6 @@ some kind of example"""
         # TODO: find option to not require args
         test_choices = ["version", "os"]
         tests.add_argument("-ts", "--test", help="Testing toolbox for SMB",
-                           required=False,
                            choices=test_choices)
         
         # maybe still usable

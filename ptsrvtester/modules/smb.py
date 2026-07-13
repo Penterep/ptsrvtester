@@ -3,6 +3,7 @@ import argparse
 from ._base import BaseModule, BaseArgs, Out
 from dataclasses import dataclass
 from typing import List, Optional
+from ptsrvtester.modules.utils.ptprinthelper import ptprint
 
 from impacket.smbconnection import (
     SMBConnection,
@@ -36,7 +37,6 @@ def _get_if_available(getter):
 class SMBArgs(BaseArgs):
     target: Target
     get_version: bool
-
     
     @staticmethod
     def get_help():
@@ -117,24 +117,20 @@ class SMB(BaseModule):
     def run(self):
         self.results.Info["target"] = self.args.target.ip
         self.results.Info["port"] = self.args.target.port or 445
-        
+
         if self.args.test == "version":
             self.info = self.get_ver()
     
     def output(self):
         if self.args.test == "version":
-            self.ptprint("SMB server version info:", Out.TITLE, title=True)
-            self.ptprint(
-                f"Target: {self.results.Info['target']}:{self.results.Info['port']}",
-                Out.INFO,
-            )
-            self.ptprint(f"Server name: {self.results.Info['server_name']}", Out.INFO)
-            self.ptprint(f"Server version: {self.results.Info['os_version']}", Out.INFO)
+            ptprint("SMB server version info:", bullet_type="TITLE")
+            ptprint(f"Target: {self.results.Info['target']}:{self.results.Info['port']}",
+                    bullet_type="INFO")
+            ptprint(f"Server name: {self.results.Info['server_name']}", bullet_type="INFO")
+            ptprint(f"Server version: {self.results.Info['os_version']}", bullet_type="INFO")
             is_vuln = "SMBv1" in self.results.Dialects
-            self.ptprint(
-                f"Supported dialects: {", ".join(self.results.Dialects)}",
-                Out.VULN if is_vuln else Out.NOTVULN,
-            )
+            ptprint(f"Supported dialects: {", ".join(self.results.Dialects)}",
+                    bullet_type="VULN" if is_vuln else "NOTVULN")
 
     def fill_results_info(self, data: dict) -> None:
         for key in data.keys():
@@ -181,6 +177,7 @@ class SMB(BaseModule):
         """
         # TODO: add check if server even connected
         # TODO: add timeout if server doesn't respond
+        # TODO: fix server name and server ver fetch
 
         port = self.args.target.port or 445
 

@@ -1,8 +1,8 @@
 from ptlibs.ptjsonlib import PtJsonLib
 import argparse
-from ._base import BaseModule, BaseArgs, Out
+from ._base import BaseModule, BaseArgs
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 from ptsrvtester.modules.utils.ptprinthelper import ptprint
 
 from impacket.smbconnection import (
@@ -69,6 +69,7 @@ some kind of example"""
             "target",
             type=valid_target_smb,
             help="""IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 445 is default""",
+            required=True,
         )
         
         tests = parser.add_argument_group(
@@ -76,7 +77,11 @@ some kind of example"""
             "Toolbox of non-invasive tests on a specified target server"
         )
         
-        tests.add_argument("-ts", "--test", help="Testing toolbox for SMB")
+        # TODO: find option to not require args
+        test_choices = ["version", "os"]
+        tests.add_argument("-ts", "--test", help="Testing toolbox for SMB",
+                           required=False,
+                           choices=test_choices)
         
         # maybe still usable
         # smb_subparsers = parser.add_subparsers(dest="command", help="Select SMB command", required=True)

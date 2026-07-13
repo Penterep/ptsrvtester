@@ -30,6 +30,7 @@ setuptools.setup(
     "ldap3>=2.9.1",
     "ptlibs>=1.0.20,<2",
     "pysnmp>=7.1.20",
+    "pyasn1>=0.6.1",
     "python-whois>=0.9.5",
     "paramiko>=4.0.0",
     "beautifulsoup4>=4.14.0",

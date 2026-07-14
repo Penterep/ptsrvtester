@@ -1,0 +1,5 @@
+{
+  "subject": "EICAR antivirus test - plain body (PTL-SVC-SMTP-ANTIVIRUS)",
+  "bodyPlainEicar": true,
+  "body": "EICAR standard string at the beginning of the plain message body (Kaspersky SMTP traffic protection guidance)."
+}

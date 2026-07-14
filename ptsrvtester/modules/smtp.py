@@ -1,4 +1,4 @@
-import argparse, ipaddress, json, os, queue, random, re, secrets, shutil, smtplib, socket, ssl, statistics, struct, subprocess, sys, textwrap, threading, time, unicodedata, zipfile, dns.resolver
+import argparse, base64, ipaddress, json, os, queue, random, re, secrets, shutil, smtplib, socket, ssl, statistics, struct, subprocess, sys, textwrap, threading, time, unicodedata, zipfile, dns.resolver
 from datetime import datetime, timedelta, timezone
 from base64 import b64decode, b64encode
 from io import BytesIO
@@ -544,8 +544,6 @@ ALIAS_VARIANT_TITLES: dict[str, str] = {
     "bang_nested": "Nested UUCP bang path test",
 }
 
-BCC_TEST_SECTION_TITLE = "BCC disclosure test"
-
 SSRF_VARIANT_TITLES: dict[str, str] = {
     "plain": "Plain URL test",
     "html_link": "HTML link test",
@@ -814,8 +812,8 @@ class RcptLimitResult(NamedTuple):
     catch_all_delivery_attempted: bool = False  # True when a DATA probe was submitted
     catch_all_delivery_data_ok: bool = False  # True when server accepted DATA (250)
     catch_all_probe_uuid: str | None = None  # Correlates manual inbox check (Message-ID / X-header)
-    # ── ``-rls`` / ``--recipient-limit-send``: deliver message after RCPT storm ──
-    limit_send_mode: bool = False  # True when ``-rls`` was used
+    # ── RCPTLIM with ``--send``: deliver one message after the RCPT storm ──
+    limit_send_mode: bool = False  # True when ``--send`` was used with RCPTLIM
     limit_send_attempted: bool = False  # True when DATA was submitted (accepted > 0)
     limit_send_ok: bool = False  # True when server accepted DATA (250)
     limit_send_data_code: int | None = None
@@ -1234,6 +1232,7 @@ class AntivirusCategoryResult(NamedTuple):
     detail: str | None
     message_summary: tuple[str, ...] = ()
     test_id: str = ""
+    payload_test_ids: tuple[str, ...] = ()
 
 
 class AntivirusResult(NamedTuple):
@@ -1357,6 +1356,9 @@ class AliasTestResult(NamedTuple):
     elapsed_sec: float
     detail: str | None
     verification_instructions: str
+    base_mail_sent: bool = False
+    base_test_id: str = ""
+    base_smtp_trace: tuple[str, ...] = ()
 
 
 class FloodResult(NamedTuple):
@@ -1566,23 +1568,18 @@ def _smtp_users_file_supplies_name_list(args: ArgsWithBruteforce) -> bool:
 
 
 def _rcpt_limit_active(args) -> bool:
-    """True when ``-rl`` or ``-rls`` is active."""
-    return (
-        getattr(args, "rcpt_limit", None) is not None
-        or getattr(args, "rcpt_limit_send", None) is not None
-    )
+    """True when ``-rl`` / RCPTLIM is active."""
+    return getattr(args, "rcpt_limit", None) is not None
 
 
 def _rcpt_limit_send_mode(args) -> bool:
-    """True for ``-rls`` / ``--recipient-limit-send`` (submit DATA after RCPT storm)."""
-    return getattr(args, "rcpt_limit_send", None) is not None
+    """True when RCPTLIM should submit DATA after the RCPT storm (global ``--send``)."""
+    return bool(getattr(args, "send", False))
 
 
 def _rcpt_limit_max_attempts(args) -> int:
-    """Max RCPT iterations for ``-rl`` / ``-rls`` (default ``RCPT_LIMIT_DEFAULT_ATTEMPTS``)."""
-    raw = getattr(args, "rcpt_limit_send", None)
-    if raw is None:
-        raw = getattr(args, "rcpt_limit", None)
+    """Max RCPT iterations for RCPTLIM (default ``RCPT_LIMIT_DEFAULT_ATTEMPTS``)."""
+    raw = getattr(args, "rcpt_limit", None)
     if raw is None:
         return RCPT_LIMIT_DEFAULT_ATTEMPTS
     return max(1, int(raw))
@@ -1598,7 +1595,471 @@ def _normalize_smtp_role(value: str) -> str:
     return role
 
 
+# region -ts test registry (single source of truth for `-ts/--tests`)
+
+# Common outbound message options (shown in per-test help for tests that send mail)
+_TS_COMMON_MSG: list[list[str]] = [
+    ["-r", "--rcpt-to", "<email>", "Recipient (To)"],
+    ["-m", "--mail-from", "<email>", "Envelope sender (MAIL FROM)"],
+    ["-cc", "--cc", "<emails>", "CC recipients (comma-separated)"],
+    ["-fn", "--from-name", "<name>", "Display name in From header"],
+    ["", "--subject", "<text>", "Message subject"],
+    ["", "--data", "<text>", "Message body"],
+]
+
+# Ordered groups for the main help table
+SMTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
+    ("Recon & fingerprint", ["BANNER", "IDENTIFY", "IDAGG", "EHLO", "AUTHLIST", "ROLE", "ENCRYPT", "NTLM"]),
+    ("Authentication", ["AUTHFMT", "AUTHENUM", "AUTHDN"]),
+    ("Protocol & validation", ["HELOVAL", "HELOONLY", "HELOBYP", "INVCMD"]),
+    ("Relay & addressing", ["OPENREL", "PROBEDOM", "ALIAS", "BCC", "SPOOF", "BOUNCE"]),
+    ("Enumeration & credentials", ["ENUM", "BRUTE"]),
+    ("Rate limiting & stress", ["RATELIM", "RCPTLIM", "RCPTDUP", "NOOP1", "NOOP2", "BOMB", "FLOOD"]),
+    ("Content security", ["AV", "SSRF", "ZIPXXE"]),
+    ("Indirect (no direct SMTP connection)", ["BLACKLIST", "SPF"]),
+    ("Utility", ["INTERACT"]),
+]
+
+# Per-test definitions:
+#   desc      one-line description for the main -ts table
+#   long      list of <=3 lines describing what the test does (per-test help)
+#   flags     dict dest->value applied to the args namespace when selected
+#   value     (dest, default) for tests whose flag carries a value (default set if None)
+#   requires  human-readable prerequisite strings (per-test help)
+#   common    True -> append common outbound message options to per-test help
+#   mods      test-specific option rows [short, long, metavar, help] (per-test help)
+SMTP_TESTS: dict[str, dict] = {
+    "BANNER": {
+        "desc": "Grab banner and service identification",
+        "long": ["Connect and read the greeting banner, then identify the product,",
+                 "version and CPE from the advertised software string."],
+        "flags": {"banner": True},
+    },
+    "IDENTIFY": {
+        "desc": "Identify server software from responses",
+        "long": ["Fingerprint the SMTP server from typical responses (banner, EHLO,",
+                 "HELP, RCPT error syntax, TLS) without intrusive probing."],
+        "flags": {"identify": True},
+    },
+    "IDAGG": {
+        "desc": "Aggressive fingerprinting (VRFY, unknown commands)",
+        "long": ["Enhanced identification via VRFY/EXPN, unknown commands (FOOBAR)",
+                 "and RFC-edge probing. More accurate but may trigger WAF/IDS."],
+        "flags": {"identify": True, "id_aggressive": True},
+    },
+    "EHLO": {
+        "desc": "Grab EHLO extensions (commands JSON)",
+        "long": ["Send EHLO and list advertised extensions and AUTH mechanisms."],
+        "flags": {"commands": True},
+    },
+    "AUTHLIST": {
+        "desc": "Grab EHLO AUTH mechanisms (auth JSON)",
+        "long": ["Same EHLO probe as EHLO but with an authentication-focused JSON",
+                 "output shape listing the advertised AUTH mechanisms."],
+        "flags": {"authentications": True},
+    },
+    "ROLE": {
+        "desc": "Identify server role (MTA / Submission / Hybrid)",
+        "long": ["Determine whether the server behaves as an MTA, a Submission",
+                 "service, or a hybrid, based on ports and policy responses."],
+        "flags": {"role_identify": True},
+    },
+    "ENCRYPT": {
+        "desc": "Check encryption methods (TLS / STARTTLS)",
+        "long": ["Inspect supported transport encryption: implicit TLS and STARTTLS."],
+        "flags": {"isencrypt": True},
+    },
+    "NTLM": {
+        "desc": "Inspect NTLM authentication",
+        "long": ["Probe NTLM (NTLMSSP) authentication and decode the server challenge",
+                 "for leaked domain / host information."],
+        "flags": {"ntlm": True},
+    },
+    "AUTHFMT": {
+        "desc": "Probe AUTH LOGIN identity format",
+        "long": ["Determine the identity shape the server expects for AUTH LOGIN",
+                 "(bare username vs e-mail vs NetBIOS) using passive probes."],
+        "flags": {"auth_format": True},
+    },
+    "AUTHENUM": {
+        "desc": "Enumerate users via AUTH",
+        "long": ["User enumeration through advertised AUTH LOGIN / PLAIN / NTLM,",
+                 "using synthetic invalid baselines to spot differing responses."],
+        "flags": {"auth_enum": True},
+        "requires": ["-u/--user or -U/--users (candidate names)"],
+        "mods": [
+            ["-u", "--user", "<name> …", "Candidate username(s)"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+        ],
+    },
+    "AUTHDN": {
+        "desc": "Test AUTH downgrade after failed authentication",
+        "long": ["Check whether advertised AUTH mechanisms change (weaken) after a",
+                 "failed authentication attempt."],
+        "flags": {"auth_downgrade": True},
+    },
+    "HELOVAL": {
+        "desc": "Test HELO/EHLO hostname validation",
+        "long": ["Test how strictly the server validates the HELO/EHLO hostname."],
+        "flags": {"helo_validation": True},
+    },
+    "HELOONLY": {
+        "desc": "Test HELO-only without EHLO extensions",
+        "long": ["Check whether the server accepts plain HELO without EHLO",
+                 "extensions (legacy / downgrade behaviour)."],
+        "flags": {"helo_only": True},
+    },
+    "HELOBYP": {
+        "desc": "Test HELO/EHLO bypass of restrictions",
+        "long": ["Try HELO/EHLO values that may bypass security restrictions",
+                 "(relay / policy checks)."],
+        "flags": {"helo_bypass": True},
+    },
+    "INVCMD": {
+        "desc": "Test invalid or non-standard commands",
+        "long": ["Send invalid / non-standard SMTP commands and observe robustness,",
+                 "information leaks and tarpitting behaviour."],
+        "flags": {"invalid_commands": True},
+    },
+    "OPENREL": {
+        "desc": "Test open relay",
+        "long": ["Check whether the server relays mail for non-local recipients",
+                 "(open relay)."],
+        "flags": {"open_relay": True},
+    },
+    "PROBEDOM": {
+        "desc": "Probe which recipient domains are accepted as local",
+        "long": ["Probe which recipient domain the server's RCPT TO treats as local."],
+        "flags": {"probe_accepted_domain": True},
+    },
+    "ALIAS": {
+        "desc": "Test alias and addressing bypass",
+        "long": ["Test address normalization / alias bypass variants (case, dotted,",
+                 "plus, percent, UUCP bang paths) against a base recipient."],
+        "flags": {"alias_test": True},
+        "requires": ["-r/--rcpt-to (base recipient)"],
+        "common": True,
+        "mods": [
+            ["", "--alias-variants", "<v1,v2,...>", "case,case_domain,dotted,plus,percent,bang_simple,bang_nested (default: all)"],
+            ["", "--alias-timeout", "<sec>", "Timeout per variant (default: 30)"],
+        ],
+    },
+    "BCC": {
+        "desc": "Test BCC header disclosure",
+        "long": ["Send a message with To, Cc and Bcc; verify the server strips the",
+                 "Bcc header so hidden recipients are not disclosed to To/Cc."],
+        "value": ("bcc_test", None),
+        "requires": ["-bcc/--bcc <emails> (Bcc addresses)", "-r/--rcpt-to (To)", "-cc/--cc (Cc)"],
+        "common": True,
+        "mods": [
+            ["-bcc", "--bcc", "<emails>", "Bcc recipients (comma-separated)"],
+            ["", "--bcc-timeout", "<sec>", "Timeout for BCC test (default: 30)"],
+        ],
+    },
+    "SPOOF": {
+        "desc": "Test header spoofing (From, Reply-To, Return-Path)",
+        "long": ["Send messages with spoofed From / Reply-To / Return-Path headers",
+                 "and report whether the server accepts them (phishing risk)."],
+        "flags": {"spoof_headers": True},
+        "requires": ["-r/--rcpt-to (recipient)"],
+        "common": True,
+        "mods": [
+            ["", "--spoof-variants", "<v1,v2,...>", "from,reply_to,return_path (default: all)"],
+            ["", "--spoof-timeout", "<sec>", "Timeout per message (default: 30)"],
+        ],
+    },
+    "BOUNCE": {
+        "desc": "Test bounce / backscatter replay",
+        "long": ["Two-probe bounce/backscatter test on one connection to detect",
+                 "servers that generate backscatter to a controlled address."],
+        "flags": {"bounce_replay": True},
+        "requires": ["-m/--mail-from (controlled bounce address)", "-r/--rcpt-to (recipient)"],
+        "common": True,
+    },
+    "ENUM": {
+        "desc": "Enumerate users (VRFY / EXPN / RCPT)",
+        "long": ["Enumerate valid users via VRFY, EXPN and/or RCPT. Defaults to all",
+                 "methods; narrow with --enum-methods and feed names via -u/-U."],
+        "value": ("enumerate", "ALL"),
+        "mods": [
+            ["-e", "--enum-methods", "[VRFY/EXPN/RCPT/ALL]", "Methods to use (default: ALL)"],
+            ["-u", "--user", "<name> …", "Candidate username(s)"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-t", "--threads", "<n>", "Enumeration threads (default: 1)"],
+            ["-sd", "--slow-down", "", "Test slow-down / tarpitting protection"],
+            ["", "--enum-reconnect-after", "<n>", "Reconnect after n consecutive failures"],
+        ],
+    },
+    "BRUTE": {
+        "desc": "Bruteforce credentials",
+        "long": ["Bruteforce SMTP AUTH using username(s) and password(s).",
+                 "Requires credentials via -u/-p or -U/-P."],
+        "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
+        "mods": [
+            ["-u", "--user", "<name> …", "Username(s)"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "<password>", "Single password"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+        ],
+    },
+    "RATELIM": {
+        "desc": "Test connection rate limiting",
+        "long": ["Open many connections to measure whether the server enforces",
+                 "connection rate limiting / banning."],
+        "value": ("rate_limit", RATE_LIMIT_DEFAULT_ATTEMPTS),
+        "mods": [
+            ["-rt", "--rate-limit", "<n>", f"Max simultaneous connections to attempt (default: {RATE_LIMIT_DEFAULT_ATTEMPTS})"],
+        ],
+    },
+    "RCPTLIM": {
+        "desc": "Test RCPT TO recipient limit",
+        "long": ["Storm RCPT TO in one message to find the per-message recipient",
+                 "limit. Without -u/-U generates random recipients. With --send it",
+                 "also submits one message (DATA) after the RCPT storm."],
+        "value": ("rcpt_limit", RCPT_LIMIT_DEFAULT_ATTEMPTS),
+        "mods": [
+            ["-rl", "--recipient-limit", "<n>", f"Max RCPT attempts per session (default: {RCPT_LIMIT_DEFAULT_ATTEMPTS})"],
+            ["", "--send", "", "Submit DATA after the RCPT storm (requires -m/--mail-from)"],
+            ["", "--rl-no-precheck", "", "Skip role/open-relay/AUTH pre-check"],
+            ["-d", "--domain", "<domain>", "Recipient domain for the probe"],
+            ["-m", "--mail-from", "<email>", "Envelope MAIL FROM (default <>)"],
+        ],
+    },
+    "RCPTDUP": {
+        "desc": "Test duplicate RCPT TO for one address",
+        "long": ["Send RCPT TO repeatedly for the same recipient in one transaction.",
+                 "SMTP acceptance does not prove N deliveries — use --send + manual check."],
+        "value": ("rcpt_duplicate", RCPT_DUP_DEFAULT),
+        "requires": ["-r/--rcpt-to (probed address)"],
+        "mods": [
+            ["-rdd", "--rcpt-duplicate", "<n>", f"Repeats (default {RCPT_DUP_DEFAULT}, max {RCPT_DUP_MAX})"],
+            ["", "--send", "", "Submit minimal DATA after RCPT for manual verification"],
+        ],
+    },
+    "NOOP1": {
+        "desc": "NOOP flood on a single connection",
+        "long": ["Send NOOPs as fast as possible on one connection; report how many",
+                 "the server accepts, response-time growth and error rate."],
+        "flags": {"noop_flood1": True},
+    },
+    "NOOP2": {
+        "desc": "NOOP flood on parallel connections",
+        "long": ["NOOP flooding DoS across N parallel connections; reports per-command",
+                 "reaction time and error rate under load."],
+        "value": ("noop_flood2", NOOP_FLOOD2_DEFAULT_CONNECTIONS),
+        "mods": [
+            ["-nf2", "--noop-flood2", "<n>", f"Parallel connections (default: {NOOP_FLOOD2_DEFAULT_CONNECTIONS})"],
+        ],
+    },
+    "BOMB": {
+        "desc": "Mail flooding / rate limiting",
+        "long": ["Send many messages to test mail flooding and rate limiting."],
+        "flags": {"bomb": True},
+        "requires": ["-r/--rcpt-to (recipient)"],
+        "common": True,
+        "mods": [
+            ["", "--bomb-count", "<n>", "Messages to send (default: 100)"],
+            ["", "--bomb-timeout", "<sec>", "Max time for the whole test (default: 60)"],
+            ["", "--bomb-delay", "<sec>", "Delay between messages (default: 0)"],
+            ["", "--bomb-threads", "<n>", "Parallel threads (default: 1)"],
+            ["", "--bomb-randomize", "", "Add unique ID to each message"],
+        ],
+    },
+    "FLOOD": {
+        "desc": "Queue overload via SIZE and volume",
+        "long": ["Test the SIZE extension and queue overload; may delay production",
+                 "mail. Stops on 421 (panic)."],
+        "flags": {"flood": True},
+        "requires": ["-r/--rcpt-to (recipient)"],
+        "common": True,
+        "mods": [
+            ["", "--flood-count", "<n>", "Messages for queue stress (default: 150, max 500)"],
+            ["", "--flood-timeout", "<sec>", "Max time for queue stress (default: 90)"],
+            ["", "--flood-skip-size-test", "", "Skip MAIL FROM SIZE=oversized test"],
+        ],
+    },
+    "AV": {
+        "desc": "Antivirus / antispam filters",
+        "long": ["Send benign malware-signature samples (EICAR, double extensions,",
+                 "XXE, ...) to test antivirus / antispam filtering."],
+        "flags": {"antivirus": True},
+        "requires": ["-r/--rcpt-to (recipient)"],
+        "common": True,
+        "mods": [
+            ["", "--av-categories", "<cat,...>", "eicar,double_ext,executable,nested_archive,encoded_content,html_sanitization,xxe,mime_malformed (default: all except zip_bomb)"],
+            ["", "--av-zip-bomb", "", "Include zip_bomb category (DoS risk!)"],
+            ["", "--av-timeout", "<sec>", "Per-message timeout (default: 30)"],
+            ["", "--av-skip-absent", "", "Skip categories with no definition files"],
+        ],
+    },
+    "SSRF": {
+        "desc": "Server-side link fetching (SSRF)",
+        "long": ["Embed canary URLs in messages to detect whether the server fetches",
+                 "links (SSRF). Requires a canary/callback URL."],
+        "flags": {"ssrf": True},
+        "requires": ["-r/--rcpt-to (recipient)", "--ssrf-canary-url <URL>"],
+        "common": True,
+        "mods": [
+            ["", "--ssrf-canary-url", "<URL>", "Canary/callback URL (Interactsh, ngrok, ...)"],
+            ["", "--ssrf-variants", "<v1,v2,...>", "plain,html_link,html_img,html_iframe,multipart,ssrf_malformed,ssrf_nested (default: all)"],
+            ["", "--ssrf-internal-urls", "", "Also test internal URLs (127.0.0.1, localhost)"],
+            ["", "--ssrf-timeout", "<sec>", "Per-message timeout (default: 30)"],
+        ],
+    },
+    "ZIPXXE": {
+        "desc": "Zip bomb, Billion Laughs, XXE",
+        "long": ["Send Zip bomb, Billion Laughs and XXE payloads to test archive /",
+                 "XML handling. XXE variants require a canary URL."],
+        "flags": {"zipxxe": True},
+        "requires": ["-r/--rcpt-to (recipient)", "--zipxxe-canary-url for xxe_* variants"],
+        "common": True,
+        "mods": [
+            ["", "--zipxxe-canary-url", "<URL>", "Canary URL for xxe_zip / xxe_docx / xxe_body"],
+            ["", "--zipxxe-variants", "<v1,v2,...>", "billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx,xxe_body (default: all)"],
+            ["", "--zipxxe-zip-bomb", "", "Include zip_bomb (minimal ~200KB; DoS risk!)"],
+            ["", "--zipxxe-zip-bomb-full", "", "Include zip_bomb_full (~100KB→~100MB; extreme DoS risk!)"],
+            ["", "--zipxxe-timeout", "<sec>", "Per-message timeout (default: 30)"],
+        ],
+    },
+    "BLACKLIST": {
+        "desc": "Check target against blacklists",
+        "long": ["Look up the target (domain + public IP) against DNS blacklists.",
+                 "No direct SMTP connection is made."],
+        "flags": {"blacklist_test": True},
+    },
+    "SPF": {
+        "desc": "Check SPF records (requires domain target)",
+        "long": ["Fetch and evaluate SPF records for the target domain.",
+                 "Requires a domain name (not a bare IP)."],
+        "flags": {"spf_test": True},
+    },
+    "INTERACT": {
+        "desc": "Interactive SMTP CLI",
+        "long": ["Open an interactive SMTP session for manual command entry."],
+        "flags": {"interactive": True},
+    },
+}
+
+
+# Tests that cannot be realized without actually delivering a message. When one of
+# these is selected explicitly via ``-ts`` without ``--send`` we refuse to run and
+# tell the user that ``--send`` is required (see ``_apply_smtp_tests``). Tests not
+# listed here either never send (recon/validation) or only send optionally when
+# ``--send`` is given (RCPTLIM, RCPTDUP). OPENREL is intentionally exempt: it is a
+# core recon test that runs in run-all mode.
+SMTP_SEND_REQUIRED: frozenset[str] = frozenset(
+    {"BCC", "BOUNCE", "BOMB", "FLOOD", "AV", "ZIPXXE", "SSRF", "SPOOF", "ALIAS"}
+)
+
+
+def _smtp_parse_test_codes(raw: str | None) -> list[str]:
+    """Split and upper-case a raw -ts value into a list of codes."""
+    if not raw:
+        return []
+    return [c.strip().upper() for c in str(raw).split(",") if c.strip()]
+
+
+def _apply_smtp_tests(args) -> None:
+    """Translate ``-ts/--tests`` codes into the internal per-test dest flags.
+
+    ``ALL`` (or no ``-ts``) leaves every flag at default -> run-all mode.
+    """
+    codes = _smtp_parse_test_codes(getattr(args, "tests", None))
+    if not codes:
+        return
+    if "ALL" in codes:
+        # Explicit full scan: apply nothing so _is_run_all_mode() stays True.
+        return
+    unknown = [c for c in codes if c not in SMTP_TESTS]
+    if unknown:
+        available = ", ".join(sorted(SMTP_TESTS))
+        raise argparse.ArgumentError(
+            None,
+            f"Unknown test(s): {', '.join(unknown)}. Available: ALL, {available}",
+        )
+
+    # Tests that must deliver a message require the global --send switch.
+    if not getattr(args, "send", False):
+        need_send = [c for c in codes if c in SMTP_SEND_REQUIRED]
+        if need_send:
+            raise argparse.ArgumentError(
+                None,
+                "; ".join(
+                    f"{code}: Parameter --send is required for this test"
+                    for code in need_send
+                ),
+            )
+
+    for code in codes:
+        spec = SMTP_TESTS[code]
+        for dest, val in spec.get("flags", {}).items():
+            setattr(args, dest, val)
+        value = spec.get("value")
+        if value is not None:
+            dest, default = value
+            if getattr(args, dest, None) is None and default is not None:
+                setattr(args, dest, default)
+
+    # Every explicitly selected test must actually activate; otherwise report what is
+    # missing instead of silently falling back to run-all mode.
+    inactive: list[tuple[str, list[str]]] = []
+    for code in codes:
+        spec = SMTP_TESTS[code]
+        if code == "BRUTE":
+            active = check_if_brute(args)
+        elif "flags" in spec:
+            active = all(getattr(args, dest, None) for dest in spec["flags"])
+        elif "value" in spec:
+            active = getattr(args, spec["value"][0], None) is not None
+        else:
+            active = True
+        if not active:
+            inactive.append((code, list(spec.get("requires", []))))
+    if inactive:
+        parts = [
+            f"{code} requires {'; '.join(req)}" if req else f"{code} could not be activated"
+            for code, req in inactive
+        ]
+        raise argparse.ArgumentError(None, "; ".join(parts))
+
+
+def _smtp_test_help(codes: list[str]):
+    """Build a help object (for ptprinthelper.help_print) describing given test codes."""
+    if not codes:
+        return None
+    valid = [c for c in codes if c in SMTP_TESTS]
+    if not valid:
+        available = ", ".join(sorted(SMTP_TESTS))
+        return [
+            {"unknown_test": [f"Unknown test: {', '.join(codes)}"]},
+            {"available_tests": [f"ALL, {available}"]},
+        ]
+    out: list[dict] = []
+    for code in valid:
+        spec = SMTP_TESTS[code]
+        header = f"{code} — {spec.get('desc', '')}"
+        out.append({"test": [header, *spec.get("long", [])]})
+        req = list(spec.get("requires", []))
+        if code in SMTP_SEND_REQUIRED:
+            req.append("--send (required to actually deliver the test message(s))")
+        if req:
+            out.append({"requires": req})
+        rows: list[list[str]] = list(spec.get("mods", []))
+        if spec.get("common"):
+            rows = rows + _TS_COMMON_MSG
+        if rows:
+            out.append({"test_options": rows})
+        has_opts = bool(rows or req)
+        usage = f"ptsrvtester smtp -ts {code} " + ("<options> <target>" if has_opts else "<target>")
+        out.append({"usage": [usage]})
+    return out
+
+
+# endregion
+
+
 class SMTPArgs(ArgsWithBruteforce):
+    tests: str | None
     target: Target
     tls: bool
     starttls: bool
@@ -1620,136 +2081,94 @@ class SMTPArgs(ArgsWithBruteforce):
     smtp_role: str | None
     probe_accepted_domain: bool
     rcpt_duplicate: int | None
-    rcpt_duplicate_send: bool
+    send: bool
     smtp_subject: str | None
     smtp_data: str | None
 
     @staticmethod
     def get_help():
+        # Test selection table (-ts): one code + one-line description per test.
+        options: list[list[str]] = [
+            ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,AV); ALL runs everything:"],
+        ]
+        for group_title, codes in SMTP_TEST_GROUPS:
+            options.append(["", "", "", ""])
+            options.append(["", "", get_colored_text(group_title, "TITLE")])
+            for code in codes:
+                options.append(["", "", code, SMTP_TESTS[code]["desc"]])
+
+        # Global options (test-specific modifiers live in `smtp -ts <TEST> -h`).
+        options += [
+            ["", "", "", ""],
+            [get_colored_text("Connection", "TITLE")],
+            ["", "--tls", "", "Use implicit SSL/TLS (default port 465)"],
+            ["", "--starttls", "", "Use explicit STARTTLS (default port 587)"],
+            ["-f", "--fqdn", "<fqdn>", "FQDN for EHLO/HELO (default: from target or hostname)"],
+            ["", "", "", ""],
+            [get_colored_text("Message (outbound tests)", "TITLE")],
+            ["", "--send", "", "Actually deliver test messages (DATA); required by delivery tests"],
+            ["-m", "--mail-from", "<email>", "Envelope sender (MAIL FROM)"],
+            ["-r", "--rcpt-to", "<email>", "Recipient (To)"],
+            ["-cc", "--cc", "<emails>", "CC recipients (comma-separated)"],
+            ["-fn", "--from-name", "<name>", "Display name in From header"],
+            ["", "--subject", "<text>", f"Message subject (default: {DEFAULT_SMTP_SUBJECT!r})"],
+            ["", "--data", "<text>", f"Message body (default: {DEFAULT_SMTP_DATA!r})"],
+            ["", "", "", ""],
+            [get_colored_text("Credentials", "TITLE")],
+            ["-u", "--user", "<name> …", "Username(s) for BRUTE / ENUM"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "<password>", "Password for BRUTE"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "", "", ""],
+            [get_colored_text("Targeting & misc", "TITLE")],
+            ["-t", "--threads", "<n>", "Threads for enumeration (default: 1)"],
+            ["-d", "--domain", "<domain>", "Recipient domain for RCPT limit tests"],
+            ["-R", "--role", "<mta|submission>", "Expected server role"],
+            ["", "", "", ""],
+            [get_colored_text("Output", "TITLE")],
+            ["-j", "--json", "", "Output in JSON format"],
+            ["-vv", "--verbose", "", "Enable verbose mode"],
+            ["-v", "--version", "", "Show version and exit"],
+            ["-h", "--help", "", "Show this help; 'smtp -ts <TEST> -h' for test options"],
+        ]
+
         return [
             {"description": ["SMTP Testing Module"]},
-            {"usage": ["ptsrvtester smtp <options> <target>"]},
+            {"usage": ["ptsrvtester smtp -ts <test>[,<test>...] <options> <target>"]},
             {"usage_example": [
-                "ptsrvtester smtp -e ALL -sd -U wordlist.txt mail.example.com:25",
-                "ptsrvtester smtp -b -c --ntlm 127.0.0.1",
-                "ptsrvtester smtp -id mail.example.com:25",
-                "ptsrvtester smtp -id --id-aggressive smtp.example.com:25",
-                "ptsrvtester smtp -br -m attacker@example.com -r foo@foo.com smtp.example.com:25",
-                "ptsrvtester smtp -br -m attacker@example.com -r foo@foo.com -u user -p pass smtp.example.com:587",
-                "ptsrvtester smtp -bomb -r victim@example.com smtp.example.com:587",
-                "ptsrvtester smtp -av -r victim@example.com smtp.example.com:587",
-                "ptsrvtester smtp -bomb -av -r victim@example.com smtp.example.com:25",
-                "ptsrvtester smtp -ssrf -r victim@example.com --ssrf-canary-url https://xyz.oast.fun/ssrf smtp.example.com:587",
-                "ptsrvtester smtp -flood -r victim@example.com smtp.example.com:587",
-                "ptsrvtester smtp -bomb -flood -r victim@example.com smtp.example.com:25",
-                "ptsrvtester smtp -sh -r victim@example.com smtp.example.com:25",
-                "ptsrvtester smtp -sh -r victim@example.com -u user -p pass smtp.example.com:587",
-                "ptsrvtester smtp -bcc bcc@example.com -r to@example.com --cc cc@example.com smtp.example.com:25",
-                "ptsrvtester smtp -pd mail.example.com:25",
+                "ptsrvtester smtp -ts BANNER,EHLO mail.example.com:25",
+                "ptsrvtester smtp -ts ALL mail.example.com:25",
+                "ptsrvtester smtp -ts OPENREL mail.example.com:25",
+                "ptsrvtester smtp -ts BOUNCE -m attacker@example.com -r foo@foo.com smtp.example.com:25",
+                "ptsrvtester smtp -ts BOMB -r victim@example.com smtp.example.com:587",
+                "ptsrvtester smtp -ts AV,SSRF,ZIPXXE -r victim@example.com --ssrf-canary-url http://cb --zipxxe-canary-url http://cb smtp.example.com:25",
+                "ptsrvtester smtp -ts ENUM -e ALL -U wordlist.txt mail.example.com:25",
+                "ptsrvtester smtp -ts SPOOF -r victim@example.com smtp.example.com:25",
+                "ptsrvtester smtp -ts BCC -r to@example.com --cc cc@example.com --bcc bcc@example.com smtp.example.com:25",
+                "ptsrvtester smtp -ts AV -h",
             ]},
-            {"options": [
-                ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
-                ["-id", "--identify", "", "Identify SMTP server software from typical responses (banner, EHLO, HELP, RCPT error syntax, TLS)"],
-                ["", "--id-aggressive", "", "Enhanced fingerprinting via VRFY, unknown commands (FOOBAR), and RFC-edge probing (may trigger WAF/IDS)"],
-                ["-c", "--commands", "", "Grab EHLO (alias for -A, different JSON)"],
-                ["-A", "--authentications", "", "Grab EHLO (alias for -c, different JSON)"],
-                ["-af", "--auth-format", "", "AUTH LOGIN identity shape probe (username vs e-mail vs NetBIOS)"],
-                ["-ae", "--auth-enum", "", "AUTH enumeration: 2 synthetic baselines per advertised LOGIN / PLAIN / NTLM"],
-                ["-ad", "--auth-downgrade", "", "Test AUTH downgrade after failed authentication"],
-                ["-he", "--helo-validation", "", "Test HELO/EHLO hostname validation"],
-                ["-iv", "--invalid-commands", "", "Test invalid/non-standard SMTP commands"],
-                ["-ho", "--helo-only", "", "Test if server supports only HELO without EHLO extensions"],
-                ["-hb", "--helo-bypass", "", "Test HELO/EHLO value for bypassing security restrictions"],
-                ["-m", "--mail-from", "<email>", "Sender address (MAIL FROM)"],
-                ["-r", "--rcpt-to", "<email>", "Recipient (To); required for -bomb, -av, -ssrf, -zipxxe, -sh, -bcc, -al, -br, -rdd"],
-                ["-fn", "--from-name", "<name>", "Sender display name in From header"],
-                ["-cc", "--cc", "<emails>", "CC recipients, comma-separated; used by -bomb, -av, -ssrf; required for -bcc"],
-                ["", "--subject", "<text>", f"Subject for outbound test messages (default: {DEFAULT_SMTP_SUBJECT!r})"],
-                ["", "--data", "<text>", f"Plain-text body for outbound test messages (default: {DEFAULT_SMTP_DATA!r})"],
-                ["-ie", "--is-encrypt", "", "Check encryption methods"],
-                ["", "--ntlm", "", "Inspect NTLM authentication"],
-                ["-e", "--enumerate", "[VRFY/EXPN/RCPT/ALL]", "User enumeration (default: ALL)"],
-                ["-t", "--threads", "<threads>", "Threads for enumeration (default: 1)"],
-                ["", "--enum-reconnect-after", "<n>", "Reconnect after n consecutive failures during enum (default: 4)"],
-                ["-sd", "--slow-down", "", "Test slow-down protection (requires -e)"],
-                ["-rt", "--rate-limit", "<n>", f"Rate limiting test (default: {RATE_LIMIT_DEFAULT_ATTEMPTS} attempts)"],
-                ["-nf1", "--noop-flood1", "", "NOOP flooding test (1 connection, rapid NOOP commands)"],
-                ["-nf2", "--noop-flood2", "<n>", f"NOOP flooding DoS test (default: {NOOP_FLOOD2_DEFAULT_CONNECTIONS} parallel connections)"],
-                ["-rl", "--recipient-limit", "<n>", "Test RCPT TO limit (without -u/-U is generated 1000 random recipients; optional -m sets envelope MAIL FROM)"],
-                ["-rls", "--recipient-limit-send", "<n>", "Like -rl but submits DATA after RCPT storm (requires -m); tests whether multi-recipient delivery succeeds"],
-                ["-rdd", "--rcpt-duplicate", "<n>", f"Probe N duplicate RCPT TO for same address in one MAIL (default {RCPT_DUP_DEFAULT}, max {RCPT_DUP_MAX}; requires -r)"],
-                ["", "--rdd-send", "", "With -rdd: send minimal DATA after RCPT so analyst can verify mailbox copies manually"],
-                ["", "--rl-no-precheck", "", "Skip role/open-relay/auth pre-check for -rl (run RCPT TO probe directly)"],
-                ["-d", "--domain", "<domain>", "Recipient domain for RCPT TO limit test"],
-                ["-pd", "--probe-accepted-domain", "", "Probe which recipient domain RCPT treats as local"],
-                ["-or", "--open-relay", "", "Test open relay"],
-                ["-ri", "--role-identify", "", "Identify server role (MTA / Submission / Hybrid)"],
-                ["-R", "--role", "<mta|submission>", "Role of SMTP server (MTA or Submission)"],
-                ["-I", "--interactive", "", "Interactive SMTP CLI"],
-                ["-bl", "--blacklist-test", "", "Test against blacklists"],
-                ["-s", "--spf-test", "", "Test SPF records (requires domain name)"],
-                ["-f", "--fqdn", "<fqdn>", "FQDN for EHLO/HELO (default: from target or system hostname)"],
-                ["", "--tls", "", "Use implicit SSL/TLS"],
-                ["", "--starttls", "", "Use explicit SSL/TLS"],
-                ["-u", "--user", "<name> …", "Username(s); bruteforce and/or -e targets (combine with -U file)"],
-                ["-U", "--users", "<wordlist>", "Username file: bruteforce with -p/-P; also names for -e, -ae, -rl"],
-                ["-p", "--password", "<password>", "Single password for bruteforce"],
-                ["-P", "--passwords", "<wordlist>", "File with passwords"],
-                ["-br", "--bounce-replay", "", "Bounce/backscatter test; requires -m (MAIL FROM) and -r (RCPT TO)"],
-                ["-sh", "--spoof-headers", "", "Test header spoofing (From, Reply-To, Return-Path); requires -r"],
-                ["", "--spoofhdr-variants", "<v1,v2,...>", "Variants: from,reply_to,return_path (default: all)"],
-                ["", "--spoofhdr-timeout", "<sec>", "Timeout per message for Spoof headers test (default: 30)"],
-                ["-bcc", "--bcc-test", "<emails>", "BCC disclosure test; requires -r and --cc"],
-                ["", "--bcc-timeout", "<sec>", "Timeout for BCC test (default: 30)"],
-                ["-al", "--alias-test", "", "Alias & addressing bypass; requires -r"],
-                ["", "--alias-variants", "<v1,v2,...>", "Variants: case,case_domain,dotted,plus,percent,bang_simple,bang_nested (default: all)"],
-                ["", "--alias-timeout", "<sec>", "Timeout per variant (default: 30)"],
-                ["-bomb", "--bomb", "", "Test mail flooding / rate limiting"],
-                ["", "--bomb-count", "<n>", "Number of messages to send (default: 100)"],
-                ["", "--bomb-timeout", "<sec>", "Max time for entire test (default: 60)"],
-                ["", "--bomb-delay", "<sec>", "Delay between messages (default: 0)"],
-                ["", "--bomb-threads", "<n>", "Parallel threads for flooding (default: 1)"],
-                ["", "--bomb-randomize", "", "Add unique ID to each message"],
-                ["-av", "--antivirus", "", "Test antivirus/antispam protection; requires -r"],
-                ["", "--antivirus-categories", "<cat1,cat2,...>", "Categories: eicar,double_ext,executable,nested_archive,encoded_content,html_sanitization,xxe,mime_malformed (default: all except zip_bomb)"],
-                ["", "--antivirus-zip-bomb", "", "Include zip_bomb category (DoS risk!)"],
-                ["", "--antivirus-timeout", "<sec>", "Timeout per message (default: 30)"],
-                ["", "--antivirus-skip-absent", "", "Skip categories with no definition files"],
-                ["-ssrf", "--ssrf", "", "Test SSRF – server fetches links; requires -r and --ssrf-canary-url"],
-                ["", "--ssrf-canary-url", "<URL>", "Canary URL for SSRF test (Interactsh, ngrok, etc.)"],
-                ["", "--ssrf-variants", "<v1,v2,...>", "Variants: plain,html_link,html_img,html_iframe,multipart,ssrf_malformed,ssrf_nested (default: all)"],
-                ["", "--ssrf-internal-urls", "", "Also test internal URLs (127.0.0.1, localhost)"],
-                ["", "--ssrf-timeout", "<sec>", "Timeout per message (default: 30)"],
-                ["-flood", "--flood", "", "Test queue flood – SIZE extension, queue overload"],
-                ["", "--flood-count", "<n>", "Messages for queue stress (default: 150, max 500)"],
-                ["", "--flood-timeout", "<sec>", "Max time for queue stress (default: 90)"],
-                ["", "--flood-skip-size-test", "", "Skip MAIL FROM SIZE=oversized test"],
-                ["-zipxxe", "--zipxxe", "", "Test Zip Bomb, Billion Laughs, XXE; requires -r"],
-                ["", "--zipxxe-canary-url", "<URL>", "Canary URL for XXE variants (xxe_zip, xxe_docx; Interactsh, ngrok, etc.)"],
-                ["", "--zipxxe-variants", "<v1,v2,...>", "Variants: billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx,xxe_body (default: all); zip_bomb/zip_bomb_full via flags"],
-                ["", "--zipxxe-zip-bomb", "", "Include zip_bomb variant (minimal ~200KB; DoS risk!)"],
-                ["", "--zipxxe-zip-bomb-full", "", "Include zip_bomb_full (~100KB→~100MB; extreme DoS risk!)"],
-                ["", "--zipxxe-timeout", "<sec>", "Timeout per message (default: 30)"],
-                ["-h", "--help", "", "Show this help message and exit"],
-                ["-vv", "--verbose", "", "Enable verbose mode"],
-            ]}
+            {"options": options},
         ]
+
+    @staticmethod
+    def get_test_help(codes):
+        """Per-test help object (used by `smtp -ts <TEST> -h`)."""
+        return _smtp_test_help(codes)
 
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """example usage:
   ptsrvtester smtp -h
-  ptsrvtester smtp -e ALL -sd -U wordlist.txt mail.example.com:25
-  ptsrvtester smtp -br -m attacker@example.com -r foo@foo.com smtp.example.com:25
-  ptsrvtester smtp -bomb -r victim@example.com smtp.example.com:587
-  ptsrvtester smtp -av -r victim@example.com smtp.example.com:587
-  ptsrvtester smtp -ssrf -r victim@example.com --ssrf-canary-url https://xyz.oast.fun/ssrf smtp.example.com:587
-  ptsrvtester smtp -flood -r victim@example.com smtp.example.com:587
-  ptsrvtester smtp -bomb -av -ssrf -flood -zipxxe -r victim@example.com --ssrf-canary-url http://cb --zipxxe-canary-url http://cb smtp.example.com:25
-  ptsrvtester smtp -sh -r victim@example.com smtp.example.com:25
-  ptsrvtester smtp -sh -r victim@example.com -u user -p pass smtp.example.com:587
-  ptsrvtester smtp -bcc bcc@example.com -r to@example.com --cc cc@example.com smtp.example.com:25
-  ptsrvtester smtp -al -r admin@example.com smtp.example.com:25
-  ptsrvtester smtp -pd mail.example.com:25"""
+  ptsrvtester smtp -ts BANNER,EHLO mail.example.com:25
+  ptsrvtester smtp -ts ALL mail.example.com:25
+  ptsrvtester smtp -ts ENUM -e ALL -U wordlist.txt mail.example.com:25
+  ptsrvtester smtp -ts BOUNCE -m attacker@example.com -r foo@foo.com smtp.example.com:25
+  ptsrvtester smtp -ts BOMB -r victim@example.com smtp.example.com:587
+  ptsrvtester smtp -ts AV -r victim@example.com smtp.example.com:587
+  ptsrvtester smtp -ts SSRF -r victim@example.com --ssrf-canary-url https://xyz.oast.fun/ssrf smtp.example.com:587
+  ptsrvtester smtp -ts AV,SSRF,ZIPXXE -r victim@example.com --ssrf-canary-url http://cb --zipxxe-canary-url http://cb smtp.example.com:25
+  ptsrvtester smtp -ts SPOOF -r victim@example.com -u user -p pass smtp.example.com:587
+  ptsrvtester smtp -ts BCC -r to@example.com --cc cc@example.com --bcc bcc@example.com smtp.example.com:25
+  ptsrvtester smtp -ts AV -h"""
 
         parser = subparsers.add_parser(
             name,
@@ -1782,6 +2201,15 @@ class SMTPArgs(ArgsWithBruteforce):
 
         direct = parser.add_argument_group(
             "DIRECT SCANNING", "Operations that communicate directly with the target server"
+        )
+        direct.add_argument(
+            "-ts",
+            "--tests",
+            type=str,
+            default=None,
+            metavar="<test>",
+            dest="tests",
+            help="Comma-separated test codes (e.g. BANNER,AV) or ALL; 'smtp -ts <TEST> -h' for test options",
         )
         direct.add_argument("-b", "--banner", action="store_true", help="Grab banner + Service Identification (product, version, CPE)")
         direct.add_argument(
@@ -1865,8 +2293,8 @@ class SMTPArgs(ArgsWithBruteforce):
             "-m", "--mail-from", type=str,
             help=(
                 "Sender address (MAIL FROM); used by -bomb, -av, -br (default: bombtest/avtest@{fqdn} when not set). "
-                "Required for -rls/--recipient-limit-send (envelope MAIL FROM). "
-                "Optional with -rl/-rls: envelope MAIL FROM for RCPT probes and accept-all pre-probe "
+                "Required for RCPTLIM with --send (envelope MAIL FROM for delivery). "
+                "Optional with RCPTLIM: envelope MAIL FROM for RCPT probes and accept-all pre-probe "
                 "(default <> when omitted)."
             ),
         )
@@ -1890,7 +2318,7 @@ class SMTPArgs(ArgsWithBruteforce):
             metavar="emails",
             dest="cc",
             default=None,
-            help="CC recipients, comma-separated; used by -bomb, -av, -ssrf; required for -bcc (no validation)",
+            help="Cc recipients, comma-separated; used by -bomb, -av, -ssrf; required for -ts BCC (no validation)",
         )
         direct.add_argument(
             "--subject",
@@ -1899,6 +2327,18 @@ class SMTPArgs(ArgsWithBruteforce):
             dest="smtp_subject",
             default=None,
             help=f"Subject line for outbound test messages (default: {DEFAULT_SMTP_SUBJECT!r})",
+        )
+        direct.add_argument(
+            "--send",
+            action="store_true",
+            dest="send",
+            default=False,
+            help=(
+                "Actually deliver the test message(s) via DATA. Required for delivery tests "
+                "(BCC, SPOOF, BOUNCE, BOMB, FLOOD, AV, SSRF, ZIPXXE, ALIAS); also enables the "
+                "optional DATA step for RCPTLIM and RCPTDUP. Without it these tests are refused "
+                "or run without sending."
+            ),
         )
         direct.add_argument(
             "--data",
@@ -1926,7 +2366,7 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Test header spoofing (From, Reply-To, Return-Path); -r recipient (required); -m envelope (MAIL FROM)",
         )
         direct.add_argument(
-            "--spoofhdr-variants",
+            "--spoof-variants",
             type=str,
             metavar="v1,v2,...",
             dest="spoofhdr_variants",
@@ -1934,7 +2374,7 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Spoof headers variants: from,reply_to,return_path (default: all); -r recipient, -m envelope (MAIL FROM)",
         )
         direct.add_argument(
-            "--spoofhdr-timeout",
+            "--spoof-timeout",
             type=float,
             default=30.0,
             metavar="sec",
@@ -1943,12 +2383,12 @@ class SMTPArgs(ArgsWithBruteforce):
         )
         direct.add_argument(
             "-bcc",
-            "--bcc-test",
+            "--bcc",
             type=str,
             metavar="<emails>",
             dest="bcc_test",
             default=None,
-            help="BCC disclosure test; BCC emails comma-separated; -r and --cc required; -m envelope",
+            help="Bcc recipients, comma-separated (used by -ts BCC)",
         )
         direct.add_argument(
             "--bcc-timeout",
@@ -2011,11 +2451,13 @@ class SMTPArgs(ArgsWithBruteforce):
         direct.add_argument(
             "-e",
             "--enumerate",
+            "--enum-methods",
             type=str,
             choices=["VRFY", "EXPN", "RCPT", "ALL"],
             nargs="?",
             const="ALL",
             default=None,
+            dest="enumerate",
             help="User enumeration [VRFY/EXPN/RCPT/ALL] (default: ALL)",
         )
         direct.add_argument(
@@ -2075,20 +2517,6 @@ class SMTPArgs(ArgsWithBruteforce):
             ),
         )
         direct.add_argument(
-            "-rls", "--recipient-limit-send",
-            nargs="?",
-            type=int,
-            const=RCPT_LIMIT_DEFAULT_ATTEMPTS,
-            default=None,
-            metavar="N",
-            dest="rcpt_limit_send",
-            help=(
-                "Like -rl/--recipient-limit but after the RCPT TO storm submits one message (DATA) "
-                f"with all accepted recipients (default: {RCPT_LIMIT_DEFAULT_ATTEMPTS} RCPT attempts). "
-                "Requires -m/--mail-from as envelope MAIL FROM; reports whether DATA succeeded (250) or failed."
-            ),
-        )
-        direct.add_argument(
             "--rl-no-precheck",
             action="store_true",
             dest="rl_no_precheck",
@@ -2109,17 +2537,8 @@ class SMTPArgs(ArgsWithBruteforce):
             help=(
                 "Send RCPT TO repeatedly for the same recipient in one MAIL transaction "
                 f"(N times, default {RCPT_DUP_DEFAULT}, max {RCPT_DUP_MAX}; requires -r/--rcpt-to). "
-                "SMTP acceptance does not prove N mailbox deliveries — use --rdd-send for a minimal "
+                "SMTP acceptance does not prove N mailbox deliveries — use --send for a minimal "
                 "message and verify the inbox manually."
-            ),
-        )
-        direct.add_argument(
-            "--rdd-send",
-            action="store_true",
-            dest="rcpt_duplicate_send",
-            help=(
-                "With -rdd: after all RCPT replies, submit one minimal DATA payload (Message-ID) "
-                "so the analyst can correlate manual inbox checks."
             ),
         )
         direct.add_argument(
@@ -2216,21 +2635,21 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Test antivirus/antispam protection; requires -r",
         )
         stress.add_argument(
-            "--antivirus-categories",
+            "--av-categories",
             type=str,
             metavar="cat1,cat2,...",
             dest="antivirus_categories",
             default=None,
-            help="Comma-separated categories (default: all except zip_bomb). Available: eicar, double_ext, executable, nested_archive, encoded_content, html_sanitization, xxe, mime_malformed. Use --antivirus-zip-bomb for zip_bomb.",
+            help="Comma-separated categories (default: all except zip_bomb). Available: eicar, double_ext, executable, nested_archive, encoded_content, html_sanitization, xxe, mime_malformed. Use --av-zip-bomb for zip_bomb.",
         )
         stress.add_argument(
-            "--antivirus-zip-bomb",
+            "--av-zip-bomb",
             action="store_true",
             dest="antivirus_zip_bomb",
             help="Include zip_bomb category (DoS risk! Use with caution)",
         )
         stress.add_argument(
-            "--antivirus-timeout",
+            "--av-timeout",
             type=float,
             default=30.0,
             metavar="sec",
@@ -2238,7 +2657,7 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Timeout per message for antivirus test in seconds (default: 30)",
         )
         stress.add_argument(
-            "--antivirus-skip-absent",
+            "--av-skip-absent",
             action="store_true",
             dest="antivirus_skip_absent",
             help="Skip categories that have no definition files",
@@ -2370,6 +2789,9 @@ class SMTP(BaseModule):
                 None, f'module "{args.module}" received wrong arguments namespace'
             )
 
+        # Translate -ts/--tests codes into the internal per-test dest flags before validation.
+        _apply_smtp_tests(args)
+
         if args.slow_down and args.enumerate == None:
             raise argparse.ArgumentError(None, "--slow-down requires also --enumerate")
 
@@ -2396,12 +2818,12 @@ class SMTP(BaseModule):
         bcc_test_requested = getattr(args, "bcc_test", None)
         if bcc_test_requested:
             if not args.rcpt_to or not str(args.rcpt_to).strip():
-                raise argparse.ArgumentError(None, "-bcc requires -r/--rcpt-to (To recipient)")
+                raise argparse.ArgumentError(None, "-ts BCC requires -r/--rcpt-to (To recipient)")
             cc_val = getattr(args, "cc", None) or ""
             if not cc_val.strip():
-                raise argparse.ArgumentError(None, "-bcc requires --cc (Cc recipient)")
+                raise argparse.ArgumentError(None, "-ts BCC requires -cc/--cc (Cc recipient)")
             if not str(bcc_test_requested).strip():
-                raise argparse.ArgumentError(None, "-bcc requires BCC email addresses as argument")
+                raise argparse.ArgumentError(None, "-ts BCC requires -bcc/--bcc <emails> (Bcc addresses)")
         alias_test_requested = getattr(args, "alias_test", False)
         if alias_test_requested and (not args.rcpt_to or not str(args.rcpt_to).strip()):
             raise argparse.ArgumentError(None, "-al/--alias-test requires -r/--rcpt-to (base recipient)")
@@ -2413,18 +2835,12 @@ class SMTP(BaseModule):
                 )
             if not args.rcpt_to or not str(args.rcpt_to).strip():
                 raise argparse.ArgumentError(None, "-br/--bounce-replay requires -r/--rcpt-to (recipient)")
-        rls_n = getattr(args, "rcpt_limit_send", None)
         rl_n = getattr(args, "rcpt_limit", None)
-        if rls_n is not None and rl_n is not None:
-            raise argparse.ArgumentError(
-                None,
-                "-rls/--recipient-limit-send cannot be combined with -rl/--recipient-limit",
-            )
-        if rls_n is not None:
+        if rl_n is not None and getattr(args, "send", False):
             if not args.mail_from or not str(args.mail_from).strip() or "@" not in str(args.mail_from):
                 raise argparse.ArgumentError(
                     None,
-                    "-rls/--recipient-limit-send requires -m/--mail-from (envelope MAIL FROM for delivery)",
+                    "RCPTLIM with --send requires -m/--mail-from (envelope MAIL FROM for delivery)",
                 )
         rdd_n = getattr(args, "rcpt_duplicate", None)
         if rdd_n is not None:
@@ -2438,8 +2854,6 @@ class SMTP(BaseModule):
                 raise argparse.ArgumentError(
                     None, f"-rdd/--rcpt-duplicate N must not exceed {RCPT_DUP_MAX}"
                 )
-        if getattr(args, "rcpt_duplicate_send", False) and rdd_n is None:
-            raise argparse.ArgumentError(None, "--rdd-send requires -rdd/--rcpt-duplicate")
         # Canary required only for XXE variants; billion_laughs and zip_bomb work without it
         if zipxxe_requested:
             variants_arg = getattr(args, "zipxxe_variants", None)
@@ -5081,7 +5495,7 @@ class SMTP(BaseModule):
         return f"{random.getrandbits(32):08x}"
 
     def _mail_sent_inbox_msg(self, inbox: str, test_id: str) -> str:
-        return f"Mail was sent — check inbox {str(inbox).strip()} (id message: {str(test_id).strip()})"
+        return f"Mail was sent — check inbox {str(inbox).strip()} (message id: {str(test_id).strip()})"
 
     def _mime_add_test_id_header(self, raw: str, test_id: str) -> str:
         if not test_id or f"{EMAIL_HDR_TEST_ID}:" in raw:
@@ -5099,34 +5513,123 @@ class SMTP(BaseModule):
         )
 
     @staticmethod
-    def _av_payload_labels(msg_def: dict) -> list[str]:
+    def _av_payload_label(msg_def: dict) -> str:
         attachments = msg_def.get("attachments") or []
         if attachments:
-            return [str(name) for name in attachments]
+            return str(attachments[0])
         if msg_def.get("rawEml"):
-            return [str(msg_def["rawEml"])]
+            return str(msg_def["rawEml"])
+        if msg_def.get("bodyPlainEicar"):
+            return "body (plain EICAR)"
         if msg_def.get("bodyBase64") is not None:
-            return ["body (base64)"]
+            return "body (base64)"
         if msg_def.get("bodyQuotedPrintable") is not None:
-            return ["body (quoted-printable)"]
+            return "body (quoted-printable)"
         if msg_def.get("bodyHtml"):
-            return ["body (HTML)"]
-        return ["message body"]
+            return "body (HTML)"
+        return "message body"
 
-    def _av_append_message_summaries(
+    @staticmethod
+    def _av_expand_msg_defs(msg_def: dict) -> list[dict]:
+        """One SMTP transaction per payload (industry AV testing practice)."""
+        attachments = msg_def.get("attachments") or []
+        if len(attachments) <= 1:
+            return [msg_def]
+        return [{**msg_def, "attachments": [name]} for name in attachments]
+
+    def _av_payload_summary_line(
         self,
-        summaries: list[str],
         msg_def: dict | None,
         fallback_name: str,
         status: int | None,
         outcome: str,
+    ) -> str:
+        label = self._av_payload_label(msg_def) if msg_def else fallback_name
+        if status is not None:
+            return f"{label}: {status} ({outcome})"
+        return f"{label}: ({outcome})"
+
+    def _av_record_payload_result(
+        self,
+        summaries: list[str],
+        test_ids: list[str],
+        msg_def: dict | None,
+        fallback_name: str,
+        status: int | None,
+        outcome: str,
+        *,
+        test_id: str = "",
+    ) -> tuple[str, str]:
+        summary = self._av_payload_summary_line(msg_def, fallback_name, status, outcome)
+        summaries.append(summary)
+        payload_test_id = test_id if outcome == "accepted" and test_id else ""
+        test_ids.append(payload_test_id)
+        return summary, payload_test_id
+
+    @staticmethod
+    def _av_summary_payload_label(summary_line: str) -> str:
+        if ":" in summary_line:
+            return summary_line.split(":", 1)[0].strip()
+        return summary_line.strip()
+
+    def _av_print_payload_summary(
+        self,
+        pp,
+        summary_line: str,
+        payload_test_id: str,
+        rcpt: str,
     ) -> None:
-        labels = self._av_payload_labels(msg_def) if msg_def else [fallback_name]
-        for label in labels:
-            if status is not None:
-                summaries.append(f"{label}: {status} ({outcome})")
-            else:
-                summaries.append(f"{label}: ({outcome})")
+        """Terminal summary for one AV payload (normal mode, no SMTP trace)."""
+        pp(
+            self._av_summary_payload_label(summary_line),
+            bullet_type="TEXT",
+            condition=True,
+            indent=8,
+        )
+        if "(accepted)" in summary_line and payload_test_id:
+            self._pp_mail_probe_line(
+                pp,
+                True,
+                accepted=True,
+                sent_msg=self._mail_sent_inbox_msg(rcpt, payload_test_id),
+                indent=12,
+            )
+        elif ":" in summary_line:
+            tail = summary_line.split(":", 1)[1].strip()
+            if tail:
+                pp(tail, bullet_type="TEXT", condition=True, indent=12)
+
+    def _av_stream_payload_block(
+        self,
+        payload_trace: tuple[str, ...] | list[str],
+        summary_line: str,
+        payload_test_id: str,
+        rcpt: str,
+    ) -> None:
+        """Under -vv: payload label, indented SMTP trace, then mail-sent / outcome."""
+        pp = ptprinthelper.ptprint
+        pp(
+            self._av_summary_payload_label(summary_line),
+            bullet_type="TEXT",
+            condition=True,
+            indent=8,
+        )
+        for line in payload_trace:
+            if line.startswith("---"):
+                continue
+            self._stream_smtp_trace_line(line, indent_override=12)
+        if "(accepted)" in summary_line and payload_test_id:
+            self._pp_mail_probe_line(
+                pp,
+                True,
+                accepted=True,
+                sent_msg=self._mail_sent_inbox_msg(rcpt, payload_test_id),
+                indent=12,
+            )
+        elif ":" in summary_line:
+            tail = summary_line.split(":", 1)[1].strip()
+            if tail:
+                pp(tail, bullet_type="TEXT", condition=True, indent=12)
 
     def _av_stream_category_section(
         self,
@@ -5138,23 +5641,43 @@ class SMTP(BaseModule):
         """Per-category terminal block for -av."""
         pp = ptprinthelper.ptprint
         pp(self._av_category_title(cat.category), bullet_type="TITLE", condition=True, indent=4)
+        payload_test_ids = cat.payload_test_ids or tuple("" for _ in cat.message_summary)
         if stream_trace:
+            summary_iter = iter(zip(cat.message_summary, payload_test_ids))
+            section_lines: list[str] = []
+            orphan_lines: list[str] = []
+
+            def _flush_section(lines: list[str]) -> None:
+                if not lines:
+                    return
+                try:
+                    summary_line, payload_test_id = next(summary_iter)
+                except StopIteration:
+                    return
+                self._av_stream_payload_block(lines, summary_line, payload_test_id, rcpt)
+
             for line in cat.smtp_trace:
-                if line.startswith("---"):
+                if line.startswith("---") and line.endswith("---"):
+                    if section_lines:
+                        _flush_section(section_lines)
+                        section_lines = []
+                    elif orphan_lines:
+                        _flush_section(orphan_lines)
+                        orphan_lines = []
                     continue
-                self.ptdebug(line, indent_override=8)
-        for line in cat.message_summary:
-            pp(line, bullet_type="TEXT", condition=True, indent=8)
-        if cat.detail:
-            pp(f"Summary: {cat.detail}", bullet_type="TEXT", condition=True, indent=8)
-        if cat.accepted > 0 and cat.test_id:
-            self._pp_mail_probe_line(
-                pp,
-                True,
-                accepted=True,
-                sent_msg=self._mail_sent_inbox_msg(rcpt, cat.test_id),
-                indent=8,
-            )
+                if section_lines:
+                    section_lines.append(line)
+                else:
+                    orphan_lines.append(line)
+            if section_lines:
+                _flush_section(section_lines)
+            elif orphan_lines:
+                _flush_section(orphan_lines)
+            for summary_line, payload_test_id in summary_iter:
+                self._av_print_payload_summary(pp, summary_line, payload_test_id, rcpt)
+            return
+        for line, payload_test_id in zip(cat.message_summary, payload_test_ids):
+            self._av_print_payload_summary(pp, line, payload_test_id, rcpt)
 
     def _alias_variant_title(self, variant: str) -> str:
         return ALIAS_VARIANT_TITLES.get(
@@ -5181,8 +5704,7 @@ class SMTP(BaseModule):
         if self._al_variant_mail_accepted(v):
             for line in reversed(v.smtp_trace):
                 if line.startswith("DATA:"):
-                    parts = line.split(":", 1)[1].strip().split()
-                    code = parts[0] if parts else "250"
+                    code = self._data_trace_status_code(line) or "250"
                     return f"{v.address}: {code} (accepted)"
             return f"{v.address}: 250 (accepted)"
         if v.rejected:
@@ -5191,6 +5713,17 @@ class SMTP(BaseModule):
         if v.error:
             return f"{v.address}: (error)"
         return f"{v.address}: (skipped)"
+
+    def _al_variant_outcome_tail(self, v: AliasVariantResult) -> str | None:
+        """Status tail for variant output (without the address prefix)."""
+        if self._al_variant_mail_accepted(v):
+            return None
+        line = self._al_variant_outcome_line(v)
+        prefix = f"{v.address}:"
+        if line.startswith(prefix):
+            tail = line[len(prefix):].strip()
+            return tail or None
+        return line
 
     def _al_stream_variant_section(
         self,
@@ -5202,76 +5735,59 @@ class SMTP(BaseModule):
         """Per-variant terminal block for -al."""
         pp = ptprinthelper.ptprint
         pp(self._alias_variant_title(v.variant), bullet_type="TITLE", condition=True, indent=4)
+        pp(v.address, bullet_type="TEXT", condition=True, indent=8)
         if stream_trace:
             for line in v.smtp_trace:
                 if line.startswith("---"):
                     continue
-                self.ptdebug(line, indent_override=8)
-        pp(self._al_variant_outcome_line(v), bullet_type="TEXT", condition=True, indent=8)
-        summary = self._al_variant_summary_detail(v)
-        if summary:
-            pp(f"Summary: {summary}", bullet_type="TEXT", condition=True, indent=8)
+                self._stream_smtp_trace_line(line, indent_override=12)
         mail_accepted = self._al_variant_mail_accepted(v)
         if mail_accepted and v.test_id:
-            follow_up: tuple[str, ...] = ()
-            if v.uucp_warning:
-                follow_up = ("Warning: UUCP syntax accepted",)
             self._pp_mail_probe_line(
                 pp,
                 True,
                 accepted=True,
                 sent_msg=self._mail_sent_inbox_msg(base_address, v.test_id),
-                indent=8,
-                follow_up=follow_up,
+                indent=12,
             )
+            if v.uucp_warning:
+                pp(
+                    "Warning: UUCP syntax accepted",
+                    bullet_type="WARNING",
+                    condition=True,
+                    indent=12,
+                )
+        else:
+            tail = self._al_variant_outcome_tail(v)
+            if tail:
+                pp(tail, bullet_type="TEXT", condition=True, indent=12)
 
-    @staticmethod
-    def _bcc_summary_detail(bc: BccTestResult) -> str:
-        if bc.message_accepted:
-            return "1 accepted, 0 rejected, 0 error"
-        return bc.detail or "0 accepted, 1 rejected, 0 error"
-
-    def _bcc_data_status_code(self, bc: BccTestResult) -> str:
-        if bc.smtp_status is not None:
-            return str(bc.smtp_status)
-        for line in reversed(bc.smtp_trace):
-            if line.startswith("DATA:"):
-                parts = line.split(":", 1)[1].strip().split()
-                if parts:
-                    return parts[0]
-        return "250" if bc.message_accepted else "?"
-
-    def _bcc_outcome_lines(self, bc: BccTestResult) -> tuple[str, ...]:
-        if bc.message_accepted:
-            code = self._bcc_data_status_code(bc)
-            addrs = bc.recipients_bcc or ("Bcc",)
-            return tuple(f"{addr}: {code} (accepted)" for addr in addrs)
-        for line in reversed(bc.smtp_trace):
-            if line.startswith("RCPT TO <"):
-                addr_part = line.split("RCPT TO <", 1)[1].split(">:", 1)[0]
-                parts = line.split(":", 1)[1].strip().split()
-                code = parts[0] if parts else "?"
-                if code not in ("250", "251"):
-                    return (f"{addr_part}: {code} (rejected)",)
-        addr = bc.recipients_bcc[0] if bc.recipients_bcc else "message"
-        if bc.detail and "rejected" in bc.detail.lower():
-            return (f"{addr}: (rejected)",)
-        return (f"{addr}: (error)",)
-
-    @staticmethod
-    def _bcc_verification_follow_up(bc: BccTestResult) -> tuple[str, ...]:
-        if not bc.message_accepted:
-            return ()
-        to_cc = list(bc.recipients_to) + list(bc.recipients_cc)
-        to_cc_str = ", ".join(to_cc[:2]) if to_cc else "To/Cc"
-        bcc_example = bc.recipients_bcc[0] if bc.recipients_bcc else "Bcc"
-        return (
-            f"1. Log in to {to_cc_str} (To/Cc).",
-            '2. View "Message Source" / "Original Header".',
-            f'3. SEARCH for the string "Bcc" or "{bcc_example}".',
-            "If NOT FOUND: SECURE (Server correctly stripped BCC).",
-            "If FOUND: VULNERABLE (BCC disclosure).",
-        )
+    def _al_stream_base_section(
+        self,
+        base_address: str,
+        *,
+        base_mail_sent: bool = False,
+        base_test_id: str = "",
+        base_smtp_trace: tuple[str, ...] = (),
+        stream_trace: bool = False,
+    ) -> None:
+        """Terminal block for the base recipient control send."""
+        pp = ptprinthelper.ptprint
+        pp("Base recipient", bullet_type="TITLE", condition=True, indent=4)
+        pp(base_address, bullet_type="TEXT", condition=True, indent=8)
+        if stream_trace and base_smtp_trace:
+            for line in base_smtp_trace:
+                if line.startswith("---"):
+                    continue
+                self._stream_smtp_trace_line(line, indent_override=12)
+        if base_mail_sent and base_test_id:
+            self._pp_mail_probe_line(
+                pp,
+                True,
+                accepted=True,
+                sent_msg=self._mail_sent_inbox_msg(base_address, base_test_id),
+                indent=12,
+            )
 
     def _bcc_stream_section(
         self,
@@ -5279,24 +5795,24 @@ class SMTP(BaseModule):
         *,
         stream_trace: bool = False,
     ) -> None:
-        """Terminal block for -bcc (single disclosure probe)."""
-        pp = ptprinthelper.ptprint
-        pp(BCC_TEST_SECTION_TITLE, bullet_type="TITLE", condition=True, indent=4)
-        if stream_trace:
-            for line in bc.smtp_trace:
-                if line.startswith("---"):
-                    continue
-                self.ptdebug(line, indent_override=8)
-        for line in self._bcc_outcome_lines(bc):
-            pp(line, bullet_type="TEXT", condition=True, indent=8)
+        """Verbose (-vv) SMTP trace for BCC: full dialog including the DATA payload.
+
+        The DATA trace entry already embeds the message actually transmitted (headers +
+        body), so the tester sees exactly what is sent. Nothing is printed without -vv.
+        """
+        if not stream_trace:
+            return
+        for line in bc.smtp_trace:
+            if line.startswith("---"):
+                continue
+            self._stream_smtp_trace_line(line, indent_override=4)
 
     def _bcc_stream_summary_block(self, bc: BccTestResult) -> None:
-        """Summary footer for -bcc (counts, mail-sent, verification, elapsed)."""
+        """Result footer for BCC: single mail-sent verdict (or failure reason)."""
         pp = ptprinthelper.ptprint
         show = not self.use_json
         if not show:
             return
-        pp(f"Summary {self._bcc_summary_detail(bc)}", bullet_type="TITLE", condition=True, indent=4)
         if bc.message_accepted and bc.test_id:
             inbox = bc.recipients_to[0] if bc.recipients_to else ""
             self._pp_mail_probe_line(
@@ -5304,10 +5820,11 @@ class SMTP(BaseModule):
                 True,
                 accepted=True,
                 sent_msg=self._mail_sent_inbox_msg(inbox, bc.test_id),
-                indent=8,
-                follow_up=self._bcc_verification_follow_up(bc),
+                indent=4,
             )
-        pp(f"Elapsed: {bc.elapsed_sec:.1f} s", bullet_type="TEXT", condition=True, indent=8)
+        else:
+            reason = bc.detail or "Message was not accepted by the server"
+            pp(reason, bullet_type="WARNING", condition=True, indent=4)
 
     def _ssrf_variant_title(self, variant: str) -> str:
         return SSRF_VARIANT_TITLES.get(
@@ -5326,8 +5843,7 @@ class SMTP(BaseModule):
         if v.accepted > 0:
             for line in reversed(v.smtp_trace):
                 if line.startswith("DATA:"):
-                    parts = line.split(":", 1)[1].strip().split()
-                    code = parts[0] if parts else "250"
+                    code = self._data_trace_status_code(line) or "250"
                     return f"{label}: {code} (accepted)"
             return f"{label}: 250 (accepted)"
         if v.rejected > 0:
@@ -5337,8 +5853,7 @@ class SMTP(BaseModule):
                     code = parts[0] if parts else "?"
                     return f"{label}: {code} (rejected)"
                 if line.startswith("DATA:"):
-                    parts = line.split(":", 1)[1].strip().split()
-                    code = parts[0] if parts else "?"
+                    code = self._data_trace_status_code(line) or "?"
                     return f"{label}: {code} (rejected)"
             return f"{label}: (rejected)"
         if v.error > 0:
@@ -5359,7 +5874,7 @@ class SMTP(BaseModule):
             for line in v.smtp_trace:
                 if line.startswith("---"):
                     continue
-                self.ptdebug(line, indent_override=8)
+                self._stream_smtp_trace_line(line, indent_override=8)
         pp(self._ssrf_variant_outcome_line(v), bullet_type="TEXT", condition=True, indent=8)
         if v.detail:
             pp(f"Summary: {v.detail}", bullet_type="TEXT", condition=True, indent=8)
@@ -5389,8 +5904,7 @@ class SMTP(BaseModule):
         if v.accepted > 0:
             for line in reversed(v.smtp_trace):
                 if line.startswith("DATA:"):
-                    parts = line.split(":", 1)[1].strip().split()
-                    code = parts[0] if parts else "250"
+                    code = self._data_trace_status_code(line) or "250"
                     return f"{label}: {code} (accepted)"
             return f"{label}: 250 (accepted)"
         if v.rejected > 0:
@@ -5400,8 +5914,7 @@ class SMTP(BaseModule):
                     code = parts[0] if parts else "?"
                     return f"{label}: {code} (rejected)"
                 if line.startswith("DATA:"):
-                    parts = line.split(":", 1)[1].strip().split()
-                    code = parts[0] if parts else "?"
+                    code = self._data_trace_status_code(line) or "?"
                     return f"{label}: {code} (rejected)"
             return f"{label}: (rejected)"
         if v.error > 0:
@@ -5422,7 +5935,7 @@ class SMTP(BaseModule):
             for line in v.smtp_trace:
                 if line.startswith("---"):
                     continue
-                self.ptdebug(line, indent_override=8)
+                self._stream_smtp_trace_line(line, indent_override=8)
         pp(self._zipxxe_variant_outcome_line(v), bullet_type="TEXT", condition=True, indent=8)
         if v.detail:
             pp(f"Summary: {v.detail}", bullet_type="TEXT", condition=True, indent=8)
@@ -5538,9 +6051,8 @@ class SMTP(BaseModule):
                 data_status, data_reply = smtp.data(msg)
                 data_rep = _reply_one_line(data_reply)
                 if verbose:
-                    self.ptdebug(
-                        f"Open relay ({label}): DATA → [{data_status}] {data_rep}",
-                        Out.INFO,
+                    self._stream_smtp_trace_line(
+                        self._data_trace_entry(msg, data_status, data_reply),
                     )
                 if data_status == 250:
                     self.ptdebug(f"Server is vulnerable to Open relay ({label})", Out.VULN)
@@ -6001,10 +6513,15 @@ class SMTP(BaseModule):
             try:
                 dcode, drp = smtp.data(raw_msg)
                 drep = self.bytes_to_str(drp).strip()[:500]
-                _dbg(
-                    f"Limit-send DATA ({accepted_count} RCPT) → [{dcode}] {_reply_one_line(drep)}",
-                    Out.INFO,
-                )
+                if self.args.debug and not self.use_json:
+                    self._stream_smtp_trace_line(
+                        self._data_trace_entry(raw_msg, dcode, drp),
+                    )
+                else:
+                    _dbg(
+                        f"Limit-send DATA ({accepted_count} RCPT) → [{dcode}] {_reply_one_line(drep)}",
+                        Out.INFO,
+                    )
                 return True, dcode == 250, dcode, drep
             except Exception as e:
                 drep = str(e).strip()[:500]
@@ -6458,10 +6975,15 @@ class SMTP(BaseModule):
             out["data_code"] = dcode
             out["data_reply"] = drep
             out["data_ok"] = dcode == 250
-            _dbg(
-                f"Catch-all bounce probe DATA → [{dcode}] {_reply_one_line(drep)}",
-                Out.INFO,
-            )
+            if self.args.debug and not self.use_json:
+                self._stream_smtp_trace_line(
+                    self._data_trace_entry(raw_msg, dcode, drp),
+                )
+            else:
+                _dbg(
+                    f"Catch-all bounce probe DATA → [{dcode}] {_reply_one_line(drep)}",
+                    Out.INFO,
+                )
         except Exception as e:
             out["data_reply"] = str(e).strip()[:500]
             _dbg(f"Catch-all bounce probe DATA failed: {e}", Out.INFO)
@@ -6476,7 +6998,7 @@ class SMTP(BaseModule):
         effective_role: str | None,
         auth_required: bool | None,
     ) -> None:
-        """Print ``[*] Role: …`` immediately after role identification (-rl / -rls pre-check)."""
+        """Print ``[*] Role: …`` immediately after role identification (RCPTLIM pre-check)."""
         show = not self.use_json
         if effective_role is not None:
             ptprinthelper.ptprint(
@@ -7035,7 +7557,6 @@ class SMTP(BaseModule):
 
     def test_rcpt_duplicate(self) -> RcptDuplicateResult:
         """Many RCPT TO for the same address in one MAIL transaction (-rdd / --rcpt-duplicate)."""
-        self.ptdebug("Duplicate RCPT TO probe (-rdd)", title=True)
         self._ensure_initial_info(fail_label="-rdd")
 
         raw = (self.args.rcpt_to or "").strip()
@@ -7047,8 +7568,8 @@ class SMTP(BaseModule):
         rcpt_bracket = raw if raw.startswith("<") and raw.endswith(">") else f"<{display_to}>"
 
         n = int(self.args.rcpt_duplicate or RCPT_DUP_DEFAULT)
-        send_data = bool(getattr(self.args, "rcpt_duplicate_send", False))
-        probe_uuid = secrets.token_hex(8) if send_data else None
+        send_data = bool(getattr(self.args, "send", False))
+        probe_uuid = self._new_mail_test_id() if send_data else None
 
         smtp: smtplib.SMTP | None = None
         try:
@@ -7068,10 +7589,13 @@ class SMTP(BaseModule):
                 raise RuntimeError("MAIL FROM rejected for all candidates (cannot probe RCPT)")
 
             replies: list[tuple[int, str]] = []
-            for _ in range(n):
+            for i in range(n):
                 st, rp = smtp.docmd("RCPT TO:", rcpt_bracket)
                 rps = self.bytes_to_str(rp).strip()[:500]
                 replies.append((st, rps))
+                self._stream_smtp_trace_line(
+                    f"RCPT TO: {rcpt_bracket} [{i + 1}/{n}] → {self._smtp_trace_reply(st, rp)}"
+                )
 
             rcpt_ok = tuple(replies)
             first_fail: int | None = None
@@ -7097,6 +7621,10 @@ class SMTP(BaseModule):
                     dcode, drp = smtp.data(raw_msg)
                     drep = self.bytes_to_str(drp).strip()[:500]
                     data_sent = dcode == 250
+                    if send_data and self.args.debug and not self.use_json:
+                        self._stream_smtp_trace_line(
+                            self._data_trace_entry(raw_msg, dcode, drp),
+                        )
                 except Exception as e:
                     drep = str(e).strip()[:500]
                     data_sent = False
@@ -8335,7 +8863,7 @@ class SMTP(BaseModule):
                 reply_str = self.bytes_to_str(reply)
                 if status in self._MAIL_RCPT_TRANSACTION_OK:
                     accept_msg = (
-                        f"MAIL FROM {candidate!r} accepted"
+                        f"MAIL FROM {candidate} accepted"
                         + (" (cached preference)" if cached and candidate == cached else "")
                         + f": [{status}] {reply_str.strip()[:400]}"
                     )
@@ -8343,11 +8871,11 @@ class SMTP(BaseModule):
                     self._rcpt_enum_mail_from_ok = candidate
                     return True, candidate
                 self.ptdebug(
-                    f"MAIL FROM {candidate!r} rejected: [{status}] {reply_str.strip()[:400]}",
+                    f"MAIL FROM {candidate} rejected: [{status}] {reply_str.strip()[:400]}",
                     Out.INFO,
                 )
             except Exception as e:
-                self.ptdebug(f"MAIL FROM {candidate!r} error: {e}", Out.INFO)
+                self.ptdebug(f"MAIL FROM {candidate} error: {e}", Out.INFO)
             if i < len(trial_order) - 1:
                 try:
                     smtp.docmd("RSET")
@@ -12154,7 +12682,7 @@ class SMTP(BaseModule):
             try:
                 data_status, data_reply = smtp.data(body)
                 data_line = _br_smtp_reply(data_status, data_reply)
-                _br_trace_append(f"DATA: {data_line}")
+                _br_trace_append(self._data_trace_entry(body, reply=data_line))
             except socket.timeout:
                 _br_trace_append("DATA: timeout")
                 return False, False, False, True, "Timeout (30s) on DATA"
@@ -12602,10 +13130,16 @@ class SMTP(BaseModule):
                             return ("fatal_500", 500, "")
                         if s not in (250, 251):
                             break
-                    data_status, _ = smtp.data(msg)
+                    data_status, data_reply = smtp.data(msg)
                     if data_status == 500:
                         return ("fatal_500", 500, "")
                     if data_status == 250:
+                        if self.args.debug and not self.use_json:
+                            if not any(x.startswith("DATA:") for x in smtp_trace):
+                                self._mail_test_trace_append(
+                                    smtp_trace,
+                                    self._data_trace_entry(msg, data_status, data_reply),
+                                )
                         with lock:
                             if not sample_test_id_ref[0]:
                                 sample_test_id_ref[0] = msg_test_id
@@ -12849,9 +13383,6 @@ class SMTP(BaseModule):
             text = self.bytes_to_str(reply).strip().replace("\r\n", " ").replace("\n", " ")
             return f"{status} {text}" if text else str(status)
 
-        def _av_trace_store(line: str) -> None:
-            smtp_trace.append(line)
-
         def _av_fail_line(trace: list[str], line: str) -> None:
             trace.append(line)
 
@@ -12905,8 +13436,6 @@ class SMTP(BaseModule):
             Supports: bodyBase64, bodyQuotedPrintable (encoded_content), rawEml (mime_malformed).
             """
             subject = self._outbound_subject()
-            body = self._outbound_data()
-            body_html = msg_def.get("bodyHtml")
             body_base64 = msg_def.get("bodyBase64")
             body_qp = msg_def.get("bodyQuotedPrintable")
             raw_eml = msg_def.get("rawEml")
@@ -12951,7 +13480,18 @@ class SMTP(BaseModule):
                 part["Content-Transfer-Encoding"] = "quoted-printable"
                 msg.attach(part)
             else:
+                if msg_def.get("bodyPlainEicar"):
+                    eicar_line = (
+                        r"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+                    )
+                    intro = str(msg_def.get("body") or "").strip()
+                    body = f"{eicar_line}\n\n{intro}" if intro else eicar_line
+                elif "body" in msg_def:
+                    body = str(msg_def["body"])
+                else:
+                    body = self._outbound_data()
                 msg.attach(MIMEText(body, "plain", "utf-8"))
+            body_html = msg_def.get("bodyHtml")
             if body_html:
                 msg.attach(MIMEText(body_html, "html", "utf-8"))
             for att_name in attachments:
@@ -13000,7 +13540,42 @@ class SMTP(BaseModule):
             accepted, rejected, err_count = 0, 0, 0
             smtp_trace: list[str] = []
             msg_summaries: list[str] = []
+            payload_test_ids: list[str] = []
             last_accepted_test_id = ""
+            sent = 0
+            stream_av = not self.use_json and self.args.debug
+            if stream_av:
+                self._antivirus_streamed_live = True
+                ptprinthelper.ptprint(
+                    self._av_category_title(cat),
+                    bullet_type="TITLE",
+                    condition=True,
+                    indent=4,
+                )
+
+            def _av_emit_payload(
+                payload_trace: list[str],
+                msg_def: dict | None,
+                fallback_name: str,
+                status: int | None,
+                outcome: str,
+                *,
+                test_id: str = "",
+            ) -> None:
+                summary, payload_test_id = self._av_record_payload_result(
+                    msg_summaries,
+                    payload_test_ids,
+                    msg_def,
+                    fallback_name,
+                    status,
+                    outcome,
+                    test_id=test_id,
+                )
+                if stream_av:
+                    self._av_stream_payload_block(
+                        payload_trace, summary, payload_test_id, rcpt
+                    )
+
             for mf in msg_files:
                 msg_def: dict | None = None
                 try:
@@ -13008,123 +13583,179 @@ class SMTP(BaseModule):
                         msg_def = json.load(f)
                 except (json.JSONDecodeError, OSError) as e:
                     err_count += 1
-                    _av_fail_line(smtp_trace, f"{mf.name}: load error {e}")
-                    self._av_append_message_summaries(msg_summaries, None, mf.name, None, "error")
+                    fail_line = f"{mf.name}: load error {e}"
+                    _av_fail_line(smtp_trace, fail_line)
+                    _av_emit_payload([fail_line], None, mf.name, None, "error")
                     continue
-                msg_test_id = self._new_mail_test_id()
-                raw_msg, missing_att = _build_mime(msg_def, att_dir, msg_dir, msg_test_id)
-                if missing_att:
-                    err_count += 1
-                    warn_msg = f"{mf.name}: missing attachments {missing_att} – test incomplete (avoid false SECURE)"
-                    _av_fail_line(smtp_trace, warn_msg)
-                    self._av_append_message_summaries(msg_summaries, msg_def, mf.name, None, "error")
-                    ptprinthelper.ptprint(
-                        f"{self._av_category_title(cat)}: {warn_msg}",
-                        bullet_type="WARNING",
-                        condition=not self.use_json and not self.args.debug,
-                        indent=4,
+                payload_defs = self._av_expand_msg_defs(msg_def)
+                for payload_def in payload_defs:
+                    payload_trace: list[str] = []
+                    payload_label = self._av_payload_label(payload_def)
+                    trace_name = (
+                        f"{mf.name} ({payload_label})"
+                        if len(payload_defs) > 1
+                        else mf.name
                     )
-                    continue
-                smtp, conn_err = _connect_av()
-                if smtp is None:
-                    err_count += 1
-                    _av_fail_line(smtp_trace, f"{mf.name}: connection failed {conn_err}")
-                    self._av_append_message_summaries(msg_summaries, msg_def, mf.name, None, "error")
-                    continue
-                try:
-                    _av_trace_store(f"--- {mf.name} ---")
-                    ehlo_status, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "av-test.local")
-                    _av_trace_store(f"EHLO: {_av_smtp_reply(ehlo_status, ehlo_reply)}")
-                    used_auth, auth_err = self._mail_test_auth_login(
-                        smtp,
-                        smtp_trace,
-                        trace_append=lambda line: _av_trace_store(line),
-                    )
-                    if auth_err:
+
+                    def _av_payload_trace_store(line: str) -> None:
+                        smtp_trace.append(line)
+                        payload_trace.append(line)
+
+                    def _av_payload_fail_line(line: str) -> None:
+                        smtp_trace.append(line)
+                        payload_trace.append(line)
+
+                    msg_test_id = self._new_mail_test_id()
+                    raw_msg, missing_att = _build_mime(payload_def, att_dir, msg_dir, msg_test_id)
+                    if missing_att:
                         err_count += 1
-                        _av_fail_line(smtp_trace, f"{mf.name}: {auth_err}")
-                        self._av_append_message_summaries(msg_summaries, msg_def, mf.name, None, "error")
-                        try:
-                            smtp.quit()
-                        except Exception:
-                            pass
-                        continue
-                    if used_auth:
-                        auth_used = True
-                    mail_status, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                    _av_trace_store(f"MAIL FROM: {_av_smtp_reply(mail_status, mail_reply)}")
-                    if mail_status not in (250, 251):
-                        rejected += 1
-                        self._av_append_message_summaries(
-                            msg_summaries, msg_def, mf.name, mail_status, "rejected"
+                        warn_msg = (
+                            f"{trace_name}: missing attachments {missing_att} "
+                            "– test incomplete (avoid false SECURE)"
                         )
-                        try:
-                            smtp.quit()
-                        except Exception:
-                            pass
-                        continue
-                    rcpt_status, rcpt_reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
-                    _av_trace_store(f"RCPT TO: {_av_smtp_reply(rcpt_status, rcpt_reply)}")
-                    if rcpt_status not in (250, 251):
-                        rejected += 1
-                        self._av_append_message_summaries(
-                            msg_summaries, msg_def, mf.name, rcpt_status, "rejected"
+                        _av_payload_fail_line(warn_msg)
+                        _av_emit_payload(payload_trace, payload_def, trace_name, None, "error")
+                        ptprinthelper.ptprint(
+                            f"{self._av_category_title(cat)}: {warn_msg}",
+                            bullet_type="WARNING",
+                            condition=not self.use_json and not self.args.debug,
+                            indent=4,
                         )
-                        try:
-                            smtp.quit()
-                        except Exception:
-                            pass
                         continue
-                    cc_failed = False
-                    for c in cc_list:
-                        cc_status, cc_reply = smtp.docmd("RCPT", f"TO:<{c}>")
-                        _av_trace_store(f"RCPT TO <{c}>: {_av_smtp_reply(cc_status, cc_reply)}")
-                        if cc_status not in (250, 251):
-                            rejected += 1
-                            self._av_append_message_summaries(
-                                msg_summaries, msg_def, mf.name, cc_status, "rejected"
-                            )
-                            cc_failed = True
+                    smtp, conn_err = _connect_av()
+                    if smtp is None:
+                        err_count += 1
+                        _av_payload_fail_line(f"{trace_name}: connection failed {conn_err}")
+                        _av_emit_payload(payload_trace, payload_def, trace_name, None, "error")
+                        continue
+                    try:
+                        _av_payload_trace_store(f"--- {trace_name} ---")
+                        ehlo_status, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "av-test.local")
+                        _av_payload_trace_store(f"EHLO: {_av_smtp_reply(ehlo_status, ehlo_reply)}")
+                        used_auth, auth_err = self._mail_test_auth_login(
+                            smtp,
+                            smtp_trace,
+                            trace_append=_av_payload_trace_store,
+                        )
+                        if auth_err:
+                            err_count += 1
+                            _av_payload_fail_line(f"{trace_name}: {auth_err}")
+                            _av_emit_payload(payload_trace, payload_def, trace_name, None, "error")
                             try:
                                 smtp.quit()
                             except Exception:
                                 pass
-                            break
-                    if not cc_failed:
-                        data_status, data_reply = smtp.data(raw_msg)
-                        _av_trace_store(f"DATA: {_av_smtp_reply(data_status, data_reply)}")
-                        if data_status == 250:
-                            accepted += 1
-                            last_accepted_test_id = msg_test_id
-                            self._av_append_message_summaries(
-                                msg_summaries, msg_def, mf.name, data_status, "accepted"
-                            )
-                        else:
+                            continue
+                        if used_auth:
+                            auth_used = True
+                        mail_status, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
+                        _av_payload_trace_store(
+                            f"MAIL FROM <{mail_from}>: {_av_smtp_reply(mail_status, mail_reply)}"
+                        )
+                        if mail_status not in (250, 251):
                             rejected += 1
-                            self._av_append_message_summaries(
-                                msg_summaries, msg_def, mf.name, data_status, "rejected"
+                            sent += 1
+                            _av_emit_payload(
+                                payload_trace,
+                                payload_def,
+                                trace_name,
+                                mail_status,
+                                "rejected",
                             )
-                    try:
-                        smtp.quit()
-                    except Exception:
-                        pass
-                except (
-                    smtplib.SMTPResponseException,
-                    smtplib.SMTPServerDisconnected,
-                    ConnectionResetError,
-                    BrokenPipeError,
-                    OSError,
-                    socket.timeout,
-                ) as e:
-                    err_count += 1
-                    _av_fail_line(smtp_trace, f"{mf.name}: error {e}")
-                    self._av_append_message_summaries(msg_summaries, msg_def, mf.name, None, "error")
-                    try:
-                        smtp.quit()
-                    except Exception:
-                        pass
+                            try:
+                                smtp.quit()
+                            except Exception:
+                                pass
+                            continue
+                        rcpt_status, rcpt_reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
+                        _av_payload_trace_store(
+                            f"RCPT TO <{rcpt}>: {_av_smtp_reply(rcpt_status, rcpt_reply)}"
+                        )
+                        if rcpt_status not in (250, 251):
+                            rejected += 1
+                            sent += 1
+                            _av_emit_payload(
+                                payload_trace,
+                                payload_def,
+                                trace_name,
+                                rcpt_status,
+                                "rejected",
+                            )
+                            try:
+                                smtp.quit()
+                            except Exception:
+                                pass
+                            continue
+                        cc_failed = False
+                        for c in cc_list:
+                            cc_status, cc_reply = smtp.docmd("RCPT", f"TO:<{c}>")
+                            _av_payload_trace_store(
+                                f"RCPT TO <{c}>: {_av_smtp_reply(cc_status, cc_reply)}"
+                            )
+                            if cc_status not in (250, 251):
+                                rejected += 1
+                                sent += 1
+                                _av_emit_payload(
+                                    payload_trace,
+                                    payload_def,
+                                    trace_name,
+                                    cc_status,
+                                    "rejected",
+                                )
+                                cc_failed = True
+                                try:
+                                    smtp.quit()
+                                except Exception:
+                                    pass
+                                break
+                        if not cc_failed:
+                            data_status, data_reply = smtp.data(raw_msg)
+                            _av_payload_trace_store(
+                                self._data_trace_entry(
+                                    raw_msg, reply=_av_smtp_reply(data_status, data_reply)
+                                )
+                            )
+                            sent += 1
+                            if data_status == 250:
+                                accepted += 1
+                                last_accepted_test_id = msg_test_id
+                                _av_emit_payload(
+                                    payload_trace,
+                                    payload_def,
+                                    trace_name,
+                                    data_status,
+                                    "accepted",
+                                    test_id=msg_test_id,
+                                )
+                            else:
+                                rejected += 1
+                                _av_emit_payload(
+                                    payload_trace,
+                                    payload_def,
+                                    trace_name,
+                                    data_status,
+                                    "rejected",
+                                )
+                        try:
+                            smtp.quit()
+                        except Exception:
+                            pass
+                    except (
+                        smtplib.SMTPResponseException,
+                        smtplib.SMTPServerDisconnected,
+                        ConnectionResetError,
+                        BrokenPipeError,
+                        OSError,
+                        socket.timeout,
+                    ) as e:
+                        err_count += 1
+                        _av_payload_fail_line(f"{trace_name}: error {e}")
+                        _av_emit_payload(payload_trace, payload_def, trace_name, None, "error")
+                        try:
+                            smtp.quit()
+                        except Exception:
+                            pass
 
-            sent = len(msg_files)
             detail = f"{accepted} accepted, {rejected} rejected, {err_count} error"
             cat_result = AntivirusCategoryResult(
                 category=cat,
@@ -13136,11 +13767,9 @@ class SMTP(BaseModule):
                 detail=detail,
                 message_summary=tuple(msg_summaries),
                 test_id=last_accepted_test_id,
+                payload_test_ids=tuple(payload_test_ids),
             )
             cat_results.append(cat_result)
-            if not self.use_json and self.args.debug:
-                self._antivirus_streamed_live = True
-                self._av_stream_category_section(cat_result, rcpt, stream_trace=True)
 
         elapsed = time.perf_counter() - start_time
         total_accepted = sum(c.accepted for c in cat_results)
@@ -13330,7 +13959,7 @@ class SMTP(BaseModule):
                             reply_str = self._smtp_reply_text_one_line(data_reply)
                             _sh_trace_append(
                                 smtp_trace,
-                                f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                                self._data_trace_entry(raw_msg, data_status, data_reply),
                             )
                             if data_status == 250:
                                 accepted = True
@@ -13569,7 +14198,10 @@ class SMTP(BaseModule):
         else:
             try:
                 mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                _bcc_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                _bcc_trace_append(
+                    smtp_trace,
+                    f"MAIL FROM <{mail_from}>: {self._smtp_trace_reply(mail_st, mail_reply)}",
+                )
                 if mail_st not in (250, 251):
                     detail = f"MAIL FROM rejected: {mail_st}"
                 else:
@@ -13586,7 +14218,7 @@ class SMTP(BaseModule):
                         data_status, data_reply = smtp.data(raw_msg)
                         _bcc_trace_append(
                             smtp_trace,
-                            f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                            self._data_trace_entry(raw_msg, data_status, data_reply),
                         )
                         status_code = data_status
                         reply_str = data_reply.decode() if isinstance(data_reply, bytes) else str(data_reply)
@@ -13739,10 +14371,16 @@ class SMTP(BaseModule):
         start_time = time.perf_counter()
         var_results: list[AliasVariantResult] = []
         self._alias_streamed_live = False
+        base_mail_sent = False
+        base_test_id = ""
+        base_smtp_trace: tuple[str, ...] = ()
 
-        for variant_name, addr in variants_to_test:
-            is_bang_simple = variant_name == "bang_simple"
-            uucp_warning = False
+        def _run_alias_probe(
+            variant_name: str,
+            addr: str,
+            *,
+            is_bang_simple: bool = False,
+        ) -> AliasVariantResult:
             detail_str = None
             accepted = rejected = error = False
             status_code = None
@@ -13767,33 +14405,41 @@ class SMTP(BaseModule):
                     raw_msg = msg.as_string()
 
                     mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                    _al_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                    _al_trace_append(
+                        smtp_trace,
+                        f"MAIL FROM <{mail_from}>: {self._smtp_trace_reply(mail_st, mail_reply)}",
+                    )
                     if mail_st not in (250, 251):
                         rejected = True
                         detail_str = f"MAIL FROM rejected: {mail_st}"
                     else:
-                        status, reply = smtp.docmd("RCPT", f"TO:<{addr}>")
-                        status_code = status
-                        reply_str = self._smtp_reply_text_one_line(reply)
-                        _al_trace_append(
-                            smtp_trace,
-                            f"RCPT TO <{addr}>: {self._smtp_trace_reply(status, reply)}",
-                        )
+                        rcpt_targets = [addr]
+                        if addr.lower() != base_address.lower():
+                            rcpt_targets.append(base_address)
+                        rcpt_ok = True
+                        for rcpt_addr in rcpt_targets:
+                            status, reply = smtp.docmd("RCPT", f"TO:<{rcpt_addr}>")
+                            status_code = status
+                            reply_str = self._smtp_reply_text_one_line(reply)
+                            _al_trace_append(
+                                smtp_trace,
+                                f"RCPT TO <{rcpt_addr}>: {self._smtp_trace_reply(status, reply)}",
+                            )
+                            if status not in (250, 251):
+                                rcpt_ok = False
+                                rejected = True
+                                detail_str = f"[{status}] {reply_str}"
+                                break
 
-                        if status in (250, 251):
+                        if rcpt_ok:
                             accepted = True
                             data_status, data_reply = smtp.data(raw_msg)
                             _al_trace_append(
                                 smtp_trace,
-                                f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                                self._data_trace_entry(raw_msg, data_status, data_reply),
                             )
                             if data_status != 250:
                                 detail_str = f"RCPT OK but DATA rejected: {data_status}"
-                            if is_bang_simple:
-                                uucp_warning = True
-                        else:
-                            rejected = True
-                            detail_str = f"[{status}] {reply_str}"
                 except Exception as e:
                     error = True
                     _al_trace_append(smtp_trace, f"error: {e}")
@@ -13805,7 +14451,8 @@ class SMTP(BaseModule):
                         pass
 
             mail_accepted = accepted and not (detail_str and "DATA rejected" in detail_str)
-            variant_result = AliasVariantResult(
+            uucp_warning = is_bang_simple and mail_accepted
+            return AliasVariantResult(
                 variant=variant_name,
                 address=addr,
                 accepted=accepted,
@@ -13817,6 +14464,28 @@ class SMTP(BaseModule):
                 uucp_warning=uucp_warning,
                 smtp_trace=tuple(smtp_trace),
                 test_id=alias_test_id if mail_accepted else "",
+            )
+
+        base_probe = _run_alias_probe("base", base_address)
+        base_mail_sent = self._al_variant_mail_accepted(base_probe)
+        base_test_id = base_probe.test_id
+        base_smtp_trace = base_probe.smtp_trace
+        if not self.use_json and self.args.debug:
+            self._alias_streamed_live = True
+            self._al_stream_base_section(
+                base_address,
+                base_mail_sent=base_mail_sent,
+                base_test_id=base_test_id,
+                base_smtp_trace=base_smtp_trace,
+                stream_trace=True,
+            )
+
+        for variant_name, addr in variants_to_test:
+            is_bang_simple = variant_name == "bang_simple"
+            variant_result = _run_alias_probe(
+                variant_name,
+                addr,
+                is_bang_simple=is_bang_simple,
             )
             var_results.append(variant_result)
             if not self.use_json and self.args.debug:
@@ -13837,6 +14506,9 @@ class SMTP(BaseModule):
             elapsed_sec=elapsed,
             detail=detail,
             verification_instructions=VERIFICATION_INSTRUCTIONS,
+            base_mail_sent=base_mail_sent,
+            base_test_id=base_test_id,
+            base_smtp_trace=base_smtp_trace,
         )
 
     def _get_ssrf_definitions_path(self) -> Path:
@@ -14059,7 +14731,10 @@ class SMTP(BaseModule):
                         auth_used = True
                     if not auth_err:
                         mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                        _ssrf_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                        _ssrf_trace_append(
+                            smtp_trace,
+                            f"MAIL FROM <{mail_from}>: {self._smtp_trace_reply(mail_st, mail_reply)}",
+                        )
                         if mail_st not in (250, 251):
                             rejected = 1
                             sent = 1
@@ -14085,7 +14760,7 @@ class SMTP(BaseModule):
                                 sent = 1
                                 _ssrf_trace_append(
                                     smtp_trace,
-                                    f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                                    self._data_trace_entry(raw_msg, data_status, data_reply),
                                 )
                                 if data_status == 250:
                                     accepted = 1
@@ -14146,7 +14821,10 @@ class SMTP(BaseModule):
                         ehlo_st, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "ssrf-test.local")
                         _ssrf_trace_append(smtp_trace, f"EHLO: {self._smtp_trace_reply(ehlo_st, ehlo_reply)}")
                         mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                        _ssrf_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                        _ssrf_trace_append(
+                            smtp_trace,
+                            f"MAIL FROM <{mail_from}>: {self._smtp_trace_reply(mail_st, mail_reply)}",
+                        )
                         if mail_st not in (250, 251):
                             rejected = 1
                             sent = 1
@@ -14164,7 +14842,7 @@ class SMTP(BaseModule):
                                 sent = 1
                                 _ssrf_trace_append(
                                     smtp_trace,
-                                    f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                                    self._data_trace_entry(raw_msg, data_status, data_reply),
                                 )
                                 if data_status == 250:
                                     accepted = 1
@@ -14416,7 +15094,12 @@ class SMTP(BaseModule):
                 smtp2.docmd("MAIL", f"FROM:<{mail_from}>")
                 smtp2.docmd("RCPT", f"TO:<{rcpt}>")
                 t0 = time.perf_counter()
-                data_status, _ = smtp2.data(msg)
+                data_status, data_reply = smtp2.data(msg)
+                if idx == 0:
+                    self._mail_test_trace_append(
+                        smtp_trace,
+                        self._data_trace_entry(msg, data_status, data_reply),
+                    )
                 rtt = time.perf_counter() - t0
                 rtts.append(rtt)
                 sent += 1
@@ -14764,7 +15447,10 @@ class SMTP(BaseModule):
                         auth_used = True
                     if not auth_err:
                         mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                        _zipxxe_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                        _zipxxe_trace_append(
+                            smtp_trace,
+                            f"MAIL FROM <{mail_from}>: {self._smtp_trace_reply(mail_st, mail_reply)}",
+                        )
                         if mail_st not in (250, 251):
                             rejected = 1
                             sent = 1
@@ -14782,7 +15468,7 @@ class SMTP(BaseModule):
                                 sent = 1
                                 _zipxxe_trace_append(
                                     smtp_trace,
-                                    f"DATA: {self._smtp_trace_reply(data_status, data_reply)}",
+                                    self._data_trace_entry(raw_msg, data_status, data_reply),
                                 )
                                 if data_status == 250:
                                     accepted = 1
@@ -15867,8 +16553,7 @@ class SMTP(BaseModule):
         if r.all_rcpt_2xx:
             bullet = "VULN" if r.duplicate_count >= 3 else "TITLE"
             pp(
-                f"All {r.duplicate_count} duplicate RCPT TO accepted for {r.recipient!r} "
-                f"(delivery fan-out is implementation-defined; check mailbox / logs manually)",
+                f"All {r.duplicate_count} duplicate RCPT TO accepted for {r.recipient}",
                 bullet_type=bullet, condition=show, indent=4,
             )
         else:
@@ -15880,15 +16565,14 @@ class SMTP(BaseModule):
                 bullet_type="NOTVULN", condition=show, indent=4,
             )
         if r.data_sent and r.probe_uuid:
-            pp(f"DATA accepted with probe id {r.probe_uuid} — correlate in recipient inbox",
-               bullet_type="TITLE", condition=show, indent=4)
-        if r.all_rcpt_2xx and r.duplicate_count >= 3:
-            pp(
-                f"Expect one delivery after DATA if amplification is mitigated; "
-                f"several copies or leaky Delivered-To/Received warrant documenting",
-                bullet_type="TITLE", condition=show, indent=4,
+            self._pp_mail_probe_line(
+                pp,
+                show,
+                accepted=True,
+                sent_msg=self._mail_sent_inbox_msg(r.recipient, r.probe_uuid),
+                indent=4,
             )
-        if getattr(self.args, "rcpt_duplicate_send", False) and not r.data_sent:
+        elif getattr(self.args, "send", False) and not r.data_sent:
             extra = f": {r.data_reply_snippet}" if r.data_reply_snippet else ""
             pp(f"DATA not completed{extra}", bullet_type="TITLE", condition=show, indent=4)
 
@@ -16654,6 +17338,106 @@ class SMTP(BaseModule):
         text = self._smtp_reply_text_one_line(reply)
         return f"{status} {text}" if text else str(status)
 
+    def _readable_payload_lines(
+        self,
+        raw_payload: str,
+        *,
+        max_body_lines: int = 40,
+        max_line: int = 120,
+    ) -> list[str]:
+        """Display lines for a sent DATA payload (-vv).
+
+        Headers are shown as sent. A base64 text body is decoded and shown readable
+        (with a note that it is base64 on the wire); a binary/large base64 body is
+        summarised instead of dumped; other bodies are shown with sane length caps.
+        """
+        if not raw_payload:
+            return []
+        text = raw_payload.replace("\r\n", "\n").replace("\r", "\n")
+        head, _sep, body = text.partition("\n\n")
+        header_lines = [h for h in head.split("\n") if h.strip() != ""]
+        out: list[str] = list(header_lines)
+        body = body.strip("\n")
+        if not body:
+            return out
+        is_b64 = any(
+            h.lower().startswith("content-transfer-encoding:") and "base64" in h.lower()
+            for h in header_lines
+        )
+        out.append("")
+        if is_b64:
+            try:
+                decoded = base64.b64decode(body).decode("utf-8")
+                printable = sum(1 for c in decoded if c.isprintable() or c in "\n\t")
+                if "\x00" not in decoded and len(decoded) <= 4000 and (
+                    not decoded or printable / len(decoded) > 0.9
+                ):
+                    out.extend(decoded.replace("\r\n", "\n").rstrip("\n").split("\n"))
+                    out.append("(note: body is base64-encoded on the wire; shown decoded)")
+                    return out
+            except Exception:
+                pass
+            out.append(f"<base64 body: {len(body)} chars on the wire; not shown (binary/large)>")
+            return out
+        body_lines = body.split("\n")
+        for idx, bl in enumerate(body_lines):
+            if idx >= max_body_lines:
+                out.append(f"... ({len(body_lines) - idx} more line(s))")
+                break
+            out.append(bl if len(bl) <= max_line else f"{bl[:max_line]}…(+{len(bl) - max_line} chars)")
+        return out
+
+    def _data_trace_entry(
+        self,
+        raw_payload: str,
+        data_status=None,
+        data_reply=None,
+        *,
+        reply: str | None = None,
+    ) -> str:
+        """Trace entry for a DATA step: ``DATA:`` header, readable payload, then server reply.
+
+        Stored as one multiline string in ``smtp_trace``; rendered under -vv via
+        :py:meth:`_stream_smtp_trace_line`.
+        """
+        if reply is None:
+            reply = self._smtp_trace_reply(data_status, data_reply)
+        lines = ["DATA:"]
+        for pl in self._readable_payload_lines(raw_payload):
+            lines.append(f"    {pl}")
+        if reply:
+            lines.append(reply)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _data_trace_status_code(entry: str) -> str | None:
+        """Extract SMTP status code from a ``_data_trace_entry`` (single- or multi-line)."""
+        if not entry.startswith("DATA:"):
+            return None
+        trace_lines = entry.splitlines()
+        if len(trace_lines) == 1:
+            tail = entry.split(":", 1)[1].strip()
+            return tail.split()[0] if tail else None
+        for line in reversed(trace_lines):
+            s = line.strip()
+            if s and s[0].isdigit():
+                return s.split()[0]
+        return None
+
+    def _stream_smtp_trace_line(
+        self,
+        line: str,
+        *,
+        indent_override: int = 4,
+    ) -> None:
+        """Print one SMTP trace entry under -vv (supports multiline DATA payloads)."""
+        if self.use_json or not self.args.debug:
+            return
+        if line.startswith("---") and line.endswith("---"):
+            self.ptdebug(line.strip("- ").strip(), title=True)
+            return
+        self.ptdebug(line, indent_override=indent_override)
+
     @staticmethod
     def _mail_variant_msg_summary(
         smtp_trace: tuple[str, ...],
@@ -16671,9 +17455,9 @@ class SMTP(BaseModule):
         if accepted:
             for line in reversed(smtp_trace):
                 if line.startswith("DATA:"):
-                    parts = line.split(":", 1)[1].strip().split()
-                    if parts:
-                        return (f"DATA: {parts[0]} (accepted)",)
+                    code = self._data_trace_status_code(line)
+                    if code:
+                        return (f"DATA: {code} (accepted)",)
         if rejected:
             for line in reversed(smtp_trace):
                 if line.startswith("RCPT TO"):
@@ -16685,19 +17469,15 @@ class SMTP(BaseModule):
                     if parts and parts[0] not in ("250", "251"):
                         return (f"MAIL FROM: {parts[0]} (rejected)",)
                 if line.startswith("DATA:"):
-                    parts = line.split(":", 1)[1].strip().split()
-                    if parts:
-                        return (f"DATA: {parts[0]} (rejected)",)
+                    code = self._data_trace_status_code(line)
+                    if code:
+                        return (f"DATA: {code} (rejected)",)
         return ()
 
     def _mail_test_trace_append(self, trace: list[str], line: str) -> None:
-        """Store SMTP trace line; with -vv print live via ptdebug (same as -av)."""
+        """Store SMTP trace line; with -vv print live via :py:meth:`_stream_smtp_trace_line`."""
         trace.append(line)
-        if self.args.debug and not self.use_json:
-            if line.startswith("---") and line.endswith("---"):
-                self.ptdebug(line.strip("- ").strip(), title=True)
-            else:
-                self.ptdebug(line, Out.TEXT)
+        self._stream_smtp_trace_line(line)
 
     def _mail_test_auth_login(
         self,
@@ -16793,10 +17573,7 @@ class SMTP(BaseModule):
 
     def _br_stream_trace_line(self, line: str) -> None:
         """-vv SMTP trace for -br (ADDITIONS, indent 8 under probe title)."""
-        if self.use_json or not self.args.debug:
-            return
-        text = line.strip("- ").strip() if line.startswith("---") and line.endswith("---") else line
-        self.ptdebug(text, indent_override=8)
+        self._stream_smtp_trace_line(line, indent_override=8)
 
     def _stream_bounce_replay_trace_line(self, line: str) -> None:
         """-vv SMTP trace for -br replay in streamer (ADDITIONS, same as live)."""
@@ -17260,7 +18037,9 @@ class SMTP(BaseModule):
         pp(self._sh_variant_section_title(v.variant), bullet_type="TITLE", condition=True, indent=4)
         if stream_trace:
             for line in v.smtp_trace:
-                self.ptdebug(line, indent_override=8)
+                if line.startswith("---"):
+                    continue
+                self._stream_smtp_trace_line(line, indent_override=8)
         if v.accepted:
             pp(
                 self._mail_sent_inbox_msg(rcpt, v.test_id),
@@ -17322,10 +18101,14 @@ class SMTP(BaseModule):
         al = self.results.alias_test
         if al is None or not show:
             return
-        if not self.args.debug:
-            pp("Base recipient", bullet_type="TITLE", condition=show, indent=4)
-            pp(al.base_address, bullet_type="TEXT", condition=show, indent=8)
         if not (self.args.debug and getattr(self, "_alias_streamed_live", False)):
+            self._al_stream_base_section(
+                al.base_address,
+                base_mail_sent=al.base_mail_sent,
+                base_test_id=al.base_test_id,
+                base_smtp_trace=al.base_smtp_trace,
+                stream_trace=False,
+            )
             for v in al.variants:
                 self._al_stream_variant_section(v, al.base_address, stream_trace=False)
 
@@ -17336,25 +18119,12 @@ class SMTP(BaseModule):
             if p.strip()
         ) if mail_sent else ()
 
-        accepted_count = sum(1 for v in al.variants if self._al_variant_mail_accepted(v))
-        error_count = sum(1 for v in al.variants if v.error)
-        variant_count = len(al.variants)
-        if variant_count == 0:
-            verdict: tuple[str, str] = ("WARNING", "Indeterminate")
-        elif accepted_count > 0:
-            verdict = ("VULN", "VULNERABLE")
-        elif error_count == variant_count:
-            verdict = ("WARNING", "Indeterminate")
-        else:
-            verdict = ("NOTVULN", "NOT VULNERABLE")
-
         self._pp_av_summary_block(
             pp,
             show=show,
             detail=al.detail,
             elapsed_sec=al.elapsed_sec,
             extra_lines=extra,
-            verdict=verdict,
         )
 
     def _stream_auth_downgrade_result(self) -> None:
@@ -17801,7 +18571,7 @@ class SMTP(BaseModule):
                 parts.append(f"Duplicate RCPT probe error: {rdd_err}")
         elif (rdd := self.results.rcpt_duplicate) is not None:
             bits = [
-                f"Duplicate RCPT TO: {rdd.duplicate_count}× same recipient ({rdd.recipient!r}) "
+                f"Duplicate RCPT TO: {rdd.duplicate_count}× same recipient ({rdd.recipient}) "
                 f"in one MAIL transaction",
             ]
             if rdd.all_rcpt_2xx:
@@ -17814,7 +18584,7 @@ class SMTP(BaseModule):
                 bits.append(
                     f"DATA submitted (probe {rdd.probe_uuid or 'n/a'}); verify inbox manually for copy count"
                 )
-            elif getattr(self.args, "rcpt_duplicate_send", False):
+            elif getattr(self.args, "send", False):
                 bits.append("DATA not sent (not all RCPT were 2xx or DATA failed)")
             if rdd.all_rcpt_2xx and rdd.duplicate_count >= 3:
                 bits.append(
@@ -18317,13 +19087,13 @@ class SMTP(BaseModule):
                     "vuln_code": VULNS.RcptDuplicate.value,
                     "vuln_request": (
                         f"Same recipient accepted {rd.duplicate_count} times as separate RCPT TO "
-                        f"in one MAIL transaction ({rd.recipient!r})"
+                        f"in one MAIL transaction ({rd.recipient})"
                     ),
                     "vuln_response": (
                         "SMTP returned 2xx for each duplicate RCPT TO — envelope semantics treat them as "
                         "separate recipients; after DATA, correct handling should still yield one logical "
                         "delivery without amplification. If the recipient receives multiple distinct copies, "
-                        "that matches this finding (PTV-SVC-SMTP-RCPTDUP). Verify manually with --rdd-send "
+                        "that matches this finding (PTV-SVC-SMTP-RCPTDUP). Verify manually with --send "
                         "and mailbox/logs; also review Delivered-To / Received: a single message may "
                         "still expose repeated routing (informational leak)."
                     ),
@@ -18551,6 +19321,7 @@ class SMTP(BaseModule):
                             "error": c.error,
                             "smtpTrace": list(c.smtp_trace),
                             "messageSummary": list(c.message_summary),
+                            "payloadTestIds": list(c.payload_test_ids),
                             "detail": c.detail,
                             "testId": c.test_id or None,
                         }
@@ -18603,6 +19374,8 @@ class SMTP(BaseModule):
             if (al := self.results.alias_test) is not None:
                 props["aliasTest"] = {
                     "baseAddress": al.base_address,
+                    "baseMailSent": al.base_mail_sent,
+                    "baseTestId": al.base_test_id or None,
                     "elapsedSec": round(al.elapsed_sec, 2),
                     "detail": al.detail,
                     "verificationInstructions": al.verification_instructions,
@@ -19186,6 +19959,7 @@ class SMTP(BaseModule):
                             "error": c.error,
                             "smtpTrace": list(c.smtp_trace),
                             "messageSummary": list(c.message_summary),
+                            "payloadTestIds": list(c.payload_test_ids),
                             "detail": c.detail,
                             "testId": c.test_id or None,
                         }

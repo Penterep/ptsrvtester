@@ -1,0 +1,5 @@
+{
+  "subject": "EICAR antivirus test - single ZIP (PTL-SVC-SMTP-ANTIVIRUS)",
+  "body": "EICAR test file inside a single ZIP archive (eicar.org variant 3). Scanner should unpack and detect eicar.com.",
+  "attachments": ["eicar.zip"]
+}

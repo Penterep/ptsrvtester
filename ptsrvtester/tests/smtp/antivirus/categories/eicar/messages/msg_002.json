@@ -1,0 +1,5 @@
+{
+  "subject": "EICAR antivirus test - alternate filename (PTL-SVC-SMTP-ANTIVIRUS)",
+  "body": "EICAR standard test file with .txt extension (eicar.org variant 2). Harmless but should be detected by antivirus.",
+  "attachments": ["eicar.com.txt"]
+}

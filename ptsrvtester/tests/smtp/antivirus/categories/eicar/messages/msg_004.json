@@ -1,0 +1,5 @@
+{
+  "subject": "EICAR antivirus test - double ZIP (PTL-SVC-SMTP-ANTIVIRUS)",
+  "body": "EICAR test file inside a ZIP within a ZIP (eicar.org variant 4). Scanner should recurse at least two archive levels.",
+  "attachments": ["eicar_double.zip"]
+}

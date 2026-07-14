@@ -10,9 +10,152 @@ from typing import List, Optional
 from ptlibs.ptjsonlib import PtJsonLib
 
 from ._base import BaseModule, BaseArgs, Out
-from .utils.helpers import text_or_file
+from .utils.helpers import (
+    text_or_file,
+    valid_target,
+    Target
+)
 
-    
+# Per-test definitions:
+#   desc      one-line description for the main -ts table
+#   long      list of <=3 lines describing what the test does (per-test help)
+#   flags     dict dest->value applied to the args namespace when selected
+#   value     (dest, default) for tests whose flag carries a value (default set if None)
+#   requires  human-readable prerequisite strings (per-test help)
+#   common    True -> append common outbound message options to per-test help
+#   mods      test-specific option rows [short, long, metavar, help] (per-test help)
+SNMP_TESTS: dict[str, dict] = {
+    "DETECTION": {
+        "desc": "Detect SNMP versions",
+        "long": "",
+        "flags": {"version_detection": True}
+    },
+    "V2BRUTE": {
+        "desc": "SNMPv2 dictionary attack",
+        "long": "",
+        "flags": {"v2_brute_force": True}
+    },
+    "V2WRITE": {
+        "desc": "Test SNMPv2 write permission",
+        "long": "",
+        "flags": {"v2_write": True}
+    },
+    "V2WALK": {
+        "desc": "SNMPv2 MIB walk",
+        "long": "",
+        "flags": {"v2_walk": True}
+    },
+    "V3ENUM": {
+        "desc": "SNMPv3 user enumeration",
+        "long": "",
+        "flags": {"v3_enum": True}
+    },
+    "V3BRUTE": {
+        "desc": "SNMPv3 credentials bruteforce",
+        "long": "",
+        "flags": {"v3_brute_force": True}
+    },
+    "V3WALK": {
+        "desc": "SNMPv3 MIB walk",
+        "long": "",
+        "flags": {"v3_walk": True}
+    },
+    "V3WRITE": {
+        "desc": "Test SNMPv3 write permissions",
+        "long": "",
+        "flags": {"v3_write": True}
+    }
+}
+
+def _parse_test_codes(raw: str | None) -> list[str]:
+    """Split and upper-case a raw -ts value into a list of codes."""
+    if not raw:
+        return []
+    return [c.strip().upper() for c in str(raw).split(",") if c.strip()]
+
+def valid_target_snmp(target: str) -> Target:
+    return valid_target(target, domain_allowed=True)
+
+def _apply_SNMP_tests(args) -> None:
+    """Translate ``-ts/--tests`` codes into the internal per-test dest flags.
+
+    ``ALL`` (or no ``-ts``) leaves every flag at default -> run-all mode.
+    """
+    codes = _parse_test_codes(getattr(args, "tests", None))
+    if not codes:
+        return
+    if "ALL" in codes:
+        # Explicit full scan: apply nothing so _is_run_all_mode() stays True.
+        return
+    unknown = [c for c in codes if c not in SNMP_TESTS]
+    if unknown:
+        available = ", ".join(sorted(SNMP_TESTS))
+        raise argparse.ArgumentError(
+            None,
+            f"Unknown test(s): {', '.join(unknown)}. Available: ALL, {available}",
+        )
+
+    for code in codes:
+        spec = SNMP_TESTS[code]
+        for dest, val in spec.get("flags", {}).items():
+            setattr(args, dest, val)
+        value = spec.get("value")
+        if value is not None:
+            dest, default = value
+            if getattr(args, dest, None) is None and default is not None:
+                setattr(args, dest, default)
+
+    # Every explicitly selected test must actually activate; otherwise report what is
+    # missing instead of silently falling back to run-all mode.
+    inactive: list[tuple[str, list[str]]] = []
+    for code in codes:
+        spec = SNMP_TESTS[code]
+
+        if "flags" in spec:
+            active = all(getattr(args, dest, None) for dest in spec["flags"])
+        elif "value" in spec:
+            active = getattr(args, spec["value"][0], None) is not None
+        else:
+            active = True
+        if not active:
+            inactive.append((code, list(spec.get("requires", []))))
+    if inactive:
+        parts = [
+            f"{code} requires {'; '.join(req)}" if req else f"{code} could not be activated"
+            for code, req in inactive
+        ]
+        raise argparse.ArgumentError(None, "; ".join(parts))
+
+
+def _SNMP_test_help(codes: list[str]):
+    """Build a help object (for ptprinthelper.help_print) describing given test codes."""
+    if not codes:
+        return None
+    valid = [c for c in codes if c in SNMP_TESTS]
+    if not valid:
+        available = ", ".join(sorted(SNMP_TESTS))
+        return [
+            {"unknown_test": [f"Unknown test: {', '.join(codes)}"]},
+            {"available_tests": [f"ALL, {available}"]},
+        ]
+    out: list[dict] = []
+    for code in valid:
+        spec = SNMP_TESTS[code]
+        header = f"{code} — {spec.get('desc', '')}"
+        out.append({"test": [header, *spec.get("long", [])]})
+        req = list(spec.get("requires", []))
+        if req:
+            out.append({"requires": req})
+        rows: list[list[str]] = list(spec.get("mods", []))
+
+        if rows:
+            out.append({"test_options": rows})
+        has_opts = bool(rows or req)
+        usage = f"ptsrvtester SNMP -ts {code} " + ("<options> <target>" if has_opts else "<target>")
+        out.append({"usage": [usage]})
+    return out
+
+
 class VULNS(Enum):
     WeakCommunityName = "PTV-SNMPv2-WEAKCOMMUNITYNAME"
     WeakUsername = "PTV-SNMPv3-WEAKUSERNAME"
@@ -74,15 +217,11 @@ class SNMPArgs(BaseArgs):
 
     @staticmethod
     def get_help():
-        return [
-            {"description": ["SNMP Testing Module"]},
-            {"usage": ["ptsrvtester snmp <command> <options>"]},
-            {"usage_example": [
-                "ptsrvtester snmp detection --ip 192.168.1.1",
-                "ptsrvtester snmp snmpv2-brute --community-file communities.txt --ip 192.168.1.1",
-                "ptsrvtester snmp snmpv3-brute --username-file users.txt --password-file passwords.txt --ip 192.168.1.1"
-            ]},
-            {"options": [
+        options: list[list[str]] = [
+            ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,AV); ALL runs everything:"],
+        ]
+
+        options += [
                 ["detection", "<options>", "", "Detect SNMP versions"],
                 ["snmpv2-brute", "<options>", "", "SNMPv2 dictionary attack"],
                 ["snmpv2-write", "<options>", "", "Test SNMPv2 write permission"],
@@ -94,8 +233,22 @@ class SNMPArgs(BaseArgs):
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
                 ["-vv", "--verbose", "", "Enable verbose mode"],
-            ]}
+            ]
+
+        return [
+            {"description": ["SNMP Testing Module"]},
+            {"usage": ["ptsrvtester snmp <command> <options>"]},
+            {"usage_example": [
+                "ptsrvtester snmp detection --ip 192.168.1.1",
+                "ptsrvtester snmp snmpv2-brute --community-file communities.txt --ip 192.168.1.1",
+                "ptsrvtester snmp snmpv3-brute --username-file users.txt --password-file passwords.txt --ip 192.168.1.1"
+            ]},
+            {"options": options}
         ]
+
+    @staticmethod
+    def get_test_help(codes):
+        return _SNMP_test_help(codes)
 
     def add_subparser(self, name: str, subparsers) -> None:
         """Adds a subparser of SNMP arguments"""
@@ -105,105 +258,70 @@ class SNMPArgs(BaseArgs):
     ptsrvtester snmp snmpv2-brute --community-file communities.txt --ip 192.168.1.1 --port 161
     ptsrvtester snmp snmpv3-brute --username-file users.txt --password-file passwords.txt --ip 192.168.1.1 --port 161"""
 
-        parser = subparsers.add_parser(
+        snmp_subparsers = subparsers.add_parser(
             name,
             epilog=examples,
             add_help=True,
             formatter_class=argparse.RawTextHelpFormatter,
         )
 
-        if not isinstance(parser, argparse.ArgumentParser):
+        if not isinstance(snmp_subparsers, argparse.ArgumentParser):
             raise TypeError
 
-        snmp_subparsers = parser.add_subparsers(dest="command", help="Select SNMP command", required=True)
+        snmp_subparsers.add_argument("target",
+                                     type=valid_target_snmp,
+                                     help="IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:25)"
+                                     )
 
-        # SNMP Version Detection
-        detection = snmp_subparsers.add_parser("detection", help="Detect SNMP versions")
-        detection.add_argument("-ip", "--ip", required=True, help="Target IP address")
-        detection.add_argument("-p", "--port", type=int,default = 161, help="Target port")
+        snmp_subparsers.add_argument(
+            "-ts",
+            "--tests",
+            type=str,
+            default=None,
+            metavar="<test>",
+            dest="tests",
+            help="Comma-separated test codes (e.g. detection,v2brute) or ALL; 'smtp -ts <TEST> -h' for test options",
+        )
 
         # SNMPv2 Brute Force
-        snmpv2_brute_parser = snmp_subparsers.add_parser("snmpv2-brute", help="SNMPv2 dictionary attack")
-        snmpv2_brute_parser.add_argument("-ip", "--ip", required=True, help="Target IP address")
-        snmpv2_brute_parser.add_argument("-p", "--port", type=int, default = 161, help="Target port")
-        snmpv2_brute_parser.add_argument("-o", "--output",  help="File to save the output results.")
+        snmpv2_brute_parser = snmp_subparsers.add_argument_group(title="v2brute",
+                                                                 description="SNMPv2 dictionary attack")
+        snmpv2_brute_parser.add_argument("-o", "--output", help="File to save the output results.",
+                                         default=None,
+                                         type=str)
 
-        user_group1 = snmpv2_brute_parser.add_mutually_exclusive_group(required=True)
-        user_group1.add_argument("-c", "--single-community", "--community", help="Single community string")
-        user_group1.add_argument("-cf", "--community-file", help="File containing community strings")
+        # user_group1 = snmpv2_brute_parser.add_mutually_exclusive_group(required=True)
+        snmp_subparsers.add_argument("-c", "--single-community", "--community", help="Single community string")
+        snmp_subparsers.add_argument("-cf", "--community-file", help="File containing community strings")
 
         # SNMPv2 Write Permission
-        snmpv2_write_parser = snmp_subparsers.add_parser("snmpv2-write", help="Test SNMPv2 write permission")
-        snmpv2_write_parser.add_argument("-ip", "--ip", required=True, help="Target IP address")
-        snmpv2_write_parser.add_argument("-p", "--port", type=int, default = 161, help="Target port")
-        snmpv2_write_parser.add_argument("-v", "--value", default="Testvalue123", help="Value to write to the specified OID (default: 'Testvalue123')")
-
-        user_group2 = snmpv2_write_parser.add_mutually_exclusive_group(required=True)
-        user_group2.add_argument("-c", "--single-community", "--community", help="Single community string")
-        user_group2.add_argument("-cf", "--community-file", help="File containing community strings")
+        snmpv2_write_parser = snmp_subparsers.add_argument_group("v2write", description="Test SNMPv2 write permission")
+        snmpv2_write_parser.add_argument("-v", "--value", default="Testvalue123",
+                                         help="Value to write to the specified OID (default: 'Testvalue123')")
 
         # SNMPv2 GetBulk (Walk)
-        snmpv2_getbulk_parser = snmp_subparsers.add_parser("snmpv2-walk", help="SNMPv2 MIB walk")
-        snmpv2_getbulk_parser.add_argument("-ip","--ip", required=True, help="Target IP address")
-        snmpv2_getbulk_parser.add_argument("-p","--port", type=int, default = 161, help="Target port")
-        snmpv2_getbulk_parser.add_argument("-oid","--oid", default="1.3.6", help="OID to start from")
-        snmpv2_getbulk_parser.add_argument("-of","--oid-format", action="store_true", help="Use human readable OID format")
-        snmpv2_getbulk_parser.add_argument("-o","--output", help="File to save the output results.")
-
-        user_group3 = snmpv2_getbulk_parser.add_mutually_exclusive_group(required=True)
-        user_group3.add_argument("-c", "--single-community", "--community", help="Single community string")
-        user_group3.add_argument("-cf", "--community-file", help="File containing community strings")
+        snmpv2_getbulk_parser = snmp_subparsers.add_argument_group("v2walk", description="SNMPv2 MIB walk")
+        snmpv2_getbulk_parser.add_argument("-oid", "--oid", default="1.3.6", help="OID to start from")
+        snmpv2_getbulk_parser.add_argument("-of", "--oid-format", action="store_true",
+                                           help="Use human readable OID format")
 
         # SNMPv3 User Enumeration
-        user_enum_parser = snmp_subparsers.add_parser("snmpv3-enum", help="SNMPv3 user enumeration")
-        user_enum_parser.add_argument("-ip","--ip", required=True, help="Target IP address")
-        user_enum_parser.add_argument("-p","--port", type=int, default = 161, help="Target port")
-        user_enum_parser.add_argument("-o", "--output", help="File to save the output results.")
-
-        user_group4 = user_enum_parser.add_mutually_exclusive_group(required=True)
-        user_group4.add_argument("-u", "--single-username", help="Single username")
-        user_group4.add_argument("-ul", "--username-file", help="File containing usernames")
+        user_enum_parser = snmp_subparsers.add_argument_group("v3enum", description="SNMPv3 user enumeration")
 
         # SNMPv3 Brute Force
-        snmpv3_brute_parser = snmp_subparsers.add_parser("snmpv3-brute", help="SNMPv3 credentials bruteforce")
-        snmpv3_brute_parser.add_argument("-ip", "--ip", required=True, help="Target IP address")
-        snmpv3_brute_parser.add_argument("-p", "--port", type=int, default = 161, help="Target port")
+        snmpv3_brute_parser = snmp_subparsers.add_argument_group("v3brute", description="SNMPv3 credentials bruteforce")
         snmpv3_brute_parser.add_argument("-ap", "--auth-protocols", help="Authentication protocol")
         snmpv3_brute_parser.add_argument("-pp", "--priv-protocols", help="Private protocol")
-        snmpv3_brute_parser.add_argument("-o", "--output", help="File to save the output results.")
         snmpv3_brute_parser.add_argument("-s", "--spray", action="store_true", help="Enable spray mode")
-  
-        user_group6 = snmpv3_brute_parser.add_mutually_exclusive_group(required=True)
-        user_group6.add_argument("-u", "--single-username", help="Single username")
-        user_group6.add_argument("-ul", "--username-file", help="File containing usernames")
-
-        user_group7 = snmpv3_brute_parser.add_mutually_exclusive_group(required=True)
-        user_group7.add_argument("-pw", "--single-password", help="Single password")
-        user_group7.add_argument("-pl", "--password-file", help="File containing passwords")
-
 
         # SNMPv3 GetBulk (Walk)
-        snmpv3_getbulk_parser = snmp_subparsers.add_parser("snmpv3-walk", help="SNMPv3 MIB walk")
-        snmpv3_getbulk_parser.add_argument("-ip", "--ip", required=True, help="Target IP address")
-        snmpv3_getbulk_parser.add_argument("-p", "--port", type=int, default = 161, help="Target port")
+        snmpv3_getbulk_parser = snmp_subparsers.add_argument_group("v3walk", description="SNMPv3 MIB walk")
         snmpv3_getbulk_parser.add_argument("-u", "--single-username", help="Single username")
         snmpv3_getbulk_parser.add_argument("-pw", "--single-password", help="Single password")
-        snmpv3_getbulk_parser.add_argument("-ap", "--auth-protocols", help="Authentication protocol")
-        snmpv3_getbulk_parser.add_argument("-pp", "--priv-protocols", help="Private protocol")
-        snmpv3_getbulk_parser.add_argument("-oid", "--oid", default="1.3.6", help="OID to start from")
-        snmpv3_getbulk_parser.add_argument("-of", "--oid-format", action="store_true", help="Use human readable OID format")
-        snmpv3_getbulk_parser.add_argument("-o", "--output", help="File to save the output results.")
 
         # SNMPv3 Write Permission
-        snmpv3_write = snmp_subparsers.add_parser("snmpv3-write", help="Test SNMPv3 write permissions")
-        snmpv3_write.add_argument("-ip", "--ip", required=True, help="Target IP address")
-        snmpv3_write.add_argument("-p", "--port", type=int, default = 161, help="Target port")
-        snmpv3_write.add_argument("-u", "--single-username", help="Single username")
-        snmpv3_write.add_argument("-pw", "--single-password", help="Single password")
+        snmpv3_write = snmp_subparsers.add_argument_group("v3write", description="Test SNMPv3 write permissions")
         snmpv3_write.add_argument("-cred", "--valid-credentials-file", help="File containing valid credentials")
-        snmpv3_write.add_argument("-ap", "--auth-protocols", help="Authentication protocol")
-        snmpv3_write.add_argument("-pp", "--priv-protocols", help="Private protocol")
-        snmpv3_write.add_argument("-v", "--value", default="Testvalue123", help="Value to write to the specified OID (default: 'Testvalue123')")
 
 
 class SNMP(BaseModule):
@@ -215,38 +333,68 @@ class SNMP(BaseModule):
         self.args = args  # type: SNMPArgs
         self.ptjsonlib = ptjsonlib
         self.results: SNMPResult | None = None
+        _apply_SNMP_tests(args)
 
     def run(self) -> None:
         """Main SNMP execution logic"""
 
         self.results = SNMPResult()
+        setattr(self.args, "ip", self.args.target.ip)
+        setattr(self.args, "port", self.args.target.port)
+        c_string_present = getattr(self.args, "single_community", False) or getattr(self.args, "community_file", False)
+        username_present = getattr(self.args, "single_username", False) or getattr(self.args, "username_file", False)
+        password_present = getattr(self.args, "single_password", False) or getattr(self.args, "password_file", False)
 
-        if self.args.command == "detection":
+        if getattr(self.args, "version_detection", False):
             self.results.version = asyncio.run(self.version_detection())
 
-        elif self.args.command == "snmpv2-brute":
-            self.results.communities = asyncio.run(self.snmpv2_brute())
+        if getattr(self.args, "v2_brute_force", False):
+            if not c_string_present:
+                raise argparse.ArgumentError(None, "SNMPv2 brute-force module requires the -c/--single-community "
+                                                   "or -cf/--community-file argument")
+            else:
+                self.results.communities = asyncio.run(self.snmpv2_brute())
 
-        elif self.args.command == "snmpv3-brute":
-            self.results.credentials = asyncio.run(self.snmpv3_brute())
+        if getattr(self.args, "v3_brute_force", False):
+            if not username_present and not password_present:
+                raise argparse.ArgumentError(None, "SNMPv3 brute-force module requires the -c/--single-community "
+                                                   "or -cf/--community-file argument")
+            else:
+                self.results.credentials = asyncio.run(self.snmpv3_brute())
 
-        elif self.args.command == "snmpv3-enum":
-            self.results.usernames = asyncio.run(self.user_enum())
+        if getattr(self.args, "v3_enum", False):
+            if not username_present:
+                raise argparse.ArgumentError(None, "SNMPv3 enumeration module requires the -u/--single-username argument")
+            else:
+                self.results.usernames = asyncio.run(self.user_enum())
 
-        elif self.args.command == "snmpv2-write":
-            self.results.Writetest2 = asyncio.run(self.test_snmpv2_write_permission())
+        if getattr(self.args, "v2_write", False):
+            if not c_string_present:
+                raise argparse.ArgumentError(None, "SNMPv2 write permissions module requires the -c/--single-community "
+                                                   "or -cf/--community-file argument")
+            else:
+                self.results.Writetest2 = asyncio.run(self.test_snmpv2_write_permission())
 
-        elif self.args.command == "snmpv3-write":
-            self.results.Writetest3 = asyncio.run(self.test_snmpv3_write_permissions())
+        if getattr(self.args, "v3_write", False):
+            if (not username_present or password_present) or not getattr(self.args, "valid_credentials_file", False):
+                raise argparse.ArgumentError(None, "SNMPv3 write permissions module requires the -u/--single-username "
+                                                   "and -p/--single-password or -cred/--valid-credentials-file arguments")
+            else:
+                self.results.Writetest3 = asyncio.run(self.test_snmpv3_write_permissions())
 
-        elif self.args.command == "snmpv2-walk":
-            self.results.Bulk2 = asyncio.run(self.getBulk_SNMPv2())
+        if getattr(self.args, "v2_walk", False):
+            if not c_string_present:
+                raise argparse.ArgumentError(None, "Bruteforce module require the -c/--single-community "
+                                                   "or -cf/--community-file argument")
+            else:
+                self.results.Bulk2 = asyncio.run(self.getBulk_SNMPv2())
 
-        elif self.args.command == "snmpv3-walk":
-            self.results.Bulk3 = asyncio.run(self.getBulk_SNMPv3())
-        
-        else:
-            self.ptprint("Unknown command for SNMP module.", out=Out.WARNING)
+        if getattr(self.args, "v3_walk", False):
+            if not getattr(self.args, "single_password", False) and not getattr(self.args, "single_username", False):
+                raise argparse.ArgumentError(None, "SNMPv3 walk module requires the -u/--single-username "
+                                                   "and -p/--single-password argument")
+            else:
+                self.results.Bulk3 = asyncio.run(self.getBulk_SNMPv3())
 
      # Map protocol OIDs to human-readable names
     PROTOCOL_NAMES = {

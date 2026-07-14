@@ -5566,6 +5566,39 @@ class SMTP(BaseModule):
         test_ids.append(payload_test_id)
         return summary, payload_test_id
 
+    @staticmethod
+    def _av_summary_payload_label(summary_line: str) -> str:
+        if ":" in summary_line:
+            return summary_line.split(":", 1)[0].strip()
+        return summary_line.strip()
+
+    def _av_print_payload_summary(
+        self,
+        pp,
+        summary_line: str,
+        payload_test_id: str,
+        rcpt: str,
+    ) -> None:
+        """Terminal summary for one AV payload (normal mode, no SMTP trace)."""
+        pp(
+            self._av_summary_payload_label(summary_line),
+            bullet_type="TEXT",
+            condition=True,
+            indent=8,
+        )
+        if "(accepted)" in summary_line and payload_test_id:
+            self._pp_mail_probe_line(
+                pp,
+                True,
+                accepted=True,
+                sent_msg=self._mail_sent_inbox_msg(rcpt, payload_test_id),
+                indent=12,
+            )
+        elif ":" in summary_line:
+            tail = summary_line.split(":", 1)[1].strip()
+            if tail:
+                pp(tail, bullet_type="TEXT", condition=True, indent=12)
+
     def _av_stream_payload_block(
         self,
         payload_trace: tuple[str, ...] | list[str],
@@ -5573,21 +5606,30 @@ class SMTP(BaseModule):
         payload_test_id: str,
         rcpt: str,
     ) -> None:
-        """Under -vv: SMTP trace for one payload, then outcome and mail-sent lines."""
+        """Under -vv: payload label, indented SMTP trace, then mail-sent / outcome."""
         pp = ptprinthelper.ptprint
+        pp(
+            self._av_summary_payload_label(summary_line),
+            bullet_type="TEXT",
+            condition=True,
+            indent=8,
+        )
         for line in payload_trace:
             if line.startswith("---"):
                 continue
-            self._stream_smtp_trace_line(line, indent_override=8)
-        pp(summary_line, bullet_type="TEXT", condition=True, indent=8)
+            self._stream_smtp_trace_line(line, indent_override=12)
         if "(accepted)" in summary_line and payload_test_id:
             self._pp_mail_probe_line(
                 pp,
                 True,
                 accepted=True,
                 sent_msg=self._mail_sent_inbox_msg(rcpt, payload_test_id),
-                indent=8,
+                indent=12,
             )
+        elif ":" in summary_line:
+            tail = summary_line.split(":", 1)[1].strip()
+            if tail:
+                pp(tail, bullet_type="TEXT", condition=True, indent=12)
 
     def _av_stream_category_section(
         self,
@@ -5632,26 +5674,10 @@ class SMTP(BaseModule):
             elif orphan_lines:
                 _flush_section(orphan_lines)
             for summary_line, payload_test_id in summary_iter:
-                pp(summary_line, bullet_type="TEXT", condition=True, indent=8)
-                if "(accepted)" in summary_line and payload_test_id:
-                    self._pp_mail_probe_line(
-                        pp,
-                        True,
-                        accepted=True,
-                        sent_msg=self._mail_sent_inbox_msg(rcpt, payload_test_id),
-                        indent=8,
-                    )
+                self._av_print_payload_summary(pp, summary_line, payload_test_id, rcpt)
             return
         for line, payload_test_id in zip(cat.message_summary, payload_test_ids):
-            pp(line, bullet_type="TEXT", condition=True, indent=8)
-            if "(accepted)" in line and payload_test_id:
-                self._pp_mail_probe_line(
-                    pp,
-                    True,
-                    accepted=True,
-                    sent_msg=self._mail_sent_inbox_msg(rcpt, payload_test_id),
-                    indent=8,
-                )
+            self._av_print_payload_summary(pp, line, payload_test_id, rcpt)
 
     def _alias_variant_title(self, variant: str) -> str:
         return ALIAS_VARIANT_TITLES.get(
@@ -5688,6 +5714,17 @@ class SMTP(BaseModule):
             return f"{v.address}: (error)"
         return f"{v.address}: (skipped)"
 
+    def _al_variant_outcome_tail(self, v: AliasVariantResult) -> str | None:
+        """Status tail for variant output (without the address prefix)."""
+        if self._al_variant_mail_accepted(v):
+            return None
+        line = self._al_variant_outcome_line(v)
+        prefix = f"{v.address}:"
+        if line.startswith(prefix):
+            tail = line[len(prefix):].strip()
+            return tail or None
+        return line
+
     def _al_stream_variant_section(
         self,
         v: AliasVariantResult,
@@ -5698,12 +5735,12 @@ class SMTP(BaseModule):
         """Per-variant terminal block for -al."""
         pp = ptprinthelper.ptprint
         pp(self._alias_variant_title(v.variant), bullet_type="TITLE", condition=True, indent=4)
+        pp(v.address, bullet_type="TEXT", condition=True, indent=8)
         if stream_trace:
             for line in v.smtp_trace:
                 if line.startswith("---"):
                     continue
-                self._stream_smtp_trace_line(line, indent_override=8)
-        pp(self._al_variant_outcome_line(v), bullet_type="TEXT", condition=True, indent=8)
+                self._stream_smtp_trace_line(line, indent_override=12)
         mail_accepted = self._al_variant_mail_accepted(v)
         if mail_accepted and v.test_id:
             self._pp_mail_probe_line(
@@ -5711,15 +5748,19 @@ class SMTP(BaseModule):
                 True,
                 accepted=True,
                 sent_msg=self._mail_sent_inbox_msg(base_address, v.test_id),
-                indent=8,
+                indent=12,
             )
             if v.uucp_warning:
                 pp(
                     "Warning: UUCP syntax accepted",
                     bullet_type="WARNING",
                     condition=True,
-                    indent=8,
+                    indent=12,
                 )
+        else:
+            tail = self._al_variant_outcome_tail(v)
+            if tail:
+                pp(tail, bullet_type="TEXT", condition=True, indent=12)
 
     def _al_stream_base_section(
         self,
@@ -5733,20 +5774,19 @@ class SMTP(BaseModule):
         """Terminal block for the base recipient control send."""
         pp = ptprinthelper.ptprint
         pp("Base recipient", bullet_type="TITLE", condition=True, indent=4)
+        pp(base_address, bullet_type="TEXT", condition=True, indent=8)
         if stream_trace and base_smtp_trace:
             for line in base_smtp_trace:
                 if line.startswith("---"):
                     continue
-                self._stream_smtp_trace_line(line, indent_override=8)
-        else:
-            pp(base_address, bullet_type="TEXT", condition=True, indent=8)
+                self._stream_smtp_trace_line(line, indent_override=12)
         if base_mail_sent and base_test_id:
             self._pp_mail_probe_line(
                 pp,
                 True,
                 accepted=True,
                 sent_msg=self._mail_sent_inbox_msg(base_address, base_test_id),
-                indent=8,
+                indent=12,
             )
 
     def _bcc_stream_section(
@@ -13609,7 +13649,9 @@ class SMTP(BaseModule):
                         if used_auth:
                             auth_used = True
                         mail_status, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                        _av_payload_trace_store(f"MAIL FROM: {_av_smtp_reply(mail_status, mail_reply)}")
+                        _av_payload_trace_store(
+                            f"MAIL FROM <{mail_from}>: {_av_smtp_reply(mail_status, mail_reply)}"
+                        )
                         if mail_status not in (250, 251):
                             rejected += 1
                             sent += 1
@@ -13626,7 +13668,9 @@ class SMTP(BaseModule):
                                 pass
                             continue
                         rcpt_status, rcpt_reply = smtp.docmd("RCPT", f"TO:<{rcpt}>")
-                        _av_payload_trace_store(f"RCPT TO: {_av_smtp_reply(rcpt_status, rcpt_reply)}")
+                        _av_payload_trace_store(
+                            f"RCPT TO <{rcpt}>: {_av_smtp_reply(rcpt_status, rcpt_reply)}"
+                        )
                         if rcpt_status not in (250, 251):
                             rejected += 1
                             sent += 1
@@ -14154,7 +14198,10 @@ class SMTP(BaseModule):
         else:
             try:
                 mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                _bcc_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                _bcc_trace_append(
+                    smtp_trace,
+                    f"MAIL FROM <{mail_from}>: {self._smtp_trace_reply(mail_st, mail_reply)}",
+                )
                 if mail_st not in (250, 251):
                     detail = f"MAIL FROM rejected: {mail_st}"
                 else:
@@ -14358,7 +14405,10 @@ class SMTP(BaseModule):
                     raw_msg = msg.as_string()
 
                     mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                    _al_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                    _al_trace_append(
+                        smtp_trace,
+                        f"MAIL FROM <{mail_from}>: {self._smtp_trace_reply(mail_st, mail_reply)}",
+                    )
                     if mail_st not in (250, 251):
                         rejected = True
                         detail_str = f"MAIL FROM rejected: {mail_st}"
@@ -14681,7 +14731,10 @@ class SMTP(BaseModule):
                         auth_used = True
                     if not auth_err:
                         mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                        _ssrf_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                        _ssrf_trace_append(
+                            smtp_trace,
+                            f"MAIL FROM <{mail_from}>: {self._smtp_trace_reply(mail_st, mail_reply)}",
+                        )
                         if mail_st not in (250, 251):
                             rejected = 1
                             sent = 1
@@ -14768,7 +14821,10 @@ class SMTP(BaseModule):
                         ehlo_st, ehlo_reply = smtp.docmd("EHLO", self.fqdn or "ssrf-test.local")
                         _ssrf_trace_append(smtp_trace, f"EHLO: {self._smtp_trace_reply(ehlo_st, ehlo_reply)}")
                         mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                        _ssrf_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                        _ssrf_trace_append(
+                            smtp_trace,
+                            f"MAIL FROM <{mail_from}>: {self._smtp_trace_reply(mail_st, mail_reply)}",
+                        )
                         if mail_st not in (250, 251):
                             rejected = 1
                             sent = 1
@@ -15391,7 +15447,10 @@ class SMTP(BaseModule):
                         auth_used = True
                     if not auth_err:
                         mail_st, mail_reply = smtp.docmd("MAIL", f"FROM:<{mail_from}>")
-                        _zipxxe_trace_append(smtp_trace, f"MAIL FROM: {self._smtp_trace_reply(mail_st, mail_reply)}")
+                        _zipxxe_trace_append(
+                            smtp_trace,
+                            f"MAIL FROM <{mail_from}>: {self._smtp_trace_reply(mail_st, mail_reply)}",
+                        )
                         if mail_st not in (250, 251):
                             rejected = 1
                             sent = 1

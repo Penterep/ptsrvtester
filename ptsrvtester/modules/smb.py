@@ -92,13 +92,13 @@ some kind of example"""
 @dataclass
 class SMBResult:
     Info: dict
-    Dialects: List
+    Dialects: List[str]
 
 
 class SMB(BaseModule):
     mapping = {
         SMB_DIALECT:        "SMBv1",
-        SMB2_DIALECT_002:   "SMBv2.0.2",
+        SMB2_DIALECT_002:   "SMBv2.0",
         SMB2_DIALECT_21:    "SMBv2.1",
         SMB2_DIALECT_30:    "SMBv3.0",
         SMB2_DIALECT_311:   "SMBv3.1.1",
@@ -121,19 +121,47 @@ class SMB(BaseModule):
         self.results.Info["target"] = self.args.target.ip
         self.results.Info["port"] = self.args.target.port or 445
 
+        if self.args.test == "os":
+            self.info = self.get_ver(True)
         if self.args.test == "version":
             self.info = self.get_ver()
+        # if self.args.test == "debug":
+        #     self.results.Info["server_name"] = "test_name"
+        #     self.results.Info["os_version"] = ":3"
+        #     self.results.Dialects = ["SMBv123", "SMBv345", "SMBv678"]
+
     
     def output(self):
-        if self.args.test == "version":
-            ptprint("SMB server version info:", bullet_type="TITLE")
+        if self.results.Dialects == []:
+            ptprint("Connection couldn't be established", bullet_type="ERROR")
+            return
+        
+        if self.args.test == "os":
+            ptprint("SMB server version info:", bullet_type="INFO")
             ptprint(f"Target: {self.results.Info['target']}:{self.results.Info['port']}",
-                    bullet_type="INFO")
-            ptprint(f"Server name: {self.results.Info['server_name']}", bullet_type="INFO")
-            ptprint(f"Server version: {self.results.Info['os_version']}", bullet_type="INFO")
-            is_vuln = "SMBv1" in self.results.Dialects
-            ptprint(f"Supported dialects: {", ".join(self.results.Dialects)}",
-                    bullet_type="VULN" if is_vuln else "NOTVULN")
+                    bullet_type="INFO", condition=True, indent=4)
+            ptprint(f"Server name: {self.results.Info['server_name']}",
+                    bullet_type="INFO", condition=True, indent=4)
+            ptprint(f"Server version: {self.results.Info['os_version']}",
+                    bullet_type="INFO", condition=True, indent=4)
+            ptprint(f"Login required: {self.results.Info["login_required"]}",
+                    bullet_type="VULN" if not self.results.Info["login_required"] else "NOTVULN",
+                    condition=True, indent=4)
+            ptprint(f"Signing required: {self.results.Info["signing_required"]}",
+                    bullet_type="VULN" if not self.results.Info["signing_required"] else "NOTVULN",
+                    condition=True, indent=4)
+            dialect = self.results.Dialects[0]
+            ptprint(f"Lowest dialect version: {dialect}",
+                    bullet_type="VULN" if dialect == "SMBv1" else "NOTVULN",
+                    condition=True, indent=4)
+            ptprint(f"NTLMv2 supported: {self.results.Info["ntlmv2_support"]}",
+                    bullet_type="INFO", condition=True, indent=4)
+
+        if self.args.test == "version":
+            ptprint("Negotiable SMB dialects:", bullet_type="INFO")
+            for dialect in self.results.Dialects:
+                ptprint(dialect, bullet_type="VULN" if dialect == "SMBv1" else "NOTVULN",
+                        condition=True, indent=4)
 
     def fill_results_info(self, data: dict) -> None:
         for key in data.keys():
@@ -145,7 +173,7 @@ class SMB(BaseModule):
 
     def pass_client_info(self, smb_client: SMBConnection) -> None:
         negotiated = smb_client.getDialect()
-        negotiated_dialect = self.mapping.get(negotiated, f"Unknown dialect({negotiated})")
+        negotiated_dialect = self.mapping.get(negotiated, f"Unknown dialect(raw dialect code: {negotiated})")
         if negotiated_dialect not in self.results.Dialects:
             self.results.Dialects.append(negotiated_dialect)
 
@@ -167,19 +195,30 @@ class SMB(BaseModule):
             os_version = "unknown"
         else:
             os_version = os_version[1:]
-        
+
+        ntlmv2_support = _get_if_available(smb_client.doesSupportNTLMv2)
+        if not ntlmv2_support:
+            ntlmv2_support = "unknown"
+        login_required = _get_if_available(smb_client.isLoginRequired)
+        if not login_required:
+            login_required = "unknown"
+        signing_required = _get_if_available(smb_client.isSigningRequired)
+        if not signing_required:
+            signing_required = "unknown"
+
         self.fill_results_info({
             "server_name": server_name,
-            "os_version": (os_version if os_name is None or os_name == "" else f"{os_name} ({os_version})")
+            "os_version": (os_version if os_name is None or os_name == "" else f"{os_name} ({os_version})"),
+            "ntlmv2_support": ntlmv2_support,
+            "login_required": login_required,
+            "signing_required": signing_required,
         })
 
     
-    def get_ver(self) -> None:
+    def get_ver(self, just_info = False) -> None:
         """
         Checks the host system version and SMB dialect
         """
-        # TODO: add check if server even connected
-        # TODO: add timeout if server doesn't respond
         # TODO: fix server name and server ver fetch
 
         port = self.args.target.port or 445
@@ -190,9 +229,40 @@ class SMB(BaseModule):
                     remoteName="*SMBSERVER",
                     remoteHost=self.args.target.ip,
                     sess_port=port,
-                    preferredDialect=dialect
+                    preferredDialect=dialect,
+                    timeout=3
                 )
+                
+                getters = {
+                    smb_client.getSMBServer: "getSMBServer",
+                    smb_client.getDialect: "getDialect",
+                    smb_client.getServerName: "getServerName",
+                    smb_client.getClientName: "getClientName",
+                    smb_client.getRemoteName: "getRemoteName",
+                    smb_client.getServerDomain: "getServerDomain",
+                    smb_client.getServerDNSDomainName: "getServerDNSDomainName",
+                    smb_client.getServerDNSHostName: "getServerDNSHostName",
+                    smb_client.getServerOS: "getServerOS",
+                    smb_client.getServerOSMajor: "getServerOSMajor",
+                    smb_client.getServerOSMinor: "getServerOSMinor",
+                    smb_client.getServerOSBuild: "getServerOSBuild",
+                    smb_client.doesSupportNTLMv2: "doesSupportNTLMv2",
+                    smb_client.isLoginRequired: "isLoginRequired",
+                    smb_client.isSigningRequired: "isSigningRequired",
+                    smb_client.getCredentials: "getCredentials",
+                    smb_client.getIOCapabilities: "getIOCapabilities",
+                }
+                
+                test = {}
+                for getter in getters.keys():
+                    result = _get_if_available(getter)
+                    if result is not None:
+                        test[getters[getter]] = result
+                
                 self.pass_client_info(smb_client)
                 smb_client.logoff()
             except Exception:
                 continue
+                
+            if just_info and self.results.Dialects != []:
+                break

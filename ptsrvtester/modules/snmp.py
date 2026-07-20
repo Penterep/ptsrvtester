@@ -11,11 +11,18 @@ from ptlibs.ptjsonlib import PtJsonLib
 from ptlibs import ptprint
 
 from ._base import BaseModule, BaseArgs, Out
+from .utils.ptprinthelper import get_colored_text
 from .utils.helpers import (
     text_or_file,
     valid_target,
     Target
 )
+
+SNMP_TEST_GROUPS = [
+    ("General", ["VERSION"]),
+    ("SNMPv2", ["V2BRUTE", "V2WRITE", "V2WALK"]),
+    ("SNMPv3", ["V3ENUM", "V3BRUTE", "V3WALK", "V3WRITE"])
+]
 
 # Per-test definitions:
 #   desc      one-line description for the main -ts table
@@ -222,18 +229,16 @@ class SNMPArgs(BaseArgs):
             ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,AV); ALL runs everything:"],
         ]
 
+        for group_title, codes in SNMP_TEST_GROUPS:
+            options.append(["", "", "", ""])
+            options.append(["", "", get_colored_text(group_title, "TITLE")])
+            for code in codes:
+                options.append(["", "", code, SNMP_TESTS[code]["desc"]])
+
         options += [
-                ["version", "<options>", "", "Detect SNMP versions"],
-                ["v2brute", "<options>", "", "SNMPv2 dictionary attack"],
-                ["v2write", "<options>", "", "Test SNMPv2 write permission"],
-                ["v2walk", "<options>", "", "SNMPv2 MIB walk"],
-                ["v3enum", "<options>", "", "SNMPv3 user enumeration"],
-                ["v3brute", "<options>", "", "SNMPv3 credentials bruteforce"],
-                ["v3walk", "<options>", "", "SNMPv3 MIB walk"],
-                ["v3write", "<options>", "", "Test SNMPv3 write permissions"],
-                ["", "", "", ""],
-                ["-h", "--help", "", "Show this help message and exit"],
-                ["-vv", "--verbose", "", "Enable verbose mode"],
+            ["", "", "", ""],
+            ["-h", "--help", "", "Show this help message and exit"],
+            ["-vv", "--verbose", "", "Enable verbose mode"],
             ]
 
         return [

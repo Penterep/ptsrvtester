@@ -1,3 +1,4 @@
+import re
 from enum import Enum
 import asyncio
 from pysnmp.hlapi.v3arch.asyncio import *
@@ -76,10 +77,19 @@ SNMP_TESTS: dict[str, dict] = {
 }
 
 def _parse_test_codes(raw: str | None) -> list[str]:
-    """Split and upper-case a raw -ts value into a list of codes."""
+    """Split and upper-case a raw -ts value into a list of codes.
+
+    raw may be a single string (possibly comma-separated) or a list of
+    tokens as produced by argparse when -ts is given nargs='+'
+    (space-separated). Either form, or a mix of the two
+    (e.g. -ts VERSION,V2BRUTE V3WALK), is supported.
+    """
     if not raw:
         return []
-    return [c.strip().upper() for c in str(raw).split(",") if c.strip()]
+    if isinstance(raw, (list, tuple)):
+        raw = " ".join(raw)
+    return [c.strip().upper() for c in re.split(r"[,\s]+", str(raw)) if c.strip()]
+
 
 def valid_target_snmp(target: str) -> Target:
     return valid_target(target, domain_allowed=True)
@@ -283,6 +293,7 @@ class SNMPArgs(BaseArgs):
             "-ts",
             "--tests",
             type=str,
+            nargs="+",
             default=None,
             metavar="<test>",
             dest="tests",

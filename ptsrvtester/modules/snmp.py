@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from ptlibs.ptjsonlib import PtJsonLib
+from ptlibs import ptprint
 
 from ._base import BaseModule, BaseArgs, Out
 from .utils.helpers import (
@@ -25,7 +26,7 @@ from .utils.helpers import (
 #   common    True -> append common outbound message options to per-test help
 #   mods      test-specific option rows [short, long, metavar, help] (per-test help)
 SNMP_TESTS: dict[str, dict] = {
-    "DETECTION": {
+    "VERSION": {
         "desc": "Detect SNMP versions",
         "long": "",
         "flags": {"version_detection": True}
@@ -178,7 +179,7 @@ class SNMPVersion(NamedTuple):
 class WriteTestResult(NamedTuple):
     OID: str | None
     creds: str | None   #community for snmpv2
-    value: str | None   
+    value: str | None
 
 
 class AuthPrivProtocols(NamedTuple):
@@ -222,14 +223,14 @@ class SNMPArgs(BaseArgs):
         ]
 
         options += [
-                ["detection", "<options>", "", "Detect SNMP versions"],
-                ["snmpv2-brute", "<options>", "", "SNMPv2 dictionary attack"],
-                ["snmpv2-write", "<options>", "", "Test SNMPv2 write permission"],
-                ["snmpv2-walk", "<options>", "", "SNMPv2 MIB walk"],
-                ["snmpv3-enum", "<options>", "", "SNMPv3 user enumeration"],
-                ["snmpv3-brute", "<options>", "", "SNMPv3 credentials bruteforce"],
-                ["snmpv3-walk", "<options>", "", "SNMPv3 MIB walk"],
-                ["snmpv3-write", "<options>", "", "Test SNMPv3 write permissions"],
+                ["version", "<options>", "", "Detect SNMP versions"],
+                ["v2brute", "<options>", "", "SNMPv2 dictionary attack"],
+                ["v2write", "<options>", "", "Test SNMPv2 write permission"],
+                ["v2walk", "<options>", "", "SNMPv2 MIB walk"],
+                ["v3enum", "<options>", "", "SNMPv3 user enumeration"],
+                ["v3brute", "<options>", "", "SNMPv3 credentials bruteforce"],
+                ["v3walk", "<options>", "", "SNMPv3 MIB walk"],
+                ["v3write", "<options>", "", "Test SNMPv3 write permissions"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
                 ["-vv", "--verbose", "", "Enable verbose mode"],
@@ -239,9 +240,9 @@ class SNMPArgs(BaseArgs):
             {"description": ["SNMP Testing Module"]},
             {"usage": ["ptsrvtester snmp <command> <options>"]},
             {"usage_example": [
-                "ptsrvtester snmp detection --ip 192.168.1.1",
-                "ptsrvtester snmp snmpv2-brute --community-file communities.txt --ip 192.168.1.1",
-                "ptsrvtester snmp snmpv3-brute --username-file users.txt --password-file passwords.txt --ip 192.168.1.1"
+                "ptsrvtester snmp version --ip 192.168.1.1",
+                "ptsrvtester snmp v2brute --community-file communities.txt --ip 192.168.1.1",
+                "ptsrvtester snmp v3brute --username-file users.txt --password-file passwords.txt --ip 192.168.1.1"
             ]},
             {"options": options}
         ]
@@ -254,7 +255,7 @@ class SNMPArgs(BaseArgs):
         """Adds a subparser of SNMP arguments"""
 
         examples = """example usage:
-    ptsrvtester snmp detection --ip 192.168.1.1 --port 161
+    ptsrvtester snmp version --ip 192.168.1.1 --port 161
     ptsrvtester snmp snmpv2-brute --community-file communities.txt --ip 192.168.1.1 --port 161
     ptsrvtester snmp snmpv3-brute --username-file users.txt --password-file passwords.txt --ip 192.168.1.1 --port 161"""
 
@@ -280,7 +281,7 @@ class SNMPArgs(BaseArgs):
             default=None,
             metavar="<test>",
             dest="tests",
-            help="Comma-separated test codes (e.g. detection,v2brute) or ALL; 'smtp -ts <TEST> -h' for test options",
+            help="Comma-separated test codes (e.g. version,v2brute) or ALL; 'smtp -ts <TEST> -h' for test options",
         )
 
         # SNMPv2 Brute Force
@@ -346,6 +347,7 @@ class SNMP(BaseModule):
         password_present = getattr(self.args, "single_password", False) or getattr(self.args, "password_file", False)
 
         if getattr(self.args, "version_detection", False):
+            ptprint("SNMP version detection test", "TITLE", not self.args.json, colortext=True)
             self.results.version = asyncio.run(self.version_detection())
 
         if getattr(self.args, "v2_brute_force", False):
@@ -353,6 +355,7 @@ class SNMP(BaseModule):
                 raise argparse.ArgumentError(None, "SNMPv2 brute-force module requires the -c/--single-community "
                                                    "or -cf/--community-file argument")
             else:
+                ptprint("SNMPv2 brute force", "TITLE", not self.args.json, colortext=True)
                 self.results.communities = asyncio.run(self.snmpv2_brute())
 
         if getattr(self.args, "v3_brute_force", False):
@@ -360,12 +363,14 @@ class SNMP(BaseModule):
                 raise argparse.ArgumentError(None, "SNMPv3 brute-force module requires the -c/--single-community "
                                                    "or -cf/--community-file argument")
             else:
+                ptprint("SNMPv3 brute force", "TITLE", not self.args.json, colortext=True)
                 self.results.credentials = asyncio.run(self.snmpv3_brute())
 
         if getattr(self.args, "v3_enum", False):
             if not username_present:
                 raise argparse.ArgumentError(None, "SNMPv3 enumeration module requires the -u/--single-username argument")
             else:
+                ptprint("SNMPv3 user enumeration test", "TITLE", not self.args.json, colortext=True)
                 self.results.usernames = asyncio.run(self.user_enum())
 
         if getattr(self.args, "v2_write", False):
@@ -373,6 +378,7 @@ class SNMP(BaseModule):
                 raise argparse.ArgumentError(None, "SNMPv2 write permissions module requires the -c/--single-community "
                                                    "or -cf/--community-file argument")
             else:
+                ptprint("SNMPv2 write permissions test", "TITLE", not self.args.json, colortext=True)
                 self.results.Writetest2 = asyncio.run(self.test_snmpv2_write_permission())
 
         if getattr(self.args, "v3_write", False):
@@ -380,6 +386,7 @@ class SNMP(BaseModule):
                 raise argparse.ArgumentError(None, "SNMPv3 write permissions module requires the -u/--single-username "
                                                    "and -p/--single-password or -cred/--valid-credentials-file arguments")
             else:
+                ptprint("SNMPv3 write permissions test", "TITLE", not self.args.json, colortext=True)
                 self.results.Writetest3 = asyncio.run(self.test_snmpv3_write_permissions())
 
         if getattr(self.args, "v2_walk", False):
@@ -387,6 +394,7 @@ class SNMP(BaseModule):
                 raise argparse.ArgumentError(None, "Bruteforce module require the -c/--single-community "
                                                    "or -cf/--community-file argument")
             else:
+                ptprint("SNMPv2 walk", "TITLE", not self.args.json, colortext=True)
                 self.results.Bulk2 = asyncio.run(self.getBulk_SNMPv2())
 
         if getattr(self.args, "v3_walk", False):
@@ -394,6 +402,7 @@ class SNMP(BaseModule):
                 raise argparse.ArgumentError(None, "SNMPv3 walk module requires the -u/--single-username "
                                                    "and -p/--single-password argument")
             else:
+                ptprint("SNMPv3 walk", "TITLE", not self.args.json, colortext=True)
                 self.results.Bulk3 = asyncio.run(self.getBulk_SNMPv3())
 
      # Map protocol OIDs to human-readable names
@@ -483,21 +492,22 @@ class SNMP(BaseModule):
         errorIndication, errorStatus, errorIndex, varBinds = iterator
 
         if errorIndication:
-            self.ptprint(f"Error!: {errorIndication}", out=Out.ERROR)
+            ptprint(f"Error!: {errorIndication}", "ERROR", not self.args.json, indent=4)
         elif errorStatus:
-            self.ptprint(
+            ptprint(
                 "{} at {}".format(
                     errorStatus.prettyPrint(),
                     errorIndex and varBinds[int(errorIndex) - 1][0] or "?",
                 ),
-                out=Out.ERROR
+                "ERROR", not self.args.json, indent=4
             )
 
         else:
             v1 = True
             for varBind in varBinds:
-                self.ptprint("Success!: ", end="", out=Out.OK)
-                self.ptprint(" = ".join([x.prettyPrint() for x in varBind]))
+                ptprint(f"Success!: {" = ".join([x.prettyPrint() for x in varBind])}", "OK",
+                        not self.args.json, indent=4)
+
 
         ###########################################################################################
         # Detect v2c                                                                              #
@@ -513,23 +523,24 @@ class SNMP(BaseModule):
         errorIndication, errorStatus, errorIndex, varBinds = iterator
 
         if errorIndication:
-             self.ptprint(f"Error!: {errorIndication}", out=Out.ERROR)
+             ptprint(f"Error!: {errorIndication}", "ERROR", not self.args.json, indent=4)
 
         elif errorStatus:
-            self.ptprint("Error!:", out=Out.ERROR)
-            self.ptprint(
+            ptprint(f"Error!: {errorIndication}", "ERROR", not self.args.json, indent=4)
+            ptprint(
                 "{} at {}".format(
                     errorStatus.prettyPrint(),
                     errorIndex and varBinds[int(errorIndex) - 1][0] or "?",
                 ),
-                out=Out.ERROR
+                "ERROR", not self.args.json, indent=4
             )
 
         else:
             v2c = True
             for varBind in varBinds:
-                self.ptprint("Success!: ", end="", out=Out.OK)  # můžeš nastavit `out=Out.SUCCESS` pokud máš definováno
-                self.ptprint(" = ".join([x.prettyPrint() for x in varBind]))
+                ptprint(f'Success!: {" = ".join([x.prettyPrint() for x in varBind])}', "OK",
+                not self.args.json, indent=4)
+
 
         ###########################################################################################
         # Detect v3                                                                               #
@@ -545,26 +556,29 @@ class SNMP(BaseModule):
 
         if errorIndication:
             if isinstance(errorIndication, RequestTimedOut):
-                self.ptprint(f"Error!: {errorIndication}", out=Out.ERROR)
+                ptprint(f"Error!: {errorIndication}", "ERROR", not self.args.json, indent=4)
             else:
-                self.ptprint(f"Success!: {errorIndication}", out=Out.OK)
+                ptprint(f"Success!: {errorIndication}", "OK", not self.args.json, indent=4)
                 v3 = True
 
         elif errorStatus:
-            self.ptprint(
+            ptprint(
                 "{} at {}".format(
                     errorStatus.prettyPrint(),
                     errorIndex and varBinds[int(errorIndex) - 1][0] or "?",
                 ),
-                out=Out.ERROR
+                "ERROR", not self.args.json, indent=4
             )
 
         else:
             v3 = True
             for varBind in varBinds:
-                self.ptprint(" = ".join([x.prettyPrint() for x in varBind]))
-
-        self.ptprint(str(SNMPVersion(v1, v2c, v3)))
+                ptprint(" = ".join([x.prettyPrint() for x in varBind]), "TEXT", not self.args.json, indent=4)
+        v1_str = "v1" if v1 else ""
+        v2c_str = "v2" if v2c else ""
+        v3_str = "v3" if v3 else ""
+        versions = [ver for ver in [v1_str, v2c_str, v3_str] if ver != ""]
+        ptprint(f"SNMP version found: {', '.join(versions)}", "INFO", not self.args.json, indent=4)
         return SNMPVersion(v1, v2c, v3)
 
     async def snmpv2_brute(self) -> List[str]:
@@ -585,11 +599,12 @@ class SNMP(BaseModule):
         """
 
         if not self.args.community_file and not self.args.single_community:
-            self.ptprint("Error: Neither a community file nor a single community string was provided.", out=Out.WARNING)
+            ptprint("Error: Neither a community file nor a single community string was provided.", "WARNING",
+                    not self.args.json, indent=4)
             return []
-        self.drawDoubleLine()
-        self.ptprint("Starting a dictionary attack on SNMPv2...", title=True)
-        self.drawDoubleLine()
+        #self.drawDoubleLine()
+        #self.ptprint("Starting a dictionary attack on SNMPv2...", title=True)
+        #self.drawDoubleLine()
         communities = self._text_or_file(self.args.single_community, self.args.community_file)
         valid_communities = []
 
@@ -603,33 +618,31 @@ class SNMP(BaseModule):
             errorIndication, errorStatus, errorIndex, varBinds = await iterator
 
             if not errorIndication and not errorStatus:
-                self.ptprint(f"Valid community string found: {community}", out=Out.OK)
+                ptprint(f"Valid community string found: {community}", "VULN", not self.args.json, indent=4)
                 valid_communities.append(community)
             else:
-                self.ptprint(f"Error: {errorIndication or errorStatus} for {community}", out=Out.ERROR)
+                ptprint(f"Error: {errorIndication or errorStatus} for {community}", "ERROR", not self.args.debug, indent=4)
 
         if valid_communities:
-            self.ptprint("\n")
-            self.ptprint("Valid communities:", out=Out.INFO)
+            #self.ptprint("\n")
+            ptprint(f"Valid communities:", "INFO", not self.args.json, indent=4)
             for community in valid_communities:
-                self.ptprint(community)
+                ptprint(community, "VULN", not self.args.json, indent=8)
             if self.args.output:
                 for community in valid_communities:
                     self.write_to_file(community)
 
         else:
-            self.ptprint("\nNo valid communities found :(", out=Out.INFO)
+            ptprint("No valid communities found", "OK", not self.args.json, indent=4)
         return valid_communities
 
     async def user_enum(self) -> list[str]:
-
-
         # Users from input
         users: list[str] = self._text_or_file(self.args.single_username, self.args.username_file)
 
-        self.drawDoubleLine()
-        self.ptprint("Starting username enumeration...", title=True)
-        self.drawDoubleLine()
+        #self.drawDoubleLine()
+        #self.ptprint("Starting username enumeration...", title=True)
+        #self.drawDoubleLine()
         valid_usernames = set()
 
         for username in users:
@@ -644,27 +657,30 @@ class SNMP(BaseModule):
                 errorIndication, errorStatus, errorIndex, varBinds = await iterator
 
                 if not errorIndication and not errorStatus:
-                    self.ptprint(f"Valid username found: {username}", out=Out.OK)
+                    ptprint(f"Valid username found: {username}", "VULN", not self.args.json, indent=4)
                     valid_usernames.add(username)
                 elif "Wrong SNMP PDU digest" in str(errorIndication):
-                    self.ptprint(f"Potential valid username: {username}", out=Out.OK)
+                    ptprint(f"Potential valid username: {username}", "WARNING", not self.args.json, indent=4)
                     valid_usernames.add(username)
                 else:
-                    
-                    self.ptprint(f"Error for username {username}: {errorIndication or errorStatus}", out=Out.ERROR)
+
+                    ptprint(f"Error for username {username}: {errorIndication or errorStatus}", "ERROR",
+                                 not self.args.json, indent=4)
 
             except Exception as e:
-                self.ptprint(f"Error for username {username}: {e}", out=Out.ERROR)
+                ptprint(f"Error for username {username}: {e}", "ERROR", not self.args.json, indent=4)
 
         if valid_usernames:
-            self.ptprint("\n")
-            self.ptprint("Potential valid usernames:", out=Out.INFO)
+            #self.ptprint("\n")
+            ptprint(f"Potential valid usernames:", "INFO", not self.args.json,
+                    indent=4)
             for username in valid_usernames:
-                self.ptprint(username)
-                if self.args.output:
+                ptprint(username, "VULN", not self.args.json, indent=8)
+            if self.args.output:
+                for username in valid_usernames:
                     self.write_to_file(username)
         else:
-            self.ptprint("No valid usernames found.", out=Out.INFO)
+            ptprint("No valid usernames found", "OK", not self.args.json, indent=4)
 
         return list(valid_usernames)
 
@@ -692,12 +708,14 @@ class SNMP(BaseModule):
 
         # Warning
         if not self.args.username_file and not self.args.single_username:
-            self.ptprint("Error: Neither a username file nor a single username was provided.", out=Out.WARNING)
+            ptprint("Error: Neither a username file nor a single username was provided.", "WARNING", not self.args.json,
+                    indent=4)
             return None
 
         # Warning
         if not self.args.password_file and not self.args.single_password:
-            self.ptprint("Error: Neither a password file nor a single password was provided.", out=Out.WARNING)
+            ptprint("Error: Neither a password file nor a single password was provided.", "WARNING", not self.args.json,
+                    indent=4)
             return None
 
         # Users and passwords from input
@@ -724,26 +742,29 @@ class SNMP(BaseModule):
 
         # If protocols are not set, perform username enumeration first
         if (self.args.auth_protocols is None or self.args.priv_protocols is None) and self.args.username_file:
-            self.ptprint("No auth or priv protocols set." , out=Out.TITLE)
+            ptprint("No auth or priv protocols set" , "TITLE", not self.args.json, indent=4)
             users = await self.user_enum()
             valid_usernames = set(users)
             if not users:
-                self.ptprint("\n")
-                self.ptprint("Sorry, it is not possible to find valid credentials with these usernames", out=Out.ERROR)
+                #self.ptprint("\n")
+                ptprint("It is not possible to find valid credentials with these usernames", "OK",
+                        not self.args.json, indent=4)
                 return None
-            
+
         PROTOCOL_OBJECTS = {v: k for k, v in self.PROTOCOL_NAMES.items()}
 
         if isinstance(self.args.auth_protocols, str):
             self.args.auth_protocols = PROTOCOL_OBJECTS.get(self.args.auth_protocols, None)
             if self.args.auth_protocols is None:
-                self.ptprint("Warning: Unknown authentication protocol string. Using defaults.", out=Out.INFO)
+                ptprint("Warning: Unknown authentication protocol string. Using defaults", "WARNING", not self.args.json,
+                        indent=4)
 
 
         if isinstance(self.args.priv_protocols, str):
             self.args.priv_protocols = PROTOCOL_OBJECTS.get(self.args.priv_protocols, None)
             if self.args.priv_protocols is None:
-                self.ptprint("Warning: Unknown privacy protocol string. Using defaults.", out=Out.INFO)
+                ptprint("Warning: Unknown privacy protocol string. Using defaults", "WARNING", not self.args.json,
+                        indent=4)
 
         auth_protocols = [self.args.auth_protocols] if self.args.auth_protocols else default_auth_protocols
         priv_protocols = [self.args.priv_protocols] if self.args.priv_protocols else default_priv_protocols
@@ -761,10 +782,10 @@ class SNMP(BaseModule):
         valid_usernames = set()
 
         # starting the attack
-        self.ptprint("\n")
-        self.drawDoubleLine()
-        self.ptprint("Starting a dictionary attack on SNMPv3...", title=True)
-        self.drawDoubleLine()
+        #self.ptprint("\n")
+        #self.drawDoubleLine()
+        #self.ptprint("Starting a dictionary attack on SNMPv3...", title=True)
+        #self.drawDoubleLine()
 
         for protocol in protocols:
             if successful_protocol:
@@ -786,44 +807,49 @@ class SNMP(BaseModule):
                         valid_usernames.add(cred.username)
                         auth_name = self.PROTOCOL_NAMES.get(successful_protocol.auth_protocols, "Unknown Protocol")
                         priv_name = self.PROTOCOL_NAMES.get(successful_protocol.priv_protocols, "Unknown Protocol")
-                        self.ptprint(f"Valid credentials found: Username: {cred.username}, Password: {cred.password}", out=Out.OK)
-                        self.ptprint(f"Successful Authentication and Private protocols are: {auth_name} and {priv_name}", out=Out.INFO)
+                        ptprint(f"Valid credentials found: Username: {cred.username}, Password: {cred.password}", 
+                                "VULN", not self.args.json, indent=4)
+                        ptprint(f"Successful Authentication and Private protocols are: {auth_name} and {priv_name}", 
+                                "INFO", not self.args.json, indent=4)
                     elif "Wrong SNMP PDU digest" in str(errorIndication):
-                        self.ptprint(f"Digest match (likely valid username - Try different password or protocols): {cred.username}", out=Out.INFO)
+                        ptprint(f"Digest match (likely valid username - Try different password or protocols): {cred.username}",
+                                "INFO", not self.args.json, indent=4)
                         valid_usernames.add(cred.username)
                     elif "Unknown USM user" in str(errorIndication):
-                        self.ptprint(f"Error: Unknown user: {cred.username}", out=Out.ERROR)
+                        ptprint(f"Error: Unknown user: {cred.username}", "ERROR", not self.args.json, indent=4)
                     else:
-                        self.ptprint(f"Error: {errorIndication or errorStatus} for {cred.username}/{cred.password}", out=Out.ERROR)
+                        ptprint(f"Error: {errorIndication or errorStatus} for {cred.username}/{cred.password}", "ERROR",
+                                not self.args.json, indent=4)
 
                 except Exception as e:
-                    self.ptprint(f"Error: {cred.username}/{cred.password}: {e}", out=Out.ERROR)
+                    ptprint(f"Error: {cred.username}/{cred.password}: {e}", "ERROR", not self.args.json, indent=4)
 
         if valid_usernames:
-            self.ptprint("\n")
-            self.ptprint("Potential valid usernames:", out=Out.INFO)
+            #self.ptprint("\n")
+            ptprint(f"Potential valid usernames:", "INFO", not self.args.json, indent=4)
             for username in valid_usernames:
-                self.ptprint(username)
+                ptprint(username, "VULN", not self.args.json, indent=8)
 
         if self.args.output and found_credentials:
             results = [f"Username: {cred.username}, Password: {cred.password}" for cred in found_credentials]
             self.write_to_file(results)
 
         if found_credentials:
-            self.ptprint("\n")
-            self.ptprint("Found credentials:", out=Out.INFO)
+            #self.ptprint("\n")
+            ptprint("Found credentials:", "INFO", not self.args.json, indent=4)
             for cred in found_credentials:
-                self.ptprint(f"Username: {cred.username}, Password: {cred.password}")
+                ptprint(f"Username: {cred.username}, Password: {cred.password}", "VULN", not self.args.json, indent=8)
 
         if successful_protocol:
             auth_name = self.PROTOCOL_NAMES.get(successful_protocol.auth_protocols, "Unknown Protocol")
             priv_name = self.PROTOCOL_NAMES.get(successful_protocol.priv_protocols, "Unknown Protocol")
-            self.ptprint("\n")
-            self.ptprint(f"Successful Authentication and Private protocols are: {auth_name} and {priv_name}", out=Out.INFO)
+            #self.ptprint("\n")
+            ptprint(f"Successful Authentication and Private protocols are: {auth_name} and {priv_name}", "INFO",
+                    not self.args.json, indent=4)
 
         else:
-            self.ptprint("\n")
-            self.ptprint("No valid credentials found :(", out=Out.ERROR)
+            #self.ptprint("\n")
+            ptprint("No valid credentials found", "OK", not self.args.json, indent=4)
 
         return found_credentials
 
@@ -852,20 +878,25 @@ class SNMP(BaseModule):
         if isinstance(self.args.auth_protocols, str):
             self.args.auth_protocols = PROTOCOL_OBJECTS.get(self.args.auth_protocols, None)
             if self.args.auth_protocols is None:
-                self.ptprint("Warning: Unknown authentication protocol string. Using defaults.", out=Out.INFO)
+                ptprint("Warning: Unknown authentication protocol string. Using defaults", "WARNING",
+                        not self.args.json,
+                        indent=4)
 
 
         if isinstance(self.args.priv_protocols, str):
             self.args.priv_protocols = PROTOCOL_OBJECTS.get(self.args.priv_protocols, None)
             if self.args.priv_protocols is None:
-                self.ptprint("Warning: Unknown privacy protocol string. Using defaults.", out=Out.INFO)
+                ptprint("Warning: Unknown privacy protocol string. Using defaults", "WARNING", not self.args.json,
+                        indent=4)
 
         if not self.args.auth_protocols:
-            self.ptprint("Be aware that authentication protocol was not provided, so it is set as usmHMACSHAAuthProtocol", out=Out.INFO)
+            ptprint("Be aware that authentication protocol was not provided, so it is set as usmHMACSHAAuthProtocol",
+                    "INFO", not self.args.json, indent=4)
             self.args.auth_protocols = default_auth_protocol
 
         if not self.args.priv_protocols:
-            self.ptprint("Be aware that private protocol was not provided, so it is set as usmDESPrivProtocol", out=Out.INFO)
+            ptprint("Be aware that private protocol was not provided, so it is set as usmDESPrivProtocol",
+                    "INFO", not self.args.json, indent=4)
             self.args.priv_protocols = default_priv_protocol
 
         creds = []
@@ -885,20 +916,22 @@ class SNMP(BaseModule):
                         password = parts[1].split(": ")[1]
                         creds.append(Credential(username, password))
                     except IndexError:
-                        self.ptprint(f"Invalid line format: {line}", out=Out.WARNING)
+                        ptprint(f"Invalid line format: {line}", "WARNING", not self.args.json, indent=4)
                 else:
-                    self.ptprint(f"Invalid format: {line}", out=Out.WARNING)
+                    ptprint(f"Invalid format: {line}", "WARNING", not self.args.json, indent=4)
         else:
-            self.ptprint("Error: Provide either single username/password or a file with credentials.", out=Out.WARNING)
-            return
-        self.drawDoubleLine()
-        self.ptprint("Starting SNMPv3 write permission test...", title=True)
-        self.drawDoubleLine()
-        
+            ptprint("Error: Provide either single username/password or a file with credentials.", "WARNING",
+                    not self.args.json, indent=4)
+            return []
+        #self.drawDoubleLine()
+        #self.ptprint("Starting SNMPv3 write permission test...", title=True)
+        #self.drawDoubleLine()
+
 
         for cred in creds:
             try:
-                self.ptprint(f"Testing write permission for user: {cred.username} with password: {cred.password}", out=Out.INFO)
+                ptprint(f"Testing write permission for user: {cred.username} with password: {cred.password}", "INFO",
+                        not self.args.json, indent=4)
                 iterator = set_cmd(
                     SnmpEngine(),
                     UsmUserData(cred.username, cred.password, authProtocol=Protocols.auth_protocols, privProtocol=Protocols.priv_protocols),
@@ -910,23 +943,25 @@ class SNMP(BaseModule):
                 errorIndication, errorStatus, errorIndex, varBinds = await iterator
 
                 if not errorIndication and not errorStatus:
-                    self.ptprint("Test was successful!", out=Out.OK)
+                    ptprint("Test was successful!", "VULN", not self.args.json, indent=8)
                     for varBind in varBinds:
-                        self.ptprint(f"OID: {varBind[0]} was set to {varBind[1]}")
-                        self.ptprint(f"Note: Attribute was modified for testing purposes. Don't forget to revert it back if necessary.", out=Out.INFO)
+                        ptprint(f"OID: {varBind[0]} was set to {varBind[1]}", "INFO", not self.args.json, indent=8)
+                        ptprint(f"Note: Attribute was modified for testing purposes. Don't forget to revert it back if necessary.",
+                                "INFO", not self.args.json, indent=8)
                         results.append(WriteTestResult(
                         OID=str(varBind[0]),
                         creds=f"{cred.username or 'None'}:{cred.password or 'None'}",
                         value=str(varBind[1])
                         ))
                 else:
-                    self.ptprint(f"Test failed: {errorIndication or errorStatus}", out=Out.ERROR)
+                    ptprint(f"Test failed: {errorIndication or errorStatus}", "OK", not self.args.json,
+                            indent=8)
 
             except Exception as e:
-                self.ptprint(f"Exception occurred: {e}", out=Out.WARNING)
+                ptprint(f"Exception occurred: {e}", "ERROR", not self.args.json, indent=8)
 
         return results
-    
+
     async def test_snmpv2_write_permission(self) -> list[WriteTestResult]:
         """
             Tests SNMPv2 write permissions by attempting to set a value on the target device.
@@ -942,17 +977,19 @@ class SNMP(BaseModule):
         """
         results: list[WriteTestResult] = []
         if not self.args.community_file and not self.args.single_community:
-            self.ptprint("Error: Neither a community file nor a single community string was provided.", out=Out.WARNING)
+            ptprint("Error: Neither a community file nor a single community string was provided.", "ERROR", not self.args.json,
+                    indent=4)
             return results
 
         communities = self._text_or_file(self.args.single_community, self.args.community_file)
-        self.drawDoubleLine()
-        self.ptprint("Starting SNMPv2 write permission test...", title=True)
-        self.drawDoubleLine()
+        #self.drawDoubleLine()
+        #self.ptprint("Starting SNMPv2 write permission test...", title=True)
+        #self.drawDoubleLine()
 
         for community in communities:
             try:
-                self.ptprint(f"Testing write permission for community string: {community}", out=Out.INFO)
+                ptprint(f"Testing write permission for community string: {community}", "INFO", not self.args.json,
+                        indent=4)
                 iterator = set_cmd(
                     SnmpEngine(),
                     CommunityData(community),
@@ -964,20 +1001,21 @@ class SNMP(BaseModule):
                 errorIndication, errorStatus, errorIndex, varBinds = await iterator
 
                 if not errorIndication and not errorStatus:
-                    self.ptprint("Write was successful!", out=Out.OK)
+                    ptprint("Write was successful!", "VULN", not self.args.json, indent=8)
                     for varBind in varBinds:
-                        self.ptprint(f"OID: {varBind[0]} was set to {varBind[1]}")
-                        self.ptprint(f"Note: Attribute was modified for testing purposes. Don't forget to revert it back if necessary.", out=Out.INFO)
+                        ptprint(f"OID: {varBind[0]} was set to {varBind[1]}", "INFO", not self.args.json, indent=8)
+                        ptprint(f"Note: Attribute was modified for testing purposes. Don't forget to revert it back if necessary.",
+                                "INFO", not self.args.json, indent=8)
                         results.append(WriteTestResult(
                         OID=str(varBind[0]),
                         creds=f"{community}",
                         value=str(varBind[1])
                         ))
                 else:
-                    self.ptprint(f"Write failed: {errorIndication or errorStatus}", out=Out.ERROR)
+                    ptprint(f"Write failed: {errorIndication or errorStatus}", "OK", not self.args.json, indent=8)
 
             except Exception as e:
-                self.ptprint(f"Exception occurred: {e}", out=Out.WARNING)
+                ptprint(f"Exception occurred: {e}", "ERROR", not self.args.json, indent=8)
 
         return results
 
@@ -999,20 +1037,21 @@ class SNMP(BaseModule):
        """
 
         if not self.args.community_file and not self.args.single_community:
-            self.ptprint("Neither a community file nor a single community string was provided. Defaulting to 'public'.", out=Out.WARNING)
+            ptprint("Neither a community file nor a single community string was provided. Defaulting to 'public'.",
+                    "WARNING", not self.args.json, indent=4)
             self.args.single_community = "public"
 
         communities = self._text_or_file(self.args.single_community, self.args.community_file)
 
-        self.drawDoubleLine()
-        self.ptprint("Starting SNMPv2 bulk walk...", title=True)
-        self.drawDoubleLine()
+        #self.drawDoubleLine()
+        #self.ptprint("Starting SNMPv2 bulk walk...", title=True)
+        #self.drawDoubleLine()
         results = []
         # for json
         result = None
 
         for community in communities:
-            self.ptprint(f"Trying community: {community}", out=Out.INFO)
+            ptprint(f"Trying community: {community}", "INFO", not self.args.json, indent=4)
             try:
                 # Use walk_cmd to traverse the MIB
                 objects = walk_cmd(
@@ -1026,10 +1065,11 @@ class SNMP(BaseModule):
                 # Iterate over the returned OID-value pairs
                 async for errorIndication, errorStatus, errorIndex, varBinds in objects:
                     if errorIndication:
-                        self.ptprint(f"Error: {errorIndication}", out=Out.ERROR)
+                        ptprint(f"Error: {errorIndication}", "ERROR", not self.args.json, indent=8)
                         break
                     elif errorStatus:
-                        self.ptprint(f"Error: {errorStatus.prettyPrint()} at {errorIndex}", out=Out.ERROR)
+                        ptprint(f"Error: {errorStatus.prettyPrint()} at {errorIndex}", "ERROR",
+                                not self.args.json, indent=8)
                         break
                     else:
                         for oid, value in varBinds:
@@ -1052,18 +1092,19 @@ class SNMP(BaseModule):
 
                             # Construct the final formatted string
                             formatted_output = f"{oid} = {value_output}"
-                            self.ptprint(formatted_output)
+                            ptprint(formatted_output, "TEXT", not self.args.json, indent=8)
                             results.append(formatted_output)
 
                 # Stop the loop if results are found
                 if results:
-                    self.ptprint(f"Results found with community '{community}', stopping further attempts.", out=Out.OK)
+                    ptprint(f"Results found with community '{community}', stopping further attempts.", "VULN",
+                            not self.args.json, indent=8)
                     result = "success"
                     break
-                    
+
 
             except Exception as e:
-                self.ptprint(f"Exception occurred for community '{community}': {e}", out=Out.WARNING)
+                ptprint(f"Exception occurred for community '{community}': {e}", "ERROR", not self.args.json, indent=8)
                 continue  # Move to the next community in case of errors
         if self.args.output:
             self.write_to_file(results)
@@ -1091,11 +1132,13 @@ class SNMP(BaseModule):
         PROTOCOL_OBJECTS = {v: k for k, v in self.PROTOCOL_NAMES.items()}
 
         if not self.args.single_username:
-            self.ptprint("\nUsername was not provided, Set the username to Start the SNMPv3 walk", out=Out.WARNING)
+            ptprint("Username was not provided, Set the username to Start the SNMPv3 walk", "ERROR",
+                    not self.args.json, indent=4)
             return []
 
         if not self.args.single_password:
-            self.ptprint("\nPassword was not provided, Set the password to Start the SNMPv3 walk", out=Out.WARNING)
+            ptprint("Password was not provided, Set the password to Start the SNMPv3 walk", "WARNING",
+                    not self.args.json, indent=4)
             return []
 
         PROTOCOL_OBJECTS = {v: k for k, v in self.PROTOCOL_NAMES.items()}
@@ -1103,20 +1146,24 @@ class SNMP(BaseModule):
         if isinstance(self.args.auth_protocols, str):
             self.args.auth_protocols = PROTOCOL_OBJECTS.get(self.args.auth_protocols, None)
             if self.args.auth_protocols is None:
-                self.ptprint("Warning: Unknown authentication protocol string. Using defaults.", out=Out.INFO)
+                ptprint("Warning: Unknown authentication protocol string. Using defaults.", "INFO", not self.args.json,
+                        indent=4)
 
 
         if isinstance(self.args.priv_protocols, str):
             self.args.priv_protocols = PROTOCOL_OBJECTS.get(self.args.priv_protocols, None)
             if self.args.priv_protocols is None:
-                self.ptprint("Warning: Unknown privacy protocol string. Using defaults.", out=Out.INFO)
+                ptprint("Warning: Unknown privacy protocol string. Using defaults.", "INFO", not self.args.json,
+                        indent=4)
 
         if not self.args.auth_protocols:
-            self.ptprint("Be aware that authentication protocol was not provided, so it is set as usmHMACSHAAuthProtocol", out=Out.INFO)
+            ptprint("Be aware that authentication protocol was not provided, so it is set as usmHMACSHAAuthProtocol",
+                    "INFO", not self.args.json, indent=4)
             self.args.auth_protocols = usmHMACSHAAuthProtocol
 
         if not self.args.priv_protocols:
-            self.ptprint("Be aware that private protocol was not provided, so it is set as usmAesCfb128Protocol", out=Out.INFO)
+            ptprint("Be aware that private protocol was not provided, so it is set as usmAesCfb128Protocol",
+                    "INFO", not self.args.json, indent=4)
             self.args.priv_protocols = usmAesCfb128Protocol
 
         Protocols = AuthPrivProtocols(self.args.auth_protocols, self.args.priv_protocols)
@@ -1124,9 +1171,9 @@ class SNMP(BaseModule):
         if self.args.oid is None:
             self.args.oid = "1.3.6"
 
-        self.drawDoubleLine()
-        self.ptprint("Starting SNMPv3 bulk walk...", title=True)
-        self.drawDoubleLine()
+        #self.drawDoubleLine()
+        #self.ptprint("Starting SNMPv3 bulk walk...", title=True)
+        #self.drawDoubleLine()
         results = None
 
         objects = walk_cmd(
@@ -1140,10 +1187,10 @@ class SNMP(BaseModule):
         # Iterate over the returned OID-value pairs
         async for errorIndication, errorStatus, errorIndex, varBinds in objects:
             if errorIndication:
-                self.ptprint(f"Error: {errorIndication}", out=Out.ERROR)
+                ptprint(f"Error: {errorIndication}", "ERROR", not self.args.json, indent=4)
                 break
             elif errorStatus:
-                self.ptprint(f"Error: {errorStatus.prettyPrint()} at {errorIndex}", out=Out.ERROR)
+                ptprint(f"Error: {errorStatus.prettyPrint()} at {errorIndex}", "ERROR", not self.args.json, indent=8)
                 break
             else:
                 for oid, value in varBinds:
@@ -1166,13 +1213,13 @@ class SNMP(BaseModule):
 
                     # Construct the final formatted string
                     formatted_output = f"{oid} = {value_output}"
-                    self.ptprint(formatted_output)
+                    ptprint(formatted_output, "TEXT", not self.args.json, indent=8)
                 results= "success"
 
         if self.args.output:
             self.write_to_file(results)
         return results
-    
+
     def output(self) -> None:
         """
         class SNMPResult:
@@ -1240,4 +1287,4 @@ class SNMP(BaseModule):
         for v in deferred_vulns:
             self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
 
-        self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+        #self.ptprint(self.ptjsonlib.get_result_json(), json=True)

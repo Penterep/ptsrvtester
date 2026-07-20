@@ -590,6 +590,11 @@ class SNMP(BaseModule):
             v3 = True
             for varBind in varBinds:
                 ptprint(" = ".join([x.prettyPrint() for x in varBind]), "TEXT", not self.args.json, indent=4)
+
+        if not any([v1, v2c, v3]):
+            ptprint(f"No SNMP version detected", "OK", not self.args.json, indent=4)
+            return SNMPVersion(v1, v2c, v3)
+
         v1_str = "v1" if v1 else ""
         v2c_str = "v2" if v2c else ""
         v3_str = "v3" if v3 else ""

@@ -81,7 +81,7 @@ some kind of example"""
         
         # TODO: find option to not require args
         tests.add_argument("-ts", "--test", help="Testing toolbox for SMB",
-                           choices=OPTIONS)
+                           choices=OPTIONS, nargs='*')
         
         # maybe still usable
         # smb_subparsers = parser.add_subparsers(dest="command", help="Select SMB command", required=True)
@@ -120,23 +120,25 @@ class SMB(BaseModule):
         self.results: SMBResult = SMBResult(Info={}, Dialects=[])
     
     def run(self):
+        if self.args.test == []:
+            self.args.test = OPTIONS
+        
         self.results.Info["target"] = self.args.target.ip
         self.results.Info["port"] = self.args.target.port or 445
 
-        if self.args.test == "info":
+        if len(self.args.test) == 1 and "info" in self.args.test:
             self.get_info(True)
-        elif self.args.test == "dialects":
+        else:
             self.get_info()
-        elif self.args.test == "encryption":
-            self.get_info()
-            self.parse_encryption_support()
+            if "encryption" in self.args.test:
+                self.parse_encryption_support()
     
     def output(self):
         if self.results.Dialects == []:
             ptprint("Connection couldn't be established", bullet_type="ERROR")
             return
         
-        if self.args.test == "info":
+        if "info" in self.args.test:
             ptprint("Target:", bullet_type="INFO")
             ptprint(f"IP: {self.results.Info['target']}",
                     bullet_type="INFO", condition=True, indent=4)
@@ -166,14 +168,14 @@ class SMB(BaseModule):
             ptprint(f"NTLMv2 supported: {self.results.Info["ntlmv2_support"]}",
                     bullet_type="INFO", condition=True, indent=4)
 
-        elif self.args.test == "dialects":
+        if "dialects" in self.args.test:
             ptprint("Negotiable SMB dialects:", bullet_type="INFO")
             for dialect in self.results.Dialects:
                 ptprint(dialect, bullet_type="VULN" if dialect == "SMBv1" else "NOTVULN",
                         condition=True, indent=4)
         
         # TODO: add encryption requirement check
-        elif self.args.test == "encryption":
+        if "encryption" in self.args.test:
             ptprint("SMB encryption status:", bullet_type="INFO")
             if "SMBv3.0" not in self.results.Dialects and "SMBv3.1.1" not in self.results.Dialects:
                 ptprint("Encryption is only supported on SMBv3 and above. The server doensn't use them", bullet_type="INFO", condition=True, indent=4)

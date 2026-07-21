@@ -129,13 +129,13 @@ class SMB(BaseModule):
             ptprint("Connection couldn't be established", bullet_type="ERROR")
             return
         
-        if "info" in self.args.test:
-            ptprint("Target:", bullet_type="INFO")
-            ptprint(f"IP: {self.results.Info['target']}",
-                    bullet_type="INFO", condition=True, indent=4)
-            ptprint(f"Port: {self.results.Info['port']}",
-                    bullet_type="INFO", condition=True, indent=4)
+        ptprint("Target:", bullet_type="INFO")
+        ptprint(f"IP: {self.results.Info['target']}",
+                bullet_type="INFO", condition=True, indent=4)
+        ptprint(f"Port: {self.results.Info['port']}",
+                bullet_type="INFO", condition=True, indent=4)
 
+        if "info" in self.args.test:
             ptprint("SMB server info:", bullet_type="INFO")
             ptprint(f"Server name: {self.results.Info['server_name']}",
                     bullet_type="INFO", condition=True, indent=4)

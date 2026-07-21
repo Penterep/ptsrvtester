@@ -24,6 +24,8 @@ setuptools.setup(
     ],
     python_requires=">=3.12",
     install_requires = [
+    "aardwolf==0.2.14",
+    "asyauth==0.0.23",
     "cryptography>=42.0.8",
     "dnspython>=2.7.0",
     "impacket>=0.12.0",

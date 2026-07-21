@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
+import hashlib
+import hmac
+import importlib.metadata
 import ipaddress
+import logging
+import math
 import socket
 import ssl
 import struct
+import threading
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -13,8 +22,8 @@ from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.x509.oid import NameOID
 from impacket.spnego import SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
+from ptlibs import ptprinthelper
 from ptlibs.ptjsonlib import PtJsonLib
-from ptlibs.ptprinthelper import get_colored_text
 from pyasn1.codec.der import decoder as der_decoder
 from pyasn1.codec.der import encoder as der_encoder
 from pyasn1.error import PyAsn1Error
@@ -48,13 +57,31 @@ RDP_TEST_ORDER = (
     "RDPSEC",
     "CREDSSP",
     "RDPENC",
+    "CAPABIL",
+    "VERSION",
     "SSL",
     "NTLMINFO",
     "AUTH",
 )
 RDP_TEST_ALIASES = {"INFO": "NTLMINFO"}
 RDP_TEST_CHOICES = RDP_TEST_ORDER + tuple(RDP_TEST_ALIASES)
-IMPLEMENTED_TESTS = {"NLA", "RDPSEC", "CREDSSP", "RDPENC", "SSL", "NTLMINFO"}
+IMPLEMENTED_TESTS = {
+    "NLA",
+    "RDPSEC",
+    "CREDSSP",
+    "RDPENC",
+    "CAPABIL",
+    "VERSION",
+    "SSL",
+    "NTLMINFO",
+    "AUTH",
+}
+
+AARDWOLF_VERSION = "0.2.14"
+ASYAUTH_VERSION = "0.0.23"
+REMOTEFX_CODEC_GUID = "76772f12-bd72-4463-afb3-b73c9c6f7886"
+_AARDWOLF_SESSION_LOCK = threading.Lock()
+MAX_ACCEPTED_WEAK_CIPHERS = 32
 
 CREDSSP_TSREQUEST_VERSION = 6
 MAX_CREDSSP_MESSAGE_SIZE = 256 * 1024
@@ -90,6 +117,12 @@ ENCRYPTION_METHOD_NAMES = {
     ENCRYPTION_METHOD_128BIT: "128-bit RC4",
     ENCRYPTION_METHOD_FIPS: "FIPS 140-1",
 }
+LEGACY_ENCRYPTION_METHOD_MASK = (
+    ENCRYPTION_METHOD_40BIT
+    | ENCRYPTION_METHOD_56BIT
+    | ENCRYPTION_METHOD_128BIT
+    | ENCRYPTION_METHOD_FIPS
+)
 
 ENCRYPTION_LEVEL_NAMES = {
     0x00000000: "None",
@@ -101,7 +134,7 @@ ENCRYPTION_LEVEL_NAMES = {
 
 SERVER_RDP_VERSION_NAMES = {
     0x00080001: "RDP 4.0",
-    0x00080004: "RDP 5.x-8.x",
+    0x00080004: "RDP 5.0-8.1 family",
     0x00080005: "RDP 10.0",
     0x00080006: "RDP 10.1",
     0x00080007: "RDP 10.2",
@@ -113,10 +146,60 @@ SERVER_RDP_VERSION_NAMES = {
     0x0008000D: "RDP 10.8",
     0x0008000E: "RDP 10.9",
     0x0008000F: "RDP 10.10",
+    0x00080010: "RDP 10.11",
+    0x00080011: "RDP 10.12",
 }
 
 SC_CORE = 0x0C01
 SC_SECURITY = 0x0C02
+SC_NET = 0x0C03
+SC_MCS_MSGCHANNEL = 0x0C04
+SC_MULTITRANSPORT = 0x0C08
+
+CS_NET = 0xC003
+CS_MCS_MSGCHANNEL = 0xC006
+CS_MULTITRANSPORT = 0xC00A
+
+CHANNEL_OPTION_INITIALIZED = 0x80000000
+CHANNEL_OPTION_ENCRYPT_RDP = 0x40000000
+CHANNEL_OPTION_COMPRESS_RDP = 0x00800000
+CHANNEL_OPTION_SHOW_PROTOCOL = 0x00200000
+DEFAULT_CHANNEL_OPTIONS = (
+    CHANNEL_OPTION_INITIALIZED
+    | CHANNEL_OPTION_ENCRYPT_RDP
+    | CHANNEL_OPTION_COMPRESS_RDP
+    | CHANNEL_OPTION_SHOW_PROTOCOL
+)
+
+CAPABILITY_CHANNELS = {
+    "Clipboard": "cliprdr",
+    "Drive redirection": "rdpdr",
+    "Dynamic Virtual Channels": "drdynvc",
+    "Audio": "rdpsnd",
+}
+CAPABILITY_OUTPUT_ORDER = (
+    "Bitmap compression",
+    "RemoteFX",
+    "AVC444",
+    "Clipboard",
+    "Drive redirection",
+    "Dynamic Virtual Channels",
+    "Graphics Pipeline",
+    "Multi-monitor",
+    "Audio",
+    "UDP transport",
+)
+
+TRANSPORTTYPE_UDPFECR = 0x00000001
+TRANSPORTTYPE_UDPFECL = 0x00000004
+TRANSPORTTYPE_UDP_PREFERRED = 0x00000100
+SOFTSYNC_TCP_TO_UDP = 0x00000200
+CLIENT_MULTITRANSPORT_FLAGS = (
+    TRANSPORTTYPE_UDPFECR
+    | TRANSPORTTYPE_UDPFECL
+    | TRANSPORTTYPE_UDP_PREFERRED
+    | SOFTSYNC_TCP_TO_UDP
+)
 
 FAILURE_CODES = {
     0x00000001: "SSL required by server",
@@ -284,6 +367,82 @@ class RDPEncryptionResult:
 
 
 @dataclass(frozen=True)
+class ServerCoreData:
+    version: int
+    client_requested_protocols: int | None = None
+    early_capability_flags: int | None = None
+
+
+@dataclass
+class BasicSettingsResult:
+    status: str
+    selected_protocol: int | None = None
+    response_flags: int = 0
+    server_core: ServerCoreData | None = None
+    channel_ids: dict[str, int] = field(default_factory=dict)
+    multitransport_flags: int | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class CapabilityFinding:
+    name: str
+    status: str
+    evidence: str
+
+
+@dataclass
+class CapabilityResult:
+    status: str
+    findings: list[CapabilityFinding] = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass
+class RDPVersionResult:
+    status: str
+    advertised_version: int | None = None
+    version_name: str | None = None
+    transport: str | None = None
+    source: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class AuthTLSValidationResult:
+    status: str
+    certificate_sha256: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class AuthenticatedSessionResult:
+    status: str
+    selected_protocol: int | None = None
+    session_established: bool = False
+    server_core: ServerCoreData | None = None
+    channel_ids: dict[str, int] = field(default_factory=dict)
+    channel_data_observed: bool = False
+    demand_active_observed: bool = False
+    capability_types: frozenset[str] = field(default_factory=frozenset)
+    bitmap_codec_guids: frozenset[str] = field(default_factory=frozenset)
+    capability_error: str | None = None
+    tls_verification: str | None = None
+    certificate_sha256: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class RDPAuthResult:
+    status: str
+    selected_protocol: int | None = None
+    session_established: bool = False
+    tls_verification: str | None = None
+    certificate_sha256: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class RDPNTLMInfo:
     target_name: str | None = None
     netbios_domain: str | None = None
@@ -313,6 +472,14 @@ class TLSVersionProbe:
 
 
 @dataclass(frozen=True)
+class WeakCipherScanResult:
+    status: str
+    tested_count: int = 0
+    accepted_ciphers: tuple[str, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class CertificateInfo:
     subject: str | None
     issuer: str | None
@@ -329,6 +496,7 @@ class CertificateInfo:
     san_present: bool | None = None
     target_matches_san: bool | None = None
     signature_hash_algorithm: str | None = None
+    sha256_fingerprint: str | None = None
 
 
 @dataclass
@@ -340,6 +508,7 @@ class SSLResult:
     selected_cipher: str | None = None
     certificate: CertificateInfo | None = None
     version_probes: list[TLSVersionProbe] = field(default_factory=list)
+    weak_cipher_scan: WeakCipherScanResult | None = None
     weak_findings: list[str] = field(default_factory=list)
     error: str | None = None
 
@@ -350,9 +519,430 @@ class RDPResults:
     rdp_security: RDPSecurityResult | None = None
     credssp: CredSSPResult | None = None
     rdp_encryption: RDPEncryptionResult | None = None
+    capabilities: CapabilityResult | None = None
+    version: RDPVersionResult | None = None
     ntlm_info: NTLMInfoResult | None = None
     ssl: SSLResult | None = None
+    auth: RDPAuthResult | None = None
     not_implemented: list[str] = field(default_factory=list)
+
+
+def _split_ntlm_login(login: str) -> tuple[str | None, str]:
+    if not login or login != login.strip():
+        raise ValueError("login must not be empty or contain leading/trailing whitespace")
+    if "\x00" in login:
+        raise ValueError("login must not contain NUL characters")
+    if len(login) > 512:
+        raise ValueError("login is too long")
+
+    if "\\" in login:
+        domain, username = login.split("\\", 1)
+        if not domain or not username:
+            raise ValueError("login must use DOMAIN\\user format")
+        return domain, username
+
+    if "@" in login:
+        username, domain = login.rsplit("@", 1)
+        if not domain or not username:
+            raise ValueError("login must use user@domain format")
+        return domain, username
+
+    return None, login
+
+
+def _sanitize_auth_error(error: object, *sensitive_values: str | None) -> str:
+    message = str(error).strip() or error.__class__.__name__
+    for sensitive_value in sensitive_values:
+        if sensitive_value:
+            message = message.replace(sensitive_value, "<redacted>")
+    if len(message) > 500:
+        message = f"{message[:497]}..."
+    return message
+
+
+def _parse_bitmap_codec_guids(data: bytes) -> frozenset[str]:
+    if not data:
+        raise ValueError("empty RDP bitmap codec data")
+
+    codec_count = data[0]
+    offset = 1
+    codecs: set[str] = set()
+    for _ in range(codec_count):
+        if len(data) - offset < 19:
+            raise ValueError("truncated RDP bitmap codec entry")
+
+        codec_guid = uuid.UUID(bytes_le=data[offset : offset + 16])
+        properties_length = int.from_bytes(
+            data[offset + 17 : offset + 19],
+            byteorder="little",
+        )
+        offset += 19
+        if len(data) - offset < properties_length:
+            raise ValueError("truncated RDP bitmap codec properties")
+        offset += properties_length
+        codecs.add(str(codec_guid))
+
+    if offset != len(data):
+        raise ValueError("unexpected trailing RDP bitmap codec data")
+    return frozenset(codecs)
+
+
+def _certificate_sha256(cert_der: bytes | None) -> str | None:
+    if not cert_der:
+        return None
+    return hashlib.sha256(cert_der).hexdigest()
+
+
+@contextmanager
+def _capture_aardwolf_demand_active(parser_type):
+    capture: dict[str, object] = {}
+    original_from_bytes = parser_type.from_bytes
+
+    def capture_demand_active(data: bytes):
+        parsed = original_from_bytes(data)
+        capability_types: set[str] = set()
+        bitmap_codec_guids: frozenset[str] = frozenset()
+        capability_error: str | None = None
+
+        for capability_set in parsed.capabilitySets:
+            capability_type = capability_set.capabilitySetType.name
+            capability_types.add(capability_type)
+            if capability_type != "BITMAP_CODECS":
+                continue
+
+            codec_data = getattr(
+                capability_set.capability,
+                "supportedBitmapCodecs",
+                capability_set.capabilityData,
+            )
+            try:
+                if not isinstance(codec_data, bytes):
+                    raise TypeError("RDP bitmap codec data is not a byte string")
+                bitmap_codec_guids = _parse_bitmap_codec_guids(codec_data)
+            except (TypeError, ValueError) as exc:
+                capability_error = str(exc)
+
+        capture["observed"] = True
+        capture["capability_types"] = frozenset(capability_types)
+        capture["bitmap_codec_guids"] = bitmap_codec_guids
+        capture["capability_error"] = capability_error
+        return parsed
+
+    parser_type.from_bytes = staticmethod(capture_demand_active)
+    try:
+        yield capture
+    finally:
+        parser_type.from_bytes = staticmethod(original_from_bytes)
+
+
+def _extract_aardwolf_server_core(connection, core_key) -> ServerCoreData | None:
+    server_data = getattr(connection, "_RDPConnection__server_connect_pdu", None)
+    if server_data is None:
+        return None
+
+    try:
+        core = server_data[core_key]
+        version = int(core.version)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+    requested_protocols = getattr(core, "clientRequestedProtocols", None)
+    early_flags = getattr(core, "earlyCapabilityFlags", None)
+    return ServerCoreData(
+        version=version,
+        client_requested_protocols=(
+            int(requested_protocols) if requested_protocols is not None else None
+        ),
+        early_capability_flags=int(early_flags) if early_flags is not None else None,
+    )
+
+
+def _extract_aardwolf_channel_ids(
+    connection,
+    network_key,
+    requested_channels: tuple[str, ...],
+) -> tuple[dict[str, int], bool]:
+    server_data = getattr(connection, "_RDPConnection__server_connect_pdu", None)
+    if server_data is None:
+        return {}, False
+
+    try:
+        network = server_data[network_key]
+        channel_ids = tuple(int(channel_id) for channel_id in network.channelIdArray)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return {}, False
+
+    if len(channel_ids) != len(requested_channels):
+        return {}, False
+    return dict(zip(requested_channels, channel_ids, strict=True)), True
+
+
+def _aardwolf_probe_channel_types(
+    channel_base: type,
+    channel_options_type: type,
+) -> tuple[type, ...]:
+    def probe_channel_type(channel_name: str) -> type:
+        class ProbeChannel(channel_base):
+            def __init__(self, _settings):
+                channel_base.__init__(
+                    self,
+                    channel_name,
+                    channel_options_type(DEFAULT_CHANNEL_OPTIONS),
+                )
+
+            async def process_channel_data(self, _data):
+                return None
+
+            async def process_user_data(self, _data):
+                return None
+
+        ProbeChannel.name = channel_name
+        return ProbeChannel
+
+    return tuple(
+        probe_channel_type(channel_name)
+        for channel_name in CAPABILITY_CHANNELS.values()
+    )
+
+
+def _aardwolf_peer_certificate_sha256(connection) -> str:
+    transport = getattr(connection, "_RDPConnection__connection", None)
+    if transport is None:
+        raise RuntimeError("aardwolf TLS transport is unavailable")
+    fingerprint = _certificate_sha256(transport.get_peer_certificate())
+    if fingerprint is None:
+        raise RuntimeError("RDP server did not provide a TLS certificate")
+    return fingerprint
+
+
+def _verify_aardwolf_peer_certificate(
+    connection,
+    expected_certificate_sha256: str,
+) -> str:
+    actual_fingerprint = _aardwolf_peer_certificate_sha256(connection)
+    if not hmac.compare_digest(actual_fingerprint, expected_certificate_sha256):
+        raise RuntimeError(
+            "RDP TLS certificate changed between validation and authentication"
+        )
+    return actual_fingerprint
+
+
+async def _connect_aardwolf_session(
+    host: str,
+    port: int,
+    domain: str | None,
+    username: str,
+    password: str,
+    timeout_seconds: float,
+    expected_certificate_sha256: str,
+    tls_verification: str,
+    request_capability_channels: bool,
+) -> AuthenticatedSessionResult:
+    from aardwolf.channels import Channel
+    from aardwolf.commons.iosettings import RDPIOSettings
+    from aardwolf.commons.target import RDPTarget
+    from aardwolf.connection import RDPConnection
+    from aardwolf.protocol.T128.serverdemandactivepdu import TS_DEMAND_ACTIVE_PDU
+    from aardwolf.protocol.T124.userdata.constants import ChannelOption, TS_UD_TYPE
+    from aardwolf.protocol.x224.constants import SUPP_PROTOCOLS
+    from asyauth.common.constants import asyauthProtocol, asyauthSecret
+    from asyauth.common.credentials import UniCredential
+
+    settings = RDPIOSettings()
+    requested_channels = (
+        tuple(CAPABILITY_CHANNELS.values())
+        if request_capability_channels
+        else ()
+    )
+    settings.channels = list(
+        _aardwolf_probe_channel_types(Channel, ChannelOption)
+        if requested_channels
+        else ()
+    )
+    settings.clipboard_use_pyperclip = False
+    settings.supported_protocols = SUPP_PROTOCOLS.HYBRID | SUPP_PROTOCOLS.HYBRID_EX
+
+    credentials = UniCredential(
+        secret=password,
+        username=username,
+        domain=domain,
+        stype=asyauthSecret.PASSWORD,
+        protocol=asyauthProtocol.NTLM,
+    )
+    target = RDPTarget(
+        ip=host,
+        port=port,
+        hostname=host,
+        timeout=max(1, math.ceil(timeout_seconds)),
+        domain=domain,
+        unsafe_ssl=False,
+    )
+    connection = RDPConnection(target, credentials, settings)
+    connect_error: object | None = None
+    connected = False
+    original_credssp_auth = connection.credssp_auth
+
+    async def certificate_guarded_credssp_auth():
+        try:
+            _verify_aardwolf_peer_certificate(
+                connection,
+                expected_certificate_sha256,
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            return None, exc
+        return await original_credssp_auth()
+
+    connection.credssp_auth = certificate_guarded_credssp_auth
+    with _capture_aardwolf_demand_active(TS_DEMAND_ACTIVE_PDU) as capture:
+        try:
+            try:
+                connected, connect_error = await asyncio.wait_for(
+                    connection.connect(),
+                    timeout=timeout_seconds,
+                )
+            except TimeoutError:
+                connect_error = TimeoutError(
+                    f"RDP authentication timed out after {timeout_seconds:g} seconds"
+                )
+        finally:
+            connection.credssp_auth = original_credssp_auth
+            try:
+                await asyncio.wait_for(
+                    connection.terminate(),
+                    timeout=min(5.0, max(1.0, timeout_seconds)),
+                )
+            except (Exception, asyncio.CancelledError):
+                pass
+
+    selected_protocol = (
+        int(connection.x224_protocol)
+        if connection.x224_protocol is not None
+        else None
+    )
+    server_core = _extract_aardwolf_server_core(
+        connection,
+        TS_UD_TYPE.SC_CORE,
+    )
+    channel_ids, channel_data_observed = _extract_aardwolf_channel_ids(
+        connection,
+        TS_UD_TYPE.SC_NET,
+        requested_channels,
+    )
+    if not connected or connect_error is not None:
+        return AuthenticatedSessionResult(
+            status="failed",
+            selected_protocol=selected_protocol,
+            server_core=server_core,
+            channel_ids=channel_ids,
+            channel_data_observed=channel_data_observed,
+            demand_active_observed=bool(capture.get("observed")),
+            capability_types=capture.get("capability_types", frozenset()),
+            bitmap_codec_guids=capture.get("bitmap_codec_guids", frozenset()),
+            capability_error=capture.get("capability_error"),
+            tls_verification=tls_verification,
+            certificate_sha256=expected_certificate_sha256,
+            error=_sanitize_auth_error(
+                connect_error or "RDP authentication or session setup failed",
+                password,
+                username,
+                domain,
+            ),
+        )
+
+    return AuthenticatedSessionResult(
+        status="authenticated",
+        selected_protocol=selected_protocol,
+        session_established=True,
+        server_core=server_core,
+        channel_ids=channel_ids,
+        channel_data_observed=channel_data_observed,
+        demand_active_observed=bool(capture.get("observed")),
+        capability_types=capture.get("capability_types", frozenset()),
+        bitmap_codec_guids=capture.get("bitmap_codec_guids", frozenset()),
+        capability_error=capture.get("capability_error"),
+        tls_verification=tls_verification,
+        certificate_sha256=expected_certificate_sha256,
+    )
+
+
+def _run_aardwolf_authenticated_session(
+    host: str,
+    port: int,
+    login: str,
+    password: str,
+    timeout_seconds: float,
+    expected_certificate_sha256: str,
+    tls_verification: str,
+    request_capability_channels: bool,
+) -> AuthenticatedSessionResult:
+    try:
+        domain, username = _split_ntlm_login(login)
+        if "\x00" in password:
+            raise ValueError("password must not contain NUL characters")
+        if len(password) > 4096:
+            raise ValueError("password is too long")
+        if tls_verification not in {"verified", "insecure"}:
+            raise ValueError("invalid RDP TLS verification state")
+        if len(expected_certificate_sha256) != 64:
+            raise ValueError("invalid RDP TLS certificate fingerprint")
+        try:
+            int(expected_certificate_sha256, 16)
+        except ValueError as exc:
+            raise ValueError("invalid RDP TLS certificate fingerprint") from exc
+
+        for package, expected_version in (
+            ("aardwolf", AARDWOLF_VERSION),
+            ("asyauth", ASYAUTH_VERSION),
+        ):
+            installed_version = importlib.metadata.version(package)
+            if installed_version != expected_version:
+                raise RuntimeError(
+                    f"unsupported {package} version {installed_version}; "
+                    f"expected {expected_version}"
+                )
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("AUTH cannot run inside an existing asyncio event loop")
+
+        with _AARDWOLF_SESSION_LOCK:
+            aardwolf_logger = logging.getLogger("aardwolf")
+            logger_was_disabled = aardwolf_logger.disabled
+            aardwolf_logger.disabled = True
+            try:
+                return asyncio.run(
+                    _connect_aardwolf_session(
+                        host,
+                        port,
+                        domain,
+                        username,
+                        password,
+                        timeout_seconds,
+                        expected_certificate_sha256,
+                        tls_verification,
+                        request_capability_channels,
+                    )
+                )
+            finally:
+                aardwolf_logger.disabled = logger_was_disabled
+    except (ImportError, importlib.metadata.PackageNotFoundError) as exc:
+        return AuthenticatedSessionResult(
+            status="error",
+            error=f"RDP authentication dependency is unavailable: {exc}",
+        )
+    except (RuntimeError, ValueError) as exc:
+        return AuthenticatedSessionResult(
+            status="error",
+            error=_sanitize_auth_error(exc, password, login),
+        )
+    except Exception as exc:
+        return AuthenticatedSessionResult(
+            status="error",
+            error=_sanitize_auth_error(exc, password, login),
+        )
 
 
 def valid_target_rdp(target: str) -> Target:
@@ -597,7 +1187,7 @@ def _format_cipher(cipher: tuple | None) -> str | None:
     if not cipher:
         return None
     if len(cipher) >= 3:
-        return f"{cipher[0]} ({cipher[1]}, {cipher[2]} bits)"
+        return f"{cipher[0]} ({cipher[2]} bits)"
     return str(cipher[0])
 
 
@@ -629,6 +1219,72 @@ def _create_tls_context(version: ssl.TLSVersion | None = None) -> ssl.SSLContext
     except ssl.SSLError:
         pass
     return context
+
+
+def _available_weak_tls_cipher_names() -> tuple[str, ...]:
+    context = _create_tls_context(
+        getattr(ssl.TLSVersion, "TLSv1_2", None),
+    )
+    weak_names: set[str] = set()
+    for cipher in context.get_ciphers():
+        name = str(cipher.get("name", ""))
+        protocol = str(cipher.get("protocol", ""))
+        description = str(cipher.get("description", ""))
+        upper_name = name.upper()
+        upper_description = description.upper()
+
+        if not name or protocol == "TLSv1.3":
+            continue
+        if any(
+            marker in upper_description
+            for marker in ("AU=PSK", "KX=PSK", "PSK", "KX=SRP", "AU=SRP")
+        ):
+            continue
+
+        strength_bits = cipher.get("strength_bits")
+        weak = isinstance(strength_bits, int) and strength_bits < 128
+        weak = weak or "AU=NONE" in upper_description
+        weak = weak or "MAC=SHA1" in upper_description
+        weak = weak or any(
+            token in upper_name
+            for token in (
+                "RC4",
+                "RC2",
+                "3DES",
+                "DES",
+                "NULL",
+                "EXPORT",
+                "MD5",
+                "IDEA",
+                "SEED",
+                "ADH",
+                "AECDH",
+            )
+        )
+        if weak:
+            weak_names.add(name)
+
+    return tuple(sorted(weak_names))
+
+
+def _cipher_name(formatted_cipher: str | None) -> str | None:
+    if not formatted_cipher:
+        return None
+    return formatted_cipher.split(" (", 1)[0]
+
+
+def _cipher_scan_error_is_transport_failure(error: str) -> bool:
+    normalized = error.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "timed out",
+            "connection refused",
+            "network is unreachable",
+            "no route to host",
+            "temporary failure",
+        )
+    )
 
 
 def _ber_encode_length(length: int) -> bytes:
@@ -665,7 +1321,9 @@ def _per_decode_length(data: bytes, offset: int) -> tuple[int, int]:
     return ((first & 0x3F) << 8) | data[offset + 1], offset + 2
 
 
-def _build_client_core_data() -> bytes:
+def _build_client_core_data(
+    server_selected_protocol: int = PROTOCOL_RDP,
+) -> bytes:
     client_name = "PTSRVTESTER".encode("utf-16-le")[:30]
     client_name += b"\x00" * (32 - len(client_name))
     payload = struct.pack(
@@ -681,6 +1339,19 @@ def _build_client_core_data() -> bytes:
     payload += client_name
     payload += struct.pack("<III", 4, 0, 12)
     payload += b"\x00" * 64
+    payload += struct.pack(
+        "<HHIHHH64sBBI",
+        0xCA01,
+        1,
+        0,
+        24,
+        0x0007,
+        0x0001,
+        b"\x00" * 64,
+        0,
+        0,
+        server_selected_protocol,
+    )
     return struct.pack("<HH", 0xC001, len(payload) + 4) + payload
 
 
@@ -688,10 +1359,41 @@ def _build_client_security_data(encryption_methods: int) -> bytes:
     return struct.pack("<HHII", 0xC002, 12, encryption_methods, 0)
 
 
-def _build_mcs_connect_initial(encryption_methods: int) -> bytes:
-    client_blocks = _build_client_core_data() + _build_client_security_data(
-        encryption_methods
-    )
+def _build_client_network_data(channel_names: tuple[str, ...]) -> bytes:
+    channel_data = bytearray()
+    for channel_name in channel_names:
+        encoded_name = channel_name.encode("ascii")
+        if not encoded_name or len(encoded_name) > 7:
+            raise ValueError(f"invalid static virtual channel name: {channel_name!r}")
+        channel_data.extend(encoded_name.ljust(8, b"\x00"))
+        channel_data.extend(struct.pack("<I", DEFAULT_CHANNEL_OPTIONS))
+
+    payload = struct.pack("<I", len(channel_names)) + bytes(channel_data)
+    return struct.pack("<HH", CS_NET, len(payload) + 4) + payload
+
+
+def _build_client_message_channel_data() -> bytes:
+    return struct.pack("<HHI", CS_MCS_MSGCHANNEL, 8, 0)
+
+
+def _build_client_multitransport_data(flags: int) -> bytes:
+    return struct.pack("<HHI", CS_MULTITRANSPORT, 8, flags)
+
+
+def _build_mcs_connect_initial(
+    encryption_methods: int,
+    channel_names: tuple[str, ...] = (),
+    multitransport_flags: int | None = None,
+    server_selected_protocol: int = PROTOCOL_RDP,
+) -> bytes:
+    client_blocks = _build_client_core_data(
+        server_selected_protocol
+    ) + _build_client_security_data(encryption_methods)
+    if channel_names:
+        client_blocks += _build_client_network_data(channel_names)
+    if multitransport_flags is not None:
+        client_blocks += _build_client_message_channel_data()
+        client_blocks += _build_client_multitransport_data(multitransport_flags)
     conference_request = (
         b"\x00\x08\x00\x10\x00\x01\xc0\x00Duca"
         + _per_encode_length(len(client_blocks))
@@ -765,7 +1467,7 @@ def _read_ber_tlv(data: bytes, offset: int) -> tuple[bytes, bytes, int]:
     return tag_bytes, data[offset:end], end
 
 
-def _parse_server_security_data(packet: bytes) -> LegacyServerSecurityData:
+def _parse_server_user_data_blocks(packet: bytes) -> dict[int, bytes]:
     if len(packet) < 8 or packet[0] != 3:
         raise RDPProtocolError("invalid MCS Connect Response TPKT")
     tpkt_length = struct.unpack(">H", packet[2:4])[0]
@@ -801,9 +1503,7 @@ def _parse_server_security_data(packet: bytes) -> LegacyServerSecurityData:
         raise RDPProtocolError("truncated GCC server data blocks")
     blocks = gcc_data[blocks_offset:blocks_end]
 
-    encryption_method = None
-    encryption_level = None
-    server_rdp_version = None
+    parsed_blocks: dict[int, bytes] = {}
     offset = 0
     while offset < len(blocks):
         if offset + 4 > len(blocks):
@@ -812,16 +1512,92 @@ def _parse_server_security_data(packet: bytes) -> LegacyServerSecurityData:
         if block_length < 4 or offset + block_length > len(blocks):
             raise RDPProtocolError("invalid server data block length")
         block = blocks[offset : offset + block_length]
-        if block_type == SC_CORE and block_length >= 8:
-            server_rdp_version = struct.unpack("<I", block[4:8])[0]
-        elif block_type == SC_SECURITY:
-            if block_length < 12:
-                raise RDPProtocolError("truncated Server Security Data block")
-            encryption_method, encryption_level = struct.unpack("<II", block[4:12])
+        if block_type in parsed_blocks:
+            raise RDPProtocolError(
+                f"duplicate server data block type 0x{block_type:04x}"
+            )
+        parsed_blocks[block_type] = block
         offset += block_length
 
-    if encryption_method is None or encryption_level is None:
+    return parsed_blocks
+
+
+def _parse_server_core_data(packet: bytes) -> ServerCoreData:
+    block = _parse_server_user_data_blocks(packet).get(SC_CORE)
+    if block is None:
+        raise RDPProtocolError("MCS response has no Server Core Data block")
+    if len(block) not in (8, 12, 16):
+        raise RDPProtocolError("invalid Server Core Data block length")
+
+    version = struct.unpack("<I", block[4:8])[0]
+    client_requested_protocols = (
+        struct.unpack("<I", block[8:12])[0] if len(block) >= 12 else None
+    )
+    early_capability_flags = (
+        struct.unpack("<I", block[12:16])[0] if len(block) >= 16 else None
+    )
+    return ServerCoreData(
+        version=version,
+        client_requested_protocols=client_requested_protocols,
+        early_capability_flags=early_capability_flags,
+    )
+
+
+def _parse_server_network_data(
+    packet: bytes,
+    requested_channels: tuple[str, ...],
+) -> dict[str, int]:
+    block = _parse_server_user_data_blocks(packet).get(SC_NET)
+    if block is None:
+        if requested_channels:
+            raise RDPProtocolError("MCS response has no Server Network Data block")
+        return {}
+    if len(block) < 8:
+        raise RDPProtocolError("truncated Server Network Data block")
+
+    channel_count = struct.unpack("<H", block[6:8])[0]
+    expected_length = 8 + channel_count * 2 + (2 if channel_count % 2 else 0)
+    if len(block) != expected_length:
+        raise RDPProtocolError("invalid Server Network Data block length")
+    if channel_count != len(requested_channels):
+        raise RDPProtocolError(
+            "server channel count does not match requested channel count"
+        )
+
+    channel_ids = struct.unpack(
+        f"<{channel_count}H",
+        block[8 : 8 + channel_count * 2],
+    ) if channel_count else ()
+    return dict(zip(requested_channels, channel_ids, strict=True))
+
+
+def _parse_server_multitransport_data(packet: bytes) -> int | None:
+    block = _parse_server_user_data_blocks(packet).get(SC_MULTITRANSPORT)
+    if block is None:
+        return None
+    if len(block) != 8:
+        raise RDPProtocolError("invalid Server Multitransport Data block length")
+    return struct.unpack("<I", block[4:8])[0]
+
+
+def _parse_server_security_data(packet: bytes) -> LegacyServerSecurityData:
+    parsed_blocks = _parse_server_user_data_blocks(packet)
+    security_block = parsed_blocks.get(SC_SECURITY)
+    if security_block is None:
         raise RDPProtocolError("MCS response has no Server Security Data block")
+    if len(security_block) < 12:
+        raise RDPProtocolError("truncated Server Security Data block")
+
+    encryption_method, encryption_level = struct.unpack(
+        "<II", security_block[4:12]
+    )
+    core_block = parsed_blocks.get(SC_CORE)
+    server_rdp_version = (
+        struct.unpack("<I", core_block[4:8])[0]
+        if core_block is not None and len(core_block) >= 8
+        else None
+    )
+
     return LegacyServerSecurityData(
         encryption_method=encryption_method,
         encryption_level=encryption_level,
@@ -887,6 +1663,7 @@ class RDPArgs(BaseArgs):
     tests: list[str] | None
     login: str | None
     password: str | None
+    insecure_auth: bool
     timeout: int
 
     @staticmethod
@@ -905,19 +1682,26 @@ class RDPArgs(BaseArgs):
                 ["", "", "RDPSEC", "Legacy Standard RDP Security negotiation test"],
                 ["", "", "CREDSSP", "CredSSP protocol support test"],
                 ["", "", "RDPENC", "Security protocols and RDP encryption enumeration"],
+                ["", "", "CAPABIL", "RDP capability negotiation"],
+                ["", "", "VERSION", "RDP protocol version reported by the server"],
                 ["", "", "SSL", "TLS/RDP Security configuration test"],
                 ["", "", "NTLMINFO", "Pre-auth CredSSP/NTLM server information test"],
                 ["", "", "INFO", "Alias for NTLMINFO"],
-                ["", "", "AUTH", "Authentication capability test (planned)"],
-                ["-l", "--login", "<login>", "Login for account-based tests (planned)"],
-                ["-p", "--password", "<password>", "Password for account-based tests (planned)"],
-                ["-T", "--timeout", "<milliseconds>", "Socket timeout (default 10000)"],
+                ["", "", "AUTH", "Single CredSSP/NTLM authentication test"],
+                ["-l", "--login", "<login>", "Login for account-based tests"],
+                ["-p", "--password", "<password>", "Password for account-based tests"],
+                ["", "--insecure-auth", "", "Allow credentials with an untrusted RDP TLS certificate"],
+                ["-T", "--timeout", "<milliseconds>", "Network timeout (default 10000)"],
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
                 ["-vv", "--verbose", "", "Enable verbose mode"],
             ]},
             {"note": [
-                "When -ts/--tests is omitted, all currently implemented safe pre-auth tests are executed.",
+                "When -ts/--tests is omitted, all safe pre-auth tests are executed; "
+                "AUTH is also executed when both credentials are supplied.",
+                "AUTH performs one CredSSP/NTLM authentication attempt.",
+                "Use --insecure-auth only for an explicitly trusted test target "
+                "whose RDP certificate cannot be validated.",
             ]},
         ]
 
@@ -951,10 +1735,18 @@ class RDPArgs(BaseArgs):
             type=str.upper,
             choices=RDP_TEST_CHOICES,
             metavar="TEST",
-            help="tests to run: NLA, RDPSEC, CREDSSP, RDPENC, SSL, NTLMINFO, INFO, AUTH",
+            help=(
+                "tests to run: NLA, RDPSEC, CREDSSP, RDPENC, CAPABIL, "
+                "VERSION, SSL, NTLMINFO, INFO, AUTH"
+            ),
         )
         parser.add_argument("-l", "--login", help="login for account-based tests")
         parser.add_argument("-p", "--password", help="password for account-based tests")
+        parser.add_argument(
+            "--insecure-auth",
+            action="store_true",
+            help="allow credential use when the RDP TLS certificate is untrusted",
+        )
         parser.add_argument(
             "-T",
             "--timeout",
@@ -981,16 +1773,27 @@ class RDP(BaseModule):
             raise argparse.ArgumentError(None, "--timeout must be a positive integer")
 
         self.args = args
+        self.args.insecure_auth = bool(getattr(args, "insecure_auth", False))
         self.ptjsonlib = ptjsonlib
         self.use_json = getattr(args, "json", False)
         self.results = RDPResults()
         self.timeout_seconds = args.timeout / 1000.0
         self._security_probes: list[NegotiationProbe] | None = None
+        self._basic_settings_result: BasicSettingsResult | None = None
+        self._auth_tls_validation_result: AuthTLSValidationResult | None = None
+        self._authenticated_session_result: AuthenticatedSessionResult | None = None
 
     def run(self) -> None:
-        selected_tests = self.args.tests or [
-            test for test in RDP_TEST_ORDER if test in IMPLEMENTED_TESTS
-        ]
+        if self.args.tests is not None:
+            selected_tests = self.args.tests
+        else:
+            selected_tests = [
+                test
+                for test in RDP_TEST_ORDER
+                if test in IMPLEMENTED_TESTS and test != "AUTH"
+            ]
+            if self.args.login is not None and self.args.password is not None:
+                selected_tests.append("AUTH")
         requested_tests = []
         seen_tests = set()
         for test in selected_tests:
@@ -1009,12 +1812,142 @@ class RDP(BaseModule):
                 self.results.credssp = self._run_credssp_test()
             elif test == "RDPENC":
                 self.results.rdp_encryption = self._run_rdp_encryption_test()
+            elif test == "CAPABIL":
+                self.results.capabilities = self._run_capability_test()
+            elif test == "VERSION":
+                self.results.version = self._run_version_test()
             elif test == "NTLMINFO":
                 self.results.ntlm_info = self._run_ntlminfo_test()
             elif test == "SSL":
                 self.results.ssl = self._run_ssl_test()
+            elif test == "AUTH":
+                self.results.auth = self._run_auth_test()
             else:
                 self.results.not_implemented.append(test)
+
+    def _get_auth_tls_validation_result(self) -> AuthTLSValidationResult:
+        if self._auth_tls_validation_result is not None:
+            return self._auth_tls_validation_result
+
+        _probe, _tls_version, _cipher, cert_der, error = self._tls_handshake(
+            PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX,
+            verify_certificate=not self.args.insecure_auth,
+        )
+        fingerprint = _certificate_sha256(cert_der)
+        if error is not None or fingerprint is None:
+            detail = error or "RDP server did not provide a TLS certificate"
+            if not self.args.insecure_auth:
+                detail = (
+                    f"RDP TLS certificate validation failed: {detail}. "
+                    "Use --insecure-auth only for an explicitly trusted test target"
+                )
+            self._auth_tls_validation_result = AuthTLSValidationResult(
+                status="error",
+                error=detail,
+            )
+            return self._auth_tls_validation_result
+
+        self._auth_tls_validation_result = AuthTLSValidationResult(
+            status="insecure" if self.args.insecure_auth else "verified",
+            certificate_sha256=fingerprint,
+        )
+        return self._auth_tls_validation_result
+
+    def _get_authenticated_session_result(self) -> AuthenticatedSessionResult:
+        if self._authenticated_session_result is not None:
+            return self._authenticated_session_result
+
+        if self.args.login is None or self.args.password is None:
+            self._authenticated_session_result = AuthenticatedSessionResult(
+                status="missing_credentials",
+                error="both --login and --password are required",
+            )
+            return self._authenticated_session_result
+
+        tls_validation = self._get_auth_tls_validation_result()
+        if (
+            tls_validation.status == "error"
+            or tls_validation.certificate_sha256 is None
+        ):
+            self._authenticated_session_result = AuthenticatedSessionResult(
+                status="tls_error",
+                error=tls_validation.error,
+            )
+            return self._authenticated_session_result
+
+        self._authenticated_session_result = _run_aardwolf_authenticated_session(
+            self.args.target.ip,
+            self.args.target.port,
+            self.args.login,
+            self.args.password,
+            self.timeout_seconds,
+            tls_validation.certificate_sha256,
+            tls_validation.status,
+            self.args.tests is None or "CAPABIL" in self.args.tests,
+        )
+        return self._authenticated_session_result
+
+    def _run_auth_test(self) -> RDPAuthResult:
+        if self.args.login is None or self.args.password is None:
+            return RDPAuthResult(
+                status="missing_credentials",
+                error="both --login and --password are required",
+            )
+
+        credssp_probe = next(
+            (
+                probe
+                for probe in self._get_security_probes()
+                if probe.name == "CredSSP/NLA only"
+            ),
+            None,
+        )
+        if credssp_probe is None:
+            return RDPAuthResult(
+                status="error",
+                error="CredSSP negotiation probe was not executed",
+            )
+        if credssp_probe.selected_protocol not in (
+            PROTOCOL_HYBRID,
+            PROTOCOL_HYBRID_EX,
+        ):
+            if credssp_probe.error:
+                return RDPAuthResult(status="error", error=credssp_probe.error)
+            reason = (
+                FAILURE_CODES.get(
+                    credssp_probe.failure_code,
+                    f"failure code {credssp_probe.failure_code}",
+                )
+                if credssp_probe.failure_code is not None
+                else f"server selected {protocol_name(credssp_probe.selected_protocol)}"
+            )
+            return RDPAuthResult(
+                status="not_supported",
+                selected_protocol=credssp_probe.selected_protocol,
+                error=f"CredSSP/NLA authentication is not available ({reason})",
+            )
+
+        session = self._get_authenticated_session_result()
+        if (
+            session.status == "authenticated"
+            and session.selected_protocol
+            not in (PROTOCOL_HYBRID, PROTOCOL_HYBRID_EX)
+        ):
+            return RDPAuthResult(
+                status="error",
+                selected_protocol=session.selected_protocol,
+                session_established=session.session_established,
+                error="server established a session without selecting CredSSP",
+            )
+
+        return RDPAuthResult(
+            status=session.status,
+            selected_protocol=session.selected_protocol,
+            session_established=session.session_established,
+            tls_verification=session.tls_verification,
+            certificate_sha256=session.certificate_sha256,
+            error=session.error,
+        )
 
     def _get_security_probes(self) -> list[NegotiationProbe]:
         if self._security_probes is not None:
@@ -1192,6 +2125,396 @@ class RDP(BaseModule):
                 error=str(exc),
             )
 
+    def _get_basic_settings_result(self) -> BasicSettingsResult:
+        if self._basic_settings_result is None:
+            self._basic_settings_result = self._probe_basic_settings()
+        return self._basic_settings_result
+
+    def _probe_basic_settings(self) -> BasicSettingsResult:
+        requested_channels = tuple(CAPABILITY_CHANNELS.values())
+        failures: list[str] = []
+        transport_errors: list[str] = []
+
+        for requested_protocol in (PROTOCOL_SSL, PROTOCOL_RDP):
+            sock: socket.socket | ssl.SSLSocket | None = None
+            try:
+                sock = socket.create_connection(
+                    (self.args.target.ip, self.args.target.port),
+                    timeout=self.timeout_seconds,
+                )
+                sock.settimeout(self.timeout_seconds)
+                sock.sendall(_build_negotiation_request(requested_protocol))
+                negotiation = _parse_negotiation_reply_details(_read_tpkt(sock))
+
+                if negotiation.selected_protocol != requested_protocol:
+                    if negotiation.failure_code is not None:
+                        reason = FAILURE_CODES.get(
+                            negotiation.failure_code,
+                            f"failure code {negotiation.failure_code}",
+                        )
+                    else:
+                        reason = (
+                            f"server selected {protocol_name(negotiation.selected_protocol)}"
+                        )
+                    failures.append(
+                        f"{protocol_name(requested_protocol)}: {reason}"
+                    )
+                    continue
+
+                encryption_methods = LEGACY_ENCRYPTION_METHOD_MASK
+                if requested_protocol == PROTOCOL_SSL:
+                    server_hostname = (
+                        None
+                        if _target_is_ip(self.args.target.ip)
+                        else self.args.target.ip
+                    )
+                    sock = _create_tls_context().wrap_socket(
+                        sock,
+                        server_hostname=server_hostname,
+                    )
+
+                response_flags = negotiation.response_flags or 0
+                multitransport_flags = (
+                    CLIENT_MULTITRANSPORT_FLAGS
+                    if response_flags & NEG_RSP_EXTENDED_CLIENT_DATA_SUPPORTED
+                    else None
+                )
+                sock.sendall(
+                    _build_mcs_connect_initial(
+                        encryption_methods,
+                        requested_channels,
+                        multitransport_flags,
+                        requested_protocol,
+                    )
+                )
+                response = _read_tpkt(sock)
+
+                return BasicSettingsResult(
+                    status="ok",
+                    selected_protocol=requested_protocol,
+                    response_flags=response_flags,
+                    server_core=_parse_server_core_data(response),
+                    channel_ids=_parse_server_network_data(
+                        response,
+                        requested_channels,
+                    ),
+                    multitransport_flags=_parse_server_multitransport_data(
+                        response
+                    ),
+                )
+            except (OSError, ssl.SSLError, RDPProtocolError, ValueError) as exc:
+                transport_errors.append(
+                    f"{protocol_name(requested_protocol)}: {exc}"
+                )
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+
+        details = failures + transport_errors
+        detail = "; ".join(details) or "Basic Settings Exchange failed"
+        if any("NLA required" in failure for failure in failures):
+            return BasicSettingsResult(
+                status="unavailable",
+                error=f"NLA prevents pre-auth Basic Settings Exchange ({detail})",
+            )
+
+        if transport_errors:
+            return BasicSettingsResult(status="error", error=detail)
+
+        if failures:
+            return BasicSettingsResult(status="unavailable", error=detail)
+
+        return BasicSettingsResult(
+            status="error",
+            error=detail,
+        )
+
+    def _run_version_test(self) -> RDPVersionResult:
+        basic_settings = self._get_basic_settings_result()
+        if basic_settings.status == "ok" and basic_settings.server_core is not None:
+            return self._version_result_from_core(
+                basic_settings.server_core,
+                protocol_name(basic_settings.selected_protocol),
+                "pre_auth",
+            )
+
+        if basic_settings.status == "ok":
+            return RDPVersionResult(
+                status="error",
+                source="pre_auth",
+                error="Server Core Data was not present in the RDP response",
+            )
+
+        if (
+            basic_settings.status == "unavailable"
+            and self.args.login is not None
+            and self.args.password is not None
+        ):
+            authenticated_session = self._get_authenticated_session_result()
+            if (
+                authenticated_session.status == "authenticated"
+                and authenticated_session.server_core is not None
+            ):
+                return self._version_result_from_core(
+                    authenticated_session.server_core,
+                    protocol_name(authenticated_session.selected_protocol),
+                    "authenticated",
+                )
+
+            auth_error = authenticated_session.error or (
+                "authenticated RDP session did not expose Server Core Data"
+            )
+            pre_auth_error = (
+                basic_settings.error or "pre-auth Basic Settings Exchange unavailable"
+            )
+            return RDPVersionResult(
+                status="unavailable",
+                source="authenticated",
+                error=f"{pre_auth_error}; authenticated fallback failed: {auth_error}",
+            )
+
+        return RDPVersionResult(
+            status=basic_settings.status,
+            source="pre_auth",
+            error=basic_settings.error,
+        )
+
+    @staticmethod
+    def _version_result_from_core(
+        server_core: ServerCoreData,
+        transport: str,
+        source: str,
+    ) -> RDPVersionResult:
+        advertised_version = server_core.version
+        version_name = SERVER_RDP_VERSION_NAMES.get(
+            advertised_version,
+            f"Unknown (0x{advertised_version:08x})",
+        )
+        return RDPVersionResult(
+            status=(
+                "ambiguous"
+                if advertised_version == 0x00080004
+                else "ok"
+                if advertised_version in SERVER_RDP_VERSION_NAMES
+                else "unknown"
+            ),
+            advertised_version=advertised_version,
+            version_name=version_name,
+            transport=transport,
+            source=source,
+        )
+
+    def _run_capability_test(self) -> CapabilityResult:
+        basic_settings = self._get_basic_settings_result()
+        findings: list[CapabilityFinding] = []
+        authenticated_session: AuthenticatedSessionResult | None = None
+        if self.args.login is not None and self.args.password is not None:
+            authenticated_session = self._get_authenticated_session_result()
+
+        channel_ids = basic_settings.channel_ids
+        channel_data_observed = basic_settings.status == "ok"
+        channel_data_error = basic_settings.error
+        if (
+            not channel_data_observed
+            and authenticated_session is not None
+            and authenticated_session.status == "authenticated"
+            and authenticated_session.channel_data_observed
+        ):
+            channel_ids = authenticated_session.channel_ids
+            channel_data_observed = True
+            channel_data_error = None
+
+        response_flags = basic_settings.response_flags
+        negotiation_observed = basic_settings.status == "ok"
+        if not negotiation_observed:
+            negotiation_probes = self._get_security_probes()
+            valid_probes = [probe for probe in negotiation_probes if probe.successful]
+            negotiation_observed = bool(valid_probes)
+            for probe in valid_probes:
+                response_flags |= probe.response_flags or 0
+
+        graphics_supported = bool(
+            response_flags & NEG_RSP_DYNVC_GFX_PROTOCOL_SUPPORTED
+        )
+        if negotiation_observed:
+            findings.append(
+                CapabilityFinding(
+                    "Graphics Pipeline",
+                    "supported" if graphics_supported else "not_supported",
+                    "RDP_NEG_RSP DYNVC_GFX_PROTOCOL_SUPPORTED flag "
+                    + ("present" if graphics_supported else "absent"),
+                )
+            )
+        else:
+            findings.append(
+                CapabilityFinding(
+                    "Graphics Pipeline",
+                    "unknown",
+                    "no valid RDP negotiation response",
+                )
+            )
+
+        findings.append(
+            CapabilityFinding(
+                "Bitmap compression",
+                "supported" if negotiation_observed else "unknown",
+                (
+                    "required by the RDP Bitmap Capability Set"
+                    if negotiation_observed
+                    else "no valid RDP negotiation response"
+                ),
+            )
+        )
+
+        for capability_name, channel_name in CAPABILITY_CHANNELS.items():
+            channel_id = channel_ids.get(channel_name)
+            if capability_name == "Dynamic Virtual Channels" and graphics_supported:
+                findings.append(
+                    CapabilityFinding(
+                        capability_name,
+                        "supported",
+                        "Graphics Pipeline support proves availability of the "
+                        "dynamic virtual channel transport",
+                    )
+                )
+            elif channel_id:
+                findings.append(
+                    CapabilityFinding(
+                        capability_name,
+                        (
+                            "supported"
+                            if capability_name == "Dynamic Virtual Channels"
+                            else "allocated"
+                        ),
+                        f"static virtual channel {channel_name} allocated as {channel_id}; "
+                        "server policy was not exercised",
+                    )
+                )
+            elif channel_data_observed:
+                findings.append(
+                    CapabilityFinding(
+                        capability_name,
+                        "not_supported",
+                        f"static virtual channel {channel_name} was not allocated",
+                    )
+                )
+            else:
+                findings.append(
+                    CapabilityFinding(
+                        capability_name,
+                        "unknown",
+                        channel_data_error
+                        or "Basic Settings Exchange did not return valid "
+                        "Server Network Data",
+                    )
+                )
+
+        udp_flags = basic_settings.multitransport_flags
+        udp_supported = bool(
+            udp_flags is not None
+            and udp_flags & (TRANSPORTTYPE_UDPFECR | TRANSPORTTYPE_UDPFECL)
+        )
+        if basic_settings.status == "ok":
+            findings.append(
+                CapabilityFinding(
+                    "UDP transport",
+                    "supported" if udp_supported else "not_supported",
+                    (
+                        f"Server Multitransport flags: 0x{udp_flags:08x}"
+                        if udp_flags is not None
+                        else "Server Multitransport Data was not returned"
+                    ),
+                )
+            )
+        else:
+            udp_error = (
+                "requires authenticated multitransport negotiation"
+                if authenticated_session is not None
+                and authenticated_session.status == "authenticated"
+                else basic_settings.error
+                or "Basic Settings Exchange was not available"
+            )
+            findings.append(
+                CapabilityFinding(
+                    "UDP transport",
+                    "unknown",
+                    udp_error,
+                )
+            )
+
+        if (
+            authenticated_session is not None
+            and authenticated_session.status == "authenticated"
+            and authenticated_session.demand_active_observed
+        ):
+            if authenticated_session.capability_error is not None:
+                findings.append(
+                    CapabilityFinding(
+                        "RemoteFX",
+                        "unknown",
+                        "Demand Active was received but bitmap codecs could not be "
+                        f"decoded ({authenticated_session.capability_error})",
+                    )
+                )
+            else:
+                remotefx_supported = (
+                    REMOTEFX_CODEC_GUID
+                    in authenticated_session.bitmap_codec_guids
+                )
+                findings.append(
+                    CapabilityFinding(
+                        "RemoteFX",
+                        "supported" if remotefx_supported else "not_supported",
+                        "RemoteFX bitmap codec GUID was "
+                        + (
+                            "advertised in the server Demand Active PDU"
+                            if remotefx_supported
+                            else "not advertised in the server Demand Active PDU"
+                        ),
+                    )
+                )
+        else:
+            findings.append(
+                CapabilityFinding(
+                    "RemoteFX",
+                    "unknown",
+                    (
+                        authenticated_session.error
+                        if authenticated_session is not None
+                        and authenticated_session.error is not None
+                        else "requires authenticated capability exchange"
+                    ),
+                )
+            )
+
+        findings.extend(
+            (
+                CapabilityFinding(
+                    "AVC444",
+                    "unknown",
+                    "requires RDP Graphics capability exchange",
+                ),
+                CapabilityFinding(
+                    "Multi-monitor",
+                    "unknown",
+                    "requires monitor-layout negotiation",
+                ),
+            )
+        )
+
+        status = "partial" if any(
+            finding.status == "unknown" for finding in findings
+        ) else "ok"
+        findings.sort(key=lambda finding: CAPABILITY_OUTPUT_ORDER.index(finding.name))
+        return CapabilityResult(
+            status=status,
+            findings=findings,
+            error=basic_settings.error if basic_settings.status == "error" else None,
+        )
+
     def _run_ntlminfo_test(self) -> NTLMInfoResult:
         sock: socket.socket | None = None
         probe: NegotiationProbe | None = None
@@ -1315,6 +2638,10 @@ class RDP(BaseModule):
             return last_result
 
         result.version_probes = self._probe_tls_versions(working_protocols)
+        result.weak_cipher_scan = self._probe_weak_tls_ciphers(
+            working_protocols,
+            result.version_probes,
+        )
         result.weak_findings = self._tls_weak_findings(result)
         if result.weak_findings:
             result.status = "weak"
@@ -1324,6 +2651,9 @@ class RDP(BaseModule):
         self,
         requested_protocols: int,
         tls_version: ssl.TLSVersion | None = None,
+        *,
+        verify_certificate: bool = False,
+        cipher_names: tuple[str, ...] = (),
     ) -> tuple[
         NegotiationProbe | None,
         str | None,
@@ -1360,10 +2690,21 @@ class RDP(BaseModule):
                     "server did not select a TLS-capable RDP protocol",
                 )
 
-            server_hostname = (
-                None if _target_is_ip(self.args.target.ip) else self.args.target.ip
-            )
-            context = _create_tls_context(tls_version)
+            if verify_certificate:
+                context = ssl.create_default_context()
+                if tls_version is not None:
+                    context.minimum_version = tls_version
+                    context.maximum_version = tls_version
+                server_hostname = self.args.target.ip
+            else:
+                server_hostname = (
+                    None
+                    if _target_is_ip(self.args.target.ip)
+                    else self.args.target.ip
+                )
+                context = _create_tls_context(tls_version)
+            if cipher_names:
+                context.set_ciphers(":".join(cipher_names) + ":@SECLEVEL=0")
             with context.wrap_socket(sock, server_hostname=server_hostname) as tls_sock:
                 sock = None
                 cert_der = tls_sock.getpeercert(binary_form=True)
@@ -1374,7 +2715,7 @@ class RDP(BaseModule):
                     cert_der,
                     None,
                 )
-        except (OSError, ssl.SSLError, RDPProtocolError) as exc:
+        except (OSError, ssl.SSLError, RDPProtocolError, ValueError) as exc:
             return probe, None, None, None, str(exc)
         finally:
             if sock is not None:
@@ -1401,6 +2742,82 @@ class RDP(BaseModule):
             else:
                 probes.append(TLSVersionProbe(label, False, error=error))
         return probes
+
+    def _probe_weak_tls_ciphers(
+        self,
+        requested_protocols: int,
+        version_probes: list[TLSVersionProbe],
+    ) -> WeakCipherScanResult:
+        candidates = list(_available_weak_tls_cipher_names())
+        if not candidates:
+            return WeakCipherScanResult(
+                status="unavailable",
+                error="local OpenSSL cannot offer any classified weak cipher suites",
+            )
+
+        tls12_probe = next(
+            (probe for probe in version_probes if probe.version == "TLSv1.2"),
+            None,
+        )
+        if tls12_probe is None or not tls12_probe.supported:
+            return WeakCipherScanResult(
+                status="not_applicable",
+                tested_count=len(candidates),
+                error="TLSv1.2 is not supported",
+            )
+
+        accepted: list[str] = []
+        remaining = candidates.copy()
+        while remaining:
+            if len(accepted) >= MAX_ACCEPTED_WEAK_CIPHERS:
+                return WeakCipherScanResult(
+                    status="truncated",
+                    tested_count=len(candidates),
+                    accepted_ciphers=tuple(accepted),
+                    error=(
+                        f"stopped after {MAX_ACCEPTED_WEAK_CIPHERS} accepted "
+                        "weak cipher suites"
+                    ),
+                )
+
+            _probe, _version, selected_cipher, _cert_der, error = self._tls_handshake(
+                requested_protocols,
+                ssl.TLSVersion.TLSv1_2,
+                cipher_names=tuple(remaining),
+            )
+            if error is not None:
+                return WeakCipherScanResult(
+                    status=(
+                        "inconclusive"
+                        if _cipher_scan_error_is_transport_failure(error)
+                        else "complete"
+                    ),
+                    tested_count=len(candidates),
+                    accepted_ciphers=tuple(accepted),
+                    error=(
+                        error
+                        if _cipher_scan_error_is_transport_failure(error)
+                        else None
+                    ),
+                )
+
+            selected_name = _cipher_name(selected_cipher)
+            if selected_name not in remaining:
+                return WeakCipherScanResult(
+                    status="inconclusive",
+                    tested_count=len(candidates),
+                    accepted_ciphers=tuple(accepted),
+                    error=f"server selected unexpected cipher {selected_name or 'unknown'}",
+                )
+
+            accepted.append(selected_name)
+            remaining.remove(selected_name)
+
+        return WeakCipherScanResult(
+            status="complete",
+            tested_count=len(candidates),
+            accepted_ciphers=tuple(accepted),
+        )
 
     def _parse_certificate(self, cert_der: bytes | None, target: str) -> CertificateInfo:
         if not cert_der:
@@ -1469,6 +2886,7 @@ class RDP(BaseModule):
                 san_present=san_present,
                 target_matches_san=target_matches_san,
                 signature_hash_algorithm=signature_hash_algorithm,
+                sha256_fingerprint=_certificate_sha256(cert_der),
             )
         except Exception as exc:
             return CertificateInfo(
@@ -1507,6 +2925,10 @@ class RDP(BaseModule):
             upper = cipher.upper()
             if any(token in upper for token in weak_cipher_tokens):
                 findings.append(f"weak cipher accepted: {cipher}")
+
+        if result.weak_cipher_scan is not None:
+            for cipher in result.weak_cipher_scan.accepted_ciphers:
+                findings.append(f"weak TLSv1.2 cipher accepted: {cipher}")
 
         if result.certificate is not None:
             cert = result.certificate
@@ -1552,6 +2974,11 @@ class RDP(BaseModule):
                 requested_protocols=requested_protocols,
                 error=str(exc),
             )
+
+    def _print_status(self, message: str, out: Out, *, indent: int = 4) -> None:
+        """Print an indented status line using the shared ptlibs bullet mapping."""
+        marker = ptprinthelper.bullet(out.value)
+        self.ptprint(f"{' ' * indent}{marker}{message}", Out.TEXT)
 
     def output(self) -> None:
         properties = {
@@ -1608,6 +3035,18 @@ class RDP(BaseModule):
                 self.results.rdp_encryption
             )
 
+        if self.results.capabilities is not None:
+            self._output_capabilities_text(self.results.capabilities)
+            properties["capabilities"] = self._capabilities_json(
+                self.results.capabilities
+            )
+
+        if self.results.version is not None:
+            self._output_version_text(self.results.version)
+            properties["rdpVersion"] = self._version_json(self.results.version)
+            if self.results.version.version_name is not None:
+                properties["version"] = self.results.version.version_name
+
         if self.results.ntlm_info is not None:
             self._output_ntlminfo_text(self.results.ntlm_info)
             properties["ntlmInfo"] = self._ntlminfo_json(self.results.ntlm_info)
@@ -1637,13 +3076,16 @@ class RDP(BaseModule):
                     }
                 )
 
+        if self.results.auth is not None:
+            self._output_auth_text(self.results.auth)
+            properties["authentication"] = self._auth_json(self.results.auth)
+
         if self.results.not_implemented:
             properties["notImplementedTests"] = self.results.not_implemented
             if not self.use_json:
                 for test in self.results.not_implemented:
                     self.ptprint(f"{test} test", Out.INFO)
-                    icon = get_colored_text("[!]", color="WARNING")
-                    self.ptprint(f"    {icon} Test is not implemented yet", Out.TEXT)
+                    self._print_status("Test is not implemented yet", Out.WARNING)
 
         rdp_node = self.ptjsonlib.create_node_object("software", None, None, properties)
         self.ptjsonlib.add_node(rdp_node)
@@ -1660,20 +3102,15 @@ class RDP(BaseModule):
 
         self.ptprint("Network Level Authentication (NLA) test", Out.INFO)
         if result.status == "required":
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} NLA required", Out.TEXT)
+            self._print_status("NLA required", Out.NOTVULN)
         elif result.status == "allowed_not_required":
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} NLA is allowed but not required", Out.TEXT)
+            self._print_status("NLA is allowed but not required", Out.WARNING)
         elif result.status == "not_supported":
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} NLA is not supported", Out.TEXT)
+            self._print_status("NLA is not supported", Out.VULN)
         elif result.status == "error":
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} {result.error}", Out.TEXT)
+            self._print_status(str(result.error), Out.ERROR)
         else:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} NLA status is inconclusive", Out.TEXT)
+            self._print_status("NLA status is inconclusive", Out.WARNING)
 
         for probe in result.probes:
             self.ptdebug(probe.summary())
@@ -1686,17 +3123,16 @@ class RDP(BaseModule):
 
         self.ptprint("RDP Security test", Out.INFO)
         if result.status == "allowed":
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} Legacy Standard RDP Security is allowed", Out.TEXT)
+            self._print_status("Legacy Standard RDP Security is allowed", Out.VULN)
         elif result.status == "not_allowed":
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} Legacy Standard RDP Security is not allowed", Out.TEXT)
+            self._print_status(
+                "Legacy Standard RDP Security is not allowed",
+                Out.NOTVULN,
+            )
         elif result.status == "error":
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} {result.probe.error}", Out.TEXT)
+            self._print_status(str(result.probe.error), Out.ERROR)
         else:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} RDP Security status is inconclusive", Out.TEXT)
+            self._print_status("RDP Security status is inconclusive", Out.WARNING)
         self.ptdebug(result.probe.summary())
 
     def _output_credssp_text(self, result: CredSSPResult) -> None:
@@ -1705,20 +3141,16 @@ class RDP(BaseModule):
 
         self.ptprint("CredSSP test", Out.INFO)
         if result.status == "supported":
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(f"    {icon} CredSSP is supported", Out.TEXT)
+            self._print_status("CredSSP is supported", Out.NOTVULN)
             if result.hybrid_ex_supported:
-                self.ptprint(f"    {icon} CredSSP HYBRID_EX is supported", Out.TEXT)
+                self._print_status("CredSSP HYBRID_EX is supported", Out.NOTVULN)
         elif result.status == "not_supported":
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} CredSSP is not supported", Out.TEXT)
+            self._print_status("CredSSP is not supported", Out.VULN)
         elif result.status == "error":
-            icon = get_colored_text("[✗]", color="VULN")
             probe = next(p for p in result.probes if p.name == "CredSSP/NLA only")
-            self.ptprint(f"    {icon} {probe.error}", Out.TEXT)
+            self._print_status(str(probe.error), Out.ERROR)
         else:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(f"    {icon} CredSSP status is inconclusive", Out.TEXT)
+            self._print_status("CredSSP status is inconclusive", Out.WARNING)
         for probe in result.probes:
             self.ptdebug(probe.summary())
 
@@ -1728,8 +3160,7 @@ class RDP(BaseModule):
 
         self.ptprint("RDP security and encryption enumeration", Out.INFO)
         if result.status == "error":
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} {result.error}", Out.TEXT)
+            self._print_status(str(result.error), Out.ERROR)
             return
 
         self.ptprint("    Security protocols", Out.TEXT)
@@ -1737,41 +3168,41 @@ class RDP(BaseModule):
             supported = probe.selected_protocol == probe.requested_protocols
             if supported:
                 insecure = probe.requested_protocols == PROTOCOL_RDP
-                icon = get_colored_text(
-                    "[✗]" if insecure else "[✓]",
-                    color="VULN" if insecure else "NOTVULN",
-                )
+                status_out = Out.VULN if insecure else Out.NOTVULN
                 state = "supported"
             elif probe.failed_by_server:
-                icon = get_colored_text("[!]", color="WARNING")
+                status_out = Out.WARNING
                 state = "not supported"
             elif probe.error:
-                icon = get_colored_text("[!]", color="WARNING")
+                status_out = Out.WARNING
                 state = f"unknown ({probe.error})"
             else:
-                icon = get_colored_text("[!]", color="WARNING")
+                status_out = Out.WARNING
                 state = f"selected {protocol_name(probe.selected_protocol)}"
-            self.ptprint(f"        {icon} {probe.name}: {state}", Out.TEXT)
+            self._print_status(
+                f"{probe.name}: {state}",
+                status_out,
+                indent=8,
+            )
 
         if result.response_flags:
             self.ptprint("    Negotiation capabilities", Out.TEXT)
             for flag, name in NEGOTIATION_RESPONSE_FLAGS.items():
                 if result.response_flags & flag:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
-                    self.ptprint(f"        {icon} {name}", Out.TEXT)
+                    self._print_status(name, Out.NOTVULN, indent=8)
 
         self.ptprint("    Standard RDP encryption", Out.TEXT)
         if result.legacy_status == "not_allowed":
-            icon = get_colored_text("[✓]", color="NOTVULN")
-            self.ptprint(
-                f"        {icon} Standard RDP Security is not accepted",
-                Out.TEXT,
+            self._print_status(
+                "Standard RDP Security is not accepted",
+                Out.NOTVULN,
+                indent=8,
             )
         elif not result.legacy_probes:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(
-                f"        {icon} Encryption methods could not be enumerated",
-                Out.TEXT,
+            self._print_status(
+                "Encryption methods could not be enumerated",
+                Out.WARNING,
+                indent=8,
             )
         else:
             levels = {
@@ -1782,15 +3213,19 @@ class RDP(BaseModule):
             for legacy_probe in result.legacy_probes:
                 method_name = ENCRYPTION_METHOD_NAMES[legacy_probe.requested_method]
                 if legacy_probe.accepted is True:
-                    icon = get_colored_text("[✗]", color="VULN")
+                    status_out = Out.VULN
                     state = "accepted"
                 elif legacy_probe.accepted is False:
-                    icon = get_colored_text("[✓]", color="NOTVULN")
+                    status_out = Out.NOTVULN
                     state = "not accepted"
                 else:
-                    icon = get_colored_text("[!]", color="WARNING")
+                    status_out = Out.WARNING
                     state = f"unknown ({legacy_probe.error})"
-                self.ptprint(f"        {icon} {method_name}: {state}", Out.TEXT)
+                self._print_status(
+                    f"{method_name}: {state}",
+                    status_out,
+                    indent=8,
+                )
             if levels:
                 level_names = ", ".join(
                     ENCRYPTION_LEVEL_NAMES.get(level, f"Unknown ({level})")
@@ -1815,35 +3250,103 @@ class RDP(BaseModule):
         for probe in result.protocol_probes:
             self.ptdebug(probe.summary())
 
+    def _output_capabilities_text(self, result: CapabilityResult) -> None:
+        if self.use_json:
+            return
+
+        self.ptprint("RDP capabilities", Out.INFO)
+        for finding in result.findings:
+            if finding.status == "supported":
+                status_out = Out.NOTVULN
+                state = "supported"
+            elif finding.status == "allocated":
+                status_out = Out.WARNING
+                state = "channel allocated, policy not verified"
+            elif finding.status == "not_supported":
+                status_out = Out.WARNING
+                state = "not supported"
+            else:
+                status_out = Out.WARNING
+                state = (
+                    finding.evidence
+                    if finding.evidence.startswith("requires")
+                    else f"unknown ({finding.evidence})"
+                )
+            self._print_status(f"{finding.name}: {state}", status_out)
+            self.ptdebug(f"{finding.name}: {finding.evidence}")
+
+        if result.error:
+            self.ptdebug(f"Capability probe error: {result.error}")
+
+    def _output_version_text(self, result: RDPVersionResult) -> None:
+        if self.use_json:
+            return
+
+        self.ptprint("RDP protocol version", Out.INFO)
+        if result.status == "ok":
+            self._print_status(
+                f"Server reports: {result.version_name}",
+                Out.NOTVULN,
+            )
+        elif result.status == "ambiguous":
+            self._print_status(
+                f"Server reports: {result.version_name}",
+                Out.WARNING,
+            )
+            self.ptprint(
+                "        Exact version cannot be distinguished by the RDP handshake",
+                Out.TEXT,
+            )
+        elif result.status == "unknown":
+            self._print_status(
+                f"Unrecognized server version: {result.version_name}",
+                Out.WARNING,
+            )
+        elif result.status == "unavailable":
+            self._print_status(
+                "Version is not available before authentication: "
+                f"{result.error}",
+                Out.WARNING,
+            )
+        else:
+            self._print_status(
+                f"Version probe failed: {result.error}",
+                Out.ERROR,
+            )
+
+        if result.transport is not None:
+            self.ptdebug(f"Basic Settings Exchange transport: {result.transport}")
+        if result.source is not None:
+            self.ptdebug(f"Version source: {result.source}")
+
     def _output_ntlminfo_text(self, result: NTLMInfoResult) -> None:
         if self.use_json:
             return
 
         self.ptprint("RDP NTLM information", Out.INFO)
         if result.status == "ok" and result.info is not None:
-            icon = get_colored_text("[!]", color="WARNING")
             protocol = result.selected_protocol or "unknown protocol"
-            self.ptprint(
-                f"    {icon} NTLM challenge exposes server information via {protocol}",
-                Out.TEXT,
+            self._print_status(
+                f"NTLM challenge exposes server information via {protocol}",
+                Out.WARNING,
             )
             for line in self._ntlm_info_output_lines(result.info):
                 self.ptprint(f"        {line}", Out.TEXT)
         elif result.status == "empty":
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(
-                f"    {icon} NTLM challenge was received but no server fields were decoded",
-                Out.TEXT,
+            self._print_status(
+                "NTLM challenge was received but no server fields were decoded",
+                Out.WARNING,
             )
         elif result.status == "not_supported":
-            icon = get_colored_text("[✓]", color="NOTVULN")
             detail = f": {result.error}" if result.error else ""
-            self.ptprint(f"    {icon} NTLM information not available{detail}", Out.TEXT)
+            self._print_status(
+                f"NTLM information not available{detail}",
+                Out.NOTVULN,
+            )
         else:
-            icon = get_colored_text("[!]", color="WARNING")
-            self.ptprint(
-                f"    {icon} NTLM information test failed: {result.error}",
-                Out.TEXT,
+            self._print_status(
+                f"NTLM information test failed: {result.error}",
+                Out.WARNING,
             )
 
         if result.negotiation_probe is not None:
@@ -1855,28 +3358,98 @@ class RDP(BaseModule):
 
         self.ptprint("TLS / SSL configuration test", Out.INFO)
         if result.status in ("ok", "weak"):
-            icon = get_colored_text(
-                "[!]" if result.status == "weak" else "[✓]",
-                color="WARNING" if result.status == "weak" else "NOTVULN",
-            )
             detail = result.selected_tls_version or "unknown TLS version"
             if result.selected_cipher:
                 detail = f"{detail}, {result.selected_cipher}"
-            self.ptprint(f"    {icon} TLS handshake successful ({detail})", Out.TEXT)
+            self._print_status(
+                f"TLS handshake successful ({detail})",
+                Out.WARNING if result.status == "weak" else Out.NOTVULN,
+            )
             for finding in result.weak_findings:
-                finding_icon = get_colored_text("[!]", color="WARNING")
-                self.ptprint(f"    {finding_icon} {finding}", Out.TEXT)
+                self._print_status(finding, Out.WARNING)
         else:
-            icon = get_colored_text("[✗]", color="VULN")
-            self.ptprint(f"    {icon} TLS handshake failed: {result.error}", Out.TEXT)
+            self._print_status(
+                f"TLS handshake failed: {result.error}",
+                Out.ERROR,
+            )
 
         if result.certificate and result.certificate.subject:
             self.ptdebug(f"Certificate subject: {result.certificate.subject}")
             self.ptdebug(f"Certificate issuer: {result.certificate.issuer}")
             self.ptdebug(f"Certificate notAfter: {result.certificate.not_after}")
+            self.ptdebug(
+                "Certificate SHA-256: "
+                f"{result.certificate.sha256_fingerprint or 'unavailable'}"
+            )
+        if result.weak_cipher_scan is not None:
+            scan = result.weak_cipher_scan
+            if scan.status == "complete" and not scan.accepted_ciphers:
+                self._print_status(
+                    "No locally offerable weak TLSv1.2 cipher "
+                    f"accepted ({scan.tested_count} tested)",
+                    Out.NOTVULN,
+                )
+            elif scan.status in {"inconclusive", "unavailable", "truncated"}:
+                detail = scan.error or "scan did not complete"
+                self._print_status(
+                    f"Weak TLSv1.2 cipher scan {scan.status}: {detail}",
+                    Out.WARNING,
+                )
+            self.ptdebug(
+                f"Weak TLSv1.2 cipher candidates: {scan.tested_count}; "
+                f"accepted: {len(scan.accepted_ciphers)}"
+            )
         for probe in result.version_probes:
             status = "supported" if probe.supported else f"not supported ({probe.error})"
             self.ptdebug(f"{probe.version}: {status}")
+
+    def _output_auth_text(self, result: RDPAuthResult) -> None:
+        if self.use_json:
+            return
+
+        self.ptprint("RDP authentication test", Out.INFO)
+        if result.status == "authenticated":
+            selected_protocol = protocol_name(result.selected_protocol)
+            self._print_status(
+                "CredSSP/NTLM authentication succeeded "
+                f"({selected_protocol})",
+                Out.NOTVULN,
+            )
+        elif result.status == "tls_error":
+            self._print_status(
+                f"Credentials were not used: {result.error}",
+                Out.ERROR,
+            )
+        elif result.status == "missing_credentials":
+            self._print_status(
+                "AUTH requires both --login and --password",
+                Out.WARNING,
+            )
+        elif result.status == "not_supported":
+            self._print_status(
+                "CredSSP/NTLM authentication is not supported",
+                Out.WARNING,
+            )
+            if result.error:
+                self.ptdebug(result.error)
+        else:
+            self._print_status(
+                "Authentication or RDP session setup failed",
+                Out.WARNING,
+            )
+            if result.error:
+                self.ptdebug(result.error)
+
+        if result.tls_verification == "insecure":
+            self._print_status(
+                "TLS certificate validation was explicitly disabled",
+                Out.WARNING,
+            )
+        if result.certificate_sha256 is not None:
+            self.ptdebug(
+                "Authentication TLS certificate SHA-256: "
+                f"{result.certificate_sha256}"
+            )
 
     def _nla_json(self, result: NLAResult) -> dict:
         return {
@@ -1957,6 +3530,46 @@ class RDP(BaseModule):
             },
         }
 
+    def _capabilities_json(self, result: CapabilityResult) -> dict:
+        return {
+            "status": result.status,
+            "error": result.error,
+            "findings": [
+                {
+                    "name": finding.name,
+                    "status": finding.status,
+                    "evidence": finding.evidence,
+                }
+                for finding in result.findings
+            ],
+        }
+
+    def _version_json(self, result: RDPVersionResult) -> dict:
+        return {
+            "status": result.status,
+            "advertisedVersion": result.advertised_version,
+            "advertisedVersionHex": (
+                f"0x{result.advertised_version:08x}"
+                if result.advertised_version is not None
+                else None
+            ),
+            "versionName": result.version_name,
+            "transport": result.transport,
+            "source": result.source,
+            "error": result.error,
+            "isSupportedVersionList": False,
+        }
+
+    def _auth_json(self, result: RDPAuthResult) -> dict:
+        return {
+            "status": result.status,
+            "selectedProtocol": protocol_name(result.selected_protocol),
+            "sessionEstablished": result.session_established,
+            "tlsVerification": result.tls_verification,
+            "certificateSha256": result.certificate_sha256,
+            "error": result.error,
+        }
+
     def _ntlminfo_json(self, result: NTLMInfoResult) -> dict:
         return {
             "status": result.status,
@@ -2017,6 +3630,18 @@ class RDP(BaseModule):
                 }
                 for probe in result.version_probes
             ],
+            "weakCipherScan": (
+                {
+                    "status": result.weak_cipher_scan.status,
+                    "testedCount": result.weak_cipher_scan.tested_count,
+                    "acceptedCiphers": list(
+                        result.weak_cipher_scan.accepted_ciphers
+                    ),
+                    "error": result.weak_cipher_scan.error,
+                }
+                if result.weak_cipher_scan is not None
+                else None
+            ),
         }
 
     def _negotiation_probe_json(self, probe: NegotiationProbe) -> dict:
@@ -2055,4 +3680,5 @@ class RDP(BaseModule):
             "sanPresent": certificate.san_present,
             "targetMatchesSan": certificate.target_matches_san,
             "signatureHashAlgorithm": certificate.signature_hash_algorithm,
+            "sha256Fingerprint": certificate.sha256_fingerprint,
         }

@@ -9,6 +9,7 @@ from typing import NamedTuple
 
 from ptlibs.ptjsonlib import PtJsonLib
 from .utils import ptprinthelper
+from .utils.ptprinthelper import get_colored_text
 from ..ptntlmauth.ptntlmauth import NTLMInfo, get_NegotiateMessage_data, decode_ChallengeMessage_blob
 
 from ._base import BaseModule, BaseArgs, Out
@@ -574,6 +575,251 @@ class VULNS(Enum):
 
 # endregion
 
+
+# region -ts test registry (single source of truth for `-ts/--tests`)
+
+# Internal per-test dest flags driven by -ts. The legacy RECON flags were removed;
+# -ts is the only public interface, so these bool dests must be initialised
+# explicitly (argparse no longer defines them). run() reads exactly these.
+# Value-carrying modifiers (--eicar-mailbox, --cl-max, --usrenum-*, ...) keep their
+# own argparse defaults and are documented per-test.
+IMAP_TEST_DESTS: tuple[str, ...] = (
+    "info", "banner", "commands", "isencrypt", "sniffable", "invalid_commands",
+    "anonymous", "ntlm", "eicar", "conn_limits_probe", "imap_usrenum",
+    "imap_usrenum_plain", "imap_resource_load", "imap_mailbox_iso", "imap_tls_audit",
+)
+
+# Ordered groups for the main help table.
+IMAP_TEST_GROUPS: list[tuple[str, list[str]]] = [
+    ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "NTLM"]),
+    ("Protocol & validation", ["SNIFF", "INVCMD"]),
+    ("Authentication & enumeration", ["ANON", "USRENUM", "USRENUMPLAIN", "BRUTE"]),
+    ("Content security", ["EICAR"]),
+    ("Rate limiting & stress", ["CONNLIM", "RESLOAD"]),
+    ("Access control & TLS", ["MBOXISO", "TLSAUDIT"]),
+]
+
+# Per-test definitions:
+#   desc      one-line description for the main -ts table
+#   long      list of <=3 lines describing the test (per-test help)
+#   flags     dict dest->value applied to the args namespace when selected
+#   requires  human-readable prerequisite strings (per-test help)
+#   mods      test-specific option rows [short, long, metavar, help] (per-test help)
+IMAP_TESTS: dict[str, dict] = {
+    "BANNER": {
+        "desc": "Grab banner and service identification",
+        "long": ["Connect and read the greeting banner, then identify the product,",
+                 "version and CPE from the advertised software string."],
+        "flags": {"banner": True},
+    },
+    "CAPA": {
+        "desc": "Grab ID and CAPABILITY",
+        "long": ["Inspect the ID and CAPABILITY responses and flag weak or",
+                 "information-disclosing options."],
+        "flags": {"commands": True},
+    },
+    "ENCRYPT": {
+        "desc": "Test encryption options (plaintext / STARTTLS / TLS)",
+        "long": ["Inspect supported transport encryption on the port: plaintext",
+                 "login, explicit STARTTLS upgrade and implicit TLS."],
+        "flags": {"isencrypt": True},
+    },
+    "NTLM": {
+        "desc": "Inspect NTLM authentication",
+        "long": ["AUTHENTICATE NTLM: read CAPABILITY for AUTH=NTLM, send Negotiate",
+                 "and decode the server Challenge for leaked domain / host info."],
+        "flags": {"ntlm": True},
+    },
+    "SNIFF": {
+        "desc": "Cleartext sniffable probe",
+        "long": ["Probe cleartext IMAP: CAPABILITY, STARTTLS advertisement and",
+                 "whether AUTHENTICATE accepts a continuation on plain TCP."],
+        "flags": {"sniffable": True},
+    },
+    "INVCMD": {
+        "desc": "Test invalid / non-standard commands",
+        "long": ["Audit invalid / malformed IMAP commands, long lines, bad tags and",
+                 "binary / control octets for robustness and info leaks."],
+        "flags": {"invalid_commands": True},
+    },
+    "ANON": {
+        "desc": "Check anonymous access",
+        "long": ["Check SASL ANONYMOUS and LOGIN anonymous / guest / public to",
+                 "detect servers that accept unauthenticated access."],
+        "flags": {"anonymous": True},
+    },
+    "USRENUM": {
+        "desc": "LOGIN user enumeration",
+        "long": ["LOGIN each name from the wordlist with a fixed wrong password and",
+                 "compare errors against non-existent baselines."],
+        "flags": {"imap_usrenum": True},
+        "requires": ["--usrenum-wordlist <file>"],
+        "mods": [
+            ["", "--usrenum-wordlist", "<file>", "Username list (required)"],
+            ["", "--usrenum-password", "<str>", "Wrong password for every probe"],
+            ["", "--usrenum-max", "<n>", "Limit names read from wordlist (0 = no limit)"],
+            ["", "--usrenum-threads", "<n>", "Parallel TCP sessions (default 1)"],
+        ],
+    },
+    "USRENUMPLAIN": {
+        "desc": "AUTHENTICATE PLAIN user enumeration",
+        "long": ["AUTHENTICATE PLAIN (SASL) each name from the wordlist with a wrong",
+                 "password; use when CAPABILITY lists LOGINDISABLED."],
+        "flags": {"imap_usrenum_plain": True},
+        "requires": ["--usrenum-wordlist <file>"],
+        "mods": [
+            ["", "--usrenum-wordlist", "<file>", "Username list (required)"],
+            ["", "--usrenum-password", "<str>", "Wrong password for every probe"],
+            ["", "--usrenum-max", "<n>", "Limit names read from wordlist (0 = no limit)"],
+            ["", "--usrenum-threads", "<n>", "Parallel TCP sessions (default 1)"],
+        ],
+    },
+    "BRUTE": {
+        "desc": "Login bruteforce (USER/PASS)",
+        "long": ["Bruteforce IMAP login with the supplied username(s) and",
+                 "password(s); runs a catch-all check first."],
+        "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
+        "mods": [
+            ["-u", "--user", "<name>", "Single username"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "<password>", "Single password"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+        ],
+    },
+    "EICAR": {
+        "desc": "APPEND EICAR antivirus probe",
+        "long": ["APPEND an RFC 822 message containing the EICAR test line to a",
+                 "mailbox to check server-side antivirus / content filtering."],
+        "requires": ["-u/--user and -p/--password (no wordlists)"],
+        "mods": [
+            ["", "--eicar-mailbox", "<name>", "Mailbox name for APPEND (default INBOX)"],
+        ],
+    },
+    "CONNLIM": {
+        "desc": "Connection limits / rate / idle probes",
+        "long": ["Connection-count, connect-rate and idle-time probes; with -u/-p",
+                 "also probes parallel LOGIN sessions and IDLE lifetime."],
+        "mods": [
+            ["", "--cl-max", "<n>", "Max concurrent connections in ramp-up"],
+        ],
+    },
+    "RESLOAD": {
+        "desc": "APPEND + SEARCH resource-load stress",
+        "long": ["Bounded authenticated APPEND burst followed by a UID SEARCH ALL",
+                 "loop; watches for disconnects, errors and slowdown."],
+        "requires": ["-u/--user and -p/--password (no wordlists)"],
+        "mods": [
+            ["", "--resource-load-mailbox", "<name>", "Mailbox for APPEND phase (default INBOX)"],
+            ["", "--resource-load-append-max", "<n>", "Max APPEND operations (hard cap 5000)"],
+            ["", "--resource-load-search-max", "<n>", "Max UID SEARCH ALL commands (0 skips)"],
+        ],
+    },
+    "MBOXISO": {
+        "desc": "Mailbox isolation / ACL",
+        "long": ["Post-login isolation: NAMESPACE, LIST, GETACL, bounded EXAMINE",
+                 "path probes and a LIST dictionary for cross-user access."],
+        "requires": ["-u/--user and -p/--password (no wordlists)"],
+        "mods": [
+            ["", "--mailbox-iso-foreign-user", "<name>", "Token for cross-user heuristics (default user2)"],
+            ["", "--mailbox-iso-mailbox", "<name>", "Own baseline mailbox (default INBOX)"],
+        ],
+    },
+    "TLSAUDIT": {
+        "desc": "Strict TLS handshake + certificate audit",
+        "long": ["Strict TLS handshake with platform trust store and hostname check;",
+                 "reports TLS version, cipher and certificate subject / issuer / SAN.",
+                 "Implicit TLS on 993 (or --tls), otherwise STARTTLS when advertised."],
+        "flags": {"imap_tls_audit": True},
+    },
+}
+
+
+def _imap_parse_test_codes(raw: str | None) -> list[str]:
+    """Split and upper-case a raw -ts value into a list of codes."""
+    if not raw:
+        return []
+    return [c.strip().upper() for c in str(raw).split(",") if c.strip()]
+
+
+def _apply_imap_tests(args) -> None:
+    """Translate ``-ts/--tests`` codes into the internal per-test dest flags.
+
+    ``ALL`` (or no ``-ts``) leaves every flag at its default -> run-all mode.
+    Since the legacy flags were removed, every bool test dest is initialised here
+    so ``run()`` can read them unconditionally.
+    """
+    for dest in IMAP_TEST_DESTS:
+        if not hasattr(args, dest):
+            setattr(args, dest, False)
+
+    codes = _imap_parse_test_codes(getattr(args, "tests", None))
+    if not codes or "ALL" in codes:
+        # No -ts or explicit ALL: apply nothing so _is_default_mode() stays True.
+        return
+
+    unknown = [c for c in codes if c not in IMAP_TESTS]
+    if unknown:
+        available = ", ".join(IMAP_TESTS)
+        raise argparse.ArgumentError(
+            None,
+            f"Unknown test(s): {', '.join(unknown)}. Available: ALL, {available}",
+        )
+
+    for code in codes:
+        for dest, val in IMAP_TESTS[code].get("flags", {}).items():
+            setattr(args, dest, val)
+
+    # Every explicitly selected test must actually activate; otherwise report what
+    # is missing instead of silently falling back to run-all mode.
+    inactive: list[tuple[str, list[str]]] = []
+    for code in codes:
+        spec = IMAP_TESTS[code]
+        if code == "BRUTE":
+            active = check_if_brute(args)
+        elif "flags" in spec:
+            active = all(getattr(args, dest, None) for dest in spec["flags"])
+        else:
+            active = True
+        if not active:
+            inactive.append((code, list(spec.get("requires", []))))
+    if inactive:
+        parts = [
+            f"{code} requires {'; '.join(req)}" if req else f"{code} could not be activated"
+            for code, req in inactive
+        ]
+        raise argparse.ArgumentError(None, "; ".join(parts))
+
+
+def _imap_test_help(codes: list[str]):
+    """Build a help object (for ptprinthelper.help_print) describing given test codes."""
+    if not codes:
+        return None
+    valid = [c for c in codes if c in IMAP_TESTS]
+    if not valid:
+        available = ", ".join(IMAP_TESTS)
+        return [
+            {"unknown_test": [f"Unknown test: {', '.join(codes)}"]},
+            {"available_tests": [f"ALL, {available}"]},
+        ]
+    out: list[dict] = []
+    for code in valid:
+        spec = IMAP_TESTS[code]
+        header = f"{code} — {spec.get('desc', '')}"
+        out.append({"test": [header, *spec.get("long", [])]})
+        req = list(spec.get("requires", []))
+        if req:
+            out.append({"requires": req})
+        rows: list[list[str]] = list(spec.get("mods", []))
+        if rows:
+            out.append({"test_options": rows})
+        has_opts = bool(rows or req)
+        usage = f"ptsrvtester imap -ts {code} " + ("<options> <target>" if has_opts else "<target>")
+        out.append({"usage": [usage]})
+    return out
+
+
+# endregion
+
 # region arguments
 
 
@@ -581,6 +827,7 @@ class IMAPArgs(ArgsWithBruteforce):
     target: Target
     tls: bool
     starttls: bool
+    tests: str | None
     info: bool
     banner: bool
     commands: bool
@@ -610,117 +857,76 @@ class IMAPArgs(ArgsWithBruteforce):
 
     @staticmethod
     def get_help():
+        # Test selection table (-ts): one code + one-line description per test.
+        options: list[list[str]] = [
+            ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,CAPA); ALL runs everything:"],
+        ]
+        for group_title, codes in IMAP_TEST_GROUPS:
+            options.append(["", "", "", ""])
+            options.append(["", "", get_colored_text(group_title, "TITLE")])
+            for code in codes:
+                options.append(["", "", code, IMAP_TESTS[code]["desc"]])
+
+        # Global options (test-specific modifiers live in `imap -ts <TEST> -h`).
+        options += [
+            ["", "", "", ""],
+            [get_colored_text("Connection", "TITLE")],
+            ["", "--tls", "", "Use implicit SSL/TLS (default port 993)"],
+            ["", "--starttls", "", "Use explicit STARTTLS (default port 143)"],
+            ["", "", "", ""],
+            [get_colored_text("Credentials (BRUTE / authenticated tests)", "TITLE")],
+            ["-u", "--user", "<name>", "Single username"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "<password>", "Single password"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            ["", "", "", ""],
+            [get_colored_text("Output", "TITLE")],
+            ["-j", "--json", "", "Output in JSON format"],
+            ["-vv", "--verbose", "", "Enable verbose mode"],
+            ["-h", "--help", "", "Show this help; 'imap -ts <TEST> -h' for test options"],
+        ]
+
         return [
             {"description": ["IMAP Testing Module"]},
-            {"usage": ["ptsrvtester imap <options> <target>"]},
+            {"usage": ["ptsrvtester imap -ts <test>[,<test>...] <options> <target>"]},
             {"usage_example": [
-                "ptsrvtester imap --tls -iAN 127.0.0.1",
-                "ptsrvtester imap -u admin -P passwords.txt 127.0.0.1:143",
-                "ptsrvtester imap --sniffable 127.0.0.1:143",
-                "ptsrvtester imap -iv 127.0.0.1:143",
-                "ptsrvtester imap -cl 127.0.0.1:143",
-                "ptsrvtester imap --eicar -u user -p pass 127.0.0.1:143",
-                "ptsrvtester imap --resource-load -u user -p pass 127.0.0.1:143",
-                "ptsrvtester imap --mailbox-iso -u user -p pass 127.0.0.1:143",
-                "ptsrvtester imap --tls-audit mail.example.com:993",
-                "ptsrvtester imap --usrenum --usrenum-wordlist users.txt 127.0.0.1:143",
-                "ptsrvtester imap --usrenum-plain --usrenum-wordlist users.txt 127.0.0.1:143",
+                "ptsrvtester imap -ts BANNER,CAPA 127.0.0.1",
+                "ptsrvtester imap -ts ALL 127.0.0.1",
+                "ptsrvtester imap -ts ALL --tls 127.0.0.1:993",
+                "ptsrvtester imap -ts ENCRYPT,SNIFF 127.0.0.1:143",
+                "ptsrvtester imap -ts EICAR -u user -p pass 127.0.0.1:143",
+                "ptsrvtester imap -ts USRENUM --usrenum-wordlist users.txt --usrenum-threads 4 127.0.0.1:143",
+                "ptsrvtester imap -ts TLSAUDIT mail.example.com:993",
+                "ptsrvtester imap -ts BRUTE -u admin -P passwords.txt 127.0.0.1:143",
+                "ptsrvtester imap -ts USRENUM -h",
             ]},
-            {"options": [
-                ["-i", "--info", "", "Grab banner, ID and CAPABILITY"],
-                ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
-                ["-c", "--commands", "", "Grab ID and CAPABILITY only"],
-                ["-ie", "--is-encrypt", "", "Test encryption options (plaintext, STARTTLS, TLS)"],
-                ["-sf", "--sniffable", "", "Cleartext IMAP probe: CAPABILITY, STARTTLS, AUTHENTICATE (+) — PTV-SVC-SNIFFABLE"],
-                ["-iv", "--invalid-commands", "", "Invalid/malformed IMAP lines & long/binary probes — PTV-SVC-IMAP-INVCOMM"],
-                ["-cl", "--conn-limits", "", "Connection limits / rate / idle; optional --cl-max N; -u/-p adds LOGIN+IDLE probes — PTV-SVC-IMAP-CONN*"],
-                ["", "--cl-max", "<N>", f"Max ramp connections for -cl (default {CONN_LIMIT_DEFAULT_ATTEMPTS})"],
-                ["-A", "--anonymous", "", "Anonymous access: AUTH=ANONYMOUS, AUTHENTICATE ANONYMOUS, LOGIN anonymous/guest/public — PTL-SVC-IMAP-ANONYMOUS"],
-                ["", "--eicar", "", "APPEND EICAR test line (needs -u -p, no wordlists) — PTV-SVC-IMAP-EICAR"],
-                ["", "--eicar-mailbox", "<NAME>", "Mailbox for APPEND (default INBOX)"],
-                ["", "--usrenum", "", "LOGIN user enumeration (wrong password); needs --usrenum-wordlist — PTV-SVC-IMAP-USRENUM"],
-                [
-                    "",
-                    "--usrenum-plain",
-                    "",
-                    "AUTHENTICATE PLAIN user enumeration (wrong password); needs --usrenum-wordlist — PTV-SVC-IMAP-USRENUM",
-                ],
-                ["", "--usrenum-wordlist", "<file>", "Usernames to probe (one per line; with --usrenum or --usrenum-plain)"],
-                ["", "--usrenum-password", "<str>", "Fixed wrong password for all probes (default built-in)"],
-                ["", "--usrenum-max", "<N>", "Max names from wordlist (0 = no limit)"],
-                ["", "--usrenum-threads", "<N>", "Parallel enumeration probes / sessions (default 1)"],
-                [
-                    "",
-                    "--resource-load",
-                    "",
-                    "bounded APPEND + SEARCH stress (needs -u -p, no wordlists) — PTV-SVC-IMAP-RESLOAD",
-                ],
-                ["", "--resource-load-mailbox", "<NAME>", "mailbox for APPEND phase (default INBOX)"],
-                [
-                    "",
-                    "--resource-load-append-max",
-                    "<N>",
-                    f"max APPEND operations (default {_IMAP_LOAD_APPEND_MAX_DEFAULT}; safety-capped)",
-                ],
-                [
-                    "",
-                    "--resource-load-search-max",
-                    "<N>",
-                    f"max UID SEARCH ALL per session (default {_IMAP_LOAD_SEARCH_MAX_DEFAULT}; 0 = skip SEARCH phase)",
-                ],
-                [
-                    "",
-                    "--mailbox-iso",
-                    "",
-                    "post-login EXAMINE/LIST/GETACL/NAMESPACE isolation & shared-folder hygiene (needs -u -p) — PTV-SVC-IMAP-AUTHZ-BYPASS",
-                ],
-                [
-                    "",
-                    "--mailbox-iso-foreign-user",
-                    "<NAME>",
-                    "token for cross-user path probes (default user2; e.g. user2/INBOX, INBOX.user2)",
-                ],
-                ["", "--mailbox-iso-mailbox", "<NAME>", "own mailbox: baseline SELECT + restore after EXAMINE probes (default INBOX)"],
-                [
-                    "",
-                    "--tls-audit",
-                    "",
-                    "strict TLS + certificate audit (hostname per RFC 7817, chain trust, TLS/cipher/expiry) — PTV-SVC-IMAP-TLSAUDIT",
-                ],
-                ["-N", "--ntlm", "", "NTLM AUTHENTICATE info disclosure (CAPABILITY AUTH=NTLM; Challenge decode) — PTL-SVC-IMAP-NTLMINFO"],
-                ["", "", "", ""],
-                ["", "--tls", "", "Use implicit SSL/TLS"],
-                ["", "--starttls", "", "Use explicit SSL/TLS"],
-                ["", "", "", ""],
-                ["-u", "--user", "<username>", "Single username for bruteforce"],
-                ["-U", "--users", "<wordlist>", "File with usernames"],
-                ["-p", "--password", "<password>", "Single password for bruteforce"],
-                ["-P", "--passwords", "<wordlist>", "File with passwords"],
-                ["", "", "", ""],
-                ["-h", "--help", "", "Show this help message and exit"],
-                ["-vv", "--verbose", "", "Enable verbose mode"],
-            ]}
+            {"options": options},
         ]
+
+    @staticmethod
+    def get_test_help(codes):
+        """Per-test help object (used by `imap -ts <TEST> -h`)."""
+        return _imap_test_help(codes)
 
     def add_subparser(self, name: str, subparsers) -> None:
         """Adds a subparser of IMAP arguments"""
         examples = """example usage:
   ptsrvtester imap -h
-  ptsrvtester imap --tls -iAN 127.0.0.1
-  ptsrvtester imap -ie 127.0.0.1
-  ptsrvtester imap --sniffable 127.0.0.1:143
-  ptsrvtester imap -iv 127.0.0.1:143
-  ptsrvtester imap -cl 127.0.0.1:143
-  ptsrvtester imap --cl-max 50 -cl mail.example.com
-  ptsrvtester imap --eicar -u user -p pass 127.0.0.1:143
-  ptsrvtester imap --resource-load -u user -p pass 127.0.0.1:143
-  ptsrvtester imap --mailbox-iso -u user -p pass 127.0.0.1:143
-  ptsrvtester imap --mailbox-iso --mailbox-iso-foreign-user other --mailbox-iso-mailbox INBOX -u a -p b mail:143
-  ptsrvtester imap --tls-audit mail.example.com:993
-  ptsrvtester imap --tls-audit mail.example.com:143
-  ptsrvtester imap --usrenum --usrenum-wordlist users.txt --usrenum-threads 4 127.0.0.1:143
-  ptsrvtester imap --usrenum-plain --usrenum-wordlist users.txt 127.0.0.1:143
-  ptsrvtester -j imap -u admin -P passwords.txt --brute-threads 20 127.0.0.1:143"""
+  ptsrvtester imap -ts BANNER,CAPA 127.0.0.1
+  ptsrvtester imap -ts ALL 127.0.0.1
+  ptsrvtester imap -ts ALL --tls 127.0.0.1:993
+  ptsrvtester imap -ts ENCRYPT,SNIFF 127.0.0.1:143
+  ptsrvtester imap -ts CONNLIM --cl-max 50 mail.example.com
+  ptsrvtester imap -ts EICAR -u user -p pass 127.0.0.1:143
+  ptsrvtester imap -ts RESLOAD -u user -p pass 127.0.0.1:143
+  ptsrvtester imap -ts MBOXISO -u user -p pass 127.0.0.1:143
+  ptsrvtester imap -ts TLSAUDIT mail.example.com:993
+  ptsrvtester imap -ts USRENUM --usrenum-wordlist users.txt --usrenum-threads 4 127.0.0.1:143
+  ptsrvtester imap -ts USRENUMPLAIN --usrenum-wordlist users.txt 127.0.0.1:143
+  ptsrvtester -j imap -ts BRUTE -u admin -P passwords.txt --brute-threads 20 127.0.0.1:143
+  ptsrvtester imap -ts USRENUM -h"""
 
         parser = subparsers.add_parser(
             name,
@@ -741,205 +947,101 @@ class IMAPArgs(ArgsWithBruteforce):
         parser.add_argument("--tls", action="store_true", help="use implicit SSL/TLS")
         parser.add_argument("--starttls", action="store_true", help="use explicit SSL/TLS")
 
-        recon = parser.add_argument_group("RECON")
-        recon.add_argument(
-            "-i",
-            "--info",
-            action="store_true",
-            help="grab banner and inspect ID and CAPABILITY commands",
+        parser.add_argument(
+            "-ts",
+            "--tests",
+            type=str,
+            default=None,
+            metavar="<test>",
+            dest="tests",
+            help="Comma-separated test codes (e.g. BANNER,CAPA) or ALL; 'imap -ts <TEST> -h' for test options",
         )
-        recon.add_argument("-b", "--banner", action="store_true", help="grab banner + Service Identification (product, version, CPE)")
-        recon.add_argument("-c", "--commands", action="store_true", help="grab ID and CAPABILITY only")
-        recon.add_argument(
-            "-ie",
-            "--is-encrypt",
-            action="store_true",
-            dest="isencrypt",
-            help="test encryption options on port (plaintext, STARTTLS, TLS)",
-        )
-        recon.add_argument(
-            "-sf",
-            "--sniffable",
-            action="store_true",
-            help=(
-                "probe cleartext IMAP: CAPABILITY, STARTTLS advertisement, and whether AUTHENTICATE "
-                "accepts a continuation on plain TCP (RFC 3501 '+'); JSON may report PTV-SVC-SNIFFABLE"
-            ),
-        )
-        recon.add_argument(
-            "-iv",
-            "--invalid-commands",
-            action="store_true",
-            dest="invalid_commands",
-            help=(
-                "audit invalid/non-standard IMAP commands, long lines, bad tags, "
-                "binary/control octets (PTV-SVC-IMAP-INVCOMM)"
-            ),
-        )
-        recon.add_argument(
-            "-A",
-            "--anonymous",
-            action="store_true",
-            help="check SASL ANONYMOUS + LOGIN anonymous/guest/public (PTL-SVC-IMAP-ANONYMOUS)",
-        )
-        recon.add_argument(
-            "-N",
-            "--ntlm",
-            action="store_true",
-            help=(
-                "AUTHENTICATE NTLM: read CAPABILITY for AUTH=NTLM, send Negotiate, decode Challenge "
-                "(PTL-SVC-IMAP-NTLMINFO)"
-            ),
-        )
-        recon.add_argument(
-            "--eicar",
-            action="store_true",
-            help="APPEND RFC 822 message with EICAR test line (requires -u and -p, no wordlists) — PTV-SVC-IMAP-EICAR",
-        )
-        recon.add_argument(
+
+        # Test-specific value modifiers (documented per test in `imap -ts <TEST> -h`).
+        mods = parser.add_argument_group("TEST OPTIONS")
+        mods.add_argument(
             "--eicar-mailbox",
             default="INBOX",
             metavar="NAME",
             dest="eicar_mailbox",
-            help="mailbox name for APPEND (default INBOX)",
+            help="EICAR: mailbox name for APPEND (default INBOX)",
         )
-        recon.add_argument(
-            "-cl",
-            "--conn-limits",
-            action="store_true",
-            dest="conn_limits_probe",
-            help=(
-                "connection limits / connect-rate / idle-time probes; optional budget via --cl-max N "
-                f"(default {CONN_LIMIT_DEFAULT_ATTEMPTS}). "
-                "With -u USER -p PASS (no wordlists), also probes parallel LOGIN sessions and IDLE lifetime. "
-                "JSON: PTV-SVC-IMAP-CONNCNTIP, CONNCNTGLOB, CONNLONG, CONNRATE"
-            ),
-        )
-        recon.add_argument(
+        mods.add_argument(
             "--cl-max",
             type=int,
             default=None,
             metavar="N",
             dest="conn_limits_max",
             help=(
-                f"max concurrent connections in -cl ramp-up (default {CONN_LIMIT_DEFAULT_ATTEMPTS} when -cl is set)"
+                f"CONNLIM: max concurrent connections in ramp-up (default {CONN_LIMIT_DEFAULT_ATTEMPTS})"
             ),
         )
-        recon.add_argument(
-            "--usrenum",
-            action="store_true",
-            dest="imap_usrenum",
-            help=(
-                "LOGIN each name from --usrenum-wordlist with a fixed wrong password; "
-                "compare errors to non-existent baselines — PTV-SVC-IMAP-USRENUM"
-            ),
-        )
-        recon.add_argument(
-            "--usrenum-plain",
-            action="store_true",
-            dest="imap_usrenum_plain",
-            help=(
-                "AUTHENTICATE PLAIN (SASL) each name from --usrenum-wordlist with a fixed wrong password; "
-                "use when CAPABILITY lists LOGINDISABLED — PTV-SVC-IMAP-USRENUM"
-            ),
-        )
-        recon.add_argument(
+        mods.add_argument(
             "--usrenum-wordlist",
             metavar="FILE",
             dest="imap_usrenum_wordlist",
             default=None,
-            help="path to username list (required with --usrenum or --usrenum-plain)",
+            help="USRENUM/USRENUMPLAIN: path to username list (required)",
         )
-        recon.add_argument(
+        mods.add_argument(
             "--usrenum-password",
             metavar="STR",
             dest="imap_usrenum_password",
             default=None,
-            help=f"wrong password for every probe (default {_IMAP_USRENUM_DEFAULT_PASSWORD!r})",
+            help=f"USRENUM/USRENUMPLAIN: wrong password for every probe (default {_IMAP_USRENUM_DEFAULT_PASSWORD!r})",
         )
-        recon.add_argument(
+        mods.add_argument(
             "--usrenum-max",
             type=int,
             default=0,
             metavar="N",
             dest="imap_usrenum_max",
-            help="limit number of names read from wordlist (0 = no limit)",
+            help="USRENUM/USRENUMPLAIN: limit number of names read from wordlist (0 = no limit)",
         )
-        recon.add_argument(
+        mods.add_argument(
             "--usrenum-threads",
             type=int,
             default=1,
             metavar="N",
             dest="imap_usrenum_threads",
-            help="parallel TCP sessions for wordlist probes (LOGIN and/or PLAIN; default 1)",
+            help="USRENUM/USRENUMPLAIN: parallel TCP sessions for wordlist probes (default 1)",
         )
-        recon.add_argument(
-            "--resource-load",
-            action="store_true",
-            dest="imap_resource_load",
-            help=(
-                "bounded authenticated APPEND burst then UID SEARCH ALL loop; "
-                "rate/limit signal (disconnect, errors, slowdown) — PTV-SVC-IMAP-RESLOAD; "
-                "requires -u and -p (no wordlists)"
-            ),
-        )
-        recon.add_argument(
+        mods.add_argument(
             "--resource-load-mailbox",
             default="INBOX",
             metavar="NAME",
             dest="imap_resource_load_mailbox",
-            help="mailbox for APPEND phase (default INBOX)",
+            help="RESLOAD: mailbox for APPEND phase (default INBOX)",
         )
-        recon.add_argument(
+        mods.add_argument(
             "--resource-load-append-max",
             type=int,
             default=_IMAP_LOAD_APPEND_MAX_DEFAULT,
             metavar="N",
             dest="imap_resource_load_append_max",
-            help=f"max APPEND operations (default {_IMAP_LOAD_APPEND_MAX_DEFAULT}; hard cap 5000)",
+            help=f"RESLOAD: max APPEND operations (default {_IMAP_LOAD_APPEND_MAX_DEFAULT}; hard cap 5000)",
         )
-        recon.add_argument(
+        mods.add_argument(
             "--resource-load-search-max",
             type=int,
             default=_IMAP_LOAD_SEARCH_MAX_DEFAULT,
             metavar="N",
             dest="imap_resource_load_search_max",
-            help=f"max UID SEARCH ALL commands after APPEND (default {_IMAP_LOAD_SEARCH_MAX_DEFAULT}; 0 skips SEARCH)",
+            help=f"RESLOAD: max UID SEARCH ALL commands after APPEND (default {_IMAP_LOAD_SEARCH_MAX_DEFAULT}; 0 skips SEARCH)",
         )
-        recon.add_argument(
-            "--mailbox-iso",
-            action="store_true",
-            dest="imap_mailbox_iso",
-            help=(
-                "post-login isolation: NAMESPACE, LIST, GETACL, bounded EXAMINE path probes and LIST dictionary "
-                "(PTV-SVC-IMAP-AUTHZ-BYPASS; requires -u and -p, no wordlists)"
-            ),
-        )
-        recon.add_argument(
+        mods.add_argument(
             "--mailbox-iso-foreign-user",
             default="user2",
             metavar="NAME",
             dest="imap_mailbox_iso_foreign_user",
-            help="token embedded in cross-user SELECT/LIST heuristics (default user2)",
+            help="MBOXISO: token embedded in cross-user SELECT/LIST heuristics (default user2)",
         )
-        recon.add_argument(
+        mods.add_argument(
             "--mailbox-iso-mailbox",
             default="INBOX",
             metavar="NAME",
             dest="imap_mailbox_iso_mailbox",
-            help="own mailbox used as baseline SELECT and restore after EXAMINE probes (default INBOX)",
-        )
-        recon.add_argument(
-            "--tls-audit",
-            action="store_true",
-            dest="imap_tls_audit",
-            help=(
-                "strict TLS handshake with platform trust store and hostname check (RFC 7817); "
-                "TLS version, cipher, cert subject/issuer/SAN, expiry; implicit TLS on port 993 (or with --tls), "
-                "otherwise STARTTLS when advertised (e.g. port 143 per RFC 8314 / common deployment). "
-                "Target may be IP or hostname; for typical public certs use the DNS name on the certificate "
-                "(IP-only targets need iPAddress SAN). (PTV-SVC-IMAP-TLSAUDIT)"
-            ),
+            help="MBOXISO: own mailbox used as baseline SELECT and restore after EXAMINE probes (default INBOX)",
         )
 
         add_bruteforce_args(parser)
@@ -963,6 +1065,9 @@ class IMAP(BaseModule):
             raise argparse.ArgumentError(
                 None, f'module "{args.module}" received wrong arguments namespace'
             )
+
+        # Translate -ts/--tests codes into the internal per-test dest flags before validation.
+        _apply_imap_tests(args)
 
         # Default port: 993 for implicit TLS, 143 for plain/STARTTLS
         if args.target.port == 0:

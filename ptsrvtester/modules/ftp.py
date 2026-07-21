@@ -12,6 +12,7 @@ from ptlibs.ptjsonlib import PtJsonLib
 
 from ._base import BaseModule, BaseArgs, Out
 from .utils import ptprinthelper
+from .utils.ptprinthelper import get_colored_text
 from ptlibs.threads import ptthreads
 
 from .utils.helpers import (
@@ -676,6 +677,300 @@ class VULNS(Enum):
 
 # endregion
 
+
+# region -ts test registry (single source of truth for `-ts/--tests`)
+
+# Internal per-test dest flags driven by -ts. The legacy test flags were removed;
+# -ts is the only public interface, so these bool dests must be initialised
+# explicitly (argparse no longer defines them). run() reads exactly these.
+# Value modifiers (--bounce, --access-list, --paths-wordlist, --conn-limits-*, ...)
+# keep their own argparse defaults and are documented per-test.
+FTP_TEST_DESTS: tuple[str, ...] = (
+    "info", "banner", "commands", "isencrypt", "anonymous", "access", "enum_paths",
+    "modes", "pasv_port_audit", "conn_limits_audit", "chroot_audit", "active_audit",
+    "active_audit_full", "cmd_audit", "cmd_audit_active", "invalid_cmd_audit",
+    "user_enum", "eicar_probe", "ftp_dos_probes",
+)
+
+# Ordered groups for the main help table.
+FTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
+    ("Recon & fingerprint", ["BANNER", "CMD", "ENCRYPT"]),
+    ("Authentication & access", ["ANON", "ACCESS", "BRUTE", "USRENUM"]),
+    ("Enumeration", ["ENUMPATH"]),
+    ("Data channel & modes", ["MODES", "PASVPORT", "ACTIVE", "ACTIVEFULL"]),
+    ("Command surface & validation", ["CMDAUDIT", "CMDAUDITACTIVE", "INVCMD"]),
+    ("Rate limiting & stress", ["CONNLIM", "DOS"]),
+    ("Access control", ["CHROOT"]),
+    ("Content security", ["EICAR"]),
+]
+
+# Per-test definitions:
+#   desc      one-line description for the main -ts table
+#   long      list of <=3 lines describing the test (per-test help)
+#   flags     dict dest->value applied to the args namespace when selected
+#   requires  human-readable prerequisite strings (per-test help)
+#   mods      test-specific option rows [short, long, metavar, help] (per-test help)
+FTP_TESTS: dict[str, dict] = {
+    "BANNER": {
+        "desc": "Grab banner and service identification",
+        "long": ["Connect and read the greeting banner, then identify the product,",
+                 "version and CPE from the advertised software string."],
+        "flags": {"banner": True},
+    },
+    "CMD": {
+        "desc": "Grab HELP / SYST / STAT",
+        "long": ["Inspect the HELP, SYST and STAT command responses for software",
+                 "and configuration information disclosure."],
+        "flags": {"commands": True},
+    },
+    "ENCRYPT": {
+        "desc": "Test encryption options (plaintext / AUTH TLS / implicit TLS)",
+        "long": ["Inspect supported transport encryption: cleartext control channel,",
+                 "explicit AUTH TLS (FTPS) and implicit TLS."],
+        "flags": {"isencrypt": True},
+    },
+    "ANON": {
+        "desc": "Check anonymous authentication",
+        "long": ["Attempt anonymous / guest login to detect servers that accept",
+                 "unauthenticated access."],
+        "flags": {"anonymous": True},
+    },
+    "ACCESS": {
+        "desc": "Read/write access check (listing, bounce)",
+        "long": ["Check read/write access using anonymous or supplied credentials;",
+                 "optional directory listing and FTP bounce attack."],
+        "flags": {"access": True},
+        "requires": ["-A/--anonymous or -u/-p (credentials)"],
+        "mods": [
+            ["-l", "--access-list", "", "Display root directory listing"],
+            ["-B", "--bounce", "<ip:port>", "FTP bounce attack to given service"],
+            ["", "--bounce-file", "<file>", "File with request to send in bounce"],
+        ],
+    },
+    "BRUTE": {
+        "desc": "Login bruteforce (USER/PASS)",
+        "long": ["Bruteforce FTP login with the supplied username(s) and",
+                 "password(s)."],
+        "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
+        "mods": [
+            ["-u", "--user", "<name>", "Single username"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "<password>", "Single password"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+        ],
+    },
+    "USRENUM": {
+        "desc": "Username enumeration (USER + wrong PASS)",
+        "long": ["USER then a fixed wrong password; compare distinct replies / timing",
+                 "against controls (RFC 2577 user enumeration)."],
+        "flags": {"user_enum": True},
+        "requires": ["--user-enum-wordlist <file>"],
+        "mods": [
+            ["", "--user-enum-wordlist", "<file>", "Usernames to test (required)"],
+            ["", "--user-enum-password", "<str>", "Fixed wrong password after 331/332"],
+            ["", "--user-enum-keep-alive", "", "Reuse one TCP session for all probes"],
+            ["", "--user-enum-timing", "", "Compare median PASS-phase latency"],
+            ["", "--user-enum-threads", "<n>", "Parallel connections (default 1)"],
+            ["", "--user-enum-max", "<n>", "Cap wordlist size (0 = no limit)"],
+        ],
+    },
+    "ENUMPATH": {
+        "desc": "Path / directory dictionary enumeration",
+        "long": ["Dictionary attack for discovering files and directories using",
+                 "supplied credentials (anonymous or -u/-p)."],
+        "flags": {"enum_paths": True},
+        "requires": ["-w/--paths-wordlist <file>", "credentials (-A or -u/-p)"],
+        "mods": [
+            ["-w", "--paths-wordlist", "<file>", "Paths to test, one per line (required)"],
+            ["", "--enum-threads", "<n>", "Threads for enumeration (default 5)"],
+            ["", "--base-path", "<path>", "Start directory for enumeration"],
+        ],
+    },
+    "MODES": {
+        "desc": "Passive/active data modes + PASV IP leak",
+        "long": ["Test passive and active data mode availability and detect PASV",
+                 "IP address leakage."],
+        "flags": {"modes": True},
+        "requires": ["credentials (-A or -u/-p)"],
+    },
+    "PASVPORT": {
+        "desc": "Passive data port spread audit",
+        "long": ["Repeated passive LIST transfers to check whether data ports stay",
+                 "in a narrow, predictable range."],
+        "flags": {"pasv_port_audit": True},
+        "requires": ["credentials (-A or -u/-p)"],
+        "mods": [
+            ["", "--pasv-port-audit-samples", "<n>", "Samples (default 8, min 4)"],
+            ["", "--pasv-port-audit-max-span", "<n>", "Max acceptable port span (default 8192)"],
+        ],
+    },
+    "ACTIVE": {
+        "desc": "Quick PORT/PASV policy audit",
+        "long": ["Quick active-mode policy audit of PORT / PASV command handling."],
+        "flags": {"active_audit": True},
+    },
+    "ACTIVEFULL": {
+        "desc": "Full active-mode methodology",
+        "long": ["Full methodology: isolated sessions, raw LIST (D0), PORT+LIST and",
+                 "low-port hints. More thorough but noisier than ACTIVE."],
+        "flags": {"active_audit_full": True},
+        "mods": [
+            ["", "--active-audit-low-ports", "<list>", "Data ports <1000 to test (default 80,443,21)"],
+        ],
+    },
+    "CMDAUDIT": {
+        "desc": "HELP / FEAT / SITE command surface",
+        "long": ["Audit HELP, FEAT and SITE HELP/ALL; flag high-risk SITE",
+                 "extensions (passive, no login required)."],
+        "flags": {"cmd_audit": True},
+    },
+    "CMDAUDITACTIVE": {
+        "desc": "Safe SITE probes post-login",
+        "long": ["After the passive command audit, log in and send safe SITE probes",
+                 "(timeouts, DELE cleanup, 530 vs 550)."],
+        "flags": {"cmd_audit_active": True},
+        "requires": ["credentials (-A or -u/-p)"],
+    },
+    "INVCMD": {
+        "desc": "Invalid command resilience",
+        "long": ["Send raw / malformed control lines (incl. embedded NUL) and rate",
+                 "the server's resilience."],
+        "flags": {"invalid_cmd_audit": True},
+    },
+    "CONNLIM": {
+        "desc": "Connection / rate / idle / PASV limits",
+        "long": ["Bounded probes for concurrent sessions, rapid sequential connects,",
+                 "PASV spam and optional idle / slow-auth behaviour."],
+        "flags": {"conn_limits_audit": True},
+        "mods": [
+            ["", "--conn-limits-parallel", "<n>", "Simultaneous pre-auth sessions (default 12, max 40)"],
+            ["", "--conn-limits-sequential", "<n>", "Rapid sequential connects (default 24, max 80)"],
+            ["", "--conn-limits-pasv-attempts", "<n>", "PASV spam per session (default 18, max 60)"],
+            ["", "--conn-limits-idle-pre-auth", "<s>", "Pre-login idle seconds (0 = skip)"],
+            ["", "--conn-limits-slow-auth-gap", "<s>", "Seconds between USER and PASS (0 = skip)"],
+            ["", "--conn-limits-idle-post-auth", "<s>", "Post-login idle seconds (0 = skip; needs creds)"],
+        ],
+    },
+    "DOS": {
+        "desc": "XML / ZIP processing-resilience (DoS) probes",
+        "long": ["Off-by-default STOR probes (Billion Laughs XML + zip bomb) that may",
+                 "stress scanners / indexers. Authorized targets only."],
+        "flags": {"ftp_dos_probes": True},
+        "requires": ["credentials (-A or -u/-p)"],
+        "mods": [
+            ["", "--ftp-dos-timeout", "<sec>", "Per-operation socket timeout (default 30)"],
+            ["", "--ftp-dos-force-large", "", "Use full zip bomb (isolated labs only)"],
+        ],
+    },
+    "CHROOT": {
+        "desc": "User isolation / chroot audit",
+        "long": ["Post-login CWD / .. chain probes to check whether the account can",
+                 "reach host-style paths (/etc, /root, /home parent)."],
+        "flags": {"chroot_audit": True},
+        "requires": ["credentials (-A or -u/-p)"],
+        "mods": [
+            ["", "--chroot-audit-paths", "<list>", "Extra comma-separated absolute paths"],
+        ],
+    },
+    "EICAR": {
+        "desc": "EICAR antivirus probe (upload + verify)",
+        "long": ["Upload the EICAR test file, delay, then SIZE/RETR verification and",
+                 "DELE cleanup to check on-access antivirus."],
+        "flags": {"eicar_probe": True},
+        "requires": ["credentials (-A or -u/-p)"],
+        "mods": [
+            ["", "--eicar-post-stor-delay", "<sec>", "Wait after STOR before verify (default 0.5)"],
+        ],
+    },
+}
+
+
+def _ftp_parse_test_codes(raw: str | None) -> list[str]:
+    """Split and upper-case a raw -ts value into a list of codes."""
+    if not raw:
+        return []
+    return [c.strip().upper() for c in str(raw).split(",") if c.strip()]
+
+
+def _apply_ftp_tests(args) -> None:
+    """Translate ``-ts/--tests`` codes into the internal per-test dest flags.
+
+    ``ALL`` (or no ``-ts``) leaves every flag at its default -> run-all mode
+    (the default recon suite). Since the legacy flags were removed, every bool
+    test dest is initialised here so ``run()`` can read them unconditionally.
+    """
+    for dest in FTP_TEST_DESTS:
+        if not hasattr(args, dest):
+            setattr(args, dest, False)
+
+    codes = _ftp_parse_test_codes(getattr(args, "tests", None))
+    if not codes or "ALL" in codes:
+        # No -ts or explicit ALL: apply nothing so _is_run_all_mode() stays True.
+        return
+
+    unknown = [c for c in codes if c not in FTP_TESTS]
+    if unknown:
+        available = ", ".join(FTP_TESTS)
+        raise argparse.ArgumentError(
+            None,
+            f"Unknown test(s): {', '.join(unknown)}. Available: ALL, {available}",
+        )
+
+    for code in codes:
+        for dest, val in FTP_TESTS[code].get("flags", {}).items():
+            setattr(args, dest, val)
+
+    # Every explicitly selected test must actually activate; otherwise report what
+    # is missing instead of silently falling back to run-all mode.
+    inactive: list[tuple[str, list[str]]] = []
+    for code in codes:
+        spec = FTP_TESTS[code]
+        if code == "BRUTE":
+            active = check_if_brute(args)
+        elif "flags" in spec:
+            active = all(getattr(args, dest, None) for dest in spec["flags"])
+        else:
+            active = True
+        if not active:
+            inactive.append((code, list(spec.get("requires", []))))
+    if inactive:
+        parts = [
+            f"{code} requires {'; '.join(req)}" if req else f"{code} could not be activated"
+            for code, req in inactive
+        ]
+        raise argparse.ArgumentError(None, "; ".join(parts))
+
+
+def _ftp_test_help(codes: list[str]):
+    """Build a help object (for ptprinthelper.help_print) describing given test codes."""
+    if not codes:
+        return None
+    valid = [c for c in codes if c in FTP_TESTS]
+    if not valid:
+        available = ", ".join(FTP_TESTS)
+        return [
+            {"unknown_test": [f"Unknown test: {', '.join(codes)}"]},
+            {"available_tests": [f"ALL, {available}"]},
+        ]
+    out: list[dict] = []
+    for code in valid:
+        spec = FTP_TESTS[code]
+        header = f"{code} — {spec.get('desc', '')}"
+        out.append({"test": [header, *spec.get("long", [])]})
+        req = list(spec.get("requires", []))
+        if req:
+            out.append({"requires": req})
+        rows: list[list[str]] = list(spec.get("mods", []))
+        if rows:
+            out.append({"test_options": rows})
+        has_opts = bool(rows or req)
+        usage = f"ptsrvtester ftp -ts {code} " + ("<options> <target>" if has_opts else "<target>")
+        out.append({"usage": [usage]})
+    return out
+
+
+# endregion
+
 # region arguments
 
 
@@ -684,6 +979,7 @@ class FTPArgs(ArgsWithBruteforce):
     active: bool
     tls: bool
     starttls: bool
+    tests: str | None
     anonymous: bool
     info: bool
     access: bool
@@ -699,109 +995,85 @@ class FTPArgs(ArgsWithBruteforce):
 
     @staticmethod
     def get_help():
+        # Test selection table (-ts): one code + one-line description per test.
+        options: list[list[str]] = [
+            ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,ANON); ALL runs the default recon suite:"],
+        ]
+        for group_title, codes in FTP_TEST_GROUPS:
+            options.append(["", "", "", ""])
+            options.append(["", "", get_colored_text(group_title, "TITLE")])
+            for code in codes:
+                options.append(["", "", code, FTP_TESTS[code]["desc"]])
+
+        # Global options (test-specific modifiers live in `ftp -ts <TEST> -h`).
+        options += [
+            ["", "", "", ""],
+            [get_colored_text("Connection", "TITLE")],
+            ["", "--active", "", "Use active data mode (passive by default)"],
+            ["", "--tls", "", "Use implicit SSL/TLS (default port 990)"],
+            ["", "--starttls", "", "Use explicit AUTH TLS"],
+            ["", "", "", ""],
+            [get_colored_text("Credentials (BRUTE / authenticated tests)", "TITLE")],
+            ["-u", "--user", "<name>", "Single username"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "<password>", "Single password"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            ["", "", "", ""],
+            [get_colored_text("Output", "TITLE")],
+            ["-j", "--json", "", "Output in JSON format"],
+            ["-vv", "--verbose", "", "Enable verbose mode"],
+            ["-h", "--help", "", "Show this help; 'ftp -ts <TEST> -h' for test options"],
+        ]
+
         return [
             {"description": ["FTP Testing Module"]},
-            {"usage": ["ptsrvtester ftp <options> <target>"]},
+            {"usage": ["ptsrvtester ftp -ts <test>[,<test>...] <options> <target>"]},
             {"usage_example": [
-                "ptsrvtester ftp --starttls -iAal 127.0.0.1",
-                "ptsrvtester ftp -ie 127.0.0.1",
-                "ptsrvtester ftp -Am 127.0.0.1",
-                "ptsrvtester ftp -AM 127.0.0.1",
-                "ptsrvtester ftp -u admin -P passwords.txt 127.0.0.1:21",
-                "ptsrvtester ftp -AC 127.0.0.1",
-                "ptsrvtester ftp -AC --cmd-audit-active 127.0.0.1",
-                "ptsrvtester ftp -iv 127.0.0.1",
-                "ptsrvtester ftp -eu --user-enum-wordlist users.txt 127.0.0.1",
-                "ptsrvtester ftp -AR 127.0.0.1",
-                "ptsrvtester ftp -L 127.0.0.1",
-                "ptsrvtester ftp -u user -p pass -J 127.0.0.1",
-                "ptsrvtester ftp -A --eicar 127.0.0.1",
-                "ptsrvtester ftp -u user -p pass --eicar --eicar-post-stor-delay 0.5 127.0.0.1",
-                "ptsrvtester ftp -A --ftp-dos-probes 127.0.0.1",
-                "ptsrvtester ftp -u user -p pass --ftp-dos-probes --ftp-dos-timeout 45 127.0.0.1",
+                "ptsrvtester ftp -ts BANNER,CMD 127.0.0.1",
+                "ptsrvtester ftp -ts ALL 127.0.0.1",
+                "ptsrvtester ftp -ts ENCRYPT 127.0.0.1",
+                "ptsrvtester ftp -ts ANON,ACCESS -l 127.0.0.1",
+                "ptsrvtester ftp -ts BRUTE -u admin -P passwords.txt 127.0.0.1:21",
+                "ptsrvtester ftp -ts USRENUM --user-enum-wordlist users.txt 127.0.0.1",
+                "ptsrvtester ftp -ts ENUMPATH -w paths.txt -u user -p pass 127.0.0.1",
+                "ptsrvtester ftp -ts EICAR -A 127.0.0.1",
+                "ptsrvtester ftp -ts CONNLIM,DOS -u user -p pass 127.0.0.1",
+                "ptsrvtester ftp -ts USRENUM -h",
             ]},
-            {"options": [
-                ["-i", "--info", "", "Grab banner and inspect HELP, SYST, STAT commands"],
-                ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
-                ["-c", "--commands", "", "Grab HELP, SYST and STAT commands only"],
-                ["-ie", "--is-encrypt", "", "Test encryption options (plaintext, AUTH TLS, implicit TLS)"],
-                ["-A", "--anonymous", "", "Check anonymous authentication"],
-                ["-a", "--access", "", "Read/write check (use with -A and/or -u/-p)"],
-                ["-l", "--access-list", "", "Display directory listing"],
-                ["-B", "--bounce", "", "FTP bounce attack"],
-                ["", "--bounce-file", "<file>", "File with request to send (requires --access)"],
-                ["-m", "--modes", "", "Test passive/active data modes + PASV IP leakage"],
-                ["-R", "--pasv-port-audit", "", "Passive data port spread (PASV+LIST)"],
-                ["", "--pasv-port-audit-samples", "<n>", "Samples for -R (default 8, min 4)"],
-                ["", "--pasv-port-audit-max-span", "<n>", "Max acceptable max-min across samples (default 8192)"],
-                ["-L", "--conn-limits-audit", "", "Connection/rate/idle/PASV limits; bounded probes"],
-                ["", "--conn-limits-parallel", "<n>", "Simultaneous pre-auth sessions for -L (default 12, max 40)"],
-                ["", "--conn-limits-sequential", "<n>", "Rapid sequential connects for -L (default 24, max 80)"],
-                ["", "--conn-limits-pasv-attempts", "<n>", "PASV spam count per session for -L (default 18, max 60)"],
-                ["", "--conn-limits-idle-pre-auth", "<s>", "Pre-login idle seconds (0=skip); 421/close check"],
-                ["", "--conn-limits-slow-auth-gap", "<s>", "Seconds between USER and PASS (0=skip); wrong PASS"],
-                ["", "--conn-limits-idle-post-auth", "<s>", "Post-login idle seconds if creds (0=skip); NOOP after"],
-                ["-J", "--chroot-audit", "", "User isolation: CWD .., /etc, /home, SIZE passwd"],
-                ["", "--chroot-audit-paths", "<list>", "Extra comma-separated absolute paths for -J"],
-                ["-M", "--active-audit", "", "Quick PORT/PASV policy audit"],
-                ["", "--active-audit-full", "", "Full methodology: isolated sessions, raw LIST (D0), PORT+LIST, hints"],
-                ["", "--active-audit-low-ports", "<list>", "Comma-separated data ports <1000 for full audit (default 80,443,21)"],
-                ["-C", "--cmd-audit", "", "HELP/FEAT/SITE command surface audit"],
-                ["", "--cmd-audit-active", "", "After -C: safe SITE probes (needs login); timeouts + DELE cleanup"],
-                ["-iv", "--invalid-cmd-audit", "", "Invalid command resilience; raw bytes, resilienceRating"],
-                ["-eu", "--user-enum", "", "Username enumeration: USER then wrong PASS; needs --user-enum-wordlist"],
-                ["", "--user-enum-wordlist", "<file>", "Usernames for -eu, one per line"],
-                ["", "--user-enum-password", "<str>", "Fixed wrong password after 331/332 (default built-in)"],
-                ["", "--user-enum-keep-alive", "", "One TCP session for all -eu probes (no --user-enum-threads > 1)"],
-                ["", "--user-enum-timing", "", "Median PASS-phase timing: candidates vs controls"],
-                ["", "--user-enum-threads", "<n>", "Parallel connections for -eu (default 1)"],
-                ["", "--user-enum-max", "<n>", "Cap wordlist size for -eu (0 = no limit)"],
-                ["", "--active", "", "Use active mode"],
-                ["", "--tls", "", "Use implicit SSL/TLS"],
-                ["", "--starttls", "", "Use explicit SSL/TLS"],
-                ["-u", "--user", "<username>", "FTP username (known account with -p, or bruteforce with -P)"],
-                ["-U", "--users", "<wordlist>", "File with usernames"],
-                ["-p", "--password", "<password>", "FTP password (known account with -u, or bruteforce with -U)"],
-                ["-P", "--passwords", "<wordlist>", "File with passwords"],
-                ["-e", "--enum-paths", "", "Dictionary attack for path discovery (requires creds)"],
-                ["-w", "--paths-wordlist", "<file>", "Paths to test, one per line (required with -e)"],
-                ["", "--enum-threads", "<n>", "Threads for path enumeration (default: 5)"],
-                ["", "--base-path", "<path>", "Start directory for enumeration"],
-                ["-h", "--help", "", "Show this help message and exit"],
-                ["-vv", "--verbose", "", "Enable verbose mode"],
-                ["", "--eicar", "", "EICAR upload + delayed SIZE/RETR probe (on-access AV); needs -A or -u/-p / wordlists"],
-                ["", "--eicar-post-stor-delay", "<sec>", "Seconds to wait after STOR before verify (default 0.5)"],
-                ["", "--ftp-dos-probes", "", "XML + ZIP processing-resilience probes (off by default; needs -A or -u/-p / wordlists)"],
-                ["", "--ftp-dos-timeout", "<sec>", "Per-operation socket timeout for DoS probes (default 30)"],
-                ["", "--ftp-dos-force-large", "", "Use full zip bomb instead of minimal (isolated labs only)"],
-            ]}
+            {"options": options},
         ]
+
+    @staticmethod
+    def get_test_help(codes):
+        """Per-test help object (used by `ftp -ts <TEST> -h`)."""
+        return _ftp_test_help(codes)
 
     def add_subparser(self, name: str, subparsers) -> None:
         """Adds a subparser of FTP arguments"""
 
         examples = """example usage:
   ptsrvtester ftp -h
-  ptsrvtester ftp --starttls -iAal 127.0.0.1
-  ptsrvtester ftp -ie 127.0.0.1
-  ptsrvtester ftp -Am 127.0.0.1
-  ptsrvtester ftp -AM 127.0.0.1
-  ptsrvtester ftp -A --active-audit-full 127.0.0.1
-  ptsrvtester ftp -AC 127.0.0.1
-  ptsrvtester ftp -u myuser -p mypass -C --cmd-audit-active 127.0.0.1
-  ptsrvtester ftp -Aae -w paths.txt 127.0.0.1
-  ptsrvtester ftp -AR 127.0.0.1
-  ptsrvtester ftp -L 127.0.0.1
-  ptsrvtester ftp -u user -p pass -J 127.0.0.1
-  ptsrvtester ftp -A --eicar 127.0.0.1
-  ptsrvtester ftp -u user -p pass --eicar --eicar-post-stor-delay 0.5 127.0.0.1
-  ptsrvtester ftp -A --ftp-dos-probes --ftp-dos-timeout 30 127.0.0.1
-  ptsrvtester ftp -AL --conn-limits-idle-pre-auth 120 127.0.0.1
-  ptsrvtester -j ftp -u admin -P passwords.txt --brute-threads 20 127.0.0.1:21
+  ptsrvtester ftp -ts BANNER,CMD 127.0.0.1
+  ptsrvtester ftp -ts ALL 127.0.0.1
+  ptsrvtester ftp -ts ENCRYPT 127.0.0.1
+  ptsrvtester ftp -ts ANON,ACCESS -l 127.0.0.1
+  ptsrvtester ftp -ts ACTIVEFULL -A 127.0.0.1
+  ptsrvtester ftp -ts CMDAUDIT,CMDAUDITACTIVE -u myuser -p mypass 127.0.0.1
+  ptsrvtester ftp -ts ENUMPATH -w paths.txt -A 127.0.0.1
+  ptsrvtester ftp -ts PASVPORT -A 127.0.0.1
+  ptsrvtester ftp -ts CONNLIM --conn-limits-idle-pre-auth 120 127.0.0.1
+  ptsrvtester ftp -ts CHROOT -u user -p pass 127.0.0.1
+  ptsrvtester ftp -ts EICAR -A 127.0.0.1
+  ptsrvtester ftp -ts DOS -u user -p pass --ftp-dos-timeout 30 127.0.0.1
+  ptsrvtester ftp -ts USRENUM --user-enum-wordlist users.txt 127.0.0.1
+  ptsrvtester -j ftp -ts BRUTE -u admin -P passwords.txt --brute-threads 20 127.0.0.1:21
+  ptsrvtester ftp -ts USRENUM -h
 
 Credentials:
   Known account: use -u USER -p PASS (one login; not only wordlists).
-  Anonymous: -A. Optional read/write check: -a (with -A or after successful -u/-p)."""
+  Anonymous: -A. Some tests (ACCESS, MODES, PASVPORT, CHROOT, EICAR, DOS, ...) need -A or -u/-p."""
 
         parser = subparsers.add_parser(
             name,
@@ -826,350 +1098,199 @@ Credentials:
         tls.add_argument("--tls", action="store_true", help="use implicit SSL/TLS")
         tls.add_argument("--starttls", action="store_true", help="use explicit SSL/TLS")
 
-        recon = parser.add_argument_group("RECON")
-        recon.add_argument(
-            "-i",
-            "--info",
-            action="store_true",
-            help="grab banner and inspect HELP, SYST and STAT commands",
+        parser.add_argument(
+            "-ts",
+            "--tests",
+            type=str,
+            default=None,
+            metavar="<test>",
+            dest="tests",
+            help="Comma-separated test codes (e.g. BANNER,ANON) or ALL; 'ftp -ts <TEST> -h' for test options",
         )
-        recon.add_argument("-b", "--banner", action="store_true", help="grab banner + Service Identification (product, version, CPE)")
-        recon.add_argument("-c", "--commands", action="store_true", help="grab HELP, SYST and STAT commands only")
-        recon.add_argument(
-            "-ie", "--is-encrypt", action="store_true", dest="isencrypt",
-            help="test encryption options (plaintext, AUTH TLS, implicit TLS)"
-        )
-        recon.add_argument(
-            "-A", "--anonymous", action="store_true", help="check anonymous authentication"
-        )
-        access_check = recon.add_mutually_exclusive_group()
-        access_check.add_argument(
-            "-a",
-            "--access",
-            action="store_true",
-            help="check read/write access (needs credentials: combine with -A and/or -u/-p / wordlists)",
-        )
-        recon.add_argument(
+
+        # Test-specific value modifiers (documented per test in `ftp -ts <TEST> -h`).
+        mods = parser.add_argument_group("TEST OPTIONS")
+        mods.add_argument(
             "-l",
             "--access-list",
             action="store_true",
-            help="display root directory listing",
+            help="ACCESS: display root directory listing",
         )
-
-        bounce = parser.add_argument_group("BOUNCE", "FTP bounce attack (requires valid login)")
-        bounce.add_argument(
+        mods.add_argument(
             "-B",
             "--bounce",
             type=valid_target_bounce,
-            help="bounce to the specified IP:PORT or HOST:PORT service",
+            help="ACCESS: FTP bounce attack to the specified IP:PORT or HOST:PORT service",
         )
-        bounce.add_argument(
+        mods.add_argument(
             "--bounce-file",
             type=str,
-            help="file containing a request to be sent to the attacked service"
-            + " (requires --access or --access-all with write permissions)",
+            help="ACCESS: file containing a request to be sent to the attacked service",
         )
-
-        path_enum = parser.add_argument_group(
-            "PATH ENUMERATION",
-            "Dictionary attack for discovering files and directories (requires valid credentials)",
-        )
-        path_enum.add_argument(
-            "-e",
-            "--enum-paths",
-            action="store_true",
-            dest="enum_paths",
-            help="run path enumeration from wordlist (requires --access or -A or -u/-p / wordlists)",
-        )
-        path_enum.add_argument(
+        mods.add_argument(
             "-w",
             "--paths-wordlist",
             type=str,
             dest="paths_wordlist",
-            help="file with paths to test, one per line (required with -e)",
+            help="ENUMPATH: file with paths to test, one per line (required)",
         )
-        path_enum.add_argument(
+        mods.add_argument(
             "--enum-threads",
             type=int,
             default=5,
             dest="enum_threads",
-            help="threads for path enumeration (default: 5)",
+            help="ENUMPATH: threads for path enumeration (default: 5)",
         )
-        path_enum.add_argument(
+        mods.add_argument(
             "--base-path",
             type=str,
             default="",
             dest="base_path",
-            help="starting directory for enumeration (default: login home)",
+            help="ENUMPATH: starting directory for enumeration (default: login home)",
         )
-
-        modes_grp = parser.add_argument_group(
-            "DATA MODE",
-            "Test passive and active mode availability (requires login)",
-        )
-        modes_grp.add_argument(
-            "-m",
-            "--modes",
-            action="store_true",
-            dest="modes",
-            help="test passive/active data modes and PASV IP leakage",
-        )
-        modes_grp.add_argument(
-            "-R",
-            "--pasv-port-audit",
-            action="store_true",
-            dest="pasv_port_audit",
-            help="repeated passive LIST: check whether data ports stay in a narrow range",
-        )
-        modes_grp.add_argument(
+        mods.add_argument(
             "--pasv-port-audit-samples",
             type=int,
             default=8,
             dest="pasv_port_audit_samples",
             metavar="<n>",
-            help="number of separate login sessions / LIST transfers for -R (default 8)",
+            help="PASVPORT: number of login sessions / LIST transfers (default 8, min 4)",
         )
-        modes_grp.add_argument(
+        mods.add_argument(
             "--pasv-port-audit-max-span",
             type=int,
             default=8192,
             dest="pasv_port_audit_max_span",
             metavar="<n>",
-            help="if max(dataPort)-min(dataPort) across successful -R samples exceeds this, flag wide range (default 8192)",
+            help="PASVPORT: flag wide range if max-min data port span exceeds this (default 8192)",
         )
-
-        conn_grp = parser.add_argument_group(
-            "CONNECTION LIMITS",
-            "Bounded probes for concurrent sessions, PASV spam, optional idle/slow auth",
-        )
-        conn_grp.add_argument(
-            "-L",
-            "--conn-limits-audit",
-            action="store_true",
-            dest="conn_limits_audit",
-            help="parallel + sequential connects, PASV without transfer; optional idle/slow-auth (use only on authorized targets)",
-        )
-        conn_grp.add_argument(
+        mods.add_argument(
             "--conn-limits-parallel",
             type=int,
             default=12,
             dest="conn_limits_parallel",
             metavar="<n>",
-            help="parallel pre-auth control connections in one burst (default 12, max 40)",
+            help="CONNLIM: parallel pre-auth control connections in one burst (default 12, max 40)",
         )
-        conn_grp.add_argument(
+        mods.add_argument(
             "--conn-limits-sequential",
             type=int,
             default=24,
             dest="conn_limits_sequential",
             metavar="<n>",
-            help="rapid sequential connects after parallel phase (default 24, max 80)",
+            help="CONNLIM: rapid sequential connects after parallel phase (default 24, max 80)",
         )
-        conn_grp.add_argument(
+        mods.add_argument(
             "--conn-limits-pasv-attempts",
             type=int,
             default=18,
             dest="conn_limits_pasv_attempts",
             metavar="<n>",
-            help="PASV commands per control session without data transfer (default 18, max 60)",
+            help="CONNLIM: PASV commands per control session without transfer (default 18, max 60)",
         )
-        conn_grp.add_argument(
+        mods.add_argument(
             "--conn-limits-idle-pre-auth",
             type=float,
             default=0.0,
             dest="conn_limits_idle_pre_auth",
             metavar="<s>",
-            help="after 220, wait N seconds and watch for 421/close (0 = skip; try 60–300 on lab)",
+            help="CONNLIM: after 220, wait N seconds and watch for 421/close (0 = skip)",
         )
-        conn_grp.add_argument(
+        mods.add_argument(
             "--conn-limits-slow-auth-gap",
             type=float,
             default=0.0,
             dest="conn_limits_slow_auth_gap",
             metavar="<s>",
-            help="pause between USER and wrong PASS in seconds (0 = skip; try 45–120)",
+            help="CONNLIM: pause between USER and wrong PASS in seconds (0 = skip)",
         )
-        conn_grp.add_argument(
+        mods.add_argument(
             "--conn-limits-idle-post-auth",
             type=float,
             default=0.0,
             dest="conn_limits_idle_post_auth",
             metavar="<s>",
-            help="after login, idle N seconds then NOOP (0 = skip; requires creds)",
+            help="CONNLIM: after login, idle N seconds then NOOP (0 = skip; requires creds)",
         )
-
-        chroot_grp = parser.add_argument_group(
-            "USER ISOLATION / CHROOT",
-            "CWD probes and .. chain after login; confirm on authorized targets",
-        )
-        chroot_grp.add_argument(
-            "-J",
-            "--chroot-audit",
-            action="store_true",
-            dest="chroot_audit",
-            help="test whether account can reach host-style paths (/etc, /root, ..) or /home parent",
-        )
-        chroot_grp.add_argument(
+        mods.add_argument(
             "--chroot-audit-paths",
             type=str,
             default="",
             dest="chroot_audit_paths",
             metavar="<list>",
-            help="additional absolute paths to try with CWD (comma-separated), merged with built-in set",
+            help="CHROOT: additional comma-separated absolute paths to try with CWD",
         )
-
-        audit_grp = parser.add_argument_group(
-            "ACTIVE MODE POLICY",
-            "PORT/PASV command policy and bounce-related checks",
-        )
-        audit_grp.add_argument(
-            "-M",
-            "--active-audit",
-            action="store_true",
-            dest="active_audit",
-            help="Quick PORT/PASV policy audit",
-        )
-        audit_grp.add_argument(
-            "--active-audit-full",
-            action="store_true",
-            dest="active_audit_full",
-            help="full audit: pre-auth hints, D0 raw LIST, fresh connection per PORT+LIST, multiple low ports",
-        )
-        audit_grp.add_argument(
+        mods.add_argument(
             "--active-audit-low-ports",
             type=str,
             default="80,443,21",
             dest="active_audit_low_ports",
-            help="for --active-audit-full: comma-separated ports <1000 to test (default: 80,443,21)",
+            help="ACTIVEFULL: comma-separated data ports <1000 to test (default: 80,443,21)",
         )
-
-        cmd_grp = parser.add_argument_group(
-            "COMMAND SURFACE",
-            "Dangerous or unnecessary FTP commands (HELP, FEAT, SITE HELP)",
-        )
-        cmd_grp.add_argument(
-            "-C",
-            "--cmd-audit",
-            action="store_true",
-            dest="cmd_audit",
-            help="audit HELP, FEAT, SITE HELP/ALL; flag high-risk SITE extensions",
-        )
-        cmd_grp.add_argument(
-            "--cmd-audit-active",
-            action="store_true",
-            dest="cmd_audit_active",
-            help="after passive -C audit: login and send safe SITE probes (timeouts, DELE cleanup, 530 vs 550); needs -A or -u/-p or wordlists",
-        )
-
-        inv_grp = parser.add_argument_group(
-            "INVALID COMMAND RESILIENCE",
-            "Non-standard inputs on control channel; uses raw bytes on socket",
-        )
-        inv_grp.add_argument(
-            "-iv",
-            "--invalid-cmd-audit",
-            action="store_true",
-            dest="invalid_cmd_audit",
-            help="invalid command resilience: raw/malformed control lines incl. USER…\\x00…; JSON resilienceRating",
-        )
-
-        ue_grp = parser.add_argument_group(
-            "USERNAME ENUMERATION",
-            "USER/PASS with fixed wrong password; distinct replies vs RFC 2577",
-        )
-        ue_grp.add_argument(
-            "-eu",
-            "--user-enum",
-            action="store_true",
-            dest="user_enum",
-            help="run username enumeration probes (requires --user-enum-wordlist)",
-        )
-        ue_grp.add_argument(
+        mods.add_argument(
             "--user-enum-wordlist",
             type=str,
             dest="user_enum_wordlist",
             metavar="<file>",
-            help="usernames to test, one per line (required with -eu)",
+            help="USRENUM: usernames to test, one per line (required)",
         )
-        ue_grp.add_argument(
+        mods.add_argument(
             "--user-enum-password",
             type=str,
             default="PtsrvUEnumWrongPass!77~",
             dest="user_enum_password",
             metavar="<str>",
-            help="fixed wrong password sent after 331/332 (default: built-in marker string)",
+            help="USRENUM: fixed wrong password sent after 331/332 (default: built-in marker string)",
         )
-        ue_grp.add_argument(
+        mods.add_argument(
             "--user-enum-keep-alive",
             action="store_true",
             dest="user_enum_keep_alive",
-            help="reuse one control connection for sequential USER/PASS (faster; IDS-visible; not with --user-enum-threads > 1)",
+            help="USRENUM: reuse one control connection for all probes (not with --user-enum-threads > 1)",
         )
-        ue_grp.add_argument(
+        mods.add_argument(
             "--user-enum-timing",
             action="store_true",
             dest="user_enum_timing",
-            help="compare median PASS-phase latency (ms): wordlist vs control usernames",
+            help="USRENUM: compare median PASS-phase latency (ms): wordlist vs control usernames",
         )
-        ue_grp.add_argument(
+        mods.add_argument(
             "--user-enum-threads",
             type=int,
             default=1,
             dest="user_enum_threads",
             metavar="<n>",
-            help="parallel connections for -eu (default: 1). Ignored with --user-enum-keep-alive",
+            help="USRENUM: parallel connections (default: 1). Ignored with --user-enum-keep-alive",
         )
-        ue_grp.add_argument(
+        mods.add_argument(
             "--user-enum-max",
             type=int,
             default=0,
             dest="user_enum_max",
             metavar="<n>",
-            help="max usernames taken from wordlist after comments/blank skip (0 = no limit)",
+            help="USRENUM: max usernames from wordlist after comments/blank skip (0 = no limit)",
         )
-
-        eic_grp = parser.add_argument_group(
-            "ANTIVIRUS / EICAR",
-            "Standard EICAR test string over FTP (harmless; authorized targets only).",
-        )
-        eic_grp.add_argument(
-            "--eicar",
-            action="store_true",
-            dest="eicar_probe",
-            help="upload EICAR .com test file, delay, SIZE+RETR verification, DELE cleanup (needs -A or -u/-p or wordlists)",
-        )
-        eic_grp.add_argument(
+        mods.add_argument(
             "--eicar-post-stor-delay",
             type=float,
             default=0.5,
             dest="eicar_post_stor_delay",
             metavar="<sec>",
-            help="wait after successful STOR before SIZE/RETR (default 0.5) so on-access scanners can act",
+            help="EICAR: wait after successful STOR before SIZE/RETR (default 0.5)",
         )
-
-        dos_grp = parser.add_argument_group(
-            "FTP PROCESSING RESILIENCE (DoS probes)",
-            "Off by default: small XML/ZIP payloads that may stress scanners or indexers post-STOR. Authorized targets only.",
-        )
-        dos_grp.add_argument(
-            "--ftp-dos-probes",
-            action="store_true",
-            dest="ftp_dos_probes",
-            help="single-session STOR probes (Billion Laughs XML + zip bomb); requires -A or -u/-p / wordlists",
-        )
-        dos_grp.add_argument(
+        mods.add_argument(
             "--ftp-dos-timeout",
             type=float,
             default=30.0,
             dest="ftp_dos_timeout",
             metavar="<sec>",
-            help="socket timeout for STOR/NOOP in processing probes (default 30)",
+            help="DOS: socket timeout for STOR/NOOP in processing probes (default 30)",
         )
-        dos_grp.add_argument(
+        mods.add_argument(
             "--ftp-dos-force-large",
             action="store_true",
             dest="ftp_dos_force_large",
-            help="replace minimal zip with large expansion payload (isolated lab only)",
+            help="DOS: replace minimal zip with large expansion payload (isolated lab only)",
         )
 
         add_bruteforce_args(parser)
@@ -1192,6 +1313,9 @@ class FTP(BaseModule):
             raise argparse.ArgumentError(
                 None, f'module "{args.module}" received wrong arguments namespace'
             )
+
+        # Translate -ts/--tests codes into the internal per-test dest flags before validation.
+        _apply_ftp_tests(args)
 
         if not args.access:
             if args.bounce_file:

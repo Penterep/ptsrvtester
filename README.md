@@ -30,6 +30,7 @@ ptsrvtester snmp detection --ip 192.168.1.1
 ptsrvtester dns whois -d example.com
 ptsrvtester ldap banner -ip 192.168.1.1
 ptsrvtester dhcp info --interface eth0
+ptsrvtester rdp 192.168.1.10 -ts NLA
 ptsrvtester xrdp bruteforce --target 192.168.1.1 --username admin --wordlist passwords.txt
 ptsrvtester smtp --spoof-headers -r victim@example.com -u user -p pass smtp.example.com:587
 ptsrvtester smtp --bcc-test -r to@example.com --cc cc@example.com --bcc bcc@example.com smtp.example.com:25
@@ -54,6 +55,7 @@ ptsrvtester <module> -h     for help for module use
                          pop3   POP3 testing module
                          imap   IMAP testing module
                          dhcp   DHCP testing module
+                         rdp    RDP testing module
                          xrdp   XRDP testing module
 
    -v        --version          Show script version and exit
@@ -165,6 +167,22 @@ ptsrvtester <module> -h     for help for module use
 - DHCP DoS/flood attack testing
 - Network interface based testing
 
+**RDP Module**
+- Network Level Authentication (NLA) pre-auth negotiation test
+- Detects NLA required, NLA allowed but not required, and NLA unsupported states
+- Legacy Standard RDP Security negotiation test
+- CredSSP support detection
+- Security protocol enumeration for TLS, CredSSP, HYBRID_EX, RDSTLS, RDS AAD authentication and Standard RDP Security
+- Standard RDP encryption enumeration for 40-bit, 56-bit and 128-bit RC4 and FIPS, including the configured encryption level
+- Capability discovery for Graphics Pipeline and static virtual channels, including authenticated channel-allocation fallback when NLA blocks pre-auth exchange; UDP multitransport is reported only when server data is available, and channel allocation is distinguished from an enabled redirection policy
+- Single-attempt CredSSP/NTLM credential verification; credentials are never included in text or JSON output
+- RDP TLS certificates are validated before credential use; `--insecure-auth` is required to explicitly allow an untrusted certificate, and the certificate is fingerprint-checked again before CredSSP
+- Authenticated Demand Active capability parsing for RemoteFX; AVC444 and multi-monitor remain unknown when their separate session negotiation cannot be exercised
+- RDP protocol version reported by the server, with authenticated fallback when NLA blocks pre-auth discovery; RDP does not expose a supported-version list and the shared RDP 5.0-8.1 value remains ambiguous
+- Pre-auth CredSSP/NTLM server information disclosure test (target name, NetBIOS/DNS names, Windows build, server time when exposed)
+- TLS handshake, certificate, SAN/target match, TLS version and locally offerable weak TLSv1.2 cipher checks
+- CVE exposure is not inferred from protocol support alone; confirmation requires build/patch evidence or a dedicated authorized probe
+
 **XRDP Module**
 - XRDP server brute-force testing
 - Credential testing via GUI automation
@@ -177,6 +195,8 @@ ptsrvtester <module> -h     for help for module use
 ## Dependencies
 
 ```
+aardwolf==0.2.14
+asyauth==0.0.23
 cryptography>=42.0.8
 dnspython>=2.7.0
 impacket>=0.12.0

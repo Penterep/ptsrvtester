@@ -60,6 +60,7 @@ from .modules.smtp import SMTP
 from .modules.pop3 import POP3
 from .modules.imap import IMAP
 from .modules.dhcp import DHCP
+from .modules.rdp import RDP
 from .modules.xrdp import XRDP
 from .modules.smb import SMB
 
@@ -76,6 +77,7 @@ MODULES = {
     "pop3": POP3,
     "imap": IMAP,
     "dhcp": DHCP,
+    "rdp": RDP,
     "xrdp": XRDP,
     "smb": SMB,
 }
@@ -115,6 +117,7 @@ def get_help():
             ["pop3", "<options>", "", "POP3 testing module"],
             ["imap", "<options>", "", "IMAP testing module"],
             ["dhcp", "<options>", "", "DHCP testing module"],
+            ["rdp", "<options>", "", "RDP testing module"],
             ["xrdp", "<options>", "", "XRDP testing module"],
             ["smb", "<options>", "", "SMB testing module"],
             ["", " ", "", ""],

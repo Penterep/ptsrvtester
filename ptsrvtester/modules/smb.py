@@ -19,6 +19,7 @@ from .utils.helpers import (
     Target
 )
 
+OPTIONS = ["info", "dialects", "encryption"]
 
 def valid_target_smb(target: str) -> Target:
     # TODO: make adding port more robust
@@ -34,9 +35,6 @@ def _get_if_available(getter):
         return None
 
 
-OPTIONS = ["info", "dialects", "encryption"]
-
-
 class SMBArgs(BaseArgs):
     target: Target
     get_version: bool
@@ -45,19 +43,20 @@ class SMBArgs(BaseArgs):
     def get_help():
         return [
             {"description": ["SMB Testing Module"]},
-            {"usage": ["ptsrvtester smb <command> <options>"]},
+            {"usage": ["ptsrvtester smb <IP:PORT> <command> <options>"]},
             {"usage_example": [
-                "wow",
-                "so",
-                "many",
-                "examples",
+                "ptsrvtester smb 192.168.1.1 -ts info",
+                "ptsrvtester smb -h",
             ]},
-            {"options": ["wow", "so", "many", "options"]},
+            {"options": [
+                ["-h", "--help", "", "Prints this menu"],
+                ["-ts", "--test", "<option>", "Gets information about server", "Options: info, dialects, encryption"]
+            ]},
         ]
 
     def add_subparser(self, name: str, subparsers) -> None:
-        examples = """example will go here:
-some kind of example"""
+        examples = """ptsrvtester smb 192.168.1.1 -ts info
+ptsrvtester smb -h"""
         parser = subparsers.add_parser(
             name,
             epilog=examples,
@@ -79,16 +78,8 @@ some kind of example"""
             "Toolbox of non-invasive tests on a specified target server"
         )
         
-        # TODO: find option to not require args
         tests.add_argument("-ts", "--test", help="Testing toolbox for SMB",
                            choices=OPTIONS, nargs='*')
-        
-        # maybe still usable
-        # smb_subparsers = parser.add_subparsers(dest="command", help="Select SMB command", required=True)
-        
-        # smb_info = smb_subparsers.add_parser("-i", "--info", help="Retrieve SMB host information")
-        # smb_info.add_argument("-ip", "--ip", help="IP address of the target SMB server.")
-        # smb_info.add_argument("-p", "--port", type=int, default=445, help="Port of the SMB server (default: 445).")
 
 
 @dataclass

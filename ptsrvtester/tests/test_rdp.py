@@ -24,6 +24,7 @@ from ptsrvtester.modules.rdp import (
     ENCRYPTION_METHOD_128BIT,
     ENCRYPTION_METHOD_FIPS,
     ENCRYPTION_LEVEL_NAMES,
+    IMAGE_REMOTEFX_CODEC_GUID,
     LEGACY_ENCRYPTION_METHOD_MASK,
     LegacyEncryptionProbe,
     NLAResult,
@@ -39,6 +40,7 @@ from ptsrvtester.modules.rdp import (
     RDP,
     RDPArgs,
     RDPAuthResult,
+    RDPNTLMInfo,
     RDPProtocolError,
     RDPEncryptionResult,
     RDPVersionResult,
@@ -51,16 +53,21 @@ from ptsrvtester.modules.rdp import (
     TYPE_RDP_NEG_REQ,
     TYPE_RDP_NEG_RSP,
     TRANSPORTTYPE_UDPFECR,
+    TRANSPORTTYPE_UDP_PREFERRED,
     WeakCipherScanResult,
     NegotiationProbe,
     _aardwolf_probe_channel_types,
     _aardwolf_peer_certificate_sha256,
     _build_client_core_data,
+    _build_ntlm_negotiate_message,
     _build_negotiation_request,
+    _build_spnego_ntlm_init,
     _build_mcs_connect_initial,
     _ber_wrap,
     _capture_aardwolf_demand_active,
     _certificate_sha256,
+    _calculate_clock_skew_seconds,
+    _decode_ntlm_challenge,
     _extract_aardwolf_channel_ids,
     _extract_aardwolf_server_core,
     _format_cipher,
@@ -146,6 +153,68 @@ def certificate_der(subject_key, signing_key) -> bytes:
     return certificate.public_bytes(serialization.Encoding.DER)
 
 
+def ntlm_filetime(value: dt.datetime) -> bytes:
+    epoch = dt.datetime(1601, 1, 1, tzinfo=dt.timezone.utc)
+    delta = value - epoch
+    ticks = (
+        delta.days * 86400 * 10_000_000
+        + delta.seconds * 10_000_000
+        + delta.microseconds * 10
+    )
+    return struct.pack("<Q", ticks)
+
+
+def ntlm_challenge_fixture(
+    *,
+    target_name: str = "EXAMPLE",
+    av_pairs: tuple[tuple[int, bytes], ...] | None = None,
+) -> bytes:
+    if av_pairs is None:
+        server_time = dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+        av_pairs = (
+            (1, "RDP-SRV".encode("utf-16-le")),
+            (2, "EXAMPLE".encode("utf-16-le")),
+            (3, "rdp-srv.example.test".encode("utf-16-le")),
+            (4, "example.test".encode("utf-16-le")),
+            (5, "example.test".encode("utf-16-le")),
+            (7, ntlm_filetime(server_time)),
+        )
+
+    target_name_data = target_name.encode("utf-16-le")
+    target_info_data = b"".join(
+        struct.pack("<HH", av_id, len(value)) + value
+        for av_id, value in av_pairs
+    ) + struct.pack("<HH", 0, 0)
+    flags = 0x00000001 | 0x00000004 | 0x00800000 | 0x02000000
+    payload_offset = 56
+    target_name_buffer = struct.pack(
+        "<HHI",
+        len(target_name_data),
+        len(target_name_data),
+        payload_offset,
+    )
+    target_info_offset = payload_offset + len(target_name_data)
+    target_info_buffer = struct.pack(
+        "<HHI",
+        len(target_info_data),
+        len(target_info_data),
+        target_info_offset,
+    )
+    version = struct.pack("<BBH3sB", 10, 0, 26100, b"\x00\x00\x00", 0x0F)
+    return (
+        b"NTLMSSP\x00"
+        + struct.pack("<I", 2)
+        + target_name_buffer
+        + struct.pack("<I", flags)
+        + b"\x11\x22\x33\x44\x55\x66\x77\x88"
+        + b"\x00" * 8
+        + target_info_buffer
+        + version
+        + target_name_data
+        + target_info_data
+    )
+
+
 class NegotiationPacketTests(unittest.TestCase):
     def test_request_contains_valid_tpkt_x224_and_protocol_mask(self):
         requested = PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX
@@ -196,6 +265,144 @@ class NegotiationPacketTests(unittest.TestCase):
 
         with self.assertRaises(RDPProtocolError):
             _parse_negotiation_reply(bytes(packet))
+
+
+class RDPNTLMInfoTests(unittest.TestCase):
+    def test_negotiate_message_requests_target_info_and_version(self):
+        message = _build_ntlm_negotiate_message()
+
+        self.assertEqual(len(message), 40)
+        self.assertEqual(message[:8], b"NTLMSSP\x00")
+        self.assertEqual(struct.unpack("<I", message[8:12])[0], 1)
+        flags = struct.unpack("<I", message[12:16])[0]
+        self.assertEqual(flags, 0xA2888205)
+        self.assertEqual(message[16:32], struct.pack("<HHI", 0, 0, 40) * 2)
+        self.assertEqual(message[39], 0x0F)
+
+    def test_spnego_wrapper_has_expected_oids_and_embedded_ntlm_message(self):
+        message = _build_ntlm_negotiate_message()
+
+        wrapped = _build_spnego_ntlm_init(message)
+
+        expected_prefix = bytes.fromhex(
+            "604806062b0601050502a03e303ca00e300c"
+            "060a2b06010401823702020aa22a0428"
+        )
+        self.assertEqual(wrapped, expected_prefix + message)
+
+    def test_challenge_fixture_decodes_names_version_and_timestamp(self):
+        info = _decode_ntlm_challenge(ntlm_challenge_fixture())
+
+        self.assertEqual(info.target_name, "EXAMPLE")
+        self.assertEqual(info.netbios_domain, "EXAMPLE")
+        self.assertEqual(info.netbios_computer, "RDP-SRV")
+        self.assertEqual(info.dns_domain, "example.test")
+        self.assertEqual(info.dns_computer, "rdp-srv.example.test")
+        self.assertEqual(info.dns_tree, "example.test")
+        self.assertEqual(info.os_version, "10.0.26100")
+        self.assertEqual(info.server_time, "2026-01-02T03:04:05+00:00")
+
+    def test_missing_optional_av_pairs_remain_unknown(self):
+        info = _decode_ntlm_challenge(
+            ntlm_challenge_fixture(
+                av_pairs=((1, "RDP-SRV".encode("utf-16-le")),)
+            )
+        )
+
+        self.assertEqual(info.netbios_computer, "RDP-SRV")
+        self.assertIsNone(info.netbios_domain)
+        self.assertIsNone(info.dns_domain)
+        self.assertIsNone(info.server_time)
+
+    def test_av_pair_names_remain_unicode_when_negotiate_unicode_is_clear(self):
+        challenge = bytearray(ntlm_challenge_fixture())
+        flags = struct.unpack("<I", challenge[20:24])[0]
+        challenge[20:24] = struct.pack("<I", flags & ~0x00000001)
+        challenge[12:16] = b"\x00\x00\x00\x00"
+
+        info = _decode_ntlm_challenge(bytes(challenge))
+
+        self.assertIsNone(info.target_name)
+        self.assertEqual(info.netbios_computer, "RDP-SRV")
+        self.assertEqual(info.dns_computer, "rdp-srv.example.test")
+
+    def test_version_bytes_are_ignored_when_version_flag_is_clear(self):
+        challenge = bytearray(ntlm_challenge_fixture())
+        flags = struct.unpack("<I", challenge[20:24])[0]
+        challenge[20:24] = struct.pack("<I", flags & ~0x02000000)
+
+        info = _decode_ntlm_challenge(bytes(challenge))
+
+        self.assertIsNone(info.os_version)
+
+    def test_target_info_is_ignored_when_target_info_flag_is_clear(self):
+        challenge = bytearray(ntlm_challenge_fixture())
+        flags = struct.unpack("<I", challenge[20:24])[0]
+        challenge[20:24] = struct.pack("<I", flags & ~0x00800000)
+
+        info = _decode_ntlm_challenge(bytes(challenge))
+
+        self.assertIsNone(info.netbios_computer)
+        self.assertIsNone(info.dns_computer)
+        self.assertIsNone(info.server_time)
+
+    def test_security_buffer_maximum_length_is_advisory(self):
+        challenge = bytearray(ntlm_challenge_fixture())
+        challenge[14:16] = b"\x00\x00"
+        challenge[42:44] = b"\x00\x00"
+
+        info = _decode_ntlm_challenge(bytes(challenge))
+
+        self.assertEqual(info.target_name, "EXAMPLE")
+        self.assertEqual(info.netbios_computer, "RDP-SRV")
+
+    def test_truncated_target_information_is_rejected(self):
+        challenge = ntlm_challenge_fixture()[:-1]
+
+        with self.assertRaisesRegex(RDPProtocolError, "truncated"):
+            _decode_ntlm_challenge(challenge)
+
+    def test_invalid_timestamp_length_is_rejected(self):
+        challenge = ntlm_challenge_fixture(av_pairs=((7, b"\x00" * 7),))
+
+        with self.assertRaisesRegex(RDPProtocolError, "8 bytes"):
+            _decode_ntlm_challenge(challenge)
+
+    def test_clock_skew_uses_request_response_midpoint(self):
+        request_started = dt.datetime(
+            2026, 1, 2, 3, 4, 0, tzinfo=dt.timezone.utc
+        )
+        response_received = request_started + dt.timedelta(seconds=2)
+
+        skew = _calculate_clock_skew_seconds(
+            "2026-01-02T03:04:05+00:00",
+            request_started,
+            response_received,
+        )
+
+        self.assertEqual(skew, 4.0)
+
+    def test_output_omits_unknown_values_and_labels_self_reported_version(self):
+        module = RDP.__new__(RDP)
+        info = RDPNTLMInfo(
+            netbios_computer="RDP-SRV",
+            os_version="10.0.26100",
+            server_time="2026-01-02T03:04:05+00:00",
+            clock_skew_seconds=-2.25,
+        )
+
+        lines = module._ntlm_info_output_lines(info)
+        serialized = module._ntlm_info_json(info)
+
+        output = "\n".join(lines)
+        self.assertNotIn("None", output)
+        self.assertIn("NTLM OS version (self-reported): 10.0.26100", output)
+        self.assertIn(
+            "Approximate server clock skew (server minus scanner): -2.250 seconds",
+            output,
+        )
+        self.assertEqual(serialized["serverTime"], info.server_time)
+        self.assertEqual(serialized["clockSkewSeconds"], -2.25)
 
 
 class MCSLegacyEncryptionTests(unittest.TestCase):
@@ -809,6 +1016,27 @@ class RDPAuthenticationTests(unittest.TestCase):
 
         self.assertIs(Parser.from_bytes, original)
 
+    def test_demand_active_capture_reads_bitmap_compression_flag(self):
+        bitmap_capability = SimpleNamespace(bitmapCompressionFlag=True)
+        bitmap_set = SimpleNamespace(
+            capabilitySetType=SimpleNamespace(name="BITMAP"),
+            capability=bitmap_capability,
+            capabilityData=b"",
+        )
+
+        class Parser:
+            @staticmethod
+            def from_bytes(_data):
+                return SimpleNamespace(capabilitySets=[bitmap_set])
+
+        with _capture_aardwolf_demand_active(Parser) as capture:
+            Parser.from_bytes(b"demand-active")
+
+        self.assertTrue(capture["observed"])
+        self.assertEqual(capture["capability_types"], frozenset({"BITMAP"}))
+        self.assertIs(capture["bitmap_compression_flag"], True)
+        self.assertIsNone(capture["bitmap_capability_error"])
+
     def test_aardwolf_private_state_helpers_extract_expected_values(self):
         core_key = object()
         network_key = object()
@@ -1142,14 +1370,14 @@ class RDPCapabilityTests(unittest.TestCase):
         result = module._run_capability_test()
         findings = self.finding_map(result)
 
-        self.assertEqual(findings["Bitmap compression"], "supported")
+        self.assertEqual(findings["Bitmap compression"], "unknown")
         self.assertEqual(findings["Graphics Pipeline"], "supported")
-        self.assertEqual(findings["Dynamic Virtual Channels"], "supported")
+        self.assertEqual(findings["Dynamic Virtual Channels"], "allocated")
         self.assertEqual(findings["Clipboard"], "allocated")
         self.assertEqual(findings["Drive redirection"], "allocated")
         self.assertEqual(findings["Audio"], "allocated")
         self.assertEqual(findings["UDP transport"], "supported")
-        self.assertEqual(findings["RemoteFX"], "unknown")
+        self.assertEqual(findings["RemoteFX bitmap codec"], "unknown")
         self.assertEqual(result.status, "partial")
 
     def test_nla_still_allows_graphics_flag_classification(self):
@@ -1172,9 +1400,9 @@ class RDPCapabilityTests(unittest.TestCase):
         result = module._run_capability_test()
         findings = self.finding_map(result)
 
-        self.assertEqual(findings["Bitmap compression"], "supported")
+        self.assertEqual(findings["Bitmap compression"], "unknown")
         self.assertEqual(findings["Graphics Pipeline"], "supported")
-        self.assertEqual(findings["Dynamic Virtual Channels"], "supported")
+        self.assertEqual(findings["Dynamic Virtual Channels"], "unknown")
         self.assertEqual(findings["Clipboard"], "unknown")
         self.assertEqual(findings["UDP transport"], "unknown")
 
@@ -1199,15 +1427,18 @@ class RDPCapabilityTests(unittest.TestCase):
             },
             channel_data_observed=True,
             demand_active_observed=True,
+            capability_types=frozenset({"BITMAP"}),
+            bitmap_compression_flag=True,
         )
         module._get_security_probes = Mock(return_value=[])
 
         result = module._run_capability_test()
         findings = self.finding_map(result)
 
+        self.assertEqual(findings["Bitmap compression"], "supported")
         self.assertEqual(findings["Clipboard"], "allocated")
         self.assertEqual(findings["Drive redirection"], "allocated")
-        self.assertEqual(findings["Dynamic Virtual Channels"], "supported")
+        self.assertEqual(findings["Dynamic Virtual Channels"], "allocated")
         self.assertEqual(findings["Audio"], "allocated")
         self.assertEqual(findings["UDP transport"], "unknown")
         udp_finding = next(
@@ -1243,9 +1474,9 @@ class RDPCapabilityTests(unittest.TestCase):
             str(call.args[0]) for call in module.ptprint.call_args_list
         )
         self.assertIn("RDP capabilities", output)
-        self.assertIn("channel allocated, policy not verified", output)
+        self.assertIn("channel allocated; feature/policy not verified", output)
 
-    def test_unknown_capability_output_explains_required_negotiation(self):
+    def test_not_tested_capability_output_explains_required_exchange(self):
         module = RDP.__new__(RDP)
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
@@ -1255,8 +1486,8 @@ class RDPCapabilityTests(unittest.TestCase):
             findings=[
                 CapabilityFinding(
                     "AVC444",
-                    "unknown",
-                    "requires RDP Graphics capability exchange",
+                    "not_tested",
+                    "requires RDPGFX Caps Advertise/Confirm exchange",
                 )
             ],
         )
@@ -1266,7 +1497,72 @@ class RDPCapabilityTests(unittest.TestCase):
         output = "\n".join(
             str(call.args[0]) for call in module.ptprint.call_args_list
         )
-        self.assertIn("requires RDP Graphics capability exchange", output)
+        self.assertIn("not tested", output)
+        self.assertIn("requires RDPGFX Caps Advertise/Confirm exchange", output)
+
+    def test_supported_capability_uses_neutral_ok_output(self):
+        module = RDP.__new__(RDP)
+        module.use_json = False
+        module.args = SimpleNamespace(debug=False, json=False)
+        module.ptprint = Mock()
+        module._print_status = Mock()
+        result = CapabilityResult(
+            status="partial",
+            findings=[
+                CapabilityFinding(
+                    "Graphics Pipeline",
+                    "supported",
+                    "RDP_NEG_RSP flag present",
+                )
+            ],
+        )
+
+        module._output_capabilities_text(result)
+
+        module._print_status.assert_called_once_with(
+            "Graphics Pipeline: supported (advertised by server)",
+            Out.OK,
+        )
+
+    def test_udp_preferred_flag_is_reported_as_advertised_support(self):
+        module = RDP(rdp_args(), object())
+        module._basic_settings_result = BasicSettingsResult(
+            status="ok",
+            selected_protocol=PROTOCOL_SSL,
+            multitransport_flags=TRANSPORTTYPE_UDP_PREFERRED,
+        )
+
+        result = module._run_capability_test()
+        finding = next(
+            finding
+            for finding in result.findings
+            if finding.name == "UDP transport"
+        )
+
+        self.assertEqual(finding.status, "supported")
+        self.assertIn("static virtual channels over UDP", finding.evidence)
+        self.assertIn("0x00000100", finding.evidence)
+
+    def test_missing_multitransport_block_is_not_an_absolute_rejection(self):
+        module = RDP(rdp_args(), object())
+        module._basic_settings_result = BasicSettingsResult(
+            status="ok",
+            selected_protocol=PROTOCOL_SSL,
+            multitransport_flags=None,
+        )
+
+        result = module._run_capability_test()
+        finding = next(
+            finding
+            for finding in result.findings
+            if finding.name == "UDP transport"
+        )
+
+        self.assertEqual(finding.status, "not_advertised")
+        self.assertEqual(
+            finding.evidence,
+            "Server Multitransport Data was not returned",
+        )
 
     def test_bitmap_codec_parser_decodes_wire_guid(self):
         codec_data = (
@@ -1299,16 +1595,47 @@ class RDPCapabilityTests(unittest.TestCase):
             session_established=True,
             demand_active_observed=True,
             capability_types=frozenset({"BITMAP", "BITMAP_CODECS"}),
+            bitmap_compression_flag=True,
             bitmap_codec_guids=frozenset({REMOTEFX_CODEC_GUID}),
         )
 
         result = module._run_capability_test()
         findings = self.finding_map(result)
 
-        self.assertEqual(findings["RemoteFX"], "supported")
-        self.assertEqual(findings["AVC444"], "unknown")
+        self.assertEqual(findings["Bitmap compression"], "supported")
+        self.assertEqual(findings["RemoteFX bitmap codec"], "supported")
+        self.assertEqual(findings["AVC444"], "not_tested")
 
-    def test_authenticated_demand_active_can_reject_remotefx_support(self):
+    def test_image_remotefx_guid_is_recognized(self):
+        module = RDP(
+            rdp_args(login="EXAMPLE\\tester", password="secret"),
+            object(),
+        )
+        module._basic_settings_result = BasicSettingsResult(
+            status="ok",
+            selected_protocol=PROTOCOL_SSL,
+        )
+        module._authenticated_session_result = AuthenticatedSessionResult(
+            status="authenticated",
+            selected_protocol=PROTOCOL_HYBRID_EX,
+            session_established=True,
+            demand_active_observed=True,
+            capability_types=frozenset({"BITMAP", "BITMAP_CODECS"}),
+            bitmap_compression_flag=True,
+            bitmap_codec_guids=frozenset({IMAGE_REMOTEFX_CODEC_GUID}),
+        )
+
+        result = module._run_capability_test()
+        finding = next(
+            finding
+            for finding in result.findings
+            if finding.name == "RemoteFX bitmap codec"
+        )
+
+        self.assertEqual(finding.status, "supported")
+        self.assertIn("Image RemoteFX", finding.evidence)
+
+    def test_authenticated_demand_active_reports_remotefx_not_advertised(self):
         module = RDP(
             rdp_args(login="EXAMPLE\\tester", password="secret"),
             object(),
@@ -1323,13 +1650,60 @@ class RDPCapabilityTests(unittest.TestCase):
             selected_protocol=PROTOCOL_HYBRID,
             session_established=True,
             demand_active_observed=True,
-            capability_types=frozenset({"BITMAP"}),
+            capability_types=frozenset({"BITMAP", "BITMAP_CODECS"}),
+            bitmap_compression_flag=True,
         )
 
         result = module._run_capability_test()
         findings = self.finding_map(result)
 
-        self.assertEqual(findings["RemoteFX"], "not_supported")
+        self.assertEqual(findings["Bitmap compression"], "supported")
+        self.assertEqual(findings["RemoteFX bitmap codec"], "not_advertised")
+
+    def test_false_bitmap_compression_flag_is_reported_as_invalid(self):
+        module = RDP(
+            rdp_args(login="EXAMPLE\\tester", password="secret"),
+            object(),
+        )
+        module._basic_settings_result = BasicSettingsResult(
+            status="ok",
+            selected_protocol=PROTOCOL_SSL,
+        )
+        module._authenticated_session_result = AuthenticatedSessionResult(
+            status="authenticated",
+            demand_active_observed=True,
+            capability_types=frozenset({"BITMAP"}),
+            bitmap_compression_flag=False,
+        )
+
+        result = module._run_capability_test()
+        finding = next(
+            finding
+            for finding in result.findings
+            if finding.name == "Bitmap compression"
+        )
+
+        self.assertEqual(finding.status, "invalid")
+        self.assertIn("bitmapCompressionFlag=FALSE", finding.evidence)
+
+    def test_capability_json_preserves_status_and_evidence(self):
+        module = RDP.__new__(RDP)
+        result = CapabilityResult(
+            status="partial",
+            findings=[
+                CapabilityFinding(
+                    "Drive redirection",
+                    "allocated",
+                    "RDPDR allocated; drive policy not exercised",
+                )
+            ],
+        )
+
+        output = module._capabilities_json(result)
+
+        self.assertEqual(output["status"], "partial")
+        self.assertEqual(output["findings"][0]["status"], "allocated")
+        self.assertIn("drive policy", output["findings"][0]["evidence"])
 
 
 class WeakCipherTests(unittest.TestCase):

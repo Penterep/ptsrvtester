@@ -15,13 +15,12 @@ import struct
 import threading
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.x509.oid import NameOID
-from impacket.spnego import SPNEGO_NegTokenInit, SPNEGO_NegTokenResp, TypesMech
 from ptlibs import ptprinthelper
 from ptlibs.ptjsonlib import PtJsonLib
 from pyasn1.codec.der import decoder as der_decoder
@@ -80,6 +79,7 @@ IMPLEMENTED_TESTS = {
 AARDWOLF_VERSION = "0.2.14"
 ASYAUTH_VERSION = "0.0.23"
 REMOTEFX_CODEC_GUID = "76772f12-bd72-4463-afb3-b73c9c6f7886"
+IMAGE_REMOTEFX_CODEC_GUID = "2744ccd4-9d8a-4e74-803c-0ecbeea19c54"
 _AARDWOLF_SESSION_LOCK = threading.Lock()
 MAX_ACCEPTED_WEAK_CIPHERS = 32
 
@@ -87,8 +87,27 @@ CREDSSP_TSREQUEST_VERSION = 6
 MAX_CREDSSP_MESSAGE_SIZE = 256 * 1024
 MAX_MCS_MESSAGE_SIZE = 1024 * 1024
 NTLMSSP_SIGNATURE = b"NTLMSSP\x00"
+NTLM_NEGOTIATE_MESSAGE_TYPE = 1
 NTLM_CHALLENGE_MESSAGE_TYPE = 2
+NTLMSSP_NEGOTIATE_UNICODE = 0x00000001
+NTLMSSP_REQUEST_TARGET = 0x00000004
+NTLMSSP_NEGOTIATE_NTLM = 0x00000200
+NTLMSSP_NEGOTIATE_ALWAYS_SIGN = 0x00008000
+NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY = 0x00080000
+NTLMSSP_NEGOTIATE_TARGET_INFO = 0x00800000
 NTLMSSP_NEGOTIATE_VERSION = 0x02000000
+NTLMSSP_NEGOTIATE_128 = 0x20000000
+NTLMSSP_NEGOTIATE_56 = 0x80000000
+NTLM_AV_EOL = 0
+NTLM_AV_NB_COMPUTER_NAME = 1
+NTLM_AV_NB_DOMAIN_NAME = 2
+NTLM_AV_DNS_COMPUTER_NAME = 3
+NTLM_AV_DNS_DOMAIN_NAME = 4
+NTLM_AV_DNS_TREE_NAME = 5
+NTLM_AV_TIMESTAMP = 7
+NTLM_FILETIME_EPOCH = dt.datetime(1601, 1, 1, tzinfo=dt.timezone.utc)
+SPNEGO_OID_DER = bytes.fromhex("06062b0601050502")
+NTLMSSP_OID_DER = bytes.fromhex("060a2b06010401823702020a")
 
 PROTOCOL_NAMES = {
     PROTOCOL_RDP: "RDP",
@@ -177,9 +196,20 @@ CAPABILITY_CHANNELS = {
     "Dynamic Virtual Channels": "drdynvc",
     "Audio": "rdpsnd",
 }
+CAPABILITY_CHANNEL_LIMITATIONS = {
+    "Clipboard": "clipboard capability exchange and policy were not exercised",
+    "Drive redirection": (
+        "RDPDR is a generic device channel; drive capability and policy were "
+        "not exercised"
+    ),
+    "Dynamic Virtual Channels": (
+        "DVC capability exchange and protocol version were not observed"
+    ),
+    "Audio": "RDPSND formats, version, and audio policy were not exercised",
+}
 CAPABILITY_OUTPUT_ORDER = (
     "Bitmap compression",
-    "RemoteFX",
+    "RemoteFX bitmap codec",
     "AVC444",
     "Clipboard",
     "Drive redirection",
@@ -200,6 +230,12 @@ CLIENT_MULTITRANSPORT_FLAGS = (
     | TRANSPORTTYPE_UDP_PREFERRED
     | SOFTSYNC_TCP_TO_UDP
 )
+MULTITRANSPORT_FLAG_NAMES = {
+    TRANSPORTTYPE_UDPFECR: "reliable RDP-UDP",
+    TRANSPORTTYPE_UDPFECL: "lossy RDP-UDP",
+    TRANSPORTTYPE_UDP_PREFERRED: "static virtual channels over UDP",
+    SOFTSYNC_TCP_TO_UDP: "dynamic virtual channel TCP-to-UDP switching",
+}
 
 FAILURE_CODES = {
     0x00000001: "SSL required by server",
@@ -425,6 +461,8 @@ class AuthenticatedSessionResult:
     channel_data_observed: bool = False
     demand_active_observed: bool = False
     capability_types: frozenset[str] = field(default_factory=frozenset)
+    bitmap_compression_flag: bool | None = None
+    bitmap_capability_error: str | None = None
     bitmap_codec_guids: frozenset[str] = field(default_factory=frozenset)
     capability_error: str | None = None
     tls_verification: str | None = None
@@ -452,6 +490,7 @@ class RDPNTLMInfo:
     dns_tree: str | None = None
     os_version: str | None = None
     server_time: str | None = None
+    clock_skew_seconds: float | None = None
 
 
 @dataclass
@@ -601,12 +640,26 @@ def _capture_aardwolf_demand_active(parser_type):
     def capture_demand_active(data: bytes):
         parsed = original_from_bytes(data)
         capability_types: set[str] = set()
+        bitmap_compression_flag: bool | None = None
+        bitmap_capability_error: str | None = None
         bitmap_codec_guids: frozenset[str] = frozenset()
         capability_error: str | None = None
 
         for capability_set in parsed.capabilitySets:
             capability_type = capability_set.capabilitySetType.name
             capability_types.add(capability_type)
+            if capability_type == "BITMAP":
+                compression_flag = getattr(
+                    capability_set.capability,
+                    "bitmapCompressionFlag",
+                    None,
+                )
+                if compression_flag is None:
+                    bitmap_capability_error = (
+                        "Bitmap Capability Set compression flag was not decoded"
+                    )
+                else:
+                    bitmap_compression_flag = bool(compression_flag)
             if capability_type != "BITMAP_CODECS":
                 continue
 
@@ -624,6 +677,8 @@ def _capture_aardwolf_demand_active(parser_type):
 
         capture["observed"] = True
         capture["capability_types"] = frozenset(capability_types)
+        capture["bitmap_compression_flag"] = bitmap_compression_flag
+        capture["bitmap_capability_error"] = bitmap_capability_error
         capture["bitmap_codec_guids"] = bitmap_codec_guids
         capture["capability_error"] = capability_error
         return parsed
@@ -837,6 +892,8 @@ async def _connect_aardwolf_session(
             channel_data_observed=channel_data_observed,
             demand_active_observed=bool(capture.get("observed")),
             capability_types=capture.get("capability_types", frozenset()),
+            bitmap_compression_flag=capture.get("bitmap_compression_flag"),
+            bitmap_capability_error=capture.get("bitmap_capability_error"),
             bitmap_codec_guids=capture.get("bitmap_codec_guids", frozenset()),
             capability_error=capture.get("capability_error"),
             tls_verification=tls_verification,
@@ -858,6 +915,8 @@ async def _connect_aardwolf_session(
         channel_data_observed=channel_data_observed,
         demand_active_observed=bool(capture.get("observed")),
         capability_types=capture.get("capability_types", frozenset()),
+        bitmap_compression_flag=capture.get("bitmap_compression_flag"),
+        bitmap_capability_error=capture.get("bitmap_capability_error"),
         bitmap_codec_guids=capture.get("bitmap_codec_guids", frozenset()),
         capability_error=capture.get("capability_error"),
         tls_verification=tls_verification,
@@ -1068,13 +1127,51 @@ def _read_der_message(sock: socket.socket) -> bytes:
     return prefix + _recvall(sock, content_length)
 
 
+def _der_length(length: int) -> bytes:
+    if length < 0:
+        raise ValueError("DER length cannot be negative")
+    if length < 0x80:
+        return bytes((length,))
+    encoded = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes((0x80 | len(encoded),)) + encoded
+
+
+def _der_tlv(tag_value: int, value: bytes) -> bytes:
+    return bytes((tag_value,)) + _der_length(len(value)) + value
+
+
+def _build_ntlm_negotiate_message() -> bytes:
+    flags = (
+        NTLMSSP_NEGOTIATE_UNICODE
+        | NTLMSSP_REQUEST_TARGET
+        | NTLMSSP_NEGOTIATE_NTLM
+        | NTLMSSP_NEGOTIATE_ALWAYS_SIGN
+        | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+        | NTLMSSP_NEGOTIATE_TARGET_INFO
+        | NTLMSSP_NEGOTIATE_VERSION
+        | NTLMSSP_NEGOTIATE_128
+        | NTLMSSP_NEGOTIATE_56
+    )
+    empty_security_buffer = struct.pack("<HHI", 0, 0, 40)
+    # This required client Version field is negotiation metadata; it does not
+    # describe either the scanner host or the server being tested.
+    client_version = struct.pack("<BBH3sB", 6, 1, 7601, b"\x00\x00\x00", 0x0F)
+    return (
+        NTLMSSP_SIGNATURE
+        + struct.pack("<II", NTLM_NEGOTIATE_MESSAGE_TYPE, flags)
+        + empty_security_buffer
+        + empty_security_buffer
+        + client_version
+    )
+
+
 def _build_spnego_ntlm_init(ntlm_negotiate: bytes) -> bytes:
-    spnego = SPNEGO_NegTokenInit()
-    spnego["MechTypes"] = [
-        TypesMech["NTLMSSP - Microsoft NTLM Security Support Provider"]
-    ]
-    spnego["MechToken"] = ntlm_negotiate
-    return spnego.getData()
+    mechanism_list = _der_tlv(0x30, NTLMSSP_OID_DER)
+    mechanism_types = _der_tlv(0xA0, mechanism_list)
+    mechanism_token = _der_tlv(0xA2, _der_tlv(0x04, ntlm_negotiate))
+    neg_token_init = _der_tlv(0x30, mechanism_types + mechanism_token)
+    negotiation_token = _der_tlv(0xA0, neg_token_init)
+    return _der_tlv(0x60, SPNEGO_OID_DER + negotiation_token)
 
 
 def _build_credssp_ts_request(nego_token: bytes) -> bytes:
@@ -1114,14 +1211,18 @@ def _slice_ntlm_challenge(data: bytes, offset: int) -> bytes | None:
     if message_type != NTLM_CHALLENGE_MESSAGE_TYPE:
         return None
 
+    flags = struct.unpack("<I", message[20:24])[0]
+    security_buffer_offsets = [12]
+    if flags & NTLMSSP_NEGOTIATE_TARGET_INFO:
+        security_buffer_offsets.append(40)
+
     end = 48
-    for field_offset in (12, 40):
+    for field_offset in security_buffer_offsets:
         field_length = struct.unpack("<H", message[field_offset : field_offset + 2])[0]
         data_offset = struct.unpack("<I", message[field_offset + 4 : field_offset + 8])[0]
         if field_length:
             end = max(end, data_offset + field_length)
 
-    flags = struct.unpack("<I", message[20:24])[0]
     if flags & NTLMSSP_NEGOTIATE_VERSION:
         end = max(end, 56)
 
@@ -1139,33 +1240,170 @@ def _find_ntlm_challenge(data: bytes) -> bytes | None:
 
 
 def _extract_ntlm_challenge(nego_token: bytes) -> bytes:
-    candidates = [nego_token]
-    try:
-        spnego_response = SPNEGO_NegTokenResp(nego_token)
-        response_token = spnego_response.fields.get("ResponseToken")
-        if response_token:
-            candidates.insert(0, response_token)
-    except Exception:
-        pass
-
-    for candidate in candidates:
-        challenge = _find_ntlm_challenge(candidate)
-        if challenge is not None:
-            return challenge
+    challenge = _find_ntlm_challenge(nego_token)
+    if challenge is not None:
+        return challenge
     raise RDPProtocolError("CredSSP response did not contain an NTLM challenge")
 
 
-def _ntlm_info_from_details(details) -> RDPNTLMInfo:
-    return RDPNTLMInfo(
-        target_name=getattr(details, "target_name", None),
-        netbios_domain=getattr(details, "netbios_domain", None),
-        netbios_computer=getattr(details, "netbios_computer", None),
-        dns_domain=getattr(details, "dns_domain", None),
-        dns_computer=getattr(details, "dns_computer", None),
-        dns_tree=getattr(details, "dns_tree", None),
-        os_version=getattr(details, "os_version", None),
-        server_time=getattr(details, "server_time", None),
+def _ntlm_security_buffer(
+    message: bytes,
+    field_offset: int,
+    payload_floor: int,
+    field_name: str,
+) -> bytes:
+    if field_offset + 8 > len(message):
+        raise RDPProtocolError(f"NTLM {field_name} security buffer is truncated")
+    field_length, _maximum_length, data_offset = struct.unpack(
+        "<HHI", message[field_offset : field_offset + 8]
     )
+    if field_length == 0:
+        return b""
+    if data_offset < payload_floor:
+        raise RDPProtocolError(
+            f"NTLM {field_name} points inside the challenge header"
+        )
+    end = data_offset + field_length
+    if end > len(message):
+        raise RDPProtocolError(f"NTLM {field_name} data is truncated")
+    return message[data_offset:end]
+
+
+def _decode_ntlm_text(value: bytes, unicode_enabled: bool, field_name: str) -> str:
+    if not value:
+        return ""
+    if unicode_enabled:
+        if len(value) % 2:
+            raise RDPProtocolError(f"NTLM {field_name} has invalid UTF-16 length")
+        encoding = "utf-16-le"
+    else:
+        encoding = "latin-1"
+    try:
+        return value.decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise RDPProtocolError(
+            f"NTLM {field_name} contains invalid {encoding} data"
+        ) from exc
+
+
+def _decode_ntlm_version(message: bytes, flags: int) -> str | None:
+    if not flags & NTLMSSP_NEGOTIATE_VERSION:
+        return None
+    if len(message) < 56:
+        raise RDPProtocolError("NTLM challenge version field is truncated")
+    major, minor, build, _reserved, _revision = struct.unpack(
+        "<BBH3sB", message[48:56]
+    )
+    if major == 0 and minor == 0 and build == 0:
+        return None
+    return f"{major}.{minor}.{build}"
+
+
+def _decode_ntlm_timestamp(value: bytes) -> str:
+    if len(value) != 8:
+        raise RDPProtocolError("NTLM timestamp AV pair must contain 8 bytes")
+    ticks = int.from_bytes(value, "little")
+    try:
+        timestamp = NTLM_FILETIME_EPOCH + dt.timedelta(microseconds=ticks // 10)
+    except OverflowError as exc:
+        raise RDPProtocolError("NTLM timestamp is outside the supported range") from exc
+    return timestamp.isoformat()
+
+
+def _decode_ntlm_target_info(target_info: bytes) -> dict[int, str]:
+    decoded: dict[int, str] = {}
+    offset = 0
+    found_eol = False
+    name_pair_ids = {
+        NTLM_AV_NB_COMPUTER_NAME,
+        NTLM_AV_NB_DOMAIN_NAME,
+        NTLM_AV_DNS_COMPUTER_NAME,
+        NTLM_AV_DNS_DOMAIN_NAME,
+        NTLM_AV_DNS_TREE_NAME,
+    }
+
+    while offset < len(target_info):
+        if offset + 4 > len(target_info):
+            raise RDPProtocolError("NTLM target information AV pair is truncated")
+        av_id, av_length = struct.unpack("<HH", target_info[offset : offset + 4])
+        offset += 4
+        if offset + av_length > len(target_info):
+            raise RDPProtocolError("NTLM target information value is truncated")
+        value = target_info[offset : offset + av_length]
+        offset += av_length
+
+        if av_id == NTLM_AV_EOL:
+            if av_length != 0:
+                raise RDPProtocolError("NTLM target information terminator is invalid")
+            if offset != len(target_info):
+                raise RDPProtocolError(
+                    "NTLM target information contains data after its terminator"
+                )
+            found_eol = True
+            break
+        if av_id in name_pair_ids:
+            decoded[av_id] = _decode_ntlm_text(
+                value, True, "target information name"
+            )
+        elif av_id == NTLM_AV_TIMESTAMP:
+            decoded[av_id] = _decode_ntlm_timestamp(value)
+
+    if target_info and not found_eol:
+        raise RDPProtocolError("NTLM target information has no terminator")
+    return decoded
+
+
+def _decode_ntlm_challenge(message: bytes) -> RDPNTLMInfo:
+    if len(message) < 48:
+        raise RDPProtocolError("NTLM challenge is truncated")
+    if message[:8] != NTLMSSP_SIGNATURE:
+        raise RDPProtocolError("NTLM challenge has an invalid signature")
+    if struct.unpack("<I", message[8:12])[0] != NTLM_CHALLENGE_MESSAGE_TYPE:
+        raise RDPProtocolError("NTLM message is not a challenge")
+
+    flags = struct.unpack("<I", message[20:24])[0]
+    unicode_enabled = bool(flags & NTLMSSP_NEGOTIATE_UNICODE)
+    payload_floor = 56 if flags & NTLMSSP_NEGOTIATE_VERSION else 48
+    target_name_data = _ntlm_security_buffer(
+        message, 12, payload_floor, "target name"
+    )
+    target_info_data = (
+        _ntlm_security_buffer(message, 40, payload_floor, "target information")
+        if flags & NTLMSSP_NEGOTIATE_TARGET_INFO
+        else b""
+    )
+    target_info = _decode_ntlm_target_info(target_info_data)
+
+    return RDPNTLMInfo(
+        target_name=_decode_ntlm_text(
+            target_name_data, unicode_enabled, "target name"
+        )
+        or None,
+        netbios_domain=target_info.get(NTLM_AV_NB_DOMAIN_NAME),
+        netbios_computer=target_info.get(NTLM_AV_NB_COMPUTER_NAME),
+        dns_domain=target_info.get(NTLM_AV_DNS_DOMAIN_NAME),
+        dns_computer=target_info.get(NTLM_AV_DNS_COMPUTER_NAME),
+        dns_tree=target_info.get(NTLM_AV_DNS_TREE_NAME),
+        os_version=_decode_ntlm_version(message, flags),
+        server_time=target_info.get(NTLM_AV_TIMESTAMP),
+    )
+
+
+def _calculate_clock_skew_seconds(
+    server_time: str | None,
+    request_started: dt.datetime,
+    response_received: dt.datetime,
+) -> float | None:
+    if server_time is None:
+        return None
+    try:
+        parsed_server_time = dt.datetime.fromisoformat(server_time)
+    except ValueError:
+        return None
+    if parsed_server_time.tzinfo is None:
+        parsed_server_time = parsed_server_time.replace(tzinfo=dt.timezone.utc)
+    midpoint = request_started + (response_received - request_started) / 2
+    return round((parsed_server_time - midpoint).total_seconds(), 3)
 
 
 def _ntlm_info_has_values(info: RDPNTLMInfo) -> bool:
@@ -1179,6 +1417,7 @@ def _ntlm_info_has_values(info: RDPNTLMInfo) -> bool:
             info.dns_tree,
             info.os_version,
             info.server_time,
+            info.clock_skew_seconds,
         )
     )
 
@@ -2327,25 +2566,54 @@ class RDP(BaseModule):
             channel_data_observed = True
             channel_data_error = None
 
-        response_flags = basic_settings.response_flags
-        negotiation_observed = basic_settings.status == "ok"
-        if not negotiation_observed:
+        negotiation_responses: list[tuple[str, int]] = []
+        if basic_settings.status == "ok":
+            negotiation_responses.append(
+                (
+                    f"Basic Settings over "
+                    f"{protocol_name(basic_settings.selected_protocol)}",
+                    basic_settings.response_flags,
+                )
+            )
+        else:
             negotiation_probes = self._get_security_probes()
             valid_probes = [probe for probe in negotiation_probes if probe.successful]
-            negotiation_observed = bool(valid_probes)
             for probe in valid_probes:
-                response_flags |= probe.response_flags or 0
+                negotiation_responses.append(
+                    (probe.name, probe.response_flags or 0)
+                )
 
-        graphics_supported = bool(
-            response_flags & NEG_RSP_DYNVC_GFX_PROTOCOL_SUPPORTED
-        )
+        negotiation_observed = bool(negotiation_responses)
+        graphics_sources = [
+            (name, flags)
+            for name, flags in negotiation_responses
+            if flags & NEG_RSP_DYNVC_GFX_PROTOCOL_SUPPORTED
+        ]
+        graphics_supported = bool(graphics_sources)
         if negotiation_observed:
+            if graphics_supported:
+                graphics_evidence = (
+                    "RDP_NEG_RSP DYNVC_GFX_PROTOCOL_SUPPORTED flag present in "
+                    + ", ".join(
+                        f"{name} (flags 0x{flags:02x})"
+                        for name, flags in graphics_sources
+                    )
+                    + "; the Graphics Pipeline extension was not exercised"
+                )
+            else:
+                observed_responses = ", ".join(
+                    f"{name} (flags 0x{flags:02x})"
+                    for name, flags in negotiation_responses
+                )
+                graphics_evidence = (
+                    "RDP_NEG_RSP DYNVC_GFX_PROTOCOL_SUPPORTED flag absent from "
+                    f"{observed_responses}"
+                )
             findings.append(
                 CapabilityFinding(
                     "Graphics Pipeline",
-                    "supported" if graphics_supported else "not_supported",
-                    "RDP_NEG_RSP DYNVC_GFX_PROTOCOL_SUPPORTED flag "
-                    + ("present" if graphics_supported else "absent"),
+                    "supported" if graphics_supported else "not_advertised",
+                    graphics_evidence,
                 )
             )
         else:
@@ -2357,47 +2625,100 @@ class RDP(BaseModule):
                 )
             )
 
-        findings.append(
-            CapabilityFinding(
-                "Bitmap compression",
-                "supported" if negotiation_observed else "unknown",
-                (
-                    "required by the RDP Bitmap Capability Set"
-                    if negotiation_observed
-                    else "no valid RDP negotiation response"
-                ),
+        if (
+            authenticated_session is not None
+            and authenticated_session.status == "authenticated"
+            and authenticated_session.demand_active_observed
+        ):
+            if authenticated_session.bitmap_capability_error is not None:
+                bitmap_status = "unknown"
+                bitmap_evidence = authenticated_session.bitmap_capability_error
+            elif authenticated_session.bitmap_compression_flag is True:
+                bitmap_status = "supported"
+                bitmap_evidence = (
+                    "server Demand Active Bitmap Capability Set advertised "
+                    "bitmapCompressionFlag=TRUE"
+                )
+            elif authenticated_session.bitmap_compression_flag is False:
+                bitmap_status = "invalid"
+                bitmap_evidence = (
+                    "server Demand Active Bitmap Capability Set advertised "
+                    "bitmapCompressionFlag=FALSE, contrary to the protocol "
+                    "requirement"
+                )
+            elif "BITMAP" not in authenticated_session.capability_types:
+                bitmap_status = "not_advertised"
+                bitmap_evidence = (
+                    "server Demand Active did not advertise the Bitmap "
+                    "Capability Set"
+                )
+            else:
+                bitmap_status = "unknown"
+                bitmap_evidence = (
+                    "server Demand Active advertised the Bitmap Capability Set, "
+                    "but its compression flag was not captured"
+                )
+            findings.append(
+                CapabilityFinding(
+                    "Bitmap compression",
+                    bitmap_status,
+                    bitmap_evidence,
+                )
             )
-        )
+        else:
+            if (
+                authenticated_session is not None
+                and authenticated_session.error is not None
+            ):
+                bitmap_evidence = authenticated_session.error
+            elif (
+                authenticated_session is not None
+                and authenticated_session.status == "authenticated"
+            ):
+                bitmap_evidence = (
+                    "authenticated session did not expose the server Demand "
+                    "Active capability sets"
+                )
+            else:
+                bitmap_evidence = (
+                    "requires authenticated Demand Active capability exchange; "
+                    "Basic Settings is not a capability advertisement"
+                )
+            findings.append(
+                CapabilityFinding(
+                    "Bitmap compression",
+                    "unknown",
+                    bitmap_evidence,
+                )
+            )
 
         for capability_name, channel_name in CAPABILITY_CHANNELS.items():
             channel_id = channel_ids.get(channel_name)
-            if capability_name == "Dynamic Virtual Channels" and graphics_supported:
+            if channel_id:
                 findings.append(
                     CapabilityFinding(
                         capability_name,
-                        "supported",
-                        "Graphics Pipeline support proves availability of the "
-                        "dynamic virtual channel transport",
+                        "allocated",
+                        f"static virtual channel {channel_name} allocated as "
+                        f"{channel_id}; "
+                        f"{CAPABILITY_CHANNEL_LIMITATIONS[capability_name]}",
                     )
                 )
-            elif channel_id:
+            elif capability_name == "Dynamic Virtual Channels" and graphics_supported:
                 findings.append(
                     CapabilityFinding(
                         capability_name,
-                        (
-                            "supported"
-                            if capability_name == "Dynamic Virtual Channels"
-                            else "allocated"
-                        ),
-                        f"static virtual channel {channel_name} allocated as {channel_id}; "
-                        "server policy was not exercised",
+                        "unknown",
+                        "Graphics Pipeline was advertised, but this does not "
+                        "replace the DRDYNVC capability/version exchange required "
+                        "to verify generic DVC support",
                     )
                 )
             elif channel_data_observed:
                 findings.append(
                     CapabilityFinding(
                         capability_name,
-                        "not_supported",
+                        "not_allocated",
                         f"static virtual channel {channel_name} was not allocated",
                     )
                 )
@@ -2415,18 +2736,31 @@ class RDP(BaseModule):
         udp_flags = basic_settings.multitransport_flags
         udp_supported = bool(
             udp_flags is not None
-            and udp_flags & (TRANSPORTTYPE_UDPFECR | TRANSPORTTYPE_UDPFECL)
+            and udp_flags & CLIENT_MULTITRANSPORT_FLAGS
         )
         if basic_settings.status == "ok":
+            if udp_supported:
+                advertised_udp_features = ", ".join(
+                    name
+                    for flag, name in MULTITRANSPORT_FLAG_NAMES.items()
+                    if udp_flags is not None and udp_flags & flag
+                )
+                udp_evidence = (
+                    "Server Multitransport Data advertised "
+                    f"{advertised_udp_features} (0x{udp_flags:08x})"
+                )
+            elif udp_flags is not None:
+                udp_evidence = (
+                    "Server Multitransport Data contained no recognized UDP "
+                    f"flags (0x{udp_flags:08x})"
+                )
+            else:
+                udp_evidence = "Server Multitransport Data was not returned"
             findings.append(
                 CapabilityFinding(
                     "UDP transport",
-                    "supported" if udp_supported else "not_supported",
-                    (
-                        f"Server Multitransport flags: 0x{udp_flags:08x}"
-                        if udp_flags is not None
-                        else "Server Multitransport Data was not returned"
-                    ),
+                    "supported" if udp_supported else "not_advertised",
+                    udp_evidence,
                 )
             )
         else:
@@ -2453,33 +2787,41 @@ class RDP(BaseModule):
             if authenticated_session.capability_error is not None:
                 findings.append(
                     CapabilityFinding(
-                        "RemoteFX",
+                        "RemoteFX bitmap codec",
                         "unknown",
                         "Demand Active was received but bitmap codecs could not be "
                         f"decoded ({authenticated_session.capability_error})",
                     )
                 )
             else:
-                remotefx_supported = (
-                    REMOTEFX_CODEC_GUID
-                    in authenticated_session.bitmap_codec_guids
-                )
+                advertised_remotefx_codecs = [
+                    name
+                    for guid, name in (
+                        (REMOTEFX_CODEC_GUID, "RemoteFX"),
+                        (IMAGE_REMOTEFX_CODEC_GUID, "Image RemoteFX"),
+                    )
+                    if guid in authenticated_session.bitmap_codec_guids
+                ]
+                remotefx_supported = bool(advertised_remotefx_codecs)
                 findings.append(
                     CapabilityFinding(
-                        "RemoteFX",
-                        "supported" if remotefx_supported else "not_supported",
-                        "RemoteFX bitmap codec GUID was "
-                        + (
-                            "advertised in the server Demand Active PDU"
+                        "RemoteFX bitmap codec",
+                        "supported" if remotefx_supported else "not_advertised",
+                        (
+                            "server Demand Active advertised "
+                            + ", ".join(advertised_remotefx_codecs)
+                            + " bitmap codec GUID; this does not prove RemoteFX "
+                            "vGPU or CVE exposure"
                             if remotefx_supported
-                            else "not advertised in the server Demand Active PDU"
+                            else "server Demand Active did not advertise a "
+                            "RemoteFX bitmap codec in this session"
                         ),
                     )
                 )
         else:
             findings.append(
                 CapabilityFinding(
-                    "RemoteFX",
+                    "RemoteFX bitmap codec",
                     "unknown",
                     (
                         authenticated_session.error
@@ -2494,20 +2836,26 @@ class RDP(BaseModule):
             (
                 CapabilityFinding(
                     "AVC444",
-                    "unknown",
-                    "requires RDP Graphics capability exchange",
+                    "not_tested",
+                    "requires RDPGFX Caps Advertise/Confirm exchange",
                 ),
                 CapabilityFinding(
                     "Multi-monitor",
-                    "unknown",
-                    "requires monitor-layout negotiation",
+                    "not_tested",
+                    "requires a multi-monitor layout request and server/session "
+                    "layout verification",
                 ),
             )
         )
 
-        status = "partial" if any(
-            finding.status == "unknown" for finding in findings
-        ) else "ok"
+        status = (
+            "partial"
+            if any(
+                finding.status in {"unknown", "not_tested", "invalid"}
+                for finding in findings
+            )
+            else "ok"
+        )
         findings.sort(key=lambda finding: CAPABILITY_OUTPUT_ORDER.index(finding.name))
         return CapabilityResult(
             status=status,
@@ -2521,11 +2869,6 @@ class RDP(BaseModule):
         requested_protocols = PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX
 
         try:
-            from ..ptntlmauth.ptntlmauth import (
-                decode_ChallengeMessage_blob,
-                get_NegotiateMessage_data,
-            )
-
             sock = socket.create_connection(
                 (self.args.target.ip, self.args.target.port),
                 timeout=self.timeout_seconds,
@@ -2565,31 +2908,34 @@ class RDP(BaseModule):
             context = _create_tls_context()
             with context.wrap_socket(sock, server_hostname=server_hostname) as tls_sock:
                 sock = None
-                ntlm_negotiate = get_NegotiateMessage_data()
+                ntlm_negotiate = _build_ntlm_negotiate_message()
                 spnego_init = _build_spnego_ntlm_init(ntlm_negotiate)
+                request_started = dt.datetime.now(dt.timezone.utc)
                 tls_sock.sendall(_build_credssp_ts_request(spnego_init))
 
                 response = _read_der_message(tls_sock)
+                response_received = dt.datetime.now(dt.timezone.utc)
                 nego_token = _extract_credssp_nego_token(response)
                 if nego_token is None:
                     raise RDPProtocolError(
                         "CredSSP response did not include a negotiation token"
                     )
                 challenge = _extract_ntlm_challenge(nego_token)
-                details = decode_ChallengeMessage_blob(challenge)
-                ntlm_info = _ntlm_info_from_details(details)
+                ntlm_info = _decode_ntlm_challenge(challenge)
+                ntlm_info = replace(
+                    ntlm_info,
+                    clock_skew_seconds=_calculate_clock_skew_seconds(
+                        ntlm_info.server_time,
+                        request_started,
+                        response_received,
+                    ),
+                )
 
             return NTLMInfoResult(
                 "ok" if _ntlm_info_has_values(ntlm_info) else "empty",
                 info=ntlm_info,
                 selected_protocol=protocol_name(selected_protocol),
                 negotiation_probe=probe,
-            )
-        except ImportError as exc:
-            return NTLMInfoResult(
-                "error",
-                negotiation_probe=probe,
-                error=f"NTLMINFO test requires ntlm-auth or impacket ({exc})",
             )
         except (OSError, ssl.SSLError, RDPProtocolError, PyAsn1Error, ValueError) as exc:
             return NTLMInfoResult(
@@ -3257,14 +3603,23 @@ class RDP(BaseModule):
         self.ptprint("RDP capabilities", Out.INFO)
         for finding in result.findings:
             if finding.status == "supported":
-                status_out = Out.NOTVULN
-                state = "supported"
+                status_out = Out.OK
+                state = "supported (advertised by server)"
             elif finding.status == "allocated":
                 status_out = Out.WARNING
-                state = "channel allocated, policy not verified"
-            elif finding.status == "not_supported":
+                state = "channel allocated; feature/policy not verified"
+            elif finding.status == "not_advertised":
                 status_out = Out.WARNING
-                state = "not supported"
+                state = "not advertised"
+            elif finding.status == "not_allocated":
+                status_out = Out.WARNING
+                state = "channel not allocated"
+            elif finding.status == "not_tested":
+                status_out = Out.WARNING
+                state = f"not tested ({finding.evidence})"
+            elif finding.status == "invalid":
+                status_out = Out.WARNING
+                state = f"invalid ({finding.evidence})"
             else:
                 status_out = Out.WARNING
                 state = (
@@ -3593,19 +3948,27 @@ class RDP(BaseModule):
             "dnsTree": info.dns_tree,
             "osVersion": info.os_version,
             "serverTime": info.server_time,
+            "clockSkewSeconds": info.clock_skew_seconds,
         }
 
     def _ntlm_info_output_lines(self, info: RDPNTLMInfo) -> list[str]:
-        return [
-            f"Target name: {info.target_name}",
-            f"NetBios domain name: {info.netbios_domain}",
-            f"NetBios computer name: {info.netbios_computer}",
-            f"DNS domain name: {info.dns_domain}",
-            f"DNS computer name: {info.dns_computer}",
-            f"DNS tree: {info.dns_tree}",
-            f"OS version: {info.os_version}",
-            f"Server time: {info.server_time}",
-        ]
+        values = (
+            ("Target name", info.target_name),
+            ("NetBIOS domain/workgroup", info.netbios_domain),
+            ("NetBIOS computer name", info.netbios_computer),
+            ("DNS domain name", info.dns_domain),
+            ("DNS computer name", info.dns_computer),
+            ("DNS tree", info.dns_tree),
+            ("NTLM OS version (self-reported)", info.os_version),
+            ("Server time (NTLM, UTC)", info.server_time),
+            (
+                "Approximate server clock skew (server minus scanner)",
+                f"{info.clock_skew_seconds:+.3f} seconds"
+                if info.clock_skew_seconds is not None
+                else None,
+            ),
+        )
+        return [f"{label}: {value}" for label, value in values if value is not None]
 
     def _ssl_json(self, result: SSLResult) -> dict:
         return {

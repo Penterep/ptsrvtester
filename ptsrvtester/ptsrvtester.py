@@ -61,7 +61,7 @@ from .modules.pop3 import POP3
 from .modules.imap import IMAP
 from .modules.dhcp import DHCP
 from .modules.xrdp import XRDP
-from .modules.smb import SMB
+from .modules.smb.smb_main import SMB
 
 SCRIPTNAME = "ptsrvtester"
 

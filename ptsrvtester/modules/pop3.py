@@ -9,6 +9,7 @@ from ..ptntlmauth.ptntlmauth import NTLMInfo, get_NegotiateMessage_data, decode_
 
 from ._base import BaseModule, BaseArgs, Out
 from .utils import ptprinthelper
+from .utils.ptprinthelper import get_colored_text
 from .utils.helpers import (
     Target,
     Creds,
@@ -157,6 +158,166 @@ class VULNS(Enum):
 
 # endregion
 
+
+# region -ts test registry (single source of truth for `-ts/--tests`)
+
+# Internal per-test dest flags driven by -ts. The legacy short flags were removed;
+# -ts is the only public interface, so these dests must be initialised explicitly
+# (argparse no longer defines them). run() reads exactly these attributes.
+POP3_TEST_DESTS: tuple[str, ...] = (
+    "info", "banner", "commands", "help_info", "isencrypt", "anonymous", "ntlm",
+)
+
+# Ordered groups for the main help table.
+POP3_TEST_GROUPS: list[tuple[str, list[str]]] = [
+    ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "NTLM", "HELPINFO"]),
+    ("Authentication & credentials", ["ANON", "BRUTE"]),
+]
+
+# Per-test definitions:
+#   desc      one-line description for the main -ts table
+#   long      list of <=3 lines describing the test (per-test help)
+#   flags     dict dest->value applied to the args namespace when selected
+#   requires  human-readable prerequisite strings (per-test help + validation)
+#   mods      test-specific option rows [short, long, metavar, help] (per-test help)
+POP3_TESTS: dict[str, dict] = {
+    "BANNER": {
+        "desc": "Grab banner and service identification",
+        "long": ["Connect and read the greeting banner, then identify the product,",
+                 "version and CPE from the advertised software string."],
+        "flags": {"banner": True},
+    },
+    "CAPA": {
+        "desc": "Grab CAPA capabilities",
+        "long": ["Send CAPA and list advertised capabilities; flags weak options",
+                 "(USER plaintext, IMPLEMENTATION disclosure, missing STLS)."],
+        "flags": {"commands": True},
+    },
+    "ENCRYPT": {
+        "desc": "Test encryption options (plaintext / STLS / TLS)",
+        "long": ["Inspect supported transport encryption on the port: plaintext",
+                 "login, explicit STLS upgrade and implicit TLS."],
+        "flags": {"isencrypt": True},
+    },
+    "NTLM": {
+        "desc": "Inspect NTLM authentication",
+        "long": ["Probe NTLM (NTLMSSP) authentication and decode the server",
+                 "challenge for leaked domain / host information."],
+        "flags": {"ntlm": True},
+    },
+    "HELPINFO": {
+        "desc": "Test HELP and IMPLEMENTATION info disclosure",
+        "long": ["Send HELP (non-standard) and read IMPLEMENTATION from CAPA to",
+                 "reveal software / version information disclosed by the server."],
+        "flags": {"help_info": True},
+    },
+    "ANON": {
+        "desc": "Check anonymous authentication",
+        "long": ["Attempt anonymous / guest login and a catch-all probe to detect",
+                 "servers that accept arbitrary credentials."],
+        "flags": {"anonymous": True},
+    },
+    "BRUTE": {
+        "desc": "Login bruteforce (USER/PASS)",
+        "long": ["Bruteforce POP3 login with the supplied username(s) and",
+                 "password(s); runs a catch-all check first."],
+        "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
+        "mods": [
+            ["-u", "--user", "<name>", "Single username"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "<password>", "Single password"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+        ],
+    },
+}
+
+
+def _pop3_parse_test_codes(raw: str | None) -> list[str]:
+    """Split and upper-case a raw -ts value into a list of codes."""
+    if not raw:
+        return []
+    return [c.strip().upper() for c in str(raw).split(",") if c.strip()]
+
+
+def _apply_pop3_tests(args) -> None:
+    """Translate ``-ts/--tests`` codes into the internal per-test dest flags.
+
+    ``ALL`` (or no ``-ts``) leaves every flag at its default -> run-all mode.
+    Since the legacy flags were removed, every test dest is initialised here so
+    ``run()`` can read them unconditionally.
+    """
+    for dest in POP3_TEST_DESTS:
+        if not hasattr(args, dest):
+            setattr(args, dest, False)
+
+    codes = _pop3_parse_test_codes(getattr(args, "tests", None))
+    if not codes or "ALL" in codes:
+        # No -ts or explicit ALL: apply nothing so _is_default_mode() stays True.
+        return
+
+    unknown = [c for c in codes if c not in POP3_TESTS]
+    if unknown:
+        available = ", ".join(POP3_TESTS)
+        raise argparse.ArgumentError(
+            None,
+            f"Unknown test(s): {', '.join(unknown)}. Available: ALL, {available}",
+        )
+
+    for code in codes:
+        for dest, val in POP3_TESTS[code].get("flags", {}).items():
+            setattr(args, dest, val)
+
+    # Every explicitly selected test must actually activate; otherwise report what
+    # is missing instead of silently falling back to run-all mode.
+    inactive: list[tuple[str, list[str]]] = []
+    for code in codes:
+        spec = POP3_TESTS[code]
+        if code == "BRUTE":
+            active = check_if_brute(args)
+        elif "flags" in spec:
+            active = all(getattr(args, dest, None) for dest in spec["flags"])
+        else:
+            active = True
+        if not active:
+            inactive.append((code, list(spec.get("requires", []))))
+    if inactive:
+        parts = [
+            f"{code} requires {'; '.join(req)}" if req else f"{code} could not be activated"
+            for code, req in inactive
+        ]
+        raise argparse.ArgumentError(None, "; ".join(parts))
+
+
+def _pop3_test_help(codes: list[str]):
+    """Build a help object (for ptprinthelper.help_print) describing given test codes."""
+    if not codes:
+        return None
+    valid = [c for c in codes if c in POP3_TESTS]
+    if not valid:
+        available = ", ".join(POP3_TESTS)
+        return [
+            {"unknown_test": [f"Unknown test: {', '.join(codes)}"]},
+            {"available_tests": [f"ALL, {available}"]},
+        ]
+    out: list[dict] = []
+    for code in valid:
+        spec = POP3_TESTS[code]
+        header = f"{code} — {spec.get('desc', '')}"
+        out.append({"test": [header, *spec.get("long", [])]})
+        req = list(spec.get("requires", []))
+        if req:
+            out.append({"requires": req})
+        rows: list[list[str]] = list(spec.get("mods", []))
+        if rows:
+            out.append({"test_options": rows})
+        has_opts = bool(rows or req)
+        usage = f"ptsrvtester pop3 -ts {code} " + ("<options> <target>" if has_opts else "<target>")
+        out.append({"usage": [usage]})
+    return out
+
+
+# endregion
+
 # region arguments
 
 
@@ -164,6 +325,7 @@ class POP3Args(ArgsWithBruteforce):
     target: Target
     tls: bool
     starttls: bool
+    tests: str | None
     info: bool
     ntlm: bool
     anonymous: bool
@@ -172,45 +334,67 @@ class POP3Args(ArgsWithBruteforce):
 
     @staticmethod
     def get_help():
+        # Test selection table (-ts): one code + one-line description per test.
+        options: list[list[str]] = [
+            ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,CAPA); ALL runs everything:"],
+        ]
+        for group_title, codes in POP3_TEST_GROUPS:
+            options.append(["", "", "", ""])
+            options.append(["", "", get_colored_text(group_title, "TITLE")])
+            for code in codes:
+                options.append(["", "", code, POP3_TESTS[code]["desc"]])
+
+        # Global options (test-specific modifiers live in `pop3 -ts <TEST> -h`).
+        options += [
+            ["", "", "", ""],
+            [get_colored_text("Connection", "TITLE")],
+            ["", "--tls", "", "Use implicit SSL/TLS (default port 995)"],
+            ["", "--starttls", "", "Use explicit STLS (default port 110)"],
+            ["", "", "", ""],
+            [get_colored_text("Credentials (BRUTE)", "TITLE")],
+            ["-u", "--user", "<name>", "Single username"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "<password>", "Single password"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            ["", "", "", ""],
+            [get_colored_text("Output", "TITLE")],
+            ["-j", "--json", "", "Output in JSON format"],
+            ["-vv", "--verbose", "", "Enable verbose mode"],
+            ["-h", "--help", "", "Show this help; 'pop3 -ts <TEST> -h' for test options"],
+        ]
+
         return [
             {"description": ["POP3 Testing Module"]},
-            {"usage": ["ptsrvtester pop3 <options> <target>"]},
+            {"usage": ["ptsrvtester pop3 -ts <test>[,<test>...] <options> <target>"]},
             {"usage_example": [
-                "ptsrvtester pop3 --tls -iAN 127.0.0.1",
-                "ptsrvtester pop3 -hi 127.0.0.1",
-                "ptsrvtester pop3 -ie 127.0.0.1",
-                "ptsrvtester pop3 -u admin -P passwords.txt 127.0.0.1:110"
+                "ptsrvtester pop3 -ts BANNER,CAPA 127.0.0.1",
+                "ptsrvtester pop3 -ts ALL 127.0.0.1",
+                "ptsrvtester pop3 -ts ENCRYPT 127.0.0.1",
+                "ptsrvtester pop3 -ts ALL --tls 127.0.0.1:995",
+                "ptsrvtester pop3 -ts ANON,HELPINFO 127.0.0.1",
+                "ptsrvtester pop3 -ts BRUTE -u admin -P passwords.txt 127.0.0.1:110",
+                "ptsrvtester pop3 -ts BRUTE -h",
             ]},
-            {"options": [
-                ["-i", "--info", "", "Grab banner and capabilities (CAPA)"],
-                ["-b", "--banner", "", "Grab banner + Service Identification (product, version, CPE)"],
-                ["-c", "--commands", "", "Grab CAPA (capabilities) only"],
-                ["-hi", "--help-info", "", "Test HELP and IMPLEMENTATION – show info disclosed by server"],
-                ["-ie", "--is-encrypt", "", "Test encryption options (plaintext, STLS, TLS)"],
-                ["-A", "--anonymous", "", "Check anonymous authentication"],
-                ["-N", "--ntlm", "", "Inspect NTLM authentication"],
-                ["", "", "", ""],
-                ["", "--tls", "", "Use implicit SSL/TLS"],
-                ["", "--starttls", "", "Use explicit SSL/TLS"],
-                ["", "", "", ""],
-                ["-u", "--user", "<username>", "Single username for bruteforce"],
-                ["-U", "--users", "<wordlist>", "File with usernames"],
-                ["-p", "--password", "<password>", "Single password for bruteforce"],
-                ["-P", "--passwords", "<wordlist>", "File with passwords"],
-                ["", "", "", ""],
-                ["-h", "--help", "", "Show this help message and exit"],
-                ["-vv", "--verbose", "", "Enable verbose mode"],
-            ]}
+            {"options": options},
         ]
+
+    @staticmethod
+    def get_test_help(codes):
+        """Per-test help object (used by `pop3 -ts <TEST> -h`)."""
+        return _pop3_test_help(codes)
 
     def add_subparser(self, name: str, subparsers) -> None:
         """Adds a subparser of POP3 arguments"""
         examples = """example usage:
   ptsrvtester pop3 -h
-  ptsrvtester pop3 --tls -iAN 127.0.0.1
-  ptsrvtester pop3 -hi 127.0.0.1
-  ptsrvtester pop3 -ie 127.0.0.1
-  ptsrvtester -j pop3 -u admin -P passwords.txt --brute-threads 20 127.0.0.1:110"""
+  ptsrvtester pop3 -ts BANNER,CAPA 127.0.0.1
+  ptsrvtester pop3 -ts ALL 127.0.0.1
+  ptsrvtester pop3 -ts ENCRYPT 127.0.0.1
+  ptsrvtester pop3 -ts ALL --tls 127.0.0.1:995
+  ptsrvtester -j pop3 -ts BRUTE -u admin -P passwords.txt --brute-threads 20 127.0.0.1:110
+  ptsrvtester pop3 -ts BRUTE -h"""
 
         parser = subparsers.add_parser(
             name,
@@ -231,32 +415,15 @@ class POP3Args(ArgsWithBruteforce):
         parser.add_argument("--tls", action="store_true", help="use implicit SSL/TLS")
         parser.add_argument("--starttls", action="store_true", help="use explicit SSL/TLS")
 
-        recon = parser.add_argument_group("RECON")
-        recon.add_argument(
-            "-i",
-            "--info",
-            action="store_true",
-            help="grab banner and capabilities",
+        parser.add_argument(
+            "-ts",
+            "--tests",
+            type=str,
+            default=None,
+            metavar="<test>",
+            dest="tests",
+            help="Comma-separated test codes (e.g. BANNER,CAPA) or ALL; 'pop3 -ts <TEST> -h' for test options",
         )
-        recon.add_argument("-b", "--banner", action="store_true", help="grab banner + Service Identification (product, version, CPE)")
-        recon.add_argument("-c", "--commands", action="store_true", help="grab CAPA (capabilities) only")
-        recon.add_argument(
-            "-ie",
-            "--is-encrypt",
-            action="store_true",
-            dest="isencrypt",
-            help="test encryption options on port (plaintext, STLS, TLS)",
-        )
-        recon.add_argument(
-            "-hi",
-            "--help-info",
-            action="store_true",
-            help="test HELP and IMPLEMENTATION – show info disclosed by server",
-        )
-        recon.add_argument(
-            "-A", "--anonymous", action="store_true", help="check anonymous authentication"
-        )
-        recon.add_argument("-N", "--ntlm", action="store_true", help="inspect NTLM authentication")
 
         add_bruteforce_args(parser)
 
@@ -278,6 +445,9 @@ class POP3(BaseModule):
             raise argparse.ArgumentError(
                 None, f'module "{args.module}" received wrong arguments namespace'
             )
+
+        # Translate -ts/--tests codes into the internal per-test dest flags before validation.
+        _apply_pop3_tests(args)
 
         # Default port: 995 for implicit TLS (--tls), 110 for plain/STARTTLS (RFC 2595)
         if args.target.port == 0:

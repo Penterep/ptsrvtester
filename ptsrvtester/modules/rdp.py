@@ -2989,7 +2989,9 @@ class RDP(BaseModule):
             result.version_probes,
         )
         result.weak_findings = self._tls_weak_findings(result)
-        if result.weak_findings:
+        if result.certificate is not None and result.certificate.parse_error:
+            result.status = "partial"
+        elif result.weak_findings:
             result.status = "weak"
         return result
 
@@ -3292,8 +3294,6 @@ class RDP(BaseModule):
                 findings.append(
                     f"certificate signed with weak hash algorithm: {cert.signature_hash_algorithm}"
                 )
-            if cert.parse_error:
-                findings.append(f"certificate parse error: {cert.parse_error}")
 
         return sorted(set(findings))
 
@@ -3326,6 +3326,119 @@ class RDP(BaseModule):
         marker = ptprinthelper.bullet(out.value)
         self.ptprint(f"{' ' * indent}{marker}{message}", Out.TEXT)
 
+    @staticmethod
+    def _nla_output_category(result: NLAResult) -> Out:
+        return {
+            "required": Out.NOTVULN,
+            "allowed_not_required": Out.VULN,
+            "not_supported": Out.VULN,
+            "error": Out.ERROR,
+        }.get(result.status, Out.WARNING)
+
+    @staticmethod
+    def _rdp_security_output_category(result: RDPSecurityResult) -> Out:
+        return {
+            "allowed": Out.VULN,
+            "not_allowed": Out.NOTVULN,
+            "error": Out.ERROR,
+        }.get(result.status, Out.WARNING)
+
+    @staticmethod
+    def _credssp_output_category(result: CredSSPResult) -> Out:
+        return {
+            "supported": Out.OK,
+            "not_supported": Out.WARNING,
+            "error": Out.ERROR,
+        }.get(result.status, Out.WARNING)
+
+    @staticmethod
+    def _security_protocol_output_category(probe: NegotiationProbe) -> Out:
+        supported = probe.selected_protocol == probe.requested_protocols
+        security_verdict_protocols = {PROTOCOL_RDP, PROTOCOL_SSL}
+        if supported:
+            if probe.requested_protocols in security_verdict_protocols:
+                return Out.VULN
+            return Out.OK
+        if probe.failed_by_server:
+            if probe.requested_protocols in security_verdict_protocols:
+                return Out.NOTVULN
+            return Out.INFO
+        if probe.error:
+            return Out.ERROR
+        return Out.WARNING
+
+    @staticmethod
+    def _version_output_category(result: RDPVersionResult) -> Out:
+        return {
+            "ok": Out.OK,
+            "error": Out.ERROR,
+        }.get(result.status, Out.WARNING)
+
+    @staticmethod
+    def _ntlm_info_output_category(result: NTLMInfoResult) -> Out:
+        if result.status == "ok" and result.info is not None:
+            return Out.VULN
+        return {
+            "empty": Out.WARNING,
+            "not_supported": Out.NOTVULN,
+            "error": Out.ERROR,
+        }.get(result.status, Out.WARNING)
+
+    @staticmethod
+    def _auth_output_category(result: RDPAuthResult) -> Out:
+        return {
+            "authenticated": Out.OK,
+            "tls_error": Out.ERROR,
+            "error": Out.ERROR,
+        }.get(result.status, Out.WARNING)
+
+    def _rdp_encryption_vulnerabilities(
+        self,
+        result: RDPEncryptionResult,
+    ) -> list[dict[str, str]]:
+        vulnerabilities: list[dict[str, str]] = []
+        standard_rdp_accepted = any(
+            probe.requested_protocols == PROTOCOL_RDP
+            and probe.selected_protocol == probe.requested_protocols
+            for probe in result.protocol_probes
+        )
+        tls_without_nla_accepted = any(
+            probe.requested_protocols == PROTOCOL_SSL
+            and probe.selected_protocol == probe.requested_protocols
+            for probe in result.protocol_probes
+        )
+        accepted_legacy_methods = [
+            ENCRYPTION_METHOD_NAMES[probe.requested_method]
+            for probe in result.legacy_probes
+            if probe.accepted is True
+        ]
+
+        if standard_rdp_accepted or accepted_legacy_methods:
+            response_lines = ["Server accepted legacy Standard RDP Security"]
+            if accepted_legacy_methods:
+                response_lines.append(
+                    "Accepted encryption methods: "
+                    + ", ".join(accepted_legacy_methods)
+                )
+            vulnerabilities.append(
+                {
+                    "vuln_code": VULNS.RDP_SECURITY_ALLOWED.value,
+                    "vuln_request": "RDP encryption and security enumeration",
+                    "vuln_response": "\n".join(response_lines),
+                }
+            )
+
+        if tls_without_nla_accepted:
+            vulnerabilities.append(
+                {
+                    "vuln_code": VULNS.NLA_NOT_REQUIRED.value,
+                    "vuln_request": "RDP negotiation requesting TLS without CredSSP/NLA",
+                    "vuln_response": "Server accepted TLS security without CredSSP/NLA",
+                }
+            )
+
+        return vulnerabilities
+
     def output(self) -> None:
         properties = {
             "software_type": None,
@@ -3336,14 +3449,30 @@ class RDP(BaseModule):
             "target": self.args.target.ip,
             "port": self.args.target.port,
         }
-        deferred_vulns = []
+        deferred_vulns: dict[str, dict[str, str]] = {}
+
+        def defer_vulnerability(vulnerability: dict[str, str]) -> None:
+            """Keep one JSON finding per vulnerability code across overlapping tests."""
+            vuln_code = vulnerability["vuln_code"]
+            existing = deferred_vulns.get(vuln_code)
+            if existing is None:
+                deferred_vulns[vuln_code] = dict(vulnerability)
+                return
+
+            for field_name in ("vuln_request", "vuln_response"):
+                existing_lines = existing.get(field_name, "").splitlines()
+                for line in vulnerability.get(field_name, "").splitlines():
+                    if line and line not in existing_lines:
+                        existing_lines.append(line)
+                if existing_lines:
+                    existing[field_name] = "\n".join(existing_lines)
 
         if self.results.nla is not None:
             self._output_nla_text(self.results.nla)
             properties["nla"] = self._nla_json(self.results.nla)
 
             if self.results.nla.status == "allowed_not_required":
-                deferred_vulns.append(
+                defer_vulnerability(
                     {
                         "vuln_code": VULNS.NLA_NOT_REQUIRED.value,
                         "vuln_request": "RDP negotiation without CredSSP/NLA",
@@ -3351,7 +3480,7 @@ class RDP(BaseModule):
                     }
                 )
             elif self.results.nla.status == "not_supported":
-                deferred_vulns.append(
+                defer_vulnerability(
                     {
                         "vuln_code": VULNS.NLA_NOT_SUPPORTED.value,
                         "vuln_request": "RDP negotiation with CredSSP/NLA",
@@ -3363,7 +3492,7 @@ class RDP(BaseModule):
             self._output_rdp_security_text(self.results.rdp_security)
             properties["rdpSecurity"] = self._rdp_security_json(self.results.rdp_security)
             if self.results.rdp_security.status == "allowed":
-                deferred_vulns.append(
+                defer_vulnerability(
                     {
                         "vuln_code": VULNS.RDP_SECURITY_ALLOWED.value,
                         "vuln_request": "RDP negotiation with PROTOCOL_RDP",
@@ -3380,6 +3509,10 @@ class RDP(BaseModule):
             properties["rdpEncryption"] = self._rdp_encryption_json(
                 self.results.rdp_encryption
             )
+            for vulnerability in self._rdp_encryption_vulnerabilities(
+                self.results.rdp_encryption
+            ):
+                defer_vulnerability(vulnerability)
 
         if self.results.capabilities is not None:
             self._output_capabilities_text(self.results.capabilities)
@@ -3400,7 +3533,7 @@ class RDP(BaseModule):
                 self.results.ntlm_info.status == "ok"
                 and self.results.ntlm_info.info is not None
             ):
-                deferred_vulns.append(
+                defer_vulnerability(
                     {
                         "vuln_code": VULNS.NTLM_INFO_DISCLOSURE.value,
                         "vuln_request": "CredSSP NTLM negotiate challenge",
@@ -3414,7 +3547,7 @@ class RDP(BaseModule):
             self._output_ssl_text(self.results.ssl)
             properties["ssl"] = self._ssl_json(self.results.ssl)
             if self.results.ssl.weak_findings:
-                deferred_vulns.append(
+                defer_vulnerability(
                     {
                         "vuln_code": VULNS.TLS_WEAK_CONFIG.value,
                         "vuln_request": "RDP TLS handshake and TLS version probes",
@@ -3436,7 +3569,7 @@ class RDP(BaseModule):
         rdp_node = self.ptjsonlib.create_node_object("software", None, None, properties)
         self.ptjsonlib.add_node(rdp_node)
         node_key = rdp_node["key"]
-        for vuln in deferred_vulns:
+        for vuln in deferred_vulns.values():
             self.ptjsonlib.add_vulnerability(node_key=node_key, **vuln)
 
         self.ptjsonlib.set_status("finished", "")
@@ -3448,15 +3581,30 @@ class RDP(BaseModule):
 
         self.ptprint("Network Level Authentication (NLA) test", Out.INFO)
         if result.status == "required":
-            self._print_status("NLA required", Out.NOTVULN)
+            self._print_status(
+                "NLA required",
+                self._nla_output_category(result),
+            )
         elif result.status == "allowed_not_required":
-            self._print_status("NLA is allowed but not required", Out.WARNING)
+            self._print_status(
+                "NLA is allowed but not required",
+                self._nla_output_category(result),
+            )
         elif result.status == "not_supported":
-            self._print_status("NLA is not supported", Out.VULN)
+            self._print_status(
+                "NLA is not supported",
+                self._nla_output_category(result),
+            )
         elif result.status == "error":
-            self._print_status(str(result.error), Out.ERROR)
+            self._print_status(
+                str(result.error),
+                self._nla_output_category(result),
+            )
         else:
-            self._print_status("NLA status is inconclusive", Out.WARNING)
+            self._print_status(
+                "NLA status is inconclusive",
+                self._nla_output_category(result),
+            )
 
         for probe in result.probes:
             self.ptdebug(probe.summary())
@@ -3469,16 +3617,25 @@ class RDP(BaseModule):
 
         self.ptprint("RDP Security test", Out.INFO)
         if result.status == "allowed":
-            self._print_status("Legacy Standard RDP Security is allowed", Out.VULN)
+            self._print_status(
+                "Legacy Standard RDP Security is allowed",
+                self._rdp_security_output_category(result),
+            )
         elif result.status == "not_allowed":
             self._print_status(
                 "Legacy Standard RDP Security is not allowed",
-                Out.NOTVULN,
+                self._rdp_security_output_category(result),
             )
         elif result.status == "error":
-            self._print_status(str(result.probe.error), Out.ERROR)
+            self._print_status(
+                str(result.probe.error),
+                self._rdp_security_output_category(result),
+            )
         else:
-            self._print_status("RDP Security status is inconclusive", Out.WARNING)
+            self._print_status(
+                "RDP Security status is inconclusive",
+                self._rdp_security_output_category(result),
+            )
         self.ptdebug(result.probe.summary())
 
     def _output_credssp_text(self, result: CredSSPResult) -> None:
@@ -3487,16 +3644,31 @@ class RDP(BaseModule):
 
         self.ptprint("CredSSP test", Out.INFO)
         if result.status == "supported":
-            self._print_status("CredSSP is supported", Out.NOTVULN)
+            self._print_status(
+                "CredSSP is supported",
+                self._credssp_output_category(result),
+            )
             if result.hybrid_ex_supported:
-                self._print_status("CredSSP HYBRID_EX is supported", Out.NOTVULN)
+                self._print_status(
+                    "CredSSP HYBRID_EX is supported",
+                    self._credssp_output_category(result),
+                )
         elif result.status == "not_supported":
-            self._print_status("CredSSP is not supported", Out.VULN)
+            self._print_status(
+                "CredSSP is not supported",
+                self._credssp_output_category(result),
+            )
         elif result.status == "error":
             probe = next(p for p in result.probes if p.name == "CredSSP/NLA only")
-            self._print_status(str(probe.error), Out.ERROR)
+            self._print_status(
+                str(probe.error),
+                self._credssp_output_category(result),
+            )
         else:
-            self._print_status("CredSSP status is inconclusive", Out.WARNING)
+            self._print_status(
+                "CredSSP status is inconclusive",
+                self._credssp_output_category(result),
+            )
         for probe in result.probes:
             self.ptdebug(probe.summary())
 
@@ -3513,21 +3685,16 @@ class RDP(BaseModule):
         for probe in result.protocol_probes:
             supported = probe.selected_protocol == probe.requested_protocols
             if supported:
-                insecure = probe.requested_protocols == PROTOCOL_RDP
-                status_out = Out.VULN if insecure else Out.NOTVULN
                 state = "supported"
             elif probe.failed_by_server:
-                status_out = Out.WARNING
                 state = "not supported"
             elif probe.error:
-                status_out = Out.WARNING
                 state = f"unknown ({probe.error})"
             else:
-                status_out = Out.WARNING
                 state = f"selected {protocol_name(probe.selected_protocol)}"
             self._print_status(
                 f"{probe.name}: {state}",
-                status_out,
+                self._security_protocol_output_category(probe),
                 indent=8,
             )
 
@@ -3535,7 +3702,7 @@ class RDP(BaseModule):
             self.ptprint("    Negotiation capabilities", Out.TEXT)
             for flag, name in NEGOTIATION_RESPONSE_FLAGS.items():
                 if result.response_flags & flag:
-                    self._print_status(name, Out.NOTVULN, indent=8)
+                    self._print_status(name, Out.OK, indent=8)
 
         self.ptprint("    Standard RDP encryption", Out.TEXT)
         if result.legacy_status == "not_allowed":
@@ -3641,12 +3808,12 @@ class RDP(BaseModule):
         if result.status == "ok":
             self._print_status(
                 f"Server reports: {result.version_name}",
-                Out.NOTVULN,
+                self._version_output_category(result),
             )
         elif result.status == "ambiguous":
             self._print_status(
                 f"Server reports: {result.version_name}",
-                Out.WARNING,
+                self._version_output_category(result),
             )
             self.ptprint(
                 "        Exact version cannot be distinguished by the RDP handshake",
@@ -3655,18 +3822,18 @@ class RDP(BaseModule):
         elif result.status == "unknown":
             self._print_status(
                 f"Unrecognized server version: {result.version_name}",
-                Out.WARNING,
+                self._version_output_category(result),
             )
         elif result.status == "unavailable":
             self._print_status(
                 "Version is not available before authentication: "
                 f"{result.error}",
-                Out.WARNING,
+                self._version_output_category(result),
             )
         else:
             self._print_status(
                 f"Version probe failed: {result.error}",
-                Out.ERROR,
+                self._version_output_category(result),
             )
 
         if result.transport is not None:
@@ -3683,25 +3850,25 @@ class RDP(BaseModule):
             protocol = result.selected_protocol or "unknown protocol"
             self._print_status(
                 f"NTLM challenge exposes server information via {protocol}",
-                Out.WARNING,
+                self._ntlm_info_output_category(result),
             )
             for line in self._ntlm_info_output_lines(result.info):
                 self.ptprint(f"        {line}", Out.TEXT)
         elif result.status == "empty":
             self._print_status(
                 "NTLM challenge was received but no server fields were decoded",
-                Out.WARNING,
+                self._ntlm_info_output_category(result),
             )
         elif result.status == "not_supported":
             detail = f": {result.error}" if result.error else ""
             self._print_status(
                 f"NTLM information not available{detail}",
-                Out.NOTVULN,
+                self._ntlm_info_output_category(result),
             )
         else:
             self._print_status(
                 f"NTLM information test failed: {result.error}",
-                Out.WARNING,
+                self._ntlm_info_output_category(result),
             )
 
         if result.negotiation_probe is not None:
@@ -3712,19 +3879,25 @@ class RDP(BaseModule):
             return
 
         self.ptprint("TLS / SSL configuration test", Out.INFO)
-        if result.status in ("ok", "weak"):
+        if result.status in ("ok", "weak", "partial"):
             detail = result.selected_tls_version or "unknown TLS version"
             if result.selected_cipher:
                 detail = f"{detail}, {result.selected_cipher}"
             self._print_status(
                 f"TLS handshake successful ({detail})",
-                Out.WARNING if result.status == "weak" else Out.NOTVULN,
+                Out.OK,
             )
             for finding in result.weak_findings:
-                self._print_status(finding, Out.WARNING)
+                self._print_status(finding, Out.VULN)
         else:
             self._print_status(
                 f"TLS handshake failed: {result.error}",
+                Out.ERROR,
+            )
+
+        if result.certificate and result.certificate.parse_error:
+            self._print_status(
+                f"Certificate parse error: {result.certificate.parse_error}",
                 Out.ERROR,
             )
 
@@ -3768,12 +3941,12 @@ class RDP(BaseModule):
             self._print_status(
                 "CredSSP/NTLM authentication succeeded "
                 f"({selected_protocol})",
-                Out.NOTVULN,
+                self._auth_output_category(result),
             )
         elif result.status == "tls_error":
             self._print_status(
                 f"Credentials were not used: {result.error}",
-                Out.ERROR,
+                self._auth_output_category(result),
             )
         elif result.status == "missing_credentials":
             self._print_status(
@@ -3787,6 +3960,11 @@ class RDP(BaseModule):
             )
             if result.error:
                 self.ptdebug(result.error)
+        elif result.status == "error":
+            self._print_status(
+                f"Authentication test failed: {result.error}",
+                self._auth_output_category(result),
+            )
         else:
             self._print_status(
                 "Authentication or RDP session setup failed",

@@ -19,6 +19,7 @@ from ptsrvtester.modules.rdp import (
     BasicSettingsResult,
     CapabilityFinding,
     CapabilityResult,
+    CertificateInfo,
     CredSSPResult,
     ENCRYPTION_METHOD_40BIT,
     ENCRYPTION_METHOD_128BIT,
@@ -43,6 +44,7 @@ from ptsrvtester.modules.rdp import (
     RDPNTLMInfo,
     RDPProtocolError,
     RDPEncryptionResult,
+    RDPResults,
     RDPVersionResult,
     RDPSecurityResult,
     REMOTEFX_CODEC_GUID,
@@ -55,6 +57,7 @@ from ptsrvtester.modules.rdp import (
     TRANSPORTTYPE_UDPFECR,
     TRANSPORTTYPE_UDP_PREFERRED,
     WeakCipherScanResult,
+    VULNS,
     NegotiationProbe,
     _aardwolf_probe_channel_types,
     _aardwolf_peer_certificate_sha256,
@@ -135,6 +138,24 @@ def rdp_args(**overrides) -> RDPArgs:
     }
     values.update(overrides)
     return RDPArgs(**values)
+
+
+def rdp_output_module() -> tuple[RDP, Mock]:
+    ptjsonlib = Mock()
+    ptjsonlib.create_node_object.return_value = {"key": "rdp-node"}
+    ptjsonlib.get_result_json.return_value = {}
+
+    module = RDP(rdp_args(), ptjsonlib)
+    module.ptprint = Mock()
+    module._print_status = Mock()
+    return module, ptjsonlib
+
+
+def vulnerability_codes(ptjsonlib: Mock) -> list[str]:
+    return [
+        recorded.kwargs["vuln_code"]
+        for recorded in ptjsonlib.add_vulnerability.call_args_list
+    ]
 
 
 def certificate_der(subject_key, signing_key) -> bytes:
@@ -1203,6 +1224,432 @@ class NLAOutputTests(unittest.TestCase):
 
         bullet.assert_called_once_with("WARNING")
         module.ptprint.assert_called_once_with("    <status> message", Out.TEXT)
+
+
+class RDPCategoryConsistencyTests(unittest.TestCase):
+    def test_security_and_neutral_result_categories(self):
+        cases = (
+            (
+                "_output_nla_text",
+                NLAResult("required", []),
+                "NLA required",
+                Out.NOTVULN,
+            ),
+            (
+                "_output_nla_text",
+                NLAResult("allowed_not_required", []),
+                "NLA is allowed but not required",
+                Out.VULN,
+            ),
+            (
+                "_output_nla_text",
+                NLAResult("not_supported", []),
+                "NLA is not supported",
+                Out.VULN,
+            ),
+            (
+                "_output_nla_text",
+                NLAResult("error", [], error="connection timed out"),
+                "connection timed out",
+                Out.ERROR,
+            ),
+            (
+                "_output_rdp_security_text",
+                RDPSecurityResult(
+                    "allowed",
+                    probe(
+                        "Standard RDP Security",
+                        PROTOCOL_RDP,
+                        selected=PROTOCOL_RDP,
+                    ),
+                ),
+                "Legacy Standard RDP Security is allowed",
+                Out.VULN,
+            ),
+            (
+                "_output_rdp_security_text",
+                RDPSecurityResult(
+                    "not_allowed",
+                    probe(
+                        "Standard RDP Security",
+                        PROTOCOL_RDP,
+                        failure=5,
+                    ),
+                ),
+                "Legacy Standard RDP Security is not allowed",
+                Out.NOTVULN,
+            ),
+            (
+                "_output_rdp_security_text",
+                RDPSecurityResult(
+                    "error",
+                    probe(
+                        "Standard RDP Security",
+                        PROTOCOL_RDP,
+                        error="connection timed out",
+                    ),
+                ),
+                "connection timed out",
+                Out.ERROR,
+            ),
+            (
+                "_output_credssp_text",
+                CredSSPResult("supported", False, []),
+                "CredSSP is supported",
+                Out.OK,
+            ),
+            (
+                "_output_credssp_text",
+                CredSSPResult("not_supported", False, []),
+                "CredSSP is not supported",
+                Out.WARNING,
+            ),
+            (
+                "_output_version_text",
+                RDPVersionResult("ok", version_name="RDP 10.x"),
+                "Server reports: RDP 10.x",
+                Out.OK,
+            ),
+            (
+                "_output_ntlminfo_text",
+                NTLMInfoResult("error", error="connection timed out"),
+                "NTLM information test failed: connection timed out",
+                Out.ERROR,
+            ),
+            (
+                "_output_auth_text",
+                RDPAuthResult(
+                    "authenticated",
+                    selected_protocol=PROTOCOL_HYBRID_EX,
+                ),
+                "CredSSP/NTLM authentication succeeded (HYBRID_EX)",
+                Out.OK,
+            ),
+            (
+                "_output_auth_text",
+                RDPAuthResult("error", error="adapter failure"),
+                "Authentication test failed: adapter failure",
+                Out.ERROR,
+            ),
+        )
+
+        for method_name, result, message, expected_category in cases:
+            with self.subTest(method=method_name, status=result.status):
+                module, _ptjsonlib = rdp_output_module()
+
+                getattr(module, method_name)(result)
+
+                module._print_status.assert_any_call(
+                    message,
+                    expected_category,
+                )
+
+    def test_rdp_encryption_protocol_categories(self):
+        cases = (
+            (
+                probe(
+                    "Standard RDP Security",
+                    PROTOCOL_RDP,
+                    selected=PROTOCOL_RDP,
+                ),
+                "supported",
+                Out.VULN,
+            ),
+            (
+                probe(
+                    "Standard RDP Security",
+                    PROTOCOL_RDP,
+                    failure=5,
+                ),
+                "not supported",
+                Out.NOTVULN,
+            ),
+            (
+                probe(
+                    "TLS without NLA",
+                    PROTOCOL_SSL,
+                    selected=PROTOCOL_SSL,
+                ),
+                "supported",
+                Out.VULN,
+            ),
+            (
+                probe(
+                    "TLS without NLA",
+                    PROTOCOL_SSL,
+                    failure=5,
+                ),
+                "not supported",
+                Out.NOTVULN,
+            ),
+            (
+                probe(
+                    "CredSSP",
+                    PROTOCOL_HYBRID,
+                    selected=PROTOCOL_HYBRID,
+                ),
+                "supported",
+                Out.OK,
+            ),
+            (
+                probe(
+                    "RDSTLS",
+                    PROTOCOL_RDSTLS,
+                    failure=5,
+                ),
+                "not supported",
+                Out.INFO,
+            ),
+            (
+                probe(
+                    "RDS AAD authentication",
+                    PROTOCOL_RDSAAD,
+                    error="connection timed out",
+                ),
+                "unknown (connection timed out)",
+                Out.ERROR,
+            ),
+        )
+
+        for protocol_probe, state, expected_category in cases:
+            with self.subTest(name=protocol_probe.name, state=state):
+                module, _ptjsonlib = rdp_output_module()
+                result = RDPEncryptionResult(
+                    status="ok",
+                    protocol_probes=[protocol_probe],
+                )
+
+                module._output_rdp_encryption_text(result)
+
+                module._print_status.assert_any_call(
+                    f"{protocol_probe.name}: {state}",
+                    expected_category,
+                    indent=8,
+                )
+
+    def test_negotiation_capabilities_are_neutral_successes(self):
+        module, _ptjsonlib = rdp_output_module()
+        result = RDPEncryptionResult(
+            status="ok",
+            response_flags=NEG_RSP_DYNVC_GFX_PROTOCOL_SUPPORTED,
+        )
+
+        module._output_rdp_encryption_text(result)
+
+        module._print_status.assert_any_call(
+            "Graphics Pipeline",
+            Out.OK,
+            indent=8,
+        )
+
+    def test_nla_not_required_is_vulnerable_in_text_and_json(self):
+        module, ptjsonlib = rdp_output_module()
+        module.results = RDPResults(
+            nla=NLAResult("allowed_not_required", []),
+        )
+
+        module.output()
+
+        module._print_status.assert_any_call(
+            "NLA is allowed but not required",
+            Out.VULN,
+        )
+        self.assertEqual(
+            vulnerability_codes(ptjsonlib),
+            [VULNS.NLA_NOT_REQUIRED.value],
+        )
+
+    def test_ntlm_disclosure_is_vulnerable_in_text_and_json(self):
+        module, ptjsonlib = rdp_output_module()
+        module.results = RDPResults(
+            ntlm_info=NTLMInfoResult(
+                "ok",
+                info=RDPNTLMInfo(netbios_computer="RDP-SRV"),
+                selected_protocol="HYBRID_EX",
+            ),
+        )
+
+        module.output()
+
+        module._print_status.assert_any_call(
+            "NTLM challenge exposes server information via HYBRID_EX",
+            Out.VULN,
+        )
+        self.assertEqual(
+            vulnerability_codes(ptjsonlib),
+            [VULNS.NTLM_INFO_DISCLOSURE.value],
+        )
+
+    def test_confirmed_tls_weakness_is_vulnerable_in_text_and_json(self):
+        module, ptjsonlib = rdp_output_module()
+        module.results = RDPResults(
+            ssl=SSLResult(
+                status="weak",
+                selected_tls_version="TLSv1.3",
+                selected_cipher="TLS_AES_256_GCM_SHA384",
+                weak_findings=["TLSv1.0 supported"],
+            ),
+        )
+
+        module.output()
+
+        module._print_status.assert_any_call(
+            "TLS handshake successful "
+            "(TLSv1.3, TLS_AES_256_GCM_SHA384)",
+            Out.OK,
+        )
+        module._print_status.assert_any_call(
+            "TLSv1.0 supported",
+            Out.VULN,
+        )
+        self.assertEqual(
+            vulnerability_codes(ptjsonlib),
+            [VULNS.TLS_WEAK_CONFIG.value],
+        )
+
+    def test_rdpenc_only_creates_security_vulnerabilities(self):
+        module, ptjsonlib = rdp_output_module()
+        module.results = RDPResults(
+            rdp_encryption=RDPEncryptionResult(
+                status="ok",
+                protocol_probes=[
+                    probe(
+                        "Standard RDP Security",
+                        PROTOCOL_RDP,
+                        selected=PROTOCOL_RDP,
+                    ),
+                    probe(
+                        "TLS without NLA",
+                        PROTOCOL_SSL,
+                        selected=PROTOCOL_SSL,
+                    ),
+                ],
+                legacy_status="ok",
+                legacy_probes=[
+                    LegacyEncryptionProbe(
+                        ENCRYPTION_METHOD_40BIT,
+                        True,
+                        selected_method=ENCRYPTION_METHOD_40BIT,
+                    )
+                ],
+            ),
+        )
+
+        module.output()
+
+        self.assertEqual(
+            vulnerability_codes(ptjsonlib),
+            [
+                VULNS.RDP_SECURITY_ALLOWED.value,
+                VULNS.NLA_NOT_REQUIRED.value,
+            ],
+        )
+
+    def test_overlapping_security_tests_deduplicate_json_vulnerabilities(self):
+        module, ptjsonlib = rdp_output_module()
+        standard_rdp_probe = probe(
+            "Standard RDP Security",
+            PROTOCOL_RDP,
+            selected=PROTOCOL_RDP,
+        )
+        tls_without_nla_probe = probe(
+            "TLS without NLA",
+            PROTOCOL_SSL,
+            selected=PROTOCOL_SSL,
+        )
+        module.results = RDPResults(
+            nla=NLAResult("allowed_not_required", []),
+            rdp_security=RDPSecurityResult("allowed", standard_rdp_probe),
+            rdp_encryption=RDPEncryptionResult(
+                status="ok",
+                protocol_probes=[
+                    standard_rdp_probe,
+                    tls_without_nla_probe,
+                ],
+                legacy_status="ok",
+                legacy_probes=[
+                    LegacyEncryptionProbe(
+                        ENCRYPTION_METHOD_40BIT,
+                        True,
+                    )
+                ],
+            ),
+        )
+
+        module.output()
+
+        codes = vulnerability_codes(ptjsonlib)
+        self.assertEqual(codes.count(VULNS.RDP_SECURITY_ALLOWED.value), 1)
+        self.assertEqual(codes.count(VULNS.NLA_NOT_REQUIRED.value), 1)
+        self.assertEqual(len(codes), 2)
+        legacy_call = next(
+            recorded
+            for recorded in ptjsonlib.add_vulnerability.call_args_list
+            if recorded.kwargs["vuln_code"]
+            == VULNS.RDP_SECURITY_ALLOWED.value
+        )
+        self.assertIn("40-bit RC4", legacy_call.kwargs["vuln_response"])
+
+    def test_certificate_parse_error_is_not_a_tls_vulnerability(self):
+        certificate = CertificateInfo(
+            subject=None,
+            issuer=None,
+            serial=None,
+            not_before=None,
+            not_after=None,
+            dns_names=[],
+            ip_addresses=[],
+            expired=None,
+            not_yet_valid=None,
+            self_signed=None,
+            parse_error="invalid DER certificate",
+        )
+        runner = RDP(rdp_args(), object())
+        runner._tls_handshake = Mock(
+            return_value=(
+                probe(
+                    "TLS handshake",
+                    PROTOCOL_SSL,
+                    selected=PROTOCOL_SSL,
+                ),
+                "TLSv1.3",
+                "TLS_AES_256_GCM_SHA384 (256 bits)",
+                b"invalid-certificate",
+                None,
+            )
+        )
+        runner._parse_certificate = Mock(return_value=certificate)
+        runner._probe_tls_versions = Mock(return_value=[])
+        runner._probe_weak_tls_ciphers = Mock(
+            return_value=WeakCipherScanResult(
+                "unavailable",
+                error="no local weak cipher candidates",
+            )
+        )
+
+        result = runner._run_ssl_test()
+
+        module, ptjsonlib = rdp_output_module()
+        module.results = RDPResults(ssl=result)
+
+        module.output()
+
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.weak_findings, [])
+        module._print_status.assert_any_call(
+            "Certificate parse error: invalid DER certificate",
+            Out.ERROR,
+        )
+        self.assertNotIn(
+            VULNS.TLS_WEAK_CONFIG.value,
+            vulnerability_codes(ptjsonlib),
+        )
+        ssl_json = module._ssl_json(result)
+        self.assertEqual(ssl_json["status"], "partial")
+        self.assertEqual(
+            ssl_json["certificate"]["parseError"],
+            "invalid DER certificate",
+        )
 
 
 class RDPVersionTests(unittest.TestCase):

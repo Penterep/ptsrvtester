@@ -26,16 +26,14 @@ source ~/.zshrc
 ## Usage examples
 
 ```
-ptsrvtester snmp detection --ip 192.168.1.1
-ptsrvtester dns whois -d example.com
-ptsrvtester ldap banner -ip 192.168.1.1
-ptsrvtester dhcp info --interface eth0
-ptsrvtester xrdp bruteforce --target 192.168.1.1 --username admin --wordlist passwords.txt
-ptsrvtester smtp --spoof-headers -r victim@example.com -u user -p pass smtp.example.com:587
-ptsrvtester smtp --bcc-test -r to@example.com --cc cc@example.com --bcc bcc@example.com smtp.example.com:25
-ptsrvtester smtp -al -r admin@example.com smtp.example.com:25
-ptsrvtester smtp -id mail.example.com:25
-ptsrvtester smtp -id --id-aggressive smtp.example.com:25
+ptsrvtester smtp -ts BANNER,EHLO -tg mail.example.com:25
+ptsrvtester smtp -ts ALL -tg mail.example.com:25
+ptsrvtester smtp -ts SPOOF -r victim@example.com -tg smtp.example.com:25
+ptsrvtester smtp -ts BCC -r to@example.com --cc cc@example.com --bcc bcc@example.com -tg smtp.example.com:25
+ptsrvtester pop3 -ts BANNER,CAPA -tg 127.0.0.1
+ptsrvtester pop3 -ts ALL --tls -tg 127.0.0.1:995
+ptsrvtester pop3 -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:110
+ptsrvtester imap -ts BANNER,CAPA -tg 127.0.0.1
 ptsrvtester <module> -h     for help for module use
 ```
 
@@ -66,11 +64,11 @@ ptsrvtester <module> -h     for help for module use
 ### Module Descriptions:
 
 **SNMP Module**
-- Version detection (SNMPv1, SNMPv2c, SNMPv3)
+- Version detection
 - SNMPv2 community string brute-force
 - SNMPv3 user enumeration and credential brute-force
 - Write permission testing
-- MIB walking (SNMPv2/SNMPv3)
+- MIB walking
 
 **DNS Module**
 - DNS server information retrieval
@@ -80,7 +78,7 @@ ptsrvtester <module> -h     for help for module use
 - WHOIS queries
 - Subdomain brute-forcing
 - DNSSEC verification
-- Zone walking (NSEC/NSEC3)
+- Zone walking
 
 **LDAP Module**
 - Server banner retrieval
@@ -114,16 +112,16 @@ ptsrvtester <module> -h     for help for module use
 - Banner, Service Identification and host key retrieval
 - Authentication method detection
 - Bad public key detection
-- SSH audit (CVE identification)
+- SSH audit
 - Credential and private key brute-force
 
 **SMTP Module**
 - Banner and Service Identification
 - Server identification
 - Server information gathering
-- Encryption testing (plaintext, STARTTLS, TLS); port 465 implicit TLS
-- User enumeration (VRFY, EXPN, RCPT)
-- AUTH user enumeration (each advertised LOGIN / PLAIN / NTLM; 2 synthetic baselines + `-u`/`-U` or default_logins)
+- Encryption testing
+- User enumeration
+- AUTH user enumeration
 - HELO/EHLO hostname validation
 - AUTH downgrade test
 - Invalid/non-standard SMTP commands
@@ -146,15 +144,18 @@ ptsrvtester <module> -h     for help for module use
 - Blacklist testing
 
 **POP3 Module**
-- Banner, Service Identification and capabilities retrieval
-- Help/Implementation info disclosure test (HELP command, IMPLEMENTATION from CAPA)
-- Encryption testing (plaintext, STLS, TLS); port 995 implicit TLS
+- Banner and Service Identification
+- CAPA
+- Help/Implementation info disclosure
+- Encryption testing
 - Anonymous authentication testing
 - NTLM authentication inspection
 - Credential brute-force
 
 **IMAP Module**
-- Banner, Service Identification and capabilities retrieval
+- Banner and Service Identification
+- CAPA
+- Encryption testing
 - Anonymous authentication testing
 - NTLM authentication inspection
 - Credential brute-force
@@ -169,8 +170,7 @@ ptsrvtester <module> -h     for help for module use
 - XRDP server brute-force testing
 - Credential testing via GUI automation
 - Multi-threaded password testing
-- CVE-2024-39917 exploitation (no rate limiting)
-- Requires Linux with Xorg, xfreerdp3, and wmctrl
+- CVE-2024-39917 exploitation
 
 ```
 

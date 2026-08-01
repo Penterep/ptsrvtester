@@ -2,23 +2,24 @@
 """
     Copyright (c) 2024 Penterep Security s.r.o.
 
-    ptapptest-plus - Application Server Penetration Testing Tool
+    ptsrvtester - Application Server Penetration Testing Tool
 
-    ptapptest-plus is free software: you can redistribute it and/or modify
+    ptsrvtester is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version.
 
-    ptapptest-plus is distributed in the hope that it will be useful,
+    ptsrvtester is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
     You should have received a copy of the GNU General Public License
-    along with ptapptest-plus.  If not, see <https://www.gnu.org/licenses/>.
+    along with ptsrvtester.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import argparse
+import importlib
 import os
 import re
 import sys
@@ -26,8 +27,37 @@ import sys
 from ptlibs import ptprinthelper, ptjsonlib
 from ptlibs.ptprinthelper import out_if, out_ifnot, ptprint
 
-
 from ._version import __version__
+from .protocols._base import BaseArgs
+
+SCRIPTNAME = "ptsrvtester"
+
+# Single source of truth for the available modules.
+#   name -> ("dotted.module.path:ClassName", "one-line description")
+# The class is imported lazily (see load_module) so a single-module run — and
+# `-h`/`--version`/unknown-module — never import the other 11 protocols and
+# their heavy dependencies (scapy, impacket, paramiko, …).
+MODULES: dict[str, tuple[str, str]] = {
+    "snmp":  ("ptsrvtester.protocols.snmp:SNMP",   "SNMP testing module"),
+    "dns":   ("ptsrvtester.protocols.dns:DNS",     "DNS testing module"),
+    "ldap":  ("ptsrvtester.protocols.ldap:LDAP",   "LDAP testing module"),
+    "msrpc": ("ptsrvtester.protocols.msrpc:MSRPC", "MSRPC testing module"),
+    "ftp":   ("ptsrvtester.protocols.ftp:FTP",     "FTP testing module"),
+    "ssh":   ("ptsrvtester.protocols.ssh:SSH",     "SSH testing module"),
+    "smtp":  ("ptsrvtester.protocols.smtp:SMTP",   "SMTP testing module"),
+    "pop3":  ("ptsrvtester.protocols.pop3:POP3",   "POP3 testing module"),
+    "imap":  ("ptsrvtester.protocols.imap:IMAP",   "IMAP testing module"),
+    "dhcp":  ("ptsrvtester.protocols.dhcp:DHCP",   "DHCP testing module"),
+    "xrdp":  ("ptsrvtester.protocols.xrdp:XRDP",   "XRDP testing module"),
+    "smb":   ("ptsrvtester.protocols.smb:SMB",     "SMB testing module"),
+}
+
+
+def load_module(name: str):
+    """Import and return the module class registered under ``name`` (lazy)."""
+    dotted, _ = MODULES[name]
+    mod_path, cls_name = dotted.split(":")
+    return getattr(importlib.import_module(mod_path), cls_name)
 
 
 class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
@@ -49,36 +79,17 @@ class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
         os._exit(1)
-from .modules.snmp import SNMP
-from .modules._base import BaseArgs
-from .modules.dns import DNS
-from .modules.ldap import LDAP
-from .modules.msrpc import MSRPC
-from .modules.ftp import FTP
-from .modules.ssh import SSH
-from .modules.smtp import SMTP
-from .modules.pop3 import POP3
-from .modules.imap import IMAP
-from .modules.dhcp import DHCP
-from .modules.xrdp import XRDP
-from .modules.smb import SMB
 
-SCRIPTNAME = "ptsrvtester"
 
-MODULES = {
-    "snmp": SNMP,
-    "dns": DNS,
-    "ldap": LDAP,
-    "msrpc": MSRPC,
-    "ftp": FTP,
-    "ssh": SSH,
-    "smtp": SMTP,
-    "pop3": POP3,
-    "imap": IMAP,
-    "dhcp": DHCP,
-    "xrdp": XRDP,
-    "smb": SMB,
-}
+# argparse parser that captures its error message instead of printing argparse's
+# own usage text, so parse_args() can render it in the Penterep banner+error style.
+_LAST_ERROR: dict[str, str | None] = {"message": None}
+
+
+class CustomArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        _LAST_ERROR["message"] = message
+        raise SystemExit(2)
 
 
 class Ptsrvtester:
@@ -91,12 +102,13 @@ class Ptsrvtester:
         ptjson = PtsrvtesterJsonLib()
 
         # Run the selected module
-        module = MODULES[self.args.module](self.args, ptjson)
+        module = load_module(self.args.module)(self.args, ptjson)
         module.run()
         module.output()
 
 
 def get_help():
+    module_rows = [[name, "<options>", "", desc] for name, (_, desc) in MODULES.items()]
     return [
         {"description": ["Server Penetration Testing Tool"]},
         {"usage": ["ptsrvtester <module> <options>"]},
@@ -105,18 +117,7 @@ def get_help():
             "ptsrvtester <module> -h     for help for module use"
         ]},
         {"options": [
-            ["snmp", "<options>", "", "SNMP testing module"],
-            ["dns", "<options>", "", "DNS testing module"],
-            ["ldap", "<options>", "", "LDAP testing module"],
-            ["msrpc", "<options>", "", "MSRPC testing module"],
-            ["ftp", "<options>", "", "FTP testing module"],
-            ["ssh", "<options>", "", "SSH testing module"],
-            ["smtp", "<options>", "", "SMTP testing module"],
-            ["pop3", "<options>", "", "POP3 testing module"],
-            ["imap", "<options>", "", "IMAP testing module"],
-            ["dhcp", "<options>", "", "DHCP testing module"],
-            ["xrdp", "<options>", "", "XRDP testing module"],
-            ["smb", "<options>", "", "SMB testing module"],
+            *module_rows,
             ["", " ", "", ""],
             ["-v", "--version", "", "Show script version and exit"],
             ["-h", "--help", "", "Show this help message and exit"],
@@ -132,11 +133,10 @@ def _extract_test_help(module_args, argv):
     if get_test_help is None:
         return None
     codes = None
-    tokens = argv[2:]
-    for i, tok in enumerate(tokens):
+    for i, tok in enumerate(argv):
         if tok in ("-ts", "--tests"):
-            if i + 1 < len(tokens):
-                codes = tokens[i + 1]
+            if i + 1 < len(argv):
+                codes = argv[i + 1]
             break
         if tok.startswith("-ts="):
             codes = tok[len("-ts="):]
@@ -152,206 +152,115 @@ def _extract_test_help(module_args, argv):
     return get_test_help(parsed)
 
 
+def _print_main_help() -> None:
+    ptprinthelper.help_print(get_help(), SCRIPTNAME, __version__)
+
+
+def _print_module_help(name: str, argv: list[str]) -> None:
+    module_args = load_module(name).module_args()
+    # Per-test help: `smtp -ts <TEST> -h` shows options for that test only.
+    test_help = _extract_test_help(module_args, argv)
+    help_obj = test_help if test_help is not None else module_args.get_help()
+    ptprinthelper.help_print(help_obj, f"{SCRIPTNAME} {name}", __version__)
+
+
+def _error_unknown_module(name: str) -> None:
+    ptprinthelper.print_banner(SCRIPTNAME, __version__, False)
+    print(f"\n\033[31m[✗]\033[0m Error: Unknown module '{name}'")
+    print(f"\nAvailable modules: {', '.join(MODULES.keys())}")
+    print(f"\nUse 'ptsrvtester -h' for help.\n")
+
+
+def _friendly_error(message: str | None) -> str:
+    """Rewrite argparse's wording into the Penterep 'Invalid option(s)' style."""
+    if not message:
+        return "Invalid arguments"
+    if "unrecognized arguments:" in message:
+        match = re.search(r"unrecognized arguments:\s*(.+)", message)
+        return f"Invalid option(s): {match.group(1).strip() if match else message}"
+    return message
+
+
+def _global_parent() -> argparse.ArgumentParser:
+    """Shared -j/-vv so they work both before and after the module name."""
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument("-j", "--json", action="store_true", help="use Penterep JSON output format")
+    parent.add_argument("-vv", "--verbose", action="store_true", dest="debug", help="Enable verbose mode")
+    return parent
+
+
 def parse_args() -> BaseArgs:
-    """Processes command line arguments
+    """Processes command line arguments.
+
+    Resolves the module from argv first, then imports only that module and parses
+    its options into a typed namespace. Help / version / unknown-module are handled
+    without importing any module.
 
     Returns:
-        BaseArgs: parsed arguments of the selected module
+        BaseArgs: parsed arguments of the selected module.
     """
-    
-    # Check for help flag before argparse processing
-    # Case 1: No arguments at all - show main help
-    if len(sys.argv) == 1:
-        ptprinthelper.help_print(get_help(), SCRIPTNAME, __version__)
+    argv = sys.argv[1:]
+
+    # No arguments at all -> main help.
+    if not argv:
+        _print_main_help()
         sys.exit(0)
-    
-    # Normalize module name to lowercase (case-insensitive module names)
-    if len(sys.argv) >= 2 and not sys.argv[1].startswith("-"):
-        sys.argv[1] = sys.argv[1].lower()
-    
-    # Case 2: Only module specified without arguments - show module help
-    if len(sys.argv) == 2 and sys.argv[1] in MODULES:
-        module_name = sys.argv[1]
-        module_help = MODULES[module_name].module_args().get_help()
-        ptprinthelper.help_print(module_help, f"{SCRIPTNAME} {module_name}", __version__)
+
+    module = next((tok.lower() for tok in argv if not tok.startswith("-")), None)
+    wants_help = any(tok in ("-h", "--help", "--h", "-help") for tok in argv)
+    wants_version = any(tok in ("-v", "--version") for tok in argv)
+
+    # Version is a global action; no module needed.
+    if wants_version:
+        print(f"{SCRIPTNAME} {__version__}")
         sys.exit(0)
-    
-    # Case 2b: Non-existent module (e.g. ptsrvtester FOO) - show banner, error, and our help
-    if len(sys.argv) == 2 and sys.argv[1] not in MODULES and not sys.argv[1].startswith("-"):
-        ptprinthelper.print_banner(SCRIPTNAME, __version__, False)
-        print(f"\n\033[31m[✗]\033[0m Error: Unknown module '{sys.argv[1]}'")
-        print(f"\nAvailable modules: {', '.join(MODULES.keys())}")
-        print(f"\nUse 'ptsrvtester -h' for help.\n")
-        sys.exit(2)
-    
-    # Case 3: Help flag present
-    if "-h" in sys.argv or "--help" in sys.argv or "--h" in sys.argv or "-help" in sys.argv:
-        # Check if module is specified
-        if len(sys.argv) >= 2 and sys.argv[1] in MODULES:
-            # Show module-specific help
-            module_name = sys.argv[1]
-            module_args = MODULES[module_name].module_args()
-            # Per-test help: `smtp -ts <TEST> -h` shows options for that test only
-            test_help = _extract_test_help(module_args, sys.argv)
-            if test_help is not None:
-                ptprinthelper.help_print(test_help, f"{SCRIPTNAME} {module_name}", __version__)
-                sys.exit(0)
-            module_help = module_args.get_help()
-            ptprinthelper.help_print(module_help, f"{SCRIPTNAME} {module_name}", __version__)
-            sys.exit(0)
+
+    # Help flag: module-specific help if a known module was named, else main help.
+    if wants_help:
+        if module in MODULES:
+            _print_module_help(module, argv)
         else:
-            # Show main help
-            ptprinthelper.help_print(get_help(), SCRIPTNAME, __version__)
-            sys.exit(0)
+            _print_main_help()
+        sys.exit(0)
 
-    # Shared error message storage
-    shared_error = {'message': None}
-    
-    # Custom ArgumentParser that stores error message
-    class CustomArgumentParser(argparse.ArgumentParser):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.error_message = None
-            # Override parser_class for subparsers
-            if 'parser_class' not in kwargs:
-                kwargs['parser_class'] = CustomArgumentParser
-            
-        def error(self, message):
-            # Store error message in both instance and shared storage
-            self.error_message = message
-            shared_error['message'] = message
-            raise SystemExit(2)
-        
-        def parse_args(self, *args, **kwargs):
-            try:
-                return super().parse_args(*args, **kwargs)
-            except argparse.ArgumentError as e:
-                # Store the error message before it gets lost
-                self.error_message = e.message
-                # Re-raise to let argparse handle it normally
-                raise
-    
-    parser = CustomArgumentParser(add_help=True)
+    # Only flags, no module -> main help.
+    if module is None:
+        _print_main_help()
+        sys.exit(0)
 
-    parser.add_argument(
-        "-v", "--version", action="version", version=f"%(prog)s {__version__}", help="print version"
-    )
-    parser.add_argument("-j", "--json", action="store_true", help="use Penterep JSON output format")
-    parser.add_argument(
-        "-vv",
-        "--verbose",
-        action="store_true",
-        dest="debug",
-        help="Enable verbose mode",
-    )
+    # Unknown module -> banner + error.
+    if module not in MODULES:
+        _error_unknown_module(module)
+        sys.exit(2)
 
-    # Subparser for every application module
+    # Bare module (no further arguments) -> that module's help.
+    if len(argv) == 1:
+        _print_module_help(module, argv)
+        sys.exit(0)
+
+    # Build a parser for this one module and parse into its typed namespace.
+    parser = CustomArgumentParser(add_help=True, parents=[_global_parent()])
     subparsers = parser.add_subparsers(required=True, dest="module", parser_class=CustomArgumentParser)
-    for name, module in MODULES.items():
-        module.module_args().add_subparser(name, subparsers)
-    # Global options must be on each subparser too (subparser parses the remainder of argv)
-    for subp in subparsers.choices.values():
-        subp.add_argument("-j", "--json", action="store_true", help="use Penterep JSON output format")
-        subp.add_argument(
-            "-vv",
-            "--verbose",
-            action="store_true",
-            dest="debug",
-            help="Enable verbose mode",
-        )
+    module_args = load_module(module).module_args()
+    module_args.add_subparser(module, subparsers)
+    # Global options must be on the subparser too, so they are also accepted AFTER
+    # the module name. default=SUPPRESS: when absent here they leave the value set
+    # by the parent parser intact (so `-j` before the module name is not clobbered).
+    subparsers.choices[module].add_argument("-j", "--json", action="store_true", default=argparse.SUPPRESS, help="use Penterep JSON output format")
+    subparsers.choices[module].add_argument("-vv", "--verbose", action="store_true", dest="debug", default=argparse.SUPPRESS, help="Enable verbose mode")
 
-    # First parse to get the module name, second parse to get the module-specific arguments
+    _LAST_ERROR["message"] = None
     try:
-        args = parser.parse_args(namespace=BaseArgs)
-        args = parser.parse_args(namespace=MODULES[args.module].module_args())
-
-        # Reject unknown options: argparse can treat -i as prefix of -ie etc., so check explicitly
-        subp = subparsers.choices[args.module]
-        known = set()
-        takes_value = set()
-        for a in subp._actions:
-            for opt in getattr(a, "option_strings", ()):
-                known.add(opt)
-                if getattr(a, "nargs", None) != 0 and (
-                    getattr(a, "nargs", None) is not None or getattr(a, "type", None) is not None
-                ):
-                    takes_value.add(opt)
-        argv = sys.argv[2:]
-        i = 0
-        invalid = []
-        while i < len(argv):
-            tok = argv[i]
-            if tok == "--":
-                i += 1
-                break
-            if not tok.startswith("-") or tok == "-":
-                i += 1
-                continue
-            if tok in known:
-                if tok in takes_value and i + 1 < len(argv) and not argv[i + 1].startswith("-") and argv[i + 1] != "--":
-                    i += 2
-                else:
-                    i += 1
-                continue
-            invalid.append(tok)
-            i += 1
-        if invalid:
-            shared_error["message"] = f"Invalid option(s): {', '.join(invalid)}"
-            raise SystemExit(2)
-    except (SystemExit, argparse.ArgumentError) as e:
-        # Argparse error occurred
-        error_code = e.code if isinstance(e, SystemExit) else 2
-        
-        if error_code != 0:  # 0 means success (e.g., --version was called)
-            # Print banner first
+        args = parser.parse_args(argv, namespace=module_args)
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 2
+        if code != 0:
             ptprinthelper.print_banner(SCRIPTNAME, __version__, False)
-            
-            # Get error message
-            error_msg = None
-            if isinstance(e, argparse.ArgumentError):
-                error_msg = e.message
-            elif isinstance(e, SystemExit):
-                # Check shared error message (set by any CustomArgumentParser instance)
-                if shared_error['message']:
-                    error_msg = shared_error['message']
-                # Fallback to parser error message
-                elif hasattr(parser, 'error_message') and parser.error_message:
-                    error_msg = parser.error_message
-            
-            # Make error message user-friendly for invalid options
-            if error_msg and "unrecognized arguments:" in error_msg:
-                match = re.search(r"unrecognized arguments:\s*(.+)", error_msg)
-                invalid = match.group(1).strip() if match else error_msg
-                error_msg = f"Invalid option(s): {invalid}"
-            elif error_msg and "the following arguments are required:" in error_msg:
-                # "required: target" is misleading when user typed invalid option (e.g. -dfsdfs)
-                # Only flag as invalid if option looks suspicious: -xxx with >2 letters (not -i, -sd)
-                # and is not a registered module option (e.g. -zipxxe, -bomb, -flood).
-                invalid_arg = None
-                if len(sys.argv) >= 3 and sys.argv[1] in MODULES:
-                    subp = subparsers.choices[sys.argv[1]]
-                    known_opts = set()
-                    for a in subp._actions:
-                        known_opts.update(getattr(a, "option_strings", ()))
-                    for arg in sys.argv[2:]:
-                        if arg.startswith("-") and not arg.startswith("--"):
-                            if len(arg) > 4 and arg not in known_opts:
-                                invalid_arg = arg
-                                break
-                if invalid_arg:
-                    error_msg = f"Invalid option: {invalid_arg}"
-            
-            # Always show error message (no help on error)
-            if error_msg:
-                print(f"\n\033[31m[✗]\033[0m Error: {error_msg}")
-            else:
-                print(f"\n\033[31m[✗]\033[0m Error: Invalid arguments")
+            print(f"\n\033[31m[✗]\033[0m Error: {_friendly_error(_LAST_ERROR['message'])}")
             print()
-        sys.exit(error_code)
+        sys.exit(code)
 
     ptprinthelper.print_banner(SCRIPTNAME, __version__, args.json)
-    
-
     return args
 
 

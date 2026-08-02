@@ -12,8 +12,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from ptsrvtester.modules._base import Out
-from ptsrvtester.modules.rdp import (
+from ptsrvtester.protocols.rdp.utils.engine import (
     AuthTLSValidationResult,
     AuthenticatedSessionResult,
     BasicSettingsResult,
@@ -30,6 +29,7 @@ from ptsrvtester.modules.rdp import (
     LegacyEncryptionProbe,
     NLAResult,
     NTLMInfoResult,
+    Out,
     PROTOCOL_HYBRID,
     PROTOCOL_HYBRID_EX,
     PROTOCOL_RDSTLS,
@@ -138,6 +138,13 @@ def rdp_args(**overrides) -> RDPArgs:
     }
     values.update(overrides)
     return RDPArgs(**values)
+
+
+def bare_rdp() -> RDP:
+    """Build an engine fixture without invoking its network-facing initializer."""
+    instance = RDP.__new__(RDP)
+    instance._active_output_context = None
+    return instance
 
 
 def rdp_output_module() -> tuple[RDP, Mock]:
@@ -404,7 +411,7 @@ class RDPNTLMInfoTests(unittest.TestCase):
         self.assertEqual(skew, 4.0)
 
     def test_output_omits_unknown_values_and_labels_self_reported_version(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         info = RDPNTLMInfo(
             netbios_computer="RDP-SRV",
             os_version="10.0.26100",
@@ -561,7 +568,7 @@ class MCSLegacyEncryptionTests(unittest.TestCase):
 
 class NLAClassificationTests(unittest.TestCase):
     def classify(self, probes: list[NegotiationProbe]) -> NLAResult:
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module._security_probes = probes
         return module._run_nla_test()
 
@@ -660,7 +667,7 @@ class RDPCommandTests(unittest.TestCase):
         self.assertIn("--login", help_data)
         self.assertIn("--password", help_data)
         self.assertIn(
-            "ptsrvtester RDP 12.32.43.163 -ts NLA AUTH -l admin -p pass123",
+            "ptsrvtester rdp 12.32.43.163 -ts NLA AUTH -l admin -p pass123",
             help_data,
         )
 
@@ -782,7 +789,7 @@ class RDPCommandTests(unittest.TestCase):
 
         self.assertEqual(module.results.auth.status, "missing_credentials")
 
-    @patch("ptsrvtester.modules.rdp.IMPLEMENTED_TESTS", {"AUTH"})
+    @patch("ptsrvtester.protocols.rdp.utils.engine.IMPLEMENTED_TESTS", {"AUTH"})
     def test_default_run_includes_auth_when_credentials_are_supplied(self):
         module = RDP(
             rdp_args(login="EXAMPLE\\tester", password="secret"),
@@ -816,7 +823,7 @@ class RDPAuthenticationTests(unittest.TestCase):
         self.assertNotIn("SuperSecret", error)
         self.assertIn("<redacted>", error)
 
-    @patch("ptsrvtester.modules.rdp._run_aardwolf_authenticated_session")
+    @patch("ptsrvtester.protocols.rdp.utils.engine._run_aardwolf_authenticated_session")
     def test_authenticated_session_is_cached(self, run_session):
         run_session.return_value = AuthenticatedSessionResult(
             status="authenticated",
@@ -847,7 +854,7 @@ class RDPAuthenticationTests(unittest.TestCase):
             True,
         )
 
-    @patch("ptsrvtester.modules.rdp._run_aardwolf_authenticated_session")
+    @patch("ptsrvtester.protocols.rdp.utils.engine._run_aardwolf_authenticated_session")
     def test_auth_only_does_not_request_capability_channels(self, run_session):
         run_session.return_value = AuthenticatedSessionResult(
             status="authenticated",
@@ -879,7 +886,7 @@ class RDPAuthenticationTests(unittest.TestCase):
         )
 
     def test_auth_output_never_contains_credentials(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
         module.ptprint = Mock()
@@ -899,7 +906,7 @@ class RDPAuthenticationTests(unittest.TestCase):
         self.assertNotIn("password", output.lower())
 
     def test_tls_error_output_says_credentials_were_not_used_once(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
         module.ptprint = Mock()
@@ -918,7 +925,7 @@ class RDPAuthenticationTests(unittest.TestCase):
         self.assertNotIn("session setup failed", output)
 
     def test_failed_authentication_still_reports_insecure_tls_choice(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
         module.ptprint = Mock()
@@ -937,7 +944,7 @@ class RDPAuthenticationTests(unittest.TestCase):
         self.assertIn("TLS certificate validation was explicitly disabled", output)
 
     def test_auth_json_contains_no_identity_or_secret(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
 
         result = module._auth_json(
             RDPAuthResult(
@@ -955,7 +962,7 @@ class RDPAuthenticationTests(unittest.TestCase):
         self.assertNotIn("login", result)
         self.assertNotIn("password", result)
 
-    @patch("ptsrvtester.modules.rdp._run_aardwolf_authenticated_session")
+    @patch("ptsrvtester.protocols.rdp.utils.engine._run_aardwolf_authenticated_session")
     def test_untrusted_certificate_blocks_credentials(self, run_session):
         module = RDP(
             rdp_args(login="EXAMPLE\\tester", password="secret"),
@@ -975,7 +982,7 @@ class RDPAuthenticationTests(unittest.TestCase):
             verify_certificate=True,
         )
 
-    @patch("ptsrvtester.modules.rdp._run_aardwolf_authenticated_session")
+    @patch("ptsrvtester.protocols.rdp.utils.engine._run_aardwolf_authenticated_session")
     def test_explicit_insecure_authentication_pins_preflight_certificate(
         self,
         run_session,
@@ -1121,13 +1128,13 @@ class RDPAuthenticationTests(unittest.TestCase):
         logger.disabled = False
         try:
             with patch(
-                "ptsrvtester.modules.rdp.importlib.metadata.version",
+                "ptsrvtester.protocols.rdp.utils.engine.importlib.metadata.version",
                 side_effect=lambda package: {
                     "aardwolf": "0.2.14",
                     "asyauth": "0.0.23",
                 }[package],
             ), patch(
-                "ptsrvtester.modules.rdp._connect_aardwolf_session",
+                "ptsrvtester.protocols.rdp.utils.engine._connect_aardwolf_session",
                 new_callable=AsyncMock,
                 return_value=expected_result,
             ) as connect:
@@ -1164,13 +1171,13 @@ class RDPAuthenticationTests(unittest.TestCase):
         logger.disabled = False
         try:
             with patch(
-                "ptsrvtester.modules.rdp.importlib.metadata.version",
+                "ptsrvtester.protocols.rdp.utils.engine.importlib.metadata.version",
                 side_effect=lambda package: {
                     "aardwolf": "0.2.14",
                     "asyauth": "0.0.23",
                 }[package],
             ), patch(
-                "ptsrvtester.modules.rdp._connect_aardwolf_session",
+                "ptsrvtester.protocols.rdp.utils.engine._connect_aardwolf_session",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("adapter failure"),
             ):
@@ -1194,7 +1201,7 @@ class RDPAuthenticationTests(unittest.TestCase):
 
 class NLAOutputTests(unittest.TestCase):
     def output_for(self, status: str) -> str:
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
         module.ptprint = Mock()
@@ -1215,9 +1222,12 @@ class NLAOutputTests(unittest.TestCase):
     def test_unsupported_output(self):
         self.assertIn("NLA is not supported", self.output_for("not_supported"))
 
-    @patch("ptsrvtester.modules.rdp.ptprinthelper.bullet", return_value="<status> ")
+    @patch(
+        "ptsrvtester.protocols.rdp.utils.engine.ptprinthelper.bullet",
+        return_value="<status> ",
+    )
     def test_status_lines_use_ptlibs_bullet_mapping(self, bullet):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.ptprint = Mock()
 
         module._print_status("message", Out.WARNING)
@@ -1653,10 +1663,10 @@ class RDPCategoryConsistencyTests(unittest.TestCase):
 
 
 class RDPVersionTests(unittest.TestCase):
-    @patch("ptsrvtester.modules.rdp._create_tls_context")
-    @patch("ptsrvtester.modules.rdp._parse_negotiation_reply_details")
-    @patch("ptsrvtester.modules.rdp._read_tpkt", return_value=b"reply")
-    @patch("ptsrvtester.modules.rdp.socket.create_connection")
+    @patch("ptsrvtester.protocols.rdp.utils.engine._create_tls_context")
+    @patch("ptsrvtester.protocols.rdp.utils.engine._parse_negotiation_reply_details")
+    @patch("ptsrvtester.protocols.rdp.utils.engine._read_tpkt", return_value=b"reply")
+    @patch("ptsrvtester.protocols.rdp.utils.engine.socket.create_connection")
     def test_transport_error_is_not_hidden_by_fallback_rejection(
         self,
         create_connection,
@@ -1757,7 +1767,7 @@ class RDPVersionTests(unittest.TestCase):
         self.assertEqual(result.source, "authenticated")
 
     def test_version_output_does_not_claim_supported_version_list(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
         module.ptprint = Mock()
@@ -1778,7 +1788,7 @@ class RDPVersionTests(unittest.TestCase):
         self.assertNotIn("supported versions", output.lower())
 
     def test_version_json_identifies_authenticated_source(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
 
         output = module._version_json(
             RDPVersionResult(
@@ -1899,7 +1909,7 @@ class RDPCapabilityTests(unittest.TestCase):
         )
 
     def test_channel_allocation_output_does_not_claim_policy_is_enabled(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
         module.ptprint = Mock()
@@ -1924,7 +1934,7 @@ class RDPCapabilityTests(unittest.TestCase):
         self.assertIn("channel allocated; feature/policy not verified", output)
 
     def test_not_tested_capability_output_explains_required_exchange(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
         module.ptprint = Mock()
@@ -1948,7 +1958,7 @@ class RDPCapabilityTests(unittest.TestCase):
         self.assertIn("requires RDPGFX Caps Advertise/Confirm exchange", output)
 
     def test_supported_capability_uses_neutral_ok_output(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
         module.ptprint = Mock()
@@ -2134,7 +2144,7 @@ class RDPCapabilityTests(unittest.TestCase):
         self.assertIn("bitmapCompressionFlag=FALSE", finding.evidence)
 
     def test_capability_json_preserves_status_and_evidence(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         result = CapabilityResult(
             status="partial",
             findings=[
@@ -2166,7 +2176,7 @@ class WeakCipherTests(unittest.TestCase):
         self.assertEqual(formatted, "TLS_AES_256_GCM_SHA384 (256 bits)")
 
     @patch(
-        "ptsrvtester.modules.rdp._available_weak_tls_cipher_names",
+        "ptsrvtester.protocols.rdp.utils.engine._available_weak_tls_cipher_names",
         return_value=("WEAK-A", "WEAK-B"),
     )
     def test_scan_reports_no_accepted_weak_cipher(self, _weak_names):
@@ -2191,7 +2201,7 @@ class WeakCipherTests(unittest.TestCase):
         self.assertEqual(result.accepted_ciphers, ())
 
     @patch(
-        "ptsrvtester.modules.rdp._available_weak_tls_cipher_names",
+        "ptsrvtester.protocols.rdp.utils.engine._available_weak_tls_cipher_names",
         return_value=("WEAK-A", "WEAK-B"),
     )
     def test_scan_enumerates_each_accepted_weak_cipher(self, _weak_names):
@@ -2213,7 +2223,7 @@ class WeakCipherTests(unittest.TestCase):
         self.assertEqual(module._tls_handshake.call_count, 2)
 
     @patch(
-        "ptsrvtester.modules.rdp._available_weak_tls_cipher_names",
+        "ptsrvtester.protocols.rdp.utils.engine._available_weak_tls_cipher_names",
         return_value=("WEAK-A",),
     )
     def test_scan_does_not_treat_timeout_as_cipher_rejection(self, _weak_names):
@@ -2231,7 +2241,7 @@ class WeakCipherTests(unittest.TestCase):
         self.assertIn("timed out", result.error)
 
     def test_accepted_cipher_is_included_in_security_findings(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         result = SSLResult(
             status="ok",
             weak_cipher_scan=WeakCipherScanResult(
@@ -2246,7 +2256,7 @@ class WeakCipherTests(unittest.TestCase):
         self.assertIn("weak TLSv1.2 cipher accepted: WEAK-A", findings)
 
     def test_output_reports_completed_negative_weak_cipher_scan(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
         module.ptprint = Mock()
@@ -2266,7 +2276,7 @@ class WeakCipherTests(unittest.TestCase):
         self.assertIn("No locally offerable weak TLSv1.2 cipher accepted", output)
 
     def test_weak_cipher_scan_is_serialized_for_json(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         result = SSLResult(
             status="weak",
             weak_cipher_scan=WeakCipherScanResult(
@@ -2284,7 +2294,7 @@ class WeakCipherTests(unittest.TestCase):
 
 class CertificateParsingTests(unittest.TestCase):
     def setUp(self):
-        self.module = RDP.__new__(RDP)
+        self.module = bare_rdp()
 
     def test_self_signed_certificate_signature_is_verified(self):
         key = ec.generate_private_key(ec.SECP256R1())
@@ -2336,7 +2346,7 @@ class RDPEncryptionOutputTests(unittest.TestCase):
         )
 
     def test_output_lists_protocols_capabilities_and_legacy_methods(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
         module.ptprint = Mock()
@@ -2355,7 +2365,7 @@ class RDPEncryptionOutputTests(unittest.TestCase):
         self.assertIn("Server protocol version: RDP 5.0-8.1 family", output)
 
     def test_output_distinguishes_tls_without_nla_from_tls_transport(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
         module.use_json = False
         module.args = SimpleNamespace(debug=False, json=False)
         module.ptprint = Mock()
@@ -2373,7 +2383,7 @@ class RDPEncryptionOutputTests(unittest.TestCase):
         self.assertIn("TLS without NLA: not supported", output)
 
     def test_json_preserves_evidence_and_capabilities(self):
-        module = RDP.__new__(RDP)
+        module = bare_rdp()
 
         output = module._rdp_encryption_json(self.sample_result())
 

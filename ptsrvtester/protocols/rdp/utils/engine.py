@@ -28,8 +28,19 @@ from pyasn1.codec.der import encoder as der_encoder
 from pyasn1.error import PyAsn1Error
 from pyasn1.type import namedtype, tag, univ
 
-from ._base import BaseArgs, BaseModule, Out
-from .utils.helpers import Target, valid_target
+try:
+    from ptsrvtester.protocols._base import BaseArgs, BaseModule, Out
+except ModuleNotFoundError as exc:  # transitional compatibility before base rebase
+    if exc.name != "ptsrvtester.protocols._base":
+        raise
+    from ptsrvtester.modules._base import BaseArgs, BaseModule, Out
+
+from .cli import (
+    IMPLEMENTED_TESTS,
+    RDP_TEST_ALIASES,
+    RDP_TEST_ORDER,
+    RDPArgs,
+)
 
 
 PROTOCOL_RDP = 0x00000000
@@ -50,31 +61,6 @@ TYPE_RDP_NEG_FAILURE = 0x03
 
 X224_TPDU_CONNECTION_CONFIRM = 0xD0
 X224_TPDU_DISCONNECT_REQUEST = 0x80
-
-RDP_TEST_ORDER = (
-    "NLA",
-    "RDPSEC",
-    "CREDSSP",
-    "RDPENC",
-    "CAPABIL",
-    "VERSION",
-    "SSL",
-    "NTLMINFO",
-    "AUTH",
-)
-RDP_TEST_ALIASES = {"INFO": "NTLMINFO"}
-RDP_TEST_CHOICES = RDP_TEST_ORDER + tuple(RDP_TEST_ALIASES)
-IMPLEMENTED_TESTS = {
-    "NLA",
-    "RDPSEC",
-    "CREDSSP",
-    "RDPENC",
-    "CAPABIL",
-    "VERSION",
-    "SSL",
-    "NTLMINFO",
-    "AUTH",
-}
 
 AARDWOLF_VERSION = "0.2.14"
 ASYAUTH_VERSION = "0.0.23"
@@ -564,6 +550,7 @@ class RDPResults:
     ssl: SSLResult | None = None
     auth: RDPAuthResult | None = None
     not_implemented: list[str] = field(default_factory=list)
+    module_errors: dict[str, str] = field(default_factory=dict)
 
 
 def _split_ntlm_login(login: str) -> tuple[str | None, str]:
@@ -1002,11 +989,6 @@ def _run_aardwolf_authenticated_session(
             status="error",
             error=_sanitize_auth_error(exc, password, login),
         )
-
-
-def valid_target_rdp(target: str) -> Target:
-    """Argparse helper: IP or hostname with optional port."""
-    return valid_target(target, domain_allowed=True)
 
 
 def protocol_name(protocol: int | None) -> str:
@@ -1897,105 +1879,6 @@ def _parse_negotiation_reply(packet: bytes) -> tuple[int | None, int | None, str
     return reply.selected_protocol, reply.failure_code, reply.note
 
 
-class RDPArgs(BaseArgs):
-    target: Target
-    tests: list[str] | None
-    login: str | None
-    password: str | None
-    insecure_auth: bool
-    timeout: int
-
-    @staticmethod
-    def get_help():
-        return [
-            {"description": ["RDP Testing Module"]},
-            {"usage": ["ptsrvtester rdp <target> <options>"]},
-            {"usage_example": [
-                "ptsrvtester rdp 192.168.1.10 -ts NLA",
-                "ptsrvtester RDP 12.32.43.163 -ts NLA AUTH -l admin -p pass123",
-                "ptsrvtester RDP rdp.example.com -ts NLA",
-            ]},
-            {"options": [
-                ["-ts", "--tests", "<test>", "Specify one or more tests to perform"],
-                ["", "", "NLA", "Network Level Authentication requirement test"],
-                ["", "", "RDPSEC", "Legacy Standard RDP Security negotiation test"],
-                ["", "", "CREDSSP", "CredSSP protocol support test"],
-                ["", "", "RDPENC", "Security protocols and RDP encryption enumeration"],
-                ["", "", "CAPABIL", "RDP capability negotiation"],
-                ["", "", "VERSION", "RDP protocol version reported by the server"],
-                ["", "", "SSL", "TLS/RDP Security configuration test"],
-                ["", "", "NTLMINFO", "Pre-auth CredSSP/NTLM server information test"],
-                ["", "", "INFO", "Alias for NTLMINFO"],
-                ["", "", "AUTH", "Single CredSSP/NTLM authentication test"],
-                ["-l", "--login", "<login>", "Login for account-based tests"],
-                ["-p", "--password", "<password>", "Password for account-based tests"],
-                ["", "--insecure-auth", "", "Allow credentials with an untrusted RDP TLS certificate"],
-                ["-T", "--timeout", "<milliseconds>", "Network timeout (default 10000)"],
-                ["", "", "", ""],
-                ["-h", "--help", "", "Show this help message and exit"],
-                ["-vv", "--verbose", "", "Enable verbose mode"],
-            ]},
-            {"note": [
-                "When -ts/--tests is omitted, all safe pre-auth tests are executed; "
-                "AUTH is also executed when both credentials are supplied.",
-                "AUTH performs one CredSSP/NTLM authentication attempt.",
-                "Use --insecure-auth only for an explicitly trusted test target "
-                "whose RDP certificate cannot be validated.",
-            ]},
-        ]
-
-    def add_subparser(self, name: str, subparsers) -> None:
-        examples = """example usage:
-  ptsrvtester rdp 192.168.1.10 -ts NLA
-  ptsrvtester rdp 192.168.1.10 -ts NLA NTLMINFO
-  ptsrvtester RDP 12.32.43.163 -ts NLA AUTH -l admin -p pass123
-  ptsrvtester RDP rdp.example.com -ts NLA
-  ptsrvtester rdp 192.168.1.10 -vv"""
-
-        parser = subparsers.add_parser(
-            name,
-            add_help=True,
-            epilog=examples,
-            formatter_class=argparse.RawTextHelpFormatter,
-        )
-
-        if not isinstance(parser, argparse.ArgumentParser):
-            raise TypeError
-
-        parser.add_argument(
-            "target",
-            type=valid_target_rdp,
-            help="IP[:PORT] or HOST[:PORT] (default port: 3389)",
-        )
-        parser.add_argument(
-            "-ts",
-            "--tests",
-            nargs="+",
-            type=str.upper,
-            choices=RDP_TEST_CHOICES,
-            metavar="TEST",
-            help=(
-                "tests to run: NLA, RDPSEC, CREDSSP, RDPENC, CAPABIL, "
-                "VERSION, SSL, NTLMINFO, INFO, AUTH"
-            ),
-        )
-        parser.add_argument("-l", "--login", help="login for account-based tests")
-        parser.add_argument("-p", "--password", help="password for account-based tests")
-        parser.add_argument(
-            "--insecure-auth",
-            action="store_true",
-            help="allow credential use when the RDP TLS certificate is untrusted",
-        )
-        parser.add_argument(
-            "-T",
-            "--timeout",
-            type=int,
-            default=10000,
-            metavar="MILLISECONDS",
-            help="socket timeout in milliseconds (default: 10000)",
-        )
-
-
 class RDP(BaseModule):
     @staticmethod
     def module_args() -> RDPArgs:
@@ -2021,10 +1904,18 @@ class RDP(BaseModule):
         self._basic_settings_result: BasicSettingsResult | None = None
         self._auth_tls_validation_result: AuthTLSValidationResult | None = None
         self._authenticated_session_result: AuthenticatedSessionResult | None = None
+        self._active_output_context = None
+        self._suppressed_module_heading: str | None = None
 
     def run(self) -> None:
         if self.args.tests is not None:
             selected_tests = self.args.tests
+            if isinstance(selected_tests, str):
+                selected_tests = [
+                    code.strip().upper()
+                    for code in selected_tests.split(",")
+                    if code.strip()
+                ]
         else:
             selected_tests = [
                 test
@@ -2043,26 +1934,132 @@ class RDP(BaseModule):
             seen_tests.add(canonical)
 
         for test in requested_tests:
-            if test == "NLA":
-                self.results.nla = self._run_nla_test()
-            elif test == "RDPSEC":
-                self.results.rdp_security = self._run_rdp_security_test()
-            elif test == "CREDSSP":
-                self.results.credssp = self._run_credssp_test()
-            elif test == "RDPENC":
-                self.results.rdp_encryption = self._run_rdp_encryption_test()
-            elif test == "CAPABIL":
-                self.results.capabilities = self._run_capability_test()
-            elif test == "VERSION":
-                self.results.version = self._run_version_test()
-            elif test == "NTLMINFO":
-                self.results.ntlm_info = self._run_ntlminfo_test()
-            elif test == "SSL":
-                self.results.ssl = self._run_ssl_test()
-            elif test == "AUTH":
-                self.results.auth = self._run_auth_test()
-            else:
-                self.results.not_implemented.append(test)
+            self.run_test(test)
+
+    def run_test(self, test: str) -> None:
+        """Execute one discovered RDP test while retaining this scan's shared caches."""
+        canonical = RDP_TEST_ALIASES.get(str(test).upper(), str(test).upper())
+        if canonical == "NLA":
+            self.results.nla = self._run_nla_test()
+        elif canonical == "RDPSEC":
+            self.results.rdp_security = self._run_rdp_security_test()
+        elif canonical == "CREDSSP":
+            self.results.credssp = self._run_credssp_test()
+        elif canonical == "RDPENC":
+            self.results.rdp_encryption = self._run_rdp_encryption_test()
+        elif canonical == "CAPABIL":
+            self.results.capabilities = self._run_capability_test()
+        elif canonical == "VERSION":
+            self.results.version = self._run_version_test()
+        elif canonical == "NTLMINFO":
+            self.results.ntlm_info = self._run_ntlminfo_test()
+        elif canonical == "SSL":
+            self.results.ssl = self._run_ssl_test()
+        elif canonical == "AUTH":
+            self.results.auth = self._run_auth_test()
+        elif canonical not in self.results.not_implemented:
+            self.results.not_implemented.append(canonical)
+
+    def run_module(self, test: str, ctx) -> None:
+        """Execute one adapter and retain unexpected failures for JSON output.
+
+        ``BaseMain`` deliberately catches module exceptions so the remaining
+        modules can continue.  Its generic error line is suppressed in JSON
+        mode, however, so RDP catches here as well and records a structured
+        failure instead of producing a successful-looking partial report.
+        """
+        canonical = RDP_TEST_ALIASES.get(str(test).upper(), str(test).upper())
+        try:
+            self.run_test(canonical)
+            self.emit_test_output(canonical, ctx)
+        except Exception as exc:
+            redacted = _sanitize_auth_error(
+                exc,
+                getattr(self.args, "password", None),
+                getattr(self.args, "login", None),
+            )
+            detail = f"{type(exc).__name__}: {redacted}"
+            self.results.module_errors[canonical] = detail
+            ctx.out(f"Error in module {canonical}: {redacted}", "ERROR")
+
+    def emit_test_output(self, test: str, ctx) -> None:
+        """Render one result through a module's isolated BaseMain output context."""
+        canonical = RDP_TEST_ALIASES.get(str(test).upper(), str(test).upper())
+        outputters = {
+            "NLA": ("Network Level Authentication (NLA) test", self.results.nla, self._output_nla_text),
+            "RDPSEC": ("RDP Security test", self.results.rdp_security, self._output_rdp_security_text),
+            "CREDSSP": ("CredSSP test", self.results.credssp, self._output_credssp_text),
+            "RDPENC": ("RDP security and encryption enumeration", self.results.rdp_encryption, self._output_rdp_encryption_text),
+            "CAPABIL": ("RDP capabilities", self.results.capabilities, self._output_capabilities_text),
+            "VERSION": ("RDP protocol version", self.results.version, self._output_version_text),
+            "SSL": ("TLS / SSL configuration test", self.results.ssl, self._output_ssl_text),
+            "NTLMINFO": ("RDP NTLM information", self.results.ntlm_info, self._output_ntlminfo_text),
+            "AUTH": ("RDP authentication test", self.results.auth, self._output_auth_text),
+        }
+        entry = outputters.get(canonical)
+        if entry is None or entry[1] is None:
+            return
+        heading, result, outputter = entry
+        previous_context = self._active_output_context
+        previous_heading = self._suppressed_module_heading
+        self._active_output_context = ctx
+        self._suppressed_module_heading = heading
+        try:
+            outputter(result)
+        finally:
+            self._active_output_context = previous_context
+            self._suppressed_module_heading = previous_heading
+
+    def ptprint(
+        self,
+        string: str,
+        out: Out = Out.TEXT,
+        title: bool = False,
+        end: str = "\n",
+        json: bool = False,
+    ):
+        """Route legacy reporting through BaseMain's per-module buffer when active."""
+        if getattr(self, "_active_output_context", None) is None:
+            return super().ptprint(string, out, title, end, json)
+        if json:
+            return
+        if (
+            getattr(self, "_suppressed_module_heading", None) is not None
+            and out == Out.INFO
+            and not title
+            and string == self._suppressed_module_heading
+        ):
+            self._suppressed_module_heading = None
+            return
+        category = Out.TITLE.value if title else out.value
+        self._active_output_context.out(
+            string,
+            category,
+            colortext=bool(title or out == Out.INFO),
+        )
+
+    def ptdebug(
+        self,
+        string: str,
+        out: Out = Out.TEXT,
+        title: bool = False,
+        end: str = "\n",
+        *,
+        indent_override: int | None = None,
+    ) -> None:
+        """Route verbose legacy reporting through BaseMain's module buffer."""
+        if getattr(self, "_active_output_context", None) is None:
+            return super().ptdebug(
+                string,
+                out,
+                title,
+                end,
+                indent_override=indent_override,
+            )
+        self._active_output_context.debug(
+            string,
+            indent=4 if indent_override is None else indent_override,
+        )
 
     def _get_auth_tls_validation_result(self) -> AuthTLSValidationResult:
         if self._auth_tls_validation_result is not None:
@@ -2114,6 +2111,21 @@ class RDP(BaseModule):
             )
             return self._authenticated_session_result
 
+        selected_tests = getattr(self.args, "_rdp_selected_tests", None)
+        if selected_tests is None:
+            raw_tests = self.args.tests
+            if isinstance(raw_tests, str):
+                selected_tests = {
+                    RDP_TEST_ALIASES.get(code.strip().upper(), code.strip().upper())
+                    for code in raw_tests.split(",")
+                    if code.strip()
+                }
+            elif raw_tests is not None:
+                selected_tests = {
+                    RDP_TEST_ALIASES.get(str(code).upper(), str(code).upper())
+                    for code in raw_tests
+                }
+
         self._authenticated_session_result = _run_aardwolf_authenticated_session(
             self.args.target.ip,
             self.args.target.port,
@@ -2122,7 +2134,7 @@ class RDP(BaseModule):
             self.timeout_seconds,
             tls_validation.certificate_sha256,
             tls_validation.status,
-            self.args.tests is None or "CAPABIL" in self.args.tests,
+            selected_tests is None or "CAPABIL" in selected_tests,
         )
         return self._authenticated_session_result
 
@@ -3439,7 +3451,7 @@ class RDP(BaseModule):
 
         return vulnerabilities
 
-    def output(self) -> None:
+    def output(self, *, emit_text: bool = True) -> None:
         properties = {
             "software_type": None,
             "name": "rdp",
@@ -3468,7 +3480,8 @@ class RDP(BaseModule):
                     existing[field_name] = "\n".join(existing_lines)
 
         if self.results.nla is not None:
-            self._output_nla_text(self.results.nla)
+            if emit_text:
+                self._output_nla_text(self.results.nla)
             properties["nla"] = self._nla_json(self.results.nla)
 
             if self.results.nla.status == "allowed_not_required":
@@ -3489,7 +3502,8 @@ class RDP(BaseModule):
                 )
 
         if self.results.rdp_security is not None:
-            self._output_rdp_security_text(self.results.rdp_security)
+            if emit_text:
+                self._output_rdp_security_text(self.results.rdp_security)
             properties["rdpSecurity"] = self._rdp_security_json(self.results.rdp_security)
             if self.results.rdp_security.status == "allowed":
                 defer_vulnerability(
@@ -3501,11 +3515,13 @@ class RDP(BaseModule):
                 )
 
         if self.results.credssp is not None:
-            self._output_credssp_text(self.results.credssp)
+            if emit_text:
+                self._output_credssp_text(self.results.credssp)
             properties["credssp"] = self._credssp_json(self.results.credssp)
 
         if self.results.rdp_encryption is not None:
-            self._output_rdp_encryption_text(self.results.rdp_encryption)
+            if emit_text:
+                self._output_rdp_encryption_text(self.results.rdp_encryption)
             properties["rdpEncryption"] = self._rdp_encryption_json(
                 self.results.rdp_encryption
             )
@@ -3515,19 +3531,22 @@ class RDP(BaseModule):
                 defer_vulnerability(vulnerability)
 
         if self.results.capabilities is not None:
-            self._output_capabilities_text(self.results.capabilities)
+            if emit_text:
+                self._output_capabilities_text(self.results.capabilities)
             properties["capabilities"] = self._capabilities_json(
                 self.results.capabilities
             )
 
         if self.results.version is not None:
-            self._output_version_text(self.results.version)
+            if emit_text:
+                self._output_version_text(self.results.version)
             properties["rdpVersion"] = self._version_json(self.results.version)
             if self.results.version.version_name is not None:
                 properties["version"] = self.results.version.version_name
 
         if self.results.ntlm_info is not None:
-            self._output_ntlminfo_text(self.results.ntlm_info)
+            if emit_text:
+                self._output_ntlminfo_text(self.results.ntlm_info)
             properties["ntlmInfo"] = self._ntlminfo_json(self.results.ntlm_info)
             if (
                 self.results.ntlm_info.status == "ok"
@@ -3544,7 +3563,8 @@ class RDP(BaseModule):
                 )
 
         if self.results.ssl is not None:
-            self._output_ssl_text(self.results.ssl)
+            if emit_text:
+                self._output_ssl_text(self.results.ssl)
             properties["ssl"] = self._ssl_json(self.results.ssl)
             if self.results.ssl.weak_findings:
                 defer_vulnerability(
@@ -3556,15 +3576,22 @@ class RDP(BaseModule):
                 )
 
         if self.results.auth is not None:
-            self._output_auth_text(self.results.auth)
+            if emit_text:
+                self._output_auth_text(self.results.auth)
             properties["authentication"] = self._auth_json(self.results.auth)
 
         if self.results.not_implemented:
             properties["notImplementedTests"] = self.results.not_implemented
-            if not self.use_json:
+            if emit_text and not self.use_json:
                 for test in self.results.not_implemented:
                     self.ptprint(f"{test} test", Out.INFO)
                     self._print_status("Test is not implemented yet", Out.WARNING)
+
+        if self.results.module_errors:
+            properties["moduleErrors"] = [
+                {"test": test, "error": error}
+                for test, error in self.results.module_errors.items()
+            ]
 
         rdp_node = self.ptjsonlib.create_node_object("software", None, None, properties)
         self.ptjsonlib.add_node(rdp_node)
@@ -3572,7 +3599,11 @@ class RDP(BaseModule):
         for vuln in deferred_vulns.values():
             self.ptjsonlib.add_vulnerability(node_key=node_key, **vuln)
 
-        self.ptjsonlib.set_status("finished", "")
+        if self.results.module_errors:
+            failed = ", ".join(self.results.module_errors)
+            self.ptjsonlib.set_status("error", f"RDP module failure(s): {failed}")
+        else:
+            self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)
 
     def _output_nla_text(self, result: NLAResult) -> None:

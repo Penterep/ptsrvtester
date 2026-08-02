@@ -7,7 +7,7 @@ from impacket.smbconnection import (
     SMB2_DIALECT_311,
 )
 
-from ptsrvtester.modules.smb.smb_main import (
+from ptsrvtester.protocols.smb.smb_main import (
     TestContext
 )
 

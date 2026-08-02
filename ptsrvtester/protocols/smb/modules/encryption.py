@@ -37,7 +37,7 @@ Contract:
     aborting the other selected modules.
 """
 
-__TESTLABEL__ = "Encryption information"
+__TESTLABEL__ = "Encryption status information"
 __TESTCODE__ = ""
 __ORDER__ = 12
 

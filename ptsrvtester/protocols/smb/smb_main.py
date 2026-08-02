@@ -20,10 +20,8 @@ from .._base import BaseMain, BaseArgs
 from .smb_utils.cli import SMBArgs
 
 
-class SMB(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
-    #: Short protocol identity (also namespaces this protocol's modules).
+class SMB(BaseMain):
     NAME = "SMB"
-    #: The argparse namespace class for this protocol's options.
     ARGS_CLASS = SMBArgs
 
     @staticmethod

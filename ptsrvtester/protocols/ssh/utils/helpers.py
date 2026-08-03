@@ -273,7 +273,6 @@ def simple_bruteforce(
             on_success(result)
         return result
 
-    # TODO maybe custom without ptthreads because of missing stop-on-success functionality
     pt_threads = ptthreads.PtThreads(True)
     result = pt_threads.threads(creds, _wrapped_try, threads)
     found_creds: set[Creds] = set(result)

@@ -35,12 +35,13 @@ class SSHArgs(ArgsWithBruteforce):
     bad_pubkeys: str | None
     bad_authkeys: str | None
     privkeys: str | None
+    dheat: str | None
+    dheat_duration: float | None
 
     @staticmethod
     def get_help():
-        # Test selection table (-ts): one code + one-line description per test.
         options: list[list[str]] = [
-            ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,AUDIT); ALL runs everything:"],
+            ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,KEX); ALL runs everything:"],
         ]
         for group_title, codes in SSH_TEST_GROUPS:
             options.append(["", "", "", ""])
@@ -63,6 +64,10 @@ class SSHArgs(ArgsWithBruteforce):
             ["", "--spray", "", "Try one secret across all users (instead of all secrets per user)"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
             ["", "", "", ""],
+            [get_colored_text("DHEat DoS (DHEAT)", "TITLE")],
+            ["", "--dheat", "<N[:kex[:e_len]]>", "DHEat attack params: N concurrent sockets, optional kex + e length (default: 10)"],
+            ["", "--dheat-duration", "<seconds>", "How long to run the DHEat attack before stopping (default: 20)"],
+            ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
             ["-j", "--json", "", "Output in JSON format"],
             ["-vv", "--verbose", "", "Enable verbose mode"],
@@ -76,9 +81,10 @@ class SSHArgs(ArgsWithBruteforce):
             {"usage_example": [
                 "ptsrvtester ssh 127.0.0.1",
                 "ptsrvtester ssh -ts BANNER,HOSTKEY,AUTHM 127.0.0.1:22",
-                "ptsrvtester ssh -ts AUDIT 127.0.0.1",
+                "ptsrvtester ssh -ts KEX,ENC,MAC 127.0.0.1",
                 "ptsrvtester ssh -ts BADHOSTKEY -H ./hostkeys/ 127.0.0.1",
                 "ptsrvtester ssh -ts BRUTE -u admin -P passwords.txt 127.0.0.1:22",
+                "ptsrvtester ssh -ts DHEAT --dheat 10 --dheat-duration 30 127.0.0.1",
                 "ptsrvtester ssh -ts BRUTE -h",
             ]},
             {"options": options},
@@ -94,7 +100,7 @@ class SSHArgs(ArgsWithBruteforce):
   ptsrvtester ssh -h
   ptsrvtester ssh 127.0.0.1
   ptsrvtester ssh -ts BANNER,HOSTKEY,AUTHM 127.0.0.1:22
-  ptsrvtester ssh -ts AUDIT 127.0.0.1
+  ptsrvtester ssh -ts KEX,ENC,MAC 127.0.0.1
   ptsrvtester ssh -ts BADHOSTKEY -H ./hostkeys/ 127.0.0.1
   ptsrvtester -j ssh -ts BRUTE -u admin -P passwords.txt --brute-threads 20 127.0.0.1:22
   ptsrvtester ssh -ts BRUTE -h"""
@@ -125,7 +131,7 @@ class SSHArgs(ArgsWithBruteforce):
             default=None,
             metavar="<test>",
             dest="tests",
-            help="Comma-separated test codes (e.g. BANNER,AUDIT) or ALL; 'ssh -ts <TEST> -h' for test options",
+            help="Comma-separated test codes (e.g. BANNER,KEX) or ALL; 'ssh -ts <TEST> -h' for test options",
         )
         direct.add_argument(
             "-H",
@@ -136,10 +142,30 @@ class SSHArgs(ArgsWithBruteforce):
                  "(e.g. https://github.com/rapid7/ssh-badkeys/tree/master/host) — used by BADHOSTKEY",
         )
 
+        dheat = parser.add_argument_group(
+            "DHEAT DoS (aggressive)",
+            "Active DHEat DoS attack (CVE-2002-20001) — only runs with -ts DHEAT",
+        )
+        dheat.add_argument(
+            "--dheat",
+            type=str,
+            default=None,
+            metavar="<N[:kex[:e_len]]>",
+            dest="dheat",
+            help="DHEat params passed to ssh-audit --dheat: N concurrent sockets, optional "
+                 "key exchange and fake-e length (e.g. 10 or 10:curve25519-sha256:4). Default: 10",
+        )
+        dheat.add_argument(
+            "--dheat-duration",
+            type=float,
+            default=None,
+            metavar="<seconds>",
+            dest="dheat_duration",
+            help="how long to run the DHEat attack before stopping it and reading the verdict (default: 20)",
+        )
+
         add_bruteforce_args(parser)
 
-        # Extend the bruteforce group with the SSH-specific key options, mirroring the
-        # old flat module: -A alongside the credentials, --privkeys as a brutepass option.
         bruteforce = next(g for g in parser._action_groups if "BRUTEFORCE" in g.title)
         bruteforce.description = "user/users + password/passwords/privkeys"
         bruteforce.add_argument(

@@ -5,7 +5,6 @@ from ptsrvtester.protocols.ssh.utils.results import VULNS
 __MODULELABEL__ = "Known static (bad) host key"
 __MODULECODE__ = "BADHOSTKEY"
 __ORDER__ = 50
-# Needs -H/--bad-pubkeys, so it is skipped by the default / ALL sweep (SSH-only).
 __RUN_IN_ALL__ = False
 
 

@@ -190,6 +190,9 @@ ptsrvtester <module> -h     for help for module use
 ## Dependencies
 
 ```
+aardwolf==0.2.13
+asyauth==0.0.23
+asysocks==0.2.18
 cryptography>=42.0.8
 dnspython>=2.7.0
 impacket>=0.12.0

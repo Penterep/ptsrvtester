@@ -34,6 +34,7 @@ ptsrvtester pop3 -ts BANNER,CAPA -tg 127.0.0.1
 ptsrvtester pop3 -ts ALL --tls -tg 127.0.0.1:995
 ptsrvtester pop3 -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:110
 ptsrvtester imap -ts BANNER,CAPA -tg 127.0.0.1
+ptsrvtester rdp rdp.example.com -ts RATELIMIT --allow-load-test
 ptsrvtester <module> -h     for help for module use
 ```
 
@@ -53,6 +54,7 @@ ptsrvtester <module> -h     for help for module use
                          imap   IMAP testing module
                          dhcp   DHCP testing module
                          xrdp   XRDP testing module
+                         rdp    RDP testing module
 
    -v        --version          Show script version and exit
    -h        --help             Show this help message and exit
@@ -165,6 +167,17 @@ ptsrvtester <module> -h     for help for module use
 - DHCP starvation attack testing
 - DHCP DoS/flood attack testing
 - Network interface based testing
+
+**RDP Module**
+- TLS and certificate inspection
+- RDP version detection
+- NLA and CredSSP detection
+- Security protocol detection
+- Legacy RDP encryption testing
+- NTLM information disclosure
+- Server capability enumeration
+- Credential authentication testing
+- Connection rate limiting testing
 
 **XRDP Module**
 - XRDP server brute-force testing

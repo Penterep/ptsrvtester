@@ -49,6 +49,7 @@ MODULES: dict[str, tuple[str, str]] = {
     "imap":  ("ptsrvtester.protocols.imap:IMAP",   "IMAP testing module"),
     "dhcp":  ("ptsrvtester.protocols.dhcp:DHCP",   "DHCP testing module"),
     "xrdp":  ("ptsrvtester.protocols.xrdp:XRDP",   "XRDP testing module"),
+    "rdp":   ("ptsrvtester.protocols.rdp:RDP",     "RDP testing module"),
     "smb":   ("ptsrvtester.protocols.smb:SMB",     "SMB testing module"),
 }
 

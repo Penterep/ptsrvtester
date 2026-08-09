@@ -13,6 +13,7 @@ import socket
 import ssl
 import struct
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -37,11 +38,22 @@ except ModuleNotFoundError as exc:  # transitional compatibility before base reb
 
 from .cli import (
     IMPLEMENTED_TESTS,
+    RDP_EXPLICIT_ONLY_TESTS,
     RDP_TEST_ALIASES,
     RDP_TEST_ORDER,
     RDPArgs,
 )
-
+from .rate_limit import (
+    OpenConnectionResult,
+    RateLimitConfig,
+    RateLimitRunner,
+    SocketConnectionHandle,
+)
+from .rate_limit import ProbeMetrics as RateProbeMetrics
+from .rate_limit import ProbeOutcome as RateProbeOutcome
+from .rate_limit import ProbeRequest as RateProbeRequest
+from .rate_limit import ProbeResult as RateProbeResult
+from .rate_limit import ScenarioResult as RateScenarioResult
 
 PROTOCOL_RDP = 0x00000000
 PROTOCOL_SSL = 0x00000001
@@ -467,6 +479,17 @@ class RDPAuthResult:
 
 
 @dataclass(frozen=True)
+class RDPConnectionLimitResult:
+    status: str
+    scenarios: tuple[RateScenarioResult, ...] = ()
+    error: str | None = None
+    mode: str | None = None
+    config: RateLimitConfig | None = None
+    stopped_after_completed: bool = False
+    probe_layer: str = "RDP X.224 negotiation"
+
+
+@dataclass(frozen=True)
 class RDPNTLMInfo:
     target_name: str | None = None
     netbios_domain: str | None = None
@@ -549,6 +572,7 @@ class RDPResults:
     ntlm_info: NTLMInfoResult | None = None
     ssl: SSLResult | None = None
     auth: RDPAuthResult | None = None
+    connection_limit: RDPConnectionLimitResult | None = None
     not_implemented: list[str] = field(default_factory=list)
     module_errors: dict[str, str] = field(default_factory=dict)
 
@@ -1900,6 +1924,7 @@ class RDP(BaseModule):
         self.use_json = getattr(args, "json", False)
         self.results = RDPResults()
         self.timeout_seconds = args.timeout / 1000.0
+        self.connect_host = getattr(args, "_rdp_resolved_ip", args.target.ip)
         self._security_probes: list[NegotiationProbe] | None = None
         self._basic_settings_result: BasicSettingsResult | None = None
         self._auth_tls_validation_result: AuthTLSValidationResult | None = None
@@ -1920,7 +1945,9 @@ class RDP(BaseModule):
             selected_tests = [
                 test
                 for test in RDP_TEST_ORDER
-                if test in IMPLEMENTED_TESTS and test != "AUTH"
+                if test in IMPLEMENTED_TESTS
+                and test != "AUTH"
+                and test not in RDP_EXPLICIT_ONLY_TESTS
             ]
             if self.args.login is not None and self.args.password is not None:
                 selected_tests.append("AUTH")
@@ -1932,6 +1959,13 @@ class RDP(BaseModule):
                 continue
             requested_tests.append(canonical)
             seen_tests.add(canonical)
+
+        # Connection pressure always runs last so no later probe can compound
+        # a service impact that persists after load and recovery checks.
+        if "RATELIMIT" in requested_tests:
+            requested_tests = [
+                test for test in requested_tests if test != "RATELIMIT"
+            ] + ["RATELIMIT"]
 
         for test in requested_tests:
             self.run_test(test)
@@ -1957,6 +1991,8 @@ class RDP(BaseModule):
             self.results.ssl = self._run_ssl_test()
         elif canonical == "AUTH":
             self.results.auth = self._run_auth_test()
+        elif canonical == "RATELIMIT":
+            self.results.connection_limit = self._run_rate_limit_test()
         elif canonical not in self.results.not_implemented:
             self.results.not_implemented.append(canonical)
 
@@ -1995,6 +2031,7 @@ class RDP(BaseModule):
             "SSL": ("TLS / SSL configuration test", self.results.ssl, self._output_ssl_text),
             "NTLMINFO": ("RDP NTLM information", self.results.ntlm_info, self._output_ntlminfo_text),
             "AUTH": ("RDP authentication test", self.results.auth, self._output_auth_text),
+            "RATELIMIT": ("RDP connection rate limiting", self.results.connection_limit, self._output_rate_limit_text),
         }
         entry = outputters.get(canonical)
         if entry is None or entry[1] is None:
@@ -2198,6 +2235,202 @@ class RDP(BaseModule):
             tls_verification=session.tls_verification,
             certificate_sha256=session.certificate_sha256,
             error=session.error,
+        )
+
+    @staticmethod
+    def _rate_error_result(exc: Exception, duration_ms: float) -> RateProbeResult:
+        if isinstance(exc, (TimeoutError, socket.timeout)):
+            outcome = RateProbeOutcome.TIMEOUT
+        elif isinstance(exc, ConnectionRefusedError):
+            outcome = RateProbeOutcome.REFUSED
+        elif isinstance(exc, ConnectionResetError):
+            outcome = RateProbeOutcome.RESET
+        elif isinstance(exc, RDPProtocolError):
+            outcome = RateProbeOutcome.PROTOCOL_ERROR
+        else:
+            outcome = RateProbeOutcome.TRANSPORT_ERROR
+        return RateProbeResult(
+            outcome=outcome,
+            duration_ms=duration_ms,
+            error=str(exc),
+        )
+
+    def _rate_probe(self, _request: RateProbeRequest) -> RateProbeResult:
+        started = time.perf_counter()
+        sock: socket.socket | None = None
+        try:
+            sock = socket.create_connection(
+                (self.connect_host, self.args.target.port),
+                timeout=self.timeout_seconds,
+            )
+            sock.settimeout(self.timeout_seconds)
+            requested = PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX
+            sock.sendall(_build_negotiation_request(requested))
+            reply = _parse_negotiation_reply_details(_read_tpkt(sock))
+            duration_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+            if reply.selected_protocol is not None:
+                return RateProbeResult(
+                    RateProbeOutcome.ACCEPTED,
+                    duration_ms=duration_ms,
+                    selected_protocol=reply.selected_protocol,
+                )
+            reason = FAILURE_CODES.get(
+                reply.failure_code,
+                f"RDP negotiation failure {reply.failure_code}",
+            )
+            return RateProbeResult(
+                RateProbeOutcome.REJECTED,
+                duration_ms=duration_ms,
+                error=reason,
+            )
+        except (OSError, RDPProtocolError) as exc:
+            return self._rate_error_result(
+                exc,
+                max(0.0, (time.perf_counter() - started) * 1000.0),
+            )
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def _rate_open_held(self, _request: RateProbeRequest) -> OpenConnectionResult:
+        started = time.perf_counter()
+        sock: socket.socket | None = None
+        try:
+            sock = socket.create_connection(
+                (self.connect_host, self.args.target.port),
+                timeout=self.timeout_seconds,
+            )
+            sock.settimeout(self.timeout_seconds)
+            requested = PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX
+            sock.sendall(_build_negotiation_request(requested))
+            reply = _parse_negotiation_reply_details(_read_tpkt(sock))
+            duration_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+            if reply.selected_protocol is not None:
+                handle = SocketConnectionHandle(sock)
+                result = OpenConnectionResult(
+                    RateProbeResult(
+                        RateProbeOutcome.ACCEPTED,
+                        duration_ms=duration_ms,
+                        selected_protocol=reply.selected_protocol,
+                    ),
+                    connection=handle,
+                )
+                sock = None
+                return result
+            reason = FAILURE_CODES.get(
+                reply.failure_code,
+                f"RDP negotiation failure {reply.failure_code}",
+            )
+            return OpenConnectionResult(
+                RateProbeResult(
+                    RateProbeOutcome.REJECTED,
+                    duration_ms=duration_ms,
+                    error=reason,
+                )
+            )
+        except (OSError, RDPProtocolError) as exc:
+            return OpenConnectionResult(
+                self._rate_error_result(
+                    exc,
+                    max(0.0, (time.perf_counter() - started) * 1000.0),
+                )
+            )
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def _run_rate_limit_test(self) -> RDPConnectionLimitResult:
+        if getattr(self.args, "allow_load_test", False) is not True:
+            return RDPConnectionLimitResult(
+                status="blocked",
+                error="RATELIMIT requires --allow-load-test",
+            )
+        try:
+            count = getattr(self.args, "rate_count", 30)
+            concurrency = getattr(self.args, "rate_concurrency", 10)
+            hold_seconds = getattr(self.args, "rate_hold_seconds", 3.0)
+            cooldown_seconds = getattr(self.args, "rate_cooldown_seconds", 2.0)
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise TypeError("--rate-count must be an integer")
+            if not 5 <= count <= 200:
+                raise ValueError("--rate-count must be between 5 and 200")
+            if isinstance(concurrency, bool) or not isinstance(concurrency, int):
+                raise TypeError("--rate-concurrency must be an integer")
+            for option, value in (
+                ("--rate-hold-seconds", hold_seconds),
+                ("--rate-cooldown-seconds", cooldown_seconds),
+            ):
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise TypeError(f"{option} must be a number")
+            config = RateLimitConfig(
+                completed_connections=count,
+                held_connections=count,
+                concurrency=concurrency,
+                hold_seconds=float(hold_seconds),
+                cooldown_seconds=float(cooldown_seconds),
+                failure_threshold=2,
+                min_attempts_before_stop=5,
+                min_timing_samples=3,
+            )
+            mode = getattr(self.args, "rate_mode", "both")
+            if not isinstance(mode, str):
+                raise TypeError("--rate-mode must be text")
+            mode = mode.lower()
+            if mode not in {"completed", "held", "both"}:
+                raise ValueError("--rate-mode must be completed, held, or both")
+        except (TypeError, ValueError) as exc:
+            return RDPConnectionLimitResult(
+                status="error",
+                error=f"invalid RATELIMIT configuration: {exc}",
+            )
+
+        runner = RateLimitRunner(
+            self._rate_probe,
+            self._rate_open_held,
+            config=config,
+        )
+        stopped_after_completed = False
+        if mode == "completed":
+            scenarios = (runner.run_completed(),)
+        elif mode == "held":
+            scenarios = (runner.run_held(),)
+        else:
+            report = runner.run_both()
+            stopped_after_completed = report.stopped_after_completed
+            scenarios = (
+                (report.completed, report.held)
+                if report.held is not None
+                else (report.completed,)
+            )
+
+        verdicts = [scenario.verdict.value for scenario in scenarios]
+        if "impact_persisted" in verdicts:
+            status = "possible_ip_block_or_service_impact"
+        elif "error" in verdicts:
+            status = "error"
+        elif all(verdict == "not_observed" for verdict in verdicts):
+            status = "not_observed"
+        elif all(verdict == verdicts[0] for verdict in verdicts):
+            status = verdicts[0]
+        elif any(
+            verdict in {"limiting_observed", "slowdown_observed"}
+            for verdict in verdicts
+        ):
+            status = "behavior_observed"
+        else:
+            status = "partial"
+        return RDPConnectionLimitResult(
+            status=status,
+            scenarios=scenarios,
+            mode=mode,
+            config=config,
+            stopped_after_completed=stopped_after_completed,
         )
 
     def _get_security_probes(self) -> list[NegotiationProbe]:
@@ -3404,6 +3637,13 @@ class RDP(BaseModule):
             "error": Out.ERROR,
         }.get(result.status, Out.WARNING)
 
+    @staticmethod
+    def _rate_limit_output_category(result: RDPConnectionLimitResult) -> Out:
+        return {
+            "possible_ip_block_or_service_impact": Out.ERROR,
+            "error": Out.ERROR,
+        }.get(result.status, Out.WARNING)
+
     def _rdp_encryption_vulnerabilities(
         self,
         result: RDPEncryptionResult,
@@ -3579,6 +3819,13 @@ class RDP(BaseModule):
             if emit_text:
                 self._output_auth_text(self.results.auth)
             properties["authentication"] = self._auth_json(self.results.auth)
+
+        if self.results.connection_limit is not None:
+            if emit_text:
+                self._output_rate_limit_text(self.results.connection_limit)
+            properties["connectionLimiting"] = self._rate_limit_json(
+                self.results.connection_limit
+            )
 
         if self.results.not_implemented:
             properties["notImplementedTests"] = self.results.not_implemented
@@ -4015,6 +4262,105 @@ class RDP(BaseModule):
                 f"{result.certificate_sha256}"
             )
 
+    @staticmethod
+    def _rate_metrics_summary(metrics: RateProbeMetrics) -> str:
+        if metrics.attempted == 0:
+            return f"not attempted ({metrics.requested} configured)"
+        timing = ""
+        if metrics.median_ms is not None:
+            timing = f", median {metrics.median_ms:.1f} ms"
+        if metrics.p95_ms is not None:
+            timing += f", p95 {metrics.p95_ms:.1f} ms"
+        return (
+            f"accepted {metrics.accepted}/{metrics.attempted} attempted "
+            f"({metrics.requested} configured){timing}"
+        )
+
+    def _output_rate_limit_text(self, result: RDPConnectionLimitResult) -> None:
+        if self.use_json:
+            return
+
+        self.ptprint("RDP connection rate limiting", Out.INFO)
+        if not result.scenarios:
+            detail = f": {result.error}" if result.error else ""
+            self._print_status(
+                f"Connection rate-limit test {result.status.replace('_', ' ')}{detail}",
+                self._rate_limit_output_category(result),
+            )
+            return
+
+        overall_messages = {
+            "limiting_observed": (
+                "Connection failures were observed during load and recovery "
+                "succeeded; policy limiting cannot be distinguished from capacity "
+                "or network effects"
+            ),
+            "slowdown_observed": (
+                "Connection slowdown crossed the configured thresholds; its cause "
+                "cannot be determined from the wire response"
+            ),
+            "behavior_observed": (
+                "Connection-pressure behavior was observed, with different results "
+                "between scenarios"
+            ),
+            "not_observed": (
+                "Connection limiting was not observed within the configured sample"
+            ),
+            "possible_ip_block_or_service_impact": (
+                "RDP failures persisted after load and cooldown; possible source-IP "
+                "blocking or service/network impact"
+            ),
+            "error": "Connection rate-limit test failed",
+            "partial": "Connection rate-limit scenarios produced mixed results",
+            "inconclusive": "Connection rate-limit result is inconclusive",
+        }
+        self._print_status(
+            overall_messages.get(result.status, result.status.replace("_", " ")),
+            self._rate_limit_output_category(result),
+        )
+
+        scenario_categories = {
+            "limiting_observed": Out.WARNING,
+            "slowdown_observed": Out.WARNING,
+            "not_observed": Out.WARNING,
+            "impact_persisted": Out.ERROR,
+            "error": Out.ERROR,
+        }
+        for scenario in result.scenarios:
+            name = (
+                "completed connect/close"
+                if scenario.scenario.value == "completed"
+                else "held-open connections"
+            )
+            self._print_status(
+                f"{name}: {scenario.verdict.value.replace('_', ' ')}",
+                scenario_categories.get(scenario.verdict.value, Out.WARNING),
+                indent=8,
+            )
+            self.ptprint(
+                f"{name} baseline: {self._rate_metrics_summary(scenario.baseline)}"
+            )
+            self.ptprint(
+                f"{name} load: {self._rate_metrics_summary(scenario.load)}"
+            )
+            if scenario.control is not None:
+                self.ptprint(
+                    f"{name} control: {self._rate_metrics_summary(scenario.control)}"
+                )
+            self.ptprint(
+                f"{name} recovery: {self._rate_metrics_summary(scenario.recovery)}"
+            )
+            if scenario.held_open_count:
+                self.ptprint(
+                    f"{name}: {scenario.held_open_count} client socket handles were "
+                    "retained after X.224 acceptance; peer-side liveness snapshot: "
+                    f"{scenario.held_alive_count} alive, "
+                    f"{scenario.held_closed_count} closed, "
+                    f"{scenario.held_liveness_unknown_count} unknown"
+                )
+            for note in scenario.notes:
+                self.ptprint(f"{name}: {note}")
+
     def _nla_json(self, result: NLAResult) -> dict:
         return {
             "status": result.status,
@@ -4132,6 +4478,78 @@ class RDP(BaseModule):
             "tlsVerification": result.tls_verification,
             "certificateSha256": result.certificate_sha256,
             "error": result.error,
+        }
+
+    @staticmethod
+    def _rate_metrics_json(metrics: RateProbeMetrics | None) -> dict | None:
+        if metrics is None:
+            return None
+        return {
+            "requested": metrics.requested,
+            "attempted": metrics.attempted,
+            "accepted": metrics.accepted,
+            "failures": metrics.failures,
+            "outcomeCounts": dict(metrics.outcome_counts),
+            "medianMs": metrics.median_ms,
+            "p95Ms": metrics.p95_ms,
+            "firstFailureAttempt": metrics.first_failure_attempt,
+            "complete": metrics.complete,
+            "healthy": metrics.healthy,
+        }
+
+    def _rate_limit_json(self, result: RDPConnectionLimitResult) -> dict:
+        config = result.config
+        return {
+            "status": result.status,
+            "error": result.error,
+            "mode": result.mode,
+            "probeLayer": result.probe_layer,
+            "stoppedAfterCompleted": result.stopped_after_completed,
+            "config": (
+                {
+                    "completedConnections": config.completed_connections,
+                    "heldConnections": config.held_connections,
+                    "concurrency": config.concurrency,
+                    "baselineProbes": config.baseline_probes,
+                    "controlProbes": config.control_probes,
+                    "recoveryProbes": config.recovery_probes,
+                    "holdSeconds": config.hold_seconds,
+                    "cooldownSeconds": config.cooldown_seconds,
+                    "failureThreshold": config.failure_threshold,
+                    "minAttemptsBeforeStop": config.min_attempts_before_stop,
+                    "slowdownFactor": config.slowdown_factor,
+                    "slowdownAbsoluteMs": config.slowdown_absolute_ms,
+                    "minTimingSamples": config.min_timing_samples,
+                }
+                if config is not None
+                else None
+            ),
+            "scenarios": [
+                {
+                    "scenario": scenario.scenario.value,
+                    "verdict": scenario.verdict.value,
+                    "baseline": self._rate_metrics_json(scenario.baseline),
+                    "load": self._rate_metrics_json(scenario.load),
+                    "control": self._rate_metrics_json(scenario.control),
+                    "recovery": self._rate_metrics_json(scenario.recovery),
+                    "retainedSocketHandles": scenario.held_open_count,
+                    "heldSocketsAlive": scenario.held_alive_count,
+                    "heldSocketsClosed": scenario.held_closed_count,
+                    "heldSocketLivenessUnknown": (
+                        scenario.held_liveness_unknown_count
+                    ),
+                    "serverLivenessRevalidatedDuringHold": (
+                        scenario.server_liveness_revalidated_during_hold
+                    ),
+                    "earlyStopped": scenario.early_stopped,
+                    "safeToContinue": scenario.safe_to_continue,
+                    "slowdownObserved": scenario.slowdown_observed,
+                    "slowdownRatio": scenario.slowdown_ratio,
+                    "cleanupErrors": list(scenario.cleanup_errors),
+                    "notes": list(scenario.notes),
+                }
+                for scenario in result.scenarios
+            ],
         }
 
     def _ntlminfo_json(self, result: NTLMInfoResult) -> dict:

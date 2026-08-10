@@ -39,6 +39,7 @@ class SMB(BaseMain):
         target = self.args.target
         if getattr(target, "port", 0) == 0:
             target.port = 445  # default SMB port
+
         host = target.ip
         try:
             socket.inet_aton(host)

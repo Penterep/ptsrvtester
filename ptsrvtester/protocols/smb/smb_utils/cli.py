@@ -1,11 +1,14 @@
 import argparse
 from ptsrvtester.protocols._base import BaseArgs
 
+from .helpers import Target  #TODO: add valid_target func
+
 OPTIONS = ["info", "dialects", "encryption"]
 # bad solution since they're generated automatically; will change once the system is settled
 
 
 class SMBArgs(BaseArgs):
+    target: Target
     get_version: bool
 
     @staticmethod

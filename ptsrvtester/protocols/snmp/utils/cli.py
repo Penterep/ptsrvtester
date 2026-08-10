@@ -35,6 +35,9 @@ SNMP_TESTS: dict[str, dict] = {
             ["or"],
             ["-cf", "--community-file", "", "Filename containing community strings"]
         ],
+        "mods": [
+            ["-w", "--write-to-file", "", "Save results to a provided file"]
+        ],
         "flags": {"v2_brute_force": True}
     },
     "V2WRITE": {
@@ -51,14 +54,17 @@ SNMP_TESTS: dict[str, dict] = {
                  "network and infrastructure SNMP-enabled devices"],
         "mods": [
             ["-oid", "--oid", "", "OID to start from"],
-            ["-of", "--oid-format", "", "Use human readable OID format"]
+            ["-of", "--oid-format", "", "Use human readable OID format"],
+            ["-w", "--write-to-file", "", "Save results to a provided file"]
             ],
         "flags": {"v2_walk": True}
     },
     "V3ENUM": {
         "desc": "SNMPv3 user enumeration",
         "long": ["Enumerates SNMPv3 users on a target"],
-        ""
+        "mods": [
+            ["-w", "--write-to-file", "", "Save results to a provided file"]
+        ],
         "flags": {"v3_enum": True}
     },
     "V3BRUTE": {
@@ -78,7 +84,8 @@ SNMP_TESTS: dict[str, dict] = {
         "mods": [
             ["-ap", "--auth-protocols", "", "Authentication protocol"],
             ["-pp", "--priv-protocols", "", "Private protocol"],
-            ["-s", "--spray", "", "Enable spray mode"]
+            ["-s", "--spray", "", "Enable spray mode"],
+            ["-w", "--write-to-file", "", "Save results to a provided file"]
         ],
         "flags": {"v3_brute_force": True}
     },
@@ -93,6 +100,7 @@ SNMP_TESTS: dict[str, dict] = {
         "mods": [
             ["-ap", "--auth-protocols", "", "Authentication protocol"],
             ["-pp", "--priv-protocols", "", "Private protocol"],
+            ["-w", "--write-to-file", "", "Save results to a provided file"]
         ],
         "flags": {"v3_walk": True}
     },
@@ -180,8 +188,7 @@ class SNMPArgs(ArgsWithBruteforce):
         options += [
             ["", "", "", ""],
             ["-h", "--help", "", "Show this help message and exit"],
-            ["-vv", "--verbose", "", "Enable verbose mode"],
-            ["-w", "--write-to-file", "", "Save test result to a file"]
+            ["-vv", "--verbose", "", "Enable verbose mode"]
             ]
 
         return [

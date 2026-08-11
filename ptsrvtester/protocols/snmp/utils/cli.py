@@ -24,42 +24,101 @@ SNMP_TEST_GROUPS = [
 SNMP_TESTS: dict[str, dict] = {
     "VERSION": {
         "desc": "Detect SNMP versions",
-        "long": "",
+        "long": ["Determines which SNMP versions are supported by a host"],
         "flags": {"version_detection": True}
     },
     "V2BRUTE": {
         "desc": "SNMPv2 dictionary attack",
-        "long": "",
+        "long": ["Performs a dictionary attack on SNMPv2/1 to find valid communities"],
+        "requires": [
+            ["-c", "--single-community", "", "Single community string"],
+            ["or"],
+            ["-cf", "--community-file", "", "Filename containing community strings"]
+        ],
+        "mods": [
+            ["-w", "--write-to-file", "", "Save results to a provided file"]
+        ],
         "flags": {"v2_brute_force": True}
     },
     "V2WRITE": {
         "desc": "Test SNMPv2 write permission",
-        "long": "",
+        "long": ["Tests to see if we have write permission on the target"],
+        "mods": [
+            ["-v", "--value", "", "Value to write to the specified OID (default: 'Testvalue123)'"]
+        ],
         "flags": {"v2_write": True}
     },
     "V2WALK": {
         "desc": "SNMPv2 MIB walk",
-        "long": "",
+        "long": ["Uses SNMP GETNEXT requests to collect SNMP data from",
+                 "network and infrastructure SNMP-enabled devices"],
+        "mods": [
+            ["-oid", "--oid", "", "OID to start from"],
+            ["-of", "--oid-format", "", "Use human readable OID format"],
+            ["-w", "--write-to-file", "", "Save results to a provided file"]
+            ],
         "flags": {"v2_walk": True}
     },
     "V3ENUM": {
         "desc": "SNMPv3 user enumeration",
-        "long": "",
+        "long": ["Enumerates SNMPv3 users on a target"],
+        "mods": [
+            ["-w", "--write-to-file", "", "Save results to a provided file"]
+        ],
         "flags": {"v3_enum": True}
     },
     "V3BRUTE": {
         "desc": "SNMPv3 credentials bruteforce",
-        "long": "",
+        "long": ["Performs a dictionary attack on SNMPv3 to find valid credentials"],
+        "requires": [
+            ["-u", "--single-username", "", "Single username"],
+            ["or"],
+            ["-uf", "--username-file", "", "Username file"],
+            [""],
+            ["AND"],
+            [""],
+            ["-pw", "--single-password", "", "Single password"],
+            ["or"],
+            ["-pf", "--password-file", "Password file"]
+        ],
+        "mods": [
+            ["-ap", "--auth-protocols", "", "Authentication protocol"],
+            ["-pp", "--priv-protocols", "", "Private protocol"],
+            ["-s", "--spray", "", "Enable spray mode"],
+            ["-w", "--write-to-file", "", "Save results to a provided file"]
+        ],
         "flags": {"v3_brute_force": True}
     },
     "V3WALK": {
         "desc": "SNMPv3 MIB walk",
-        "long": "",
+        "long": ["Uses SNMP GETNEXT requests to collect SNMP data from",
+                 "network and infrastructure SNMP-enabled devices"],
+        "requires": [
+            ["-u", "--single-username", "", "Single username"],
+            ["-pw", "--single-password", "", "Single password"],
+        ],
+        "mods": [
+            ["-ap", "--auth-protocols", "", "Authentication protocol"],
+            ["-pp", "--priv-protocols", "", "Private protocol"],
+            ["-w", "--write-to-file", "", "Save results to a provided file"]
+        ],
         "flags": {"v3_walk": True}
     },
     "V3WRITE": {
         "desc": "Test SNMPv3 write permissions",
-        "long": "",
+        "long": ["Tests SNMPv3 write permissions by attempting to set a value on the target device"],
+        "requires": [
+            ["-u", "--single-username", "", "Single username"],
+            ["-pw", "--single-password", "", "Single password"],
+            "",
+            ["or"],
+            "",
+            ["-cred", "--valid-credentials-file", "", "File containing valid credentials"]
+        ],
+        "mods": [
+            ["-ap", "--auth-protocols", "", "Authentication protocol"],
+            ["-pp", "--priv-protocols", "", "Private protocol"],
+        ],
         "flags": {"v3_write": True}
     }
 }
@@ -129,16 +188,16 @@ class SNMPArgs(ArgsWithBruteforce):
         options += [
             ["", "", "", ""],
             ["-h", "--help", "", "Show this help message and exit"],
-            ["-vv", "--verbose", "", "Enable verbose mode"],
+            ["-vv", "--verbose", "", "Enable verbose mode"]
             ]
 
         return [
             {"description": ["SNMP Testing Module"]},
             {"usage": ["ptsrvtester snmp <command> <options>"]},
             {"usage_example": [
-                "ptsrvtester snmp version --ip 192.168.1.1",
-                "ptsrvtester snmp v2brute --community-file communities.txt --ip 192.168.1.1",
-                "ptsrvtester snmp v3brute --username-file users.txt --password-file passwords.txt --ip 192.168.1.1"
+                "ptsrvtester snmp version -tg 192.168.1.1:161",
+                "ptsrvtester snmp v2brute --community-file communities.txt -tg 192.168.1.1:161",
+                "ptsrvtester snmp v3brute --username-file users.txt --password-file passwords.txt -tg 192.168.1.1:161"
             ]},
             {"options": options}
         ]
@@ -151,9 +210,9 @@ class SNMPArgs(ArgsWithBruteforce):
         """Adds a subparser of SNMP arguments"""
 
         examples = """example usage:
-    ptsrvtester snmp version --ip 192.168.1.1 --port 161
-    ptsrvtester snmp snmpv2-brute --community-file communities.txt --ip 192.168.1.1 --port 161
-    ptsrvtester snmp snmpv3-brute --username-file users.txt --password-file passwords.txt --ip 192.168.1.1 --port 161"""
+    ptsrvtester snmp version -tg 192.168.1.1:161
+    ptsrvtester snmp snmpv2-brute --community-file communities.txt -tg 192.168.1.1:161
+    ptsrvtester snmp snmpv3-brute --username-file users.txt --password-file passwords.txt -tg 192.168.1.1:161"""
 
         snmp_subparsers = subparsers.add_parser(
             name,
@@ -170,6 +229,10 @@ class SNMPArgs(ArgsWithBruteforce):
                                      help="IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:25)"
                                      )
 
+        snmp_subparsers.add_argument("-w", "--write-to-file", help="File to save the output results.",
+                                                                          default=None,
+                                                                          type=str)
+
         snmp_subparsers.add_argument(
             "-ts",
             "--tests",
@@ -184,9 +247,9 @@ class SNMPArgs(ArgsWithBruteforce):
         # SNMPv2 Brute Force
         snmpv2_brute_parser = snmp_subparsers.add_argument_group(title="v2brute",
                                                                  description="SNMPv2 dictionary attack")
-        snmpv2_brute_parser.add_argument("-o", "--output", help="File to save the output results.",
-                                         default=None,
-                                         type=str)
+        #snmpv2_brute_parser.add_argument("-o", "--output", help="File to save the output results.",
+        #                                 default=None,
+        #                                 type=str)
 
         # user_group1 = snmpv2_brute_parser.add_mutually_exclusive_group(required=True)
         snmp_subparsers.add_argument("-c", "--single-community", "--community", help="Single community string")

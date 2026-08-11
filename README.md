@@ -34,7 +34,10 @@ ptsrvtester pop3 -ts BANNER,CAPA -tg 127.0.0.1
 ptsrvtester pop3 -ts ALL --tls -tg 127.0.0.1:995
 ptsrvtester pop3 -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:110
 ptsrvtester imap -ts BANNER,CAPA -tg 127.0.0.1
-ptsrvtester rdp rdp.example.com -ts RATELIMIT --allow-load-test
+ptsrvtester ftp -ts BANNER,CMD,ANON -tg 127.0.0.1
+ptsrvtester ftp -ts ALL -tg 127.0.0.1
+ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1
+ptsrvtester ftp -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:21
 ptsrvtester <module> -h     for help for module use
 ```
 

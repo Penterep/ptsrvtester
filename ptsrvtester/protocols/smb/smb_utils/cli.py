@@ -1,7 +1,7 @@
 import argparse
 from ptsrvtester.protocols._base import BaseArgs
 
-from .helpers import Target  #TODO: add valid_target func
+from .helpers import Target, valid_target_smb
 
 OPTIONS = ["info", "dialects", "encryption"]
 # bad solution since they're generated automatically; will change once the system is settled
@@ -41,7 +41,7 @@ ptsrvtester smb -h"""
         
         parser.add_argument(
             "target",
-            # type=valid_target_smb,  # used to be a test for target validity; left in in case of errors
+            type=valid_target_smb,
             help="""IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 445 is default""",
         )
         

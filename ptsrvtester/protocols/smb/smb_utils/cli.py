@@ -3,13 +3,13 @@ from ptsrvtester.protocols._base import BaseArgs
 
 from .helpers import Target, valid_target_smb
 
-OPTIONS = ["info", "dialects", "encryption"]
-# bad solution since they're generated automatically; will change once the system is settled
+# OPTIONS = ["info", "dialects", "encryption"]
+# # bad solution since they're generated automatically; will change once the system is settled
 
 
 class SMBArgs(BaseArgs):
     target: Target
-    get_version: bool
+    # get_version: bool
 
     @staticmethod
     def get_help():
@@ -22,7 +22,7 @@ class SMBArgs(BaseArgs):
             ]},
             {"options": [
                 ["-h", "--help", "", "Prints this menu"],
-                ["-ts", "--test", "<option>", "Gets information about server", "Options: info, dialects, encryption"]
+                ["-ts", "--tests", "<test>", "Comma-separated test codes (e.g. info,dialects) or ALL", "Options: info, dialects, encryption"]
             ]},
         ]
 
@@ -50,5 +50,7 @@ ptsrvtester smb -h"""
             "Toolbox of non-invasive tests on a specified target server"
         )
         
-        tests.add_argument("-ts", "--test", help="Testing toolbox for SMB",
-                           choices=OPTIONS, nargs='*')
+        tests.add_argument(
+            "-ts", "--tests", type=str, default=None, metavar="<test>", dest="tests",
+            help="Comma-separated test codes (e.g. info,dialects) or ALL. Options: info, dialects, encryption",
+        )

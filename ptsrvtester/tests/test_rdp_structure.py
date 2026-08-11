@@ -1,3 +1,4 @@
+import argparse
 import io
 import unittest
 from types import SimpleNamespace
@@ -5,8 +6,9 @@ from unittest.mock import Mock, call, patch
 
 from ptsrvtester.protocols.rdp import RDP
 from ptsrvtester.protocols.rdp.main import RDP as RDPMain
-from ptsrvtester.protocols.rdp.utils.cli import RDPArgs
-from ptsrvtester.protocols.rdp.utils.engine import NLAResult, RDP_TEST_ORDER
+from ptsrvtester.protocols.rdp.utils.cli import RDP_EXPLICIT_ONLY_TESTS, RDPArgs
+from ptsrvtester.protocols.rdp.utils.engine import RDP_TEST_ORDER, NLAResult
+from ptsrvtester.ptsrvtester import MODULES
 
 
 def structure_args(**overrides) -> RDPArgs:
@@ -17,6 +19,12 @@ def structure_args(**overrides) -> RDPArgs:
         "login": None,
         "password": None,
         "insecure_auth": False,
+        "allow_load_test": False,
+        "rate_mode": "both",
+        "rate_count": 30,
+        "rate_concurrency": 10,
+        "rate_hold_seconds": 3.0,
+        "rate_cooldown_seconds": 2.0,
         "timeout": 10000,
         "module_threads": 8,
         "json": False,
@@ -30,9 +38,104 @@ def structure_main(**overrides) -> RDP:
     return RDP(structure_args(**overrides), Mock())
 
 
+def parse_rdp_args(*arguments: str) -> RDPArgs:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="module", required=True)
+    RDPArgs().add_subparser("rdp", subparsers)
+    return parser.parse_args(
+        ["rdp", "192.0.2.10", *arguments],
+        namespace=RDPArgs(),
+    )
+
+
+class RDPRateLimitCLIParserTests(unittest.TestCase):
+    def assert_parse_rejected(self, *arguments: str) -> None:
+        with (
+            patch("sys.stderr", new=io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            parse_rdp_args(*arguments)
+        self.assertNotEqual(raised.exception.code, 0)
+
+    def test_rate_options_have_safe_defaults_and_no_implicit_opt_in(self):
+        args = parse_rdp_args()
+
+        self.assertIsNone(args.tests)
+        self.assertFalse(args.allow_load_test)
+        self.assertEqual(args.rate_mode, "both")
+        self.assertEqual(args.rate_count, 30)
+        self.assertEqual(args.rate_concurrency, 10)
+        self.assertEqual(args.rate_hold_seconds, 3.0)
+        self.assertEqual(args.rate_cooldown_seconds, 2.0)
+
+    def test_rate_options_parse_at_upper_safety_boundaries(self):
+        args = parse_rdp_args(
+            "-ts",
+            "RATELIMIT",
+            "--allow-load-test",
+            "--rate-mode",
+            "held",
+            "--rate-count",
+            "200",
+            "--rate-concurrency",
+            "50",
+            "--rate-hold-seconds",
+            "30",
+            "--rate-cooldown-seconds",
+            "60",
+        )
+
+        self.assertEqual(args.tests, ["RATELIMIT"])
+        self.assertTrue(args.allow_load_test)
+        self.assertEqual(args.rate_mode, "held")
+        self.assertEqual(args.rate_count, 200)
+        self.assertEqual(args.rate_concurrency, 50)
+        self.assertEqual(args.rate_hold_seconds, 30.0)
+        self.assertEqual(args.rate_cooldown_seconds, 60.0)
+
+    def test_rate_options_accept_lower_safety_boundaries(self):
+        args = parse_rdp_args(
+            "--rate-count",
+            "5",
+            "--rate-concurrency",
+            "1",
+            "--rate-hold-seconds",
+            "0",
+            "--rate-cooldown-seconds",
+            "0",
+        )
+
+        self.assertEqual(args.rate_count, 5)
+        self.assertEqual(args.rate_concurrency, 1)
+        self.assertEqual(args.rate_hold_seconds, 0.0)
+        self.assertEqual(args.rate_cooldown_seconds, 0.0)
+
+    def test_invalid_rate_choices_and_ranges_are_rejected(self):
+        invalid_values = (
+            ("--rate-mode", "burst"),
+            ("--rate-count", "4"),
+            ("--rate-count", "201"),
+            ("--rate-concurrency", "0"),
+            ("--rate-concurrency", "51"),
+            ("--rate-hold-seconds", "-0.1"),
+            ("--rate-hold-seconds", "30.1"),
+            ("--rate-hold-seconds", "nan"),
+            ("--rate-cooldown-seconds", "-0.1"),
+            ("--rate-cooldown-seconds", "60.1"),
+            ("--rate-cooldown-seconds", "inf"),
+        )
+        for option, value in invalid_values:
+            with self.subTest(option=option, value=value):
+                self.assert_parse_rejected(option, value)
+
+    def test_load_opt_in_does_not_accept_a_boolean_value(self):
+        self.assert_parse_rejected("--allow-load-test=false")
+
+
 class RDPStructureTests(unittest.TestCase):
-    def test_public_entrypoint_and_discovery_expose_all_nine_tests(self):
+    def test_public_entrypoint_and_discovery_expose_all_ten_tests(self):
         self.assertIs(RDP, RDPMain)
+        self.assertEqual(MODULES["rdp"][0], "ptsrvtester.protocols.rdp:RDP")
 
         module = structure_main()
         discovered = module._discover_modules()
@@ -42,7 +145,7 @@ class RDPStructureTests(unittest.TestCase):
             sorted(discovered, key=lambda code: (discovered[code].order, code)),
             list(RDP_TEST_ORDER),
         )
-        self.assertEqual(len({entry.order for entry in discovered.values()}), 9)
+        self.assertEqual(len({entry.order for entry in discovered.values()}), 10)
 
     def test_selection_accepts_list_and_comma_forms_with_alias_and_deduplication(self):
         expected = ["SSL", "NTLMINFO", "NLA"]
@@ -58,14 +161,21 @@ class RDPStructureTests(unittest.TestCase):
                 )
 
     def test_default_selection_keeps_auth_behind_complete_credentials(self):
-        pre_auth = [code for code in RDP_TEST_ORDER if code != "AUTH"]
+        pre_auth = [
+            code
+            for code in RDP_TEST_ORDER
+            if code != "AUTH" and code not in RDP_EXPLICIT_ONLY_TESTS
+        ]
+        with_auth = [
+            code for code in RDP_TEST_ORDER if code not in RDP_EXPLICIT_ONLY_TESTS
+        ]
         cases = (
             ({}, pre_auth),
             ({"login": "EXAMPLE\\tester"}, pre_auth),
             ({"password": "secret"}, pre_auth),
             (
                 {"login": "EXAMPLE\\tester", "password": "secret"},
-                list(RDP_TEST_ORDER),
+                with_auth,
             ),
         )
 
@@ -77,16 +187,36 @@ class RDPStructureTests(unittest.TestCase):
                     expected,
                 )
 
-    def test_all_selects_every_module_and_remembers_full_selection(self):
+    def test_all_excludes_ratelimit_and_remembers_full_selection(self):
         module = structure_main(tests="ALL")
 
         selected = module._select_codes(module._discover_modules())
 
-        self.assertEqual(selected, list(RDP_TEST_ORDER))
+        expected = [
+            code for code in RDP_TEST_ORDER if code not in RDP_EXPLICIT_ONLY_TESTS
+        ]
+        self.assertEqual(selected, expected)
         self.assertEqual(
             module.args._rdp_selected_tests,
-            frozenset(RDP_TEST_ORDER),
+            frozenset(expected),
         )
+
+    def test_ratelimit_named_alongside_all_remains_explicit(self):
+        module = structure_main(tests="ALL,RATELIMIT")
+
+        selected = module._select_codes(module._discover_modules())
+
+        self.assertEqual(selected[-1], "RATELIMIT")
+        self.assertEqual(selected.count("RATELIMIT"), 1)
+
+    def test_ratelimit_is_forced_last_and_engine_uses_one_resolved_ip(self):
+        module = structure_main(tests="RATELIMIT,NLA")
+
+        self.assertEqual(
+            module._select_codes(module._discover_modules()),
+            ["NLA", "RATELIMIT"],
+        )
+        self.assertEqual(module.rdp_engine.connect_host, module.target[0])
 
     def test_context_reuses_one_engine_and_execution_is_serial(self):
         module = structure_main()

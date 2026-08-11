@@ -13,7 +13,6 @@ from ptsrvtester.protocols.ssh.utils.results import VULNS
 __MODULELABEL__ = "Login bruteforce"
 __MODULECODE__ = "BRUTE"
 __ORDER__ = 70
-# Needs credentials, so it is skipped by the default / ALL sweep (SSH-only).
 __RUN_IN_ALL__ = False
 
 
@@ -31,8 +30,6 @@ def run(ctx):
         ctx.out("No credentials to try (empty user/secret list)", "WARNING", indent=4)
         return
 
-    # Silence paramiko's own stderr chatter during the run. Module threads default
-    # to 1, so redirecting the process-wide stderr here is safe.
     err = StringIO("")
     old_write = sys.stderr.write
     sys.stderr.write = err.write

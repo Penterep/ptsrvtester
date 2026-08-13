@@ -1,9 +1,12 @@
 import argparse
 import importlib.util
+import ipaddress
 import os
+import socket
 import sys
 import threading
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -11,6 +14,98 @@ from ptlibs import ptprinthelper
 from ptlibs.ptjsonlib import PtJsonLib
 from ptlibs.threads import ptthreads, printlock
 from ptlibs.ptprinthelper import out_if
+
+
+@dataclass
+class Target:
+    """A parsed ``HOST[:PORT]`` target. Shared by every protocol.
+
+    Mutable on purpose: protocols fill a default ``port`` (0 -> 22/161/...) in
+    their ``_prepare_target()``.
+    """
+    ip: str
+    port: int
+
+
+def valid_target(target: str, port_required: bool = False, domain_allowed: bool = False) -> Target:
+    """Parse/validate a ``HOST[:PORT]`` target into a :class:`Target`.
+
+    Single source of truth for every protocol's ``-tg/--target`` argument. Use
+    it as the argparse ``type=`` (usually through a per-protocol wrapper that
+    sets policy such as ``domain_allowed=True``) and feed that to
+    :func:`add_target_arg`.
+
+    Args:
+        target: the raw ``HOST[:PORT]`` string from argparse.
+        port_required: require an explicit ``:PORT``. Defaults to False.
+        domain_allowed: allow (and resolve) hostnames, not just IPs. Defaults to False.
+
+    Raises:
+        argparse.ArgumentError: invalid format, IP, hostname or port.
+
+    Returns:
+        Target: parsed target (``port`` is 0 when omitted).
+    """
+    split = target.split(":")
+    if not port_required and len(split) > 2:
+        raise argparse.ArgumentError(None, "The target has to be IP[:PORT]")
+    if port_required and len(split) != 2:
+        raise argparse.ArgumentError(None, "The target has to be IP:PORT")
+
+    host = split[0]
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if not domain_allowed:
+            raise argparse.ArgumentError(None, "Invalid target IP address") from None
+        try:
+            socket.gethostbyname(host)
+        except OSError:
+            raise argparse.ArgumentError(
+                None, f"Cannot resolve target name '{host}' into IP address"
+            ) from None
+
+    if len(split) > 1:
+        try:
+            port = int(split[1])
+            if port <= 0 or port >= 65536:
+                raise ValueError
+        except ValueError:
+            raise argparse.ArgumentError(None, "Invalid PORT number") from None
+    else:
+        port = 0
+    return Target(host, port)
+
+
+def add_target_arg(
+    parser: argparse.ArgumentParser,
+    *,
+    validator=None,
+    required: bool = True,
+    metavar: str = "<host>",
+    help: Optional[str] = None,
+) -> None:
+    """Add the standard ``-tg/--target`` switch to ``parser``.
+
+    Centralises the switch so every protocol is identical: always ``-tg``,
+    always ``dest="target"`` (so ``args.target`` is uniform downstream), and
+    ``required=True`` by default -- an optional switch is NOT required unless we
+    say so (a positional argument was; this preserves that).
+
+    Args:
+        validator: argparse ``type=`` callable; defaults to :func:`valid_target`.
+            Pass a per-protocol wrapper (e.g. ``valid_target_ssh``) for policy.
+        required: whether the target must be supplied. Defaults to True.
+        metavar / help: display overrides (help keeps per-protocol port hints).
+    """
+    parser.add_argument(
+        "-tg", "--target",
+        dest="target",
+        required=required,
+        type=validator or valid_target,
+        metavar=metavar,
+        help=help or "IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or host.example.com:22)",
+    )
 
 
 # enum from ptdefs dict
@@ -48,11 +143,7 @@ class BaseArgs(argparse.Namespace):
         if not isinstance(parser, argparse.ArgumentParser):
             raise TypeError  # IDE typing
 
-        from .utils.helpers import valid_target
-
-        parser.add_argument(
-            "target", type=valid_target, help="IP[:PORT] (e.g. 127.0.0.1 or 127.0.0.1:21)"
-        )
+        add_target_arg(parser, validator=valid_target)
 
         actions = parser.add_argument_group("actions")
         actions.add_argument("--banner", action="store_true", help="get the service banner")

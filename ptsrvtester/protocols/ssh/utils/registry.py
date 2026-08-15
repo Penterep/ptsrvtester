@@ -6,19 +6,14 @@ help tables: the main ``ssh -h`` test list and per-test ``ssh -ts <TEST> -h``.
 Keep every code here in sync with a module's ``__MODULECODE__``.
 """
 
-# Ordered groups for the main help table: (group title, [codes]).
 SSH_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "HOSTKEY", "AUTHM"]),
-    ("Crypto & configuration", ["AUDIT"]),
+    ("Crypto & configuration (ssh-audit)", ["KEX", "KEYALG", "ENC", "MAC", "FINGERPRINT"]),
     ("Known static keys", ["BADHOSTKEY", "BADAUTHKEY"]),
     ("Credentials", ["BRUTE"]),
+    ("Denial of service (aggressive)", ["DHEAT"]),
 ]
 
-# Per-test metadata:
-#   desc      one-line description for the main -ts table
-#   long      <=3 lines describing the test (per-test help)
-#   requires  human-readable prerequisites (per-test help)
-#   mods      test-specific option rows [short, long, metavar, help] (per-test help)
 SSH_TESTS: dict[str, dict] = {
     "BANNER": {
         "desc": "Grab banner and service identification",
@@ -35,10 +30,30 @@ SSH_TESTS: dict[str, dict] = {
         "long": ["List the authentication methods the server offers and warn when",
                  "keyboard-interactive is present (may affect password bruteforce)."],
     },
-    "AUDIT": {
-        "desc": "Run ssh-audit (CVEs + insecure crypto)",
-        "long": ["Use the ssh-audit tool to identify known CVEs and insecure key",
-                 "exchange / cipher / MAC configuration."],
+    "KEX": {
+        "desc": "Key exchange algorithms (ssh-audit)",
+        "long": ["Report the key exchange algorithms the server offers and flag the",
+                 "weak ones (from a shared ssh-audit scan)."],
+    },
+    "KEYALG": {
+        "desc": "Host-key algorithms (ssh-audit)",
+        "long": ["Report the host-key algorithms the server offers and flag the weak",
+                 "ones. Distinct from HOSTKEY, which fetches the actual host key."],
+    },
+    "ENC": {
+        "desc": "Encryption algorithms / ciphers (ssh-audit)",
+        "long": ["Report the encryption (cipher) algorithms the server offers and",
+                 "flag the weak ones (from a shared ssh-audit scan)."],
+    },
+    "MAC": {
+        "desc": "MAC algorithms (ssh-audit)",
+        "long": ["Report the message authentication code (MAC) algorithms the server",
+                 "offers and flag the weak ones (from a shared ssh-audit scan)."],
+    },
+    "FINGERPRINT": {
+        "desc": "Host-key fingerprints (ssh-audit)",
+        "long": ["List the SHA256/MD5 fingerprints of the server's host keys",
+                 "(informational, from a shared ssh-audit scan)."],
     },
     "BADHOSTKEY": {
         "desc": "Check host key against known static (bad) keys",
@@ -71,6 +86,17 @@ SSH_TESTS: dict[str, dict] = {
             ["", "--privkeys", "<directory>", "Directory of <name>.key private keys (+ <name>.pass)"],
             ["", "--spray", "", "Try one secret across all users (instead of all secrets per user)"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+        ],
+    },
+    "DHEAT": {
+        "desc": "DHEat DoS attack (aggressive; ssh-audit --dheat)",
+        "long": ["Actively run ssh-audit's DHEat Diffie-Hellman DoS attack",
+                 "(CVE-2002-20001) and report whether the server throttles connections.",
+                 "Aggressive and slow — never runs in the default sweep."],
+        "requires": ["explicit -ts DHEAT (excluded from ALL); target must offer a DH key exchange"],
+        "mods": [
+            ["", "--dheat", "<N[:kex[:e_len]]>", "N concurrent sockets, optional kex + fake-e length (default: 10)"],
+            ["", "--dheat-duration", "<seconds>", "How long to run the attack before stopping (default: 20)"],
         ],
     },
 }

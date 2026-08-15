@@ -15,9 +15,9 @@ def run(ctx):
     # CAPA comes from the shared probe; HELP needs its own short-lived connection.
     capa = info.capability_stls or info.capability
     try:
-        pop3 = ctx.connect()
+        pop3 = ctx.connect(debug=ctx.debug)
         try:
-            hi = fetch_help_info(pop3, capa)
+            hi = fetch_help_info(pop3, capa, debug=ctx.debug)
         finally:
             pop3.close()
     except Exception as e:

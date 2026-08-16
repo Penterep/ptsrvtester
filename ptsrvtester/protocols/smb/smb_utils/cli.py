@@ -3,13 +3,9 @@ from ptsrvtester.protocols._base import BaseArgs
 
 from .helpers import Target, valid_target_smb
 
-# OPTIONS = ["info", "dialects", "encryption"]
-# # bad solution since they're generated automatically; will change once the system is settled
-
 
 class SMBArgs(BaseArgs):
     target: Target
-    # get_version: bool
 
     @staticmethod
     def get_help():
@@ -17,7 +13,8 @@ class SMBArgs(BaseArgs):
             {"description": ["SMB Testing Module"]},
             {"usage": ["ptsrvtester smb <IP:PORT> <command> <options>"]},
             {"usage_example": [
-                "ptsrvtester smb 192.168.1.1 -ts info",
+                "ptsrvtester smb 192.168.1.1 -ts info,dialects",
+                "ptsrvtester smb localhost:1234 -ts encryption"
                 "ptsrvtester smb -h",
             ]},
             {"options": [

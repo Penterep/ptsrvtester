@@ -34,6 +34,10 @@ ptsrvtester pop3 -ts BANNER,CAPA -tg 127.0.0.1
 ptsrvtester pop3 -ts ALL --tls -tg 127.0.0.1:995
 ptsrvtester pop3 -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:110
 ptsrvtester imap -ts BANNER,CAPA -tg 127.0.0.1
+ptsrvtester ftp -ts BANNER,CMD,ANON -tg 127.0.0.1
+ptsrvtester ftp -ts ALL -tg 127.0.0.1
+ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1
+ptsrvtester ftp -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:21
 ptsrvtester <module> -h     for help for module use
 ```
 
@@ -53,6 +57,7 @@ ptsrvtester <module> -h     for help for module use
                          imap   IMAP testing module
                          dhcp   DHCP testing module
                          xrdp   XRDP testing module
+                         rdp    RDP testing module
 
    -v        --version          Show script version and exit
    -h        --help             Show this help message and exit
@@ -166,6 +171,17 @@ ptsrvtester <module> -h     for help for module use
 - DHCP DoS/flood attack testing
 - Network interface based testing
 
+**RDP Module**
+- TLS and certificate inspection
+- RDP version detection
+- NLA and CredSSP detection
+- Security protocol detection
+- Legacy RDP encryption testing
+- NTLM information disclosure
+- Server capability enumeration
+- Credential authentication testing
+- Connection rate limiting testing
+
 **XRDP Module**
 - XRDP server brute-force testing
 - Credential testing via GUI automation
@@ -177,6 +193,9 @@ ptsrvtester <module> -h     for help for module use
 ## Dependencies
 
 ```
+aardwolf==0.2.13
+asyauth==0.0.23
+asysocks==0.2.18
 cryptography>=42.0.8
 dnspython>=2.7.0
 impacket>=0.12.0

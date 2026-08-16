@@ -22,46 +22,15 @@ class SSHCreds(Creds):
     privkey: PrivKeyDetails | None
 
 
-class BruteResult(NamedTuple):
-    creds: set[SSHCreds]
-    errors: bool
-
-
 class BadPubkeyResult(NamedTuple):
     bad: bool
     path: str
 
 
-class CVE(NamedTuple):
-    name: str
-    description: str
-    severity: float
-
-
-class CryptoFinding(NamedTuple):
-    level: str
-    action: str
-    category: str
-    name: str
-    notes: str
-
-
-class SSHAuditResult(NamedTuple):
-    err: str | int | None  # sys._ExitCode
-    cryptofindings: list[CryptoFinding]
-    cves: list[CVE]
-
-
-class InfoResult(NamedTuple):
-    banner: str | None
-    host_key: str | None
-    auth_methods: list[str] | None
-
-
 class VULNS(Enum):
-    CVE = "PTV-GENERAL-VULNERABLEVERSION"
     InsecureCrypto = "PTV-GENERAL-INSECURECRYPTO"
     BadHostKey = "PTV-SSH-BADHOSTKEY"
     BadAuthKeys = "PTV-SSH-BADAUTHKEYS"
     WeakCreds = "PTV-GENERAL-WEAKCREDENTIALS"
     Banner = "PTV-SVC-BANNER"
+    DHEat = "PTV-SSH-DHEAT"

@@ -4,22 +4,15 @@ Pure functions (no ``self``) lifted from the old flat ``protocols/ssh.py`` so th
 per-test ``modules/*.py`` can reuse them. Imports are absolute on purpose: the
 modules are loaded dynamically by ``BaseMain`` with no package parent.
 """
-import contextlib
-import io
-import json
 import socket
 
 import paramiko
 import paramiko.ssh_exception
-from ssh_audit import ssh_audit
 
 from ptsrvtester.protocols.ssh.utils.helpers import filepaths, text_or_file
 from ptsrvtester.protocols.ssh.utils.results import (
     BadPubkeyResult,
-    CVE,
-    CryptoFinding,
     PrivKeyDetails,
-    SSHAuditResult,
     SSHCreds,
 )
 
@@ -83,55 +76,11 @@ def get_auth_methods(ip: str, port: int) -> list[str] | None:
     return am
 
 
-def run_ssh_audit(ip: str, port: int) -> SSHAuditResult:
-    """Run ssh-audit and parse its JSON into CVEs + crypto findings."""
-    out = ssh_audit.OutputBuffer()
-    aconf = ssh_audit.AuditConf(ip, port)
-    aconf.json = True
-
-    try:
-        # ssh-audit prints its own connection-error/chatter straight to stdout/stderr;
-        # keep it out of our (possibly JSON) output — the result is read from `out`.
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            status = ssh_audit.audit(out, aconf)
-
-        if status == ssh_audit.exitcodes.CONNECTION_ERROR:
-            return SSHAuditResult(status, [], [])
-
-        bufj = json.loads(out.get_buffer())
-
-        findings: list[CryptoFinding] = []
-        recommendations = bufj.get("recommendations", None)
-        if recommendations is not None:
-            # {"critical": {"del": {"key": [{"name","notes"}, ...]}}}
-            for level, actions in recommendations.items():
-                for action, categories in actions.items():
-                    for category, details in categories.items():
-                        for detail in details:
-                            findings.append(
-                                CryptoFinding(
-                                    level, action, category,
-                                    detail["name"], detail["notes"],
-                                )
-                            )
-
-        cves: list[CVE] = []
-        cves_ = bufj.get("cves", None)
-        if cves_ is not None:
-            for cve in cves_:
-                cves.append(CVE(cve["name"], cve["description"], float(cve["cvssv2"])))
-
-        return SSHAuditResult(None, findings, cves)
-    except SystemExit as e:
-        return SSHAuditResult(e.code, [], [])
-
-
 def check_bad_pubkey(pubkeys_path: str, host_key: str) -> BadPubkeyResult:
     """Compare the server's host key against a directory of known (bad) ``*.pub`` keys."""
     for pubkey_path in filepaths(pubkeys_path, ".pub"):
         with open(pubkey_path, "r") as f:
             line = f.read().strip()
-            # Some keys carry a trailing "user@host"; keep only "<type> <base64>".
             pubkey = " ".join(line.split(" ")[:2])
             if pubkey == host_key:
                 return BadPubkeyResult(True, pubkey_path)
@@ -193,7 +142,6 @@ def build_ssh_creds(args) -> list[SSHCreds]:
     if getattr(args, "privkeys", None):
         privkeys = parse_privkeys(args.privkeys)
 
-    # Keys take precedence over passwords when provided.
     secrets = privkeys if getattr(args, "privkeys", None) else passwords
 
     if getattr(args, "spray", False):
@@ -235,7 +183,6 @@ def try_login(ip: str, port: int, creds: SSHCreds) -> SSHCreds | None:
         )
         return creds
     except paramiko.SSHException as e:
-        # Server accepted creds but demands a password change -> still valid creds.
         if "change" in str(e).lower() and "password" in str(e).lower():
             return creds
         return None

@@ -15,12 +15,11 @@ from ptlibs.ptjsonlib import PtJsonLib
 
 from .._base import BaseMain, BaseArgs
 from .utils.cli import SSHArgs
+from .utils.sshaudit import SSHAuditShared
 
 
 class SSH(BaseMain):
-    #: Protocol identity (also namespaces this protocol's modules).
     NAME = "ssh"
-    #: The argparse namespace class for SSH options.
     ARGS_CLASS = SSHArgs
 
     @staticmethod
@@ -43,9 +42,6 @@ class SSH(BaseMain):
 
     def __init__(self, args: BaseArgs, ptjsonlib: PtJsonLib) -> None:
         super().__init__(args, ptjsonlib)
-        # Shared state every module accumulates into (built into one node by output()).
-        # Modules mutate these under ``ctx.results_lock``; the default module thread
-        # count is 1, so this is normally uncontended but stays correct if raised.
         self._properties: dict = {
             "software_type": None,
             "name": "ssh",
@@ -81,7 +77,9 @@ class SSH(BaseMain):
 
         ``properties`` / ``deferred_vulns`` are the shared JSON accumulators and
         ``results_lock`` guards them; modules read connection info as ``ctx.host`` /
-        ``ctx.ip`` / ``ctx.port``.
+        ``ctx.ip`` / ``ctx.port``. ``ssh_audit`` is the run-once ssh-audit holder
+        every crypto section test (KEX/KEYALG/ENC/MAC/FINGERPRINT) shares, so the
+        external ssh-audit scan happens at most once per invocation.
         """
         return {
             "host": self.target_host,
@@ -90,6 +88,7 @@ class SSH(BaseMain):
             "properties": self._properties,
             "deferred_vulns": self._deferred_vulns,
             "results_lock": self._results_lock,
+            "ssh_audit": SSHAuditShared(self.target[0], self.target[1]),
         }
 
     def output(self) -> None:

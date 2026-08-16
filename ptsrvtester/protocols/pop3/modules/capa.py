@@ -2,7 +2,7 @@
 from ..utils.connection import require_server_info
 from ..utils.render import emit_capa
 
-__MODULELABEL__ = "CAPA"
+__MODULELABEL__ = ""  # section titles come from emit_capa (CAPA command PLAIN/STLS/…)
 __MODULECODE__ = "CAPA"
 __ORDER__ = 20
 

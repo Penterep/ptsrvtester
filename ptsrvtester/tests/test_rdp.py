@@ -1130,7 +1130,7 @@ class RDPAuthenticationTests(unittest.TestCase):
             with patch(
                 "ptsrvtester.protocols.rdp.utils.engine.importlib.metadata.version",
                 side_effect=lambda package: {
-                    "aardwolf": "0.2.14",
+                    "aardwolf": "0.2.13",
                     "asyauth": "0.0.23",
                 }[package],
             ), patch(
@@ -1173,7 +1173,7 @@ class RDPAuthenticationTests(unittest.TestCase):
             with patch(
                 "ptsrvtester.protocols.rdp.utils.engine.importlib.metadata.version",
                 side_effect=lambda package: {
-                    "aardwolf": "0.2.14",
+                    "aardwolf": "0.2.13",
                     "asyauth": "0.0.23",
                 }[package],
             ), patch(

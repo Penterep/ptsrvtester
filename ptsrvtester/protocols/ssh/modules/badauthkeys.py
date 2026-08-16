@@ -5,7 +5,6 @@ from ptsrvtester.protocols.ssh.utils.results import VULNS
 __MODULELABEL__ = "Known static (bad) auth keys"
 __MODULECODE__ = "BADAUTHKEY"
 __ORDER__ = 60
-# Needs -A/--bad-authkeys, so it is skipped by the default / ALL sweep (SSH-only).
 __RUN_IN_ALL__ = False
 
 

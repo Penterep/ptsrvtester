@@ -1,8 +1,11 @@
 """
-Service identification from server banner.
-Maps banner content to product name, version (if numeric), OS/distribution, and CPE 2.3 (NVD-style).
-Only numeric app versions (e.g. 7.1.1, 4.96) are used as version and in CPE; distribution
-names (e.g. Ubuntu, Debian/GNU Linux) from banner go to os, not version.
+SSH service identification from the server banner.
+Maps banner content to product name, version (if numeric) and CPE 2.3 (NVD-style).
+Only numeric app versions (e.g. 7.4p1, 2020.81) are used as version and in CPE.
+
+This is the SSH-only slice of the shared identifier: it recognises the SSH server
+products (OpenSSH, libssh, Dropbear, PuTTY, Cisco IOS) — other protocols keep their
+own tables.
 
 CPE 2.3 (NIST/NVD) has exactly 11 components after the "cpe:2.3:" prefix:
   part, vendor, product, version, update, edition, language, sw_edition, target_sw, target_hw, other.
@@ -12,13 +15,9 @@ import re
 from dataclasses import dataclass
 from typing import Final
 
-# Version string acceptable for CPE (NVD uses numeric versions). Reject distro names.
 _CPE_VERSION_RE = re.compile(r"^\d+[.\d]*(?:p\d+)?[\w.-]*$", re.I)
 
-# CPE 2.3: exactly 11 components after "cpe:2.3:" (version, update, edition, language, sw_edition, target_sw, target_hw, other)
 _CPE_23_NUM_COMPONENTS = 11
-# Wildcard tail when version is unknown (8 fields after vendor:product)
-_CPE_23_ANY_TAIL = ":*:*:*:*:*:*:*:*"
 
 
 def _cpe_23_normalize(cpe: str) -> str:
@@ -28,123 +27,16 @@ def _cpe_23_normalize(cpe: str) -> str:
     parts = cpe.split(":")
     if len(parts) < 3:
         return cpe
-    # parts[0]=cpe, parts[1]=2.3, parts[2:]=component list
     components = parts[2:]
     while len(components) < _CPE_23_NUM_COMPONENTS:
         components.append("*")
     return ":".join([parts[0], parts[1]] + components[: _CPE_23_NUM_COMPONENTS])
 
-# (pattern re, product display name, CPE base with wildcard version … _CPE_23_ANY_TAIL)
-# Order: more specific first. Version is first capture group if present.
+
+# (pattern re, product display name, CPE base with wildcard version)
+# Order: more specific first. Version is the first capture group if present.
 # CPE vendor/product from NVD where available.
 _BANNER_PATTERNS: Final[list[tuple[re.Pattern[str], str, str]]] = [
-    # --- SMTP / mail (MTAs, gateways) ---
-    (re.compile(r"Kerio\s+Connect\s+(\d+\.\d+(?:\.\d+)?)", re.I), "Kerio Connect", "cpe:2.3:a:kerio:connect:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Microsoft\s+ESMTP\s+MAIL\s+Service", re.I), "Microsoft Exchange Server", "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Microsoft\s+SMTP\s+Server", re.I), "Microsoft SMTP Server", "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*"),
-    # Cloud providers first – banner is authoritative (similar EHLO across providers)
-    (re.compile(r"mx\.google\.com|smtp\.google\.com|\bgsmtp\b", re.I), "Google Workspace", "cpe:2.3:a:google:gmail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"outlook\.com|smtp\.office365\.com|protection\.outlook\.com", re.I), "Microsoft 365", "cpe:2.3:a:microsoft:exchange_online:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bzoho\b", re.I), "Zoho Mail", "cpe:2.3:a:zoho:mail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"mail\.protonmail\.ch|protonmail\.(ch|me|com)", re.I), "Proton Mail", "cpe:2.3:a:protonmail:protonmail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"mx\.messagingengine\.com", re.I), "Fastmail", "cpe:2.3:a:fastmail:fastmail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"mx\.yandex\.(ru|net|com)", re.I), "Yandex Mail", "cpe:2.3:a:yandex:yandex_mail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"yahoo\.com\s+ESMTP\s+ready", re.I), "Yahoo Mail Proxy", "cpe:2.3:a:yahoo:mail_proxy:*:*:*:*:*:*:*:*"),
-    (re.compile(r"aol\.mail.*ESMTP\s+ready", re.I), "Yahoo Mail Proxy", "cpe:2.3:a:yahoo:mail_proxy:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Mailgun\s+Delivery\s+Service", re.I), "Mailgun", "cpe:2.3:a:mailgun:mailgun:*:*:*:*:*:*:*:*"),
-    (re.compile(r"SendGrid\s+ESMTP", re.I), "SendGrid", "cpe:2.3:a:sendgrid:sendgrid:*:*:*:*:*:*:*:*"),
-    (re.compile(r"email-smtp\.[a-z0-9-]*\.?amazonaws\.com\s+ESMTP", re.I), "Amazon SES", "cpe:2.3:a:amazon:ses:*:*:*:*:*:*:*:*"),
-    (re.compile(r"mandrillapp\.com\s+ESMTP", re.I), "Mandrill (Mailchimp)", "cpe:2.3:a:mailchimp:mandrill:*:*:*:*:*:*:*:*"),
-    (re.compile(r"ESMTP\s+Sendinblue\s+SMTP\s+(\d+\.\d+)", re.I), "Sendinblue SMTP (Brevo)", "cpe:2.3:a:brevo:smtp:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bSendinblue\b", re.I), "Sendinblue SMTP (Brevo)", "cpe:2.3:a:brevo:smtp:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Cisco\s+Secure\s+Email", re.I), "Cisco Secure Email (IronPort)", "cpe:2.3:h:cisco:secure_email_gateway:*:*:*:*:*:*:*:*"),
-    (re.compile(r"(?:AsyncOS|IronPort)\s+(\d+\.\d+)", re.I), "Cisco Secure Email (IronPort)", "cpe:2.3:h:cisco:secure_email_gateway:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\b(?:AsyncOS|IronPort)\b", re.I), "Cisco Secure Email (IronPort)", "cpe:2.3:h:cisco:secure_email_gateway:*:*:*:*:*:*:*:*"),
-    (re.compile(r"ESMTP\s+IceWarp\s+(\d+(?:\.\d+)+)", re.I), "IceWarp", "cpe:2.3:a:icewarp:icewarp_server:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bIceWarp\s+(\d+(?:\.\d+)+)", re.I), "IceWarp", "cpe:2.3:a:icewarp:icewarp_server:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bIceWarp\b", re.I), "IceWarp", "cpe:2.3:a:icewarp:icewarp_server:*:*:*:*:*:*:*:*"),
-    (re.compile(r"ESMTP\s+FortiMail\s+(\d+\.\d+(?:\.\d+)?)", re.I), "FortiMail", "cpe:2.3:h:fortinet:fortimail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bFortiMail\b", re.I), "FortiMail", "cpe:2.3:h:fortinet:fortimail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Oracle\s+Communications\s+Messaging\s+Server\s+(\d+\.\d+(?:\.\d+)?)", re.I), "Oracle Communications Messaging Server", "cpe:2.3:a:oracle:communications_messaging_server:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Oracle\s+Communications\s+Messaging\s+Server", re.I), "Oracle Communications Messaging Server", "cpe:2.3:a:oracle:communications_messaging_server:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Zimbra\s+(\d+\.\d+(?:\.\d+)?)", re.I), "Zimbra Collaboration", "cpe:2.3:a:zimbra:collaboration:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bZCS\b", re.I), "Zimbra Collaboration", "cpe:2.3:a:zimbra:collaboration:*:*:*:*:*:*:*:*"),
-    (re.compile(r"hMailServer\s+(\d+\.\d+(?:\.\d+)?)", re.I), "hMailServer", "cpe:2.3:a:hmailserver:hmailserver:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bhMailServer\b", re.I), "hMailServer", "cpe:2.3:a:hmailserver:hmailserver:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Apache\s+James\s+(\d+\.\d+(?:\.\d+)?)", re.I), "Apache James", "cpe:2.3:a:apache:james:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bJames\s+SMTP\b", re.I), "Apache James", "cpe:2.3:a:apache:james:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Haraka\s+(\d+\.\d+(?:\.\d+)?)", re.I), "Haraka", "cpe:2.3:a:haraka:haraka:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bHaraka\b", re.I), "Haraka", "cpe:2.3:a:haraka:haraka:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Sendmail\s+(\d+\.\d+(?:\.\d+)?)(?:\/[^\s]*)?", re.I), "Sendmail", "cpe:2.3:a:sendmail:sendmail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bSendmail\b", re.I), "Sendmail", "cpe:2.3:a:sendmail:sendmail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Exim\s+(\d+\.\d+(?:\.\d+)?)", re.I), "Exim", "cpe:2.3:a:exim:exim:*:*:*:*:*:*:*:*"),
-    # Bare product name before generic "ESMTP service ready" (e.g. Hetzner: "host Exim ESMTP Service ready")
-    (re.compile(r"\bExim\b", re.I), "Exim", "cpe:2.3:a:exim:exim:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Postfix\s+(\d+\.\d+(?:\.\d+)?)", re.I), "Postfix", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Postfix\s+\(([^)]+)\)", re.I), "Postfix", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
-    (re.compile(r"ESMTP\s+Postfix", re.I), "Postfix", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bPostfix\b", re.I), "Postfix", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Lotus\s+Domino\s+(\d+\.\d+)", re.I), "IBM Lotus Domino", "cpe:2.3:a:ibm:domino:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bDomino\b", re.I), "IBM Lotus Domino", "cpe:2.3:a:ibm:domino:*:*:*:*:*:*:*:*"),
-    (re.compile(r"MailEnable\s+Service,\s+Version:\s*(\d+\.\d+(?:\.\d+)?)", re.I), "MailEnable", "cpe:2.3:a:mailenable:mailenable:*:*:*:*:*:*:*:*"),
-    (re.compile(r"MailEnable\s+(\d+\.\d+)", re.I), "MailEnable", "cpe:2.3:a:mailenable:mailenable:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bMailEnable\b", re.I), "MailEnable", "cpe:2.3:a:mailenable:mailenable:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Axigen\s+(\d+\.\d+(?:\.\d+)?)", re.I), "Axigen", "cpe:2.3:a:axigen:axigen_mail_server:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bAxigen\b", re.I), "Axigen", "cpe:2.3:a:axigen:axigen_mail_server:*:*:*:*:*:*:*:*"),
-    (re.compile(r"MDaemon\s+(\d+\.\d+)", re.I), "MDaemon", "cpe:2.3:a:alt-n:mdaemon:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bMDaemon\b", re.I), "MDaemon", "cpe:2.3:a:alt-n:mdaemon:*:*:*:*:*:*:*:*"),
-    (re.compile(r"SmarterMail\s+(\d+\.\d+(?:\.\d+)?)", re.I), "SmarterMail", "cpe:2.3:a:smartertools:smartermail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bSmarterMail\b", re.I), "SmarterMail", "cpe:2.3:a:smartertools:smartermail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"ESMTP\s+Postcow", re.I), "Mailcow: dockerized", "cpe:2.3:a:mailcow:mailcow:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bPostcow\b", re.I), "Mailcow: dockerized", "cpe:2.3:a:mailcow:mailcow:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bMailcow\b", re.I), "Mailcow: dockerized", "cpe:2.3:a:mailcow:mailcow:*:*:*:*:*:*:*:*"),
-    (re.compile(r"MailStore\s+Gateway", re.I), "MailStore Gateway", "cpe:2.3:a:mailstore:mailstore_gateway:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bMailStore\b", re.I), "MailStore Gateway", "cpe:2.3:a:mailstore:mailstore_gateway:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Barracuda\s+(\d+\.\d+)", re.I), "Barracuda Email Security", "cpe:2.3:h:barracuda:email_security_gateway:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bBarracuda\b", re.I), "Barracuda Email Security", "cpe:2.3:h:barracuda:email_security_gateway:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Welcome\s+to\s+coremail", re.I), "Coremail Mail Server", "cpe:2.3:a:coremail:coremail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bcoremail\b", re.I), "Coremail Mail Server", "cpe:2.3:a:coremail:coremail:*:*:*:*:*:*:*:*"),
-    (re.compile(r"pphosted\.com", re.I), "Proofpoint Email Protection", "cpe:2.3:a:proofpoint:proofpoint_email_protection:*:*:*:*:*:*:*:*"),
-    (re.compile(r"ESMTP\s+mfa-", re.I), "Proofpoint Email Protection", "cpe:2.3:a:proofpoint:proofpoint_email_protection:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bmfa-\w+", re.I), "Proofpoint Email Protection", "cpe:2.3:a:proofpoint:proofpoint_email_protection:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bProofpoint\b", re.I), "Proofpoint Email Protection", "cpe:2.3:a:proofpoint:proofpoint_email_protection:*:*:*:*:*:*:*:*"),
-    # Sophos: typical short banner before bracketed appliance form
-    (re.compile(r"\bSophos\s+ESMTP\s+ready\b", re.I), "Sophos Email Appliance", "cpe:2.3:a:sophos:email_appliance:*:*:*:*:*:*:*:*"),
-    (re.compile(r"ESMTP\s+\[Sophos\s+Email\s+Appliance\]", re.I), "Sophos Email Appliance", "cpe:2.3:a:sophos:email_appliance:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Sophos\s+Email\s+Appliance", re.I), "Sophos Email Appliance", "cpe:2.3:a:sophos:email_appliance:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bSophos\b", re.I), "Sophos Email Appliance", "cpe:2.3:a:sophos:email_appliance:*:*:*:*:*:*:*:*"),
-    (re.compile(r"ESMTP\s+\(Mimecast\)", re.I), "Mimecast", "cpe:2.3:a:mimecast:email_security_gateway:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bMimecast\b", re.I), "Mimecast", "cpe:2.3:a:mimecast:email_security_gateway:*:*:*:*:*:*:*:*"),
-    # Trustwave MailMarshal (MX/security gateway); banner often "Trustwave MailMarshal (vX.Y.Z.W) Ready"
-    (re.compile(r"Trustwave\s+MailMarshal\s+\(v?([\d.]+)\)", re.I), "Trustwave MailMarshal", "cpe:2.3:a:trustwave:mailmarshal:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bTrustwave\s+MailMarshal\b", re.I), "Trustwave MailMarshal", "cpe:2.3:a:trustwave:mailmarshal:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bMailMarshal\b", re.I), "Trustwave MailMarshal", "cpe:2.3:a:trustwave:mailmarshal:*:*:*:*:*:*:*:*"),
-    (re.compile(r"ESMTP\s+Trend\s+Micro\s+Email\s+Security\s+Service\s+ready", re.I), "Trend Micro Email Security", "cpe:2.3:a:trendmicro:email_security:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Trend\s+Micro\s+Email\s+Security", re.I), "Trend Micro Email Security", "cpe:2.3:a:trendmicro:email_security:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bDovecot\b", re.I), "Dovecot", "cpe:2.3:a:dovecot:dovecot:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Courier\s+(?:mail\s+)?(?:server|Mail)", re.I), "Courier", "cpe:2.3:a:courier-mta:courier:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bQmail\b", re.I), "Qmail", "cpe:2.3:a:qmail:qmail:*:*:*:*:*:*:*:*"),
-    # DreamHost VPS: dreamhostps.com hostname – typically runs Postfix
-    (re.compile(r"dreamhostps\.com", re.I), "Postfix (DreamHost VPS)", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
-    # Etius.jp (WebArena): Japanese hosting provider – minimal banner, Postfix typical
-    (re.compile(r"etius\.jp", re.I), "Postfix (Etius.jp / WebArena)", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
-    # LWS Hosting (lwspanel.com): French hosting – uses Postfix with "LWS mailer" banner
-    (re.compile(r"LWS\s+mailer", re.I), "Postfix (LWS Hosting)", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
-    (re.compile(r"lwspanel\.com", re.I), "Postfix (LWS Hosting)", "cpe:2.3:a:postfix:postfix:*:*:*:*:*:*:*:*"),
-    # PowerMTA (Port25): pmtaserver.com hostname – often masquerades as Exchange (custom ESMTP banner)
-    (re.compile(r"pmtaserver\.com", re.I), "PowerMTA (Port25)", "cpe:2.3:a:port25:powermta:*:*:*:*:*:*:*:*"),
-    # Generic "ESMTP service ready" only when no explicit MTA name matched above (Exim/Postfix/Sendmail/…)
-    (re.compile(r"\bESMTP\s+service\s+ready\b", re.I), "Microsoft Exchange Server (custom banner)", "cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:*"),
-    # --- IMAP / POP3 (Cyrus, etc.) ---
-    (re.compile(r"Cyrus\s+POP3\s+v?(\d+\.\d+(?:\.\d+)?)", re.I), "Cyrus POP3", "cpe:2.3:a:cyrus:imap:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Cyrus\s+POP3", re.I), "Cyrus POP3", "cpe:2.3:a:cyrus:imap:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Cyrus\s+IMAP4?\s+v?(\d+\.\d+(?:\.\d+)?)", re.I), "Cyrus IMAP", "cpe:2.3:a:cyrus:imap:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Cyrus\s+IMAP", re.I), "Cyrus IMAP", "cpe:2.3:a:cyrus:imap:*:*:*:*:*:*:*:*"),
-    (re.compile(r"University\s+of\s+Washington", re.I), "UW IMAP", "cpe:2.3:a:university_of_washington:imap:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bUW\s+IMAP\b", re.I), "UW IMAP", "cpe:2.3:a:university_of_washington:imap:*:*:*:*:*:*:*:*"),
-    (re.compile(r"CommuniGate\s+Pro\s+(\d+\.\d+)", re.I), "CommuniGate Pro", "cpe:2.3:a:stalker:communigate_pro:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bCommuniGate\b", re.I), "CommuniGate Pro", "cpe:2.3:a:stalker:communigate_pro:*:*:*:*:*:*:*:*"),
-    # --- SSH ---
     (re.compile(r"SSH-2\.0-OpenSSH_([\d\.]+(?:p\d+)?)", re.I), "OpenSSH", "cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*"),
     (re.compile(r"OpenSSH_([\d\.]+(?:p\d+)?)", re.I), "OpenSSH", "cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*"),
     (re.compile(r"SSH-2\.0-libssh_([\d\.]+)", re.I), "libssh", "cpe:2.3:a:libssh:libssh:*:*:*:*:*:*:*:*"),
@@ -156,40 +48,51 @@ _BANNER_PATTERNS: Final[list[tuple[re.Pattern[str], str, str]]] = [
     (re.compile(r"\bPuTTY\b", re.I), "PuTTY", "cpe:2.3:a:simon_tatham:putty:*:*:*:*:*:*:*:*"),
     (re.compile(r"SSH-2\.0-Cisco-\d+\.\d+(?:\.\d+)?", re.I), "Cisco IOS SSH", "cpe:2.3:o:cisco:ios:*:*:*:*:*:*:*:*"),
     (re.compile(r"SSH-2\.0-Cisco", re.I), "Cisco IOS SSH", "cpe:2.3:o:cisco:ios:*:*:*:*:*:*:*:*"),
-    # --- FTP ---
-    (re.compile(r"ProFTPD\s+(\d+\.\d+(?:\.[\w]+)?)", re.I), "ProFTPD", "cpe:2.3:a:proftpd:proftpd:*:*:*:*:*:*:*:*"),
-    (re.compile(r"ProFTPD\s+Server", re.I), "ProFTPD", "cpe:2.3:a:proftpd:proftpd:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\(vsFTPd\s+(\d+\.\d+\.\d+)\)", re.I), "vsftpd", "cpe:2.3:a:vsftpd_project:vsftpd:*:*:*:*:*:*:*:*"),
-    (re.compile(r"vsFTPd\s+(\d+\.\d+\.\d+)", re.I), "vsftpd", "cpe:2.3:a:vsftpd_project:vsftpd:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bvsFTPd\b", re.I), "vsftpd", "cpe:2.3:a:vsftpd_project:vsftpd:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Pure-FTPd\s+(\d+\.\d+(?:\.\d+)?)", re.I), "Pure-FTPd", "cpe:2.3:a:pure-ftpd:pure-ftpd:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Welcome\s+to\s+Pure-FTPd", re.I), "Pure-FTPd", "cpe:2.3:a:pure-ftpd:pure-ftpd:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Microsoft\s+FTP\s+Service", re.I), "Microsoft IIS FTP", "cpe:2.3:a:microsoft:internet_information_services:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\(MikroTik\s+(\d+\.\d+(?:\.\d+)?)\)", re.I), "MikroTik RouterOS FTP", "cpe:2.3:o:mikrotik:routeros:*:*:*:*:*:*:*:*"),
-    (re.compile(r"MikroTik\s+(\d+\.\d+(?:\.\d+)?)", re.I), "MikroTik RouterOS FTP", "cpe:2.3:o:mikrotik:routeros:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bMikroTik\b", re.I), "MikroTik RouterOS FTP", "cpe:2.3:o:mikrotik:routeros:*:*:*:*:*:*:*:*"),
-    (re.compile(r"FileZilla\s+Server\s+(\d+\.\d+(?:\.\d+)?)", re.I), "FileZilla Server", "cpe:2.3:a:filezilla-project:filezilla_server:*:*:*:*:*:*:*:*"),
-    (re.compile(r"FileZilla\s+Server", re.I), "FileZilla Server", "cpe:2.3:a:filezilla-project:filezilla_server:*:*:*:*:*:*:*:*"),
-    (re.compile(r"Serv-U\s+(\d+\.\d+)", re.I), "Serv-U FTP", "cpe:2.3:a:solarwinds:serv-u:*:*:*:*:*:*:*:*"),
-    (re.compile(r"\bServ-U\b", re.I), "Serv-U FTP", "cpe:2.3:a:solarwinds:serv-u:*:*:*:*:*:*:*:*"),
-    (re.compile(r"WS_FTP\s+Server", re.I), "WS_FTP Server", "cpe:2.3:a:progress:ws_ftp:*:*:*:*:*:*:*:*"),
 ]
+
+
+# Generic SSH software token: everything after the "SSH-<proto>-" prefix, up to the
+# first space (the optional free-text comments start after a space).
+_SSH_SOFTWARE_RE = re.compile(r"^SSH-\d+(?:\.\d+)?-(\S+)", re.I)
+# A dotted version number inside that token (allow a leading "_"/"-" separator, but not
+# a digit/dot, so we don't split a longer number). Matches 8.0.9648, 1.1, 3.2.1p2, ...
+_GENERIC_VERSION_RE = re.compile(r"(?<![\d.])\d+(?:\.\d+)+(?:p\d+)?")
 
 
 @dataclass(frozen=True)
 class ServiceIdentification:
     """Result of banner-based service identification."""
     product: str
-    version: str | None  # None if not specified or if captured string is OS/distro name
+    version: str | None
     cpe: str
-    os: str | None = None  # OS/distribution from banner (e.g. Ubuntu), when not a product version
+    os: str | None = None
+
+
+def _generic_version_disclosure(first_line: str) -> ServiceIdentification | None:
+    """Fallback for SSH servers not in the pattern table.
+
+    A banner like ``SSH-2.0-RebexSSH_8.0.9648`` discloses a concrete product and
+    version even though we can't map it to a CPE. Return that product+version (with
+    an empty CPE) so the banner test still flags the version disclosure; return None
+    when the banner exposes no version at all (e.g. ``SSH-2.0-mysshd``).
+    """
+    m = _SSH_SOFTWARE_RE.match(first_line)
+    if not m:
+        return None
+    software = m.group(1)
+    mver = _GENERIC_VERSION_RE.search(software)
+    if not mver:
+        return None
+    version = mver.group(0)
+    product = software[: mver.start()].rstrip("_-/. ") or software
+    return ServiceIdentification(product=product, version=version, cpe="", os=None)
 
 
 def identify_service(banner: str | None) -> ServiceIdentification | None:
     """
-    Identify product and optional version from server banner.
+    Identify product and optional version from an SSH server banner.
     Returns ServiceIdentification(product, version, cpe, os) or None if no match.
-    Version is set only for numeric app versions; distro names (Ubuntu, Debian, ...) go to os.
+    Version is set only for numeric app versions; non-numeric captures go to os.
     CPE uses * for version when not found (full 11-attribute CPE 2.3 string).
     """
     if not banner or not banner.strip():
@@ -197,13 +100,11 @@ def identify_service(banner: str | None) -> ServiceIdentification | None:
     text = banner.replace("\r", " ").strip()
     if not text:
         return None
-    # Use first line for matching (banner often multi-line)
     first_line = text.split("\n")[0].strip() if "\n" in text else text
     for pattern, product, cpe_base in _BANNER_PATTERNS:
         m = pattern.search(first_line)
         if m:
             raw = m.group(1).strip() if m.lastindex and m.lastindex >= 1 else None
-            # Numeric version -> version; otherwise (e.g. Ubuntu, Debian/GNU) -> os, version stays None
             if raw and _CPE_VERSION_RE.match(raw):
                 version, os_str = raw, None
             elif raw:
@@ -225,42 +126,4 @@ def identify_service(banner: str | None) -> ServiceIdentification | None:
                 cpe = cpe_base
             cpe = _cpe_23_normalize(cpe)
             return ServiceIdentification(product=product, version=version, cpe=cpe, os=os_str)
-    return None
-
-
-# SMTP 220: reject lines that name a known MTA/vendor (even if no full banner pattern matched).
-_BANNER_MTA_VENDOR_TOKEN: Final[re.Pattern[str]] = re.compile(
-    r"\b("
-    r"postfix|exim|exchange|sendmail|microsoft|icewarp|zimbra|hmail|haraka|mdaemon|"
-    r"mailenable|axigen|courier|qmail|dovecot|kerio|fortimail|cisco|barracuda|mimecast|"
-    r"proofpoint|mailgun|sendgrid|mandrill|amazon|ses|gsmtp|zoho|proton|yandex|fastmail|"
-    r"outlook|office365|mailstore|trend\s+micro|sophos|power\s*mta|postcow|mailcow|"
-    r"communigate|smartermail|hmailserver|oracle\s+communications|asyncos|ironport|"
-    r"trustwave|mailmarshal"
-    r")\b",
-    re.I,
-)
-
-# First line looks like FQDN + ESMTP only (no product fingerprint from identify_service).
-_GENERIC_SMTP_BANNER_SHAPE: Final[re.Pattern[str]] = re.compile(
-    r"^(\S+\.)+\S+\s+ESMTP(?:\s+(?:ready|server|service(?:\s+ready)?))?\s*$",
-    re.I,
-)
-
-
-def is_generic_esmtp_banner(banner: str | None) -> bool:
-    """
-    True when the SMTP greeting is a minimal hostname + ESMTP style line with no
-    identify_service() match and no obvious MTA/vendor token in the first line.
-    """
-    if not banner or not banner.strip():
-        return False
-    if identify_service(banner) is not None:
-        return False
-    first = banner.replace("\r", "").split("\n")[0].strip()
-    rest = re.sub(r"^220\s+", "", first, flags=re.I).strip()
-    if not rest or _BANNER_MTA_VENDOR_TOKEN.search(rest):
-        return False
-    if not re.search(r"\bESMTP\b", rest, re.I):
-        return False
-    return bool(_GENERIC_SMTP_BANNER_SHAPE.match(rest))
+    return _generic_version_disclosure(first_line)

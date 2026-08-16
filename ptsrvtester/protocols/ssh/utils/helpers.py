@@ -8,7 +8,6 @@ from ptlibs.threads import ptthreads
 
 from ..._base import BaseArgs
 
-# Probable mailbox names for AUTH user-enum when the operator does not pass -u/-U (SMTP -ae, etc.).
 default_logins: tuple[str, ...] = (
     "admin",
     "administrator",
@@ -18,7 +17,6 @@ default_logins: tuple[str, ...] = (
     "support",
 )
 
-# Synthetic non-existent identities used as invalid baseline alongside candidate names (-ae).
 AUTH_ENUM_SYNTHETIC_INVALID_COUNT = 2
 
 
@@ -90,9 +88,9 @@ class Target:
 
 class ArgsWithBruteforce(BaseArgs):
     user: str | list[str] | None
-    users: str | None  # renamed from users_file
-    password: str | None  # renamed from passw
-    passwords: str | None  # renamed from passw_file
+    users: str | None
+    password: str | None
+    passwords: str | None
     spray: bool
     threads: int
 

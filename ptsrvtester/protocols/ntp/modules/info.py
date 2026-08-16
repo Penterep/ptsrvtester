@@ -1,66 +1,49 @@
-"""TEMPLATE for a protocol main — copy this to protocols/<proto>/<proto>_main.py.
+"""TEMPLATE — copy this file to modules/<yourmodule>.py to add a module.
 
-The generic machinery (module discovery, ``-ts`` selection, parallel execution,
-ordered output, the ``ctx`` object) lives in :class:`BaseMain` (protocols/_base.py)
-and is inherited unchanged. A protocol main declares only the five items below.
+The generic main (main.py) discovers every ``modules/*.py`` that is NOT
+prefixed with ``_`` and exposes a callable ``run(ctx)``. This file starts with
+``_`` on purpose, so it is documentation only and is never executed.
 
-Steps to stand up a new protocol ``<proto>``:
-  1. Create ``protocols/<proto>/`` with an ``__init__.py`` exporting the class.
-  2. Put the CLI/args class in ``protocols/<proto>/<proto>_utils/cli.py`` (``<Proto>Args``).
-  3. Copy this file to ``protocols/<proto>/<proto>_main.py`` and fill in the class below.
-  4. Add modules as ``protocols/<proto>/modules/*.py`` (see protocols/smtp/modules/_TEMPLATE.py).
-  5. Register the protocol in ``ptsrvtester.py`` MODULES: one line
-     ``"<proto>": ("ptsrvtester.protocols.<proto>:<Proto>", "<Proto> testing module")``.
+Required / optional module-level attributes
+--------------------------------------------
+    __MODULELABEL__  (str, required)  one-line label; the main prints it as the
+                                    section header before your run() executes.
+    __MODULECODE__   (str, optional)  the -ts code; defaults to FILENAME.upper().
+    __ORDER__      (int, optional)  run/print order; smaller runs first (default 100).
+
+The run(ctx) entry point
+------------------------
+``ctx`` carries everything you need — you do NOT manage threads, output ordering
+or the section header yourself:
+
+    ctx.args        parsed CLI args (SMTPArgs) — all -m/-r/--tls/... options
+    ctx.target      (ip, port) tuple, already resolved
+    ctx.ptjsonlib   shared PtJsonLib — add structured results for JSON mode
+    ctx.print_lock  this module's output buffer (advanced use)
+    ctx.out(text, category="TEXT", colortext=False, indent=0)
+                    buffer a line; categories: TEXT/INFO/OK/VULN/NOTVULN/
+                    WARNING/ERROR/TITLE/ADDITIONS (text mode only)
+    ctx.debug(text) buffer a line shown only with -vv
+    ctx.json        True in --json mode  (emit via ctx.ptjsonlib, not ctx.out)
+    ctx.verbose     True in -vv mode
+    ctx.<extra>     protocol handles from build_context(): ctx.host, ctx.ip,
+                    ctx.port, ctx.fqdn, ctx.tls, ctx.starttls, ...
+
+Contract:
+  * run() takes exactly one argument (ctx) and returns None.
+  * Do NOT print with builtin print()/sys.stdout — use ctx.out()/ctx.debug()
+    so output stays isolated per module and ordered by the main.
+  * Raising is safe: the main catches it and reports the module as failed without
+    aborting the other selected modules.
 """
-import argparse
-import socket
 
-from .._base import BaseMain, BaseArgs
-# from .<proto>_utils.cli import <Proto>Args
+__MODULELABEL__ = "Info"
+__MODULECODE__ = "INFO"
+__ORDER__ = 10
 
 
-class Proto(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
-    #: Short protocol identity (also namespaces this protocol's modules).
-    NAME = "proto"
-    #: The argparse namespace class for this protocol's options.
-    ARGS_CLASS = BaseArgs  # -> <Proto>Args
-
-    @staticmethod
-    def module_args() -> BaseArgs:
-        # return <Proto>Args()
-        raise NotImplementedError
-
-    def _prepare_target(self) -> None:
-        """Resolve self.target = (ip, port) before any module runs.
-
-        Fill in protocol defaults (e.g. default port) and host resolution.
-        If you don't override this, BaseMain's default takes (ip, port) straight
-        from args.target.
-        """
-        target = self.args.target
-        if getattr(target, "port", 0) == 0:
-            target.port = 0  # <- set your protocol's default port here
-        host = target.ip
-        try:
-            socket.inet_aton(host)
-            ip = host
-        except OSError:
-            try:
-                ip = socket.gethostbyname(host)
-            except socket.gaierror:
-                raise argparse.ArgumentError(
-                    None, f"Cannot resolve domain name '{host}' to IP address"
-                )
-        self.target_host = host
-        self.target = (ip, target.port)
-
-    def build_context(self) -> dict:
-        """Protocol handles injected onto every module's ``ctx`` (besides core fields).
-
-        Modules read them as ``ctx.<name>``. Return {} if none are needed.
-        """
-        return {
-            "host": self.target_host,
-            "ip": self.target[0],
-            "port": self.target[1],
-        }
+def run(ctx):
+    ip, port = ctx.target
+    ctx.out(f"Would check {ip}:{port} here.", "TEXT")
+    # For JSON mode, add structured findings instead of text, e.g.:
+    #   ctx.ptjsonlib.add_vulnerability("PTV-SMTP-...")

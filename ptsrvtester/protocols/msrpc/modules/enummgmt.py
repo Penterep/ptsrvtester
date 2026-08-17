@@ -3,9 +3,8 @@ __MODULELABEL__ = "Enumerate MGMT UUIDs"
 __MODULECODE__ = "ENUMMGMT"
 __ORDER__ = 20
 
-from ._common import eng
+from ._common import run_probe
 
 
 def run(ctx):
-    e = eng(ctx)
-    e.results.MgmtEndpoints = e.enumerate_mgmt()
+    run_probe(ctx, __MODULECODE__, "MgmtEndpoints", "enumerate_mgmt")

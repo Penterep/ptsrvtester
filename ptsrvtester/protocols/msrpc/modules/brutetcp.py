@@ -3,9 +3,8 @@ __MODULELABEL__ = "Brute RPC over TCP"
 __MODULECODE__ = "BRUTETCP"
 __ORDER__ = 70
 
-from ._common import eng
+from ._common import run_probe
 
 
 def run(ctx):
-    e = eng(ctx)
-    e.results.TCP_Brute = e.tcp_brute()
+    run_probe(ctx, __MODULECODE__, "TCP_Brute", "tcp_brute")

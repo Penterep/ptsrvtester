@@ -1,429 +1,89 @@
+"""Small, MSRPC-specific argument and wordlist helpers."""
 from __future__ import annotations
 
-import os, ipaddress, socket, argparse
+import argparse
+import ipaddress
+import re
 from dataclasses import dataclass
-from typing import Callable
-
-from ptlibs.threads import ptthreads
-
-from ..._base import BaseArgs
-
-# Probable mailbox names for AUTH user-enum when the operator does not pass -u/-U (SMTP -ae, etc.).
-default_logins: tuple[str, ...] = (
-    "admin",
-    "administrator",
-    "root",
-    "postmaster",
-    "webmaster",
-    "support",
-)
-
-# Synthetic non-existent identities used as invalid baseline alongside candidate names (-ae).
-AUTH_ENUM_SYNTHETIC_INVALID_COUNT = 2
-
-
-def auth_enum_candidate_names(
-    args: ArgsWithBruteforce,
-    *,
-    wordlist: list[str] | None = None,
-) -> tuple[list[str], bool]:
-    """
-    Resolve AUTH enumeration candidate logins.
-
-    Returns ``(names, used_default_logins)``. With ``-u`` or a populated *wordlist*
-    (from ``-U``), only those names are used; otherwise ``default_logins``.
-    """
-    if args.user:
-        names = [x.strip() for x in text_or_file(args.user, None) if x.strip()]
-        return names, False
-    wl = wordlist or []
-    if wl:
-        return [u.strip() for u in wl if u.strip()], False
-    return list(default_logins), True
-
-
-def auth_enum_ntlm_identity_note(
-    used_default_logins: bool,
-    candidates: list[str] | tuple[str, ...],
-) -> str | None:
-    """
-    Operator hint for SMTP AUTH NTLM enumeration when identity shape may skew results.
-
-    Shown when built-in ``default_logins`` are used, or when ``-u``/``-U`` names lack
-    ``\\`` (NetBIOS) and ``@`` (UPN).
-    """
-    if used_default_logins:
-        return (
-            "Note: NTLM is tested with built-in default names (admin, root, …). "
-            "For reliable results on Windows/AD, pass -u or -U using DOMAIN\\user (legacy) "
-            "or user@domain (UPN)."
-        )
-    if candidates and not any("\\" in name or "@" in name for name in candidates):
-        return (
-            "Note: NTLM identity format may affect results; "
-            "consider DOMAIN\\user or user@domain in -u/-U."
-        )
-    return None
-
-
-def vendor_from_cpe(cpe: str | None) -> str | None:
-    """Extract vendor from CPE 2.3 string (e.g. cpe:2.3:a:microsoft:exchange_server:*:*:*:*:*:*:*:* -> microsoft)."""
-    if not cpe or ":" not in cpe:
-        return None
-    parts = cpe.split(":")
-    if len(parts) >= 4 and parts[2] in ("a", "o", "h"):
-        return parts[3] or None
-    return None
-
-
-@dataclass(frozen=True)
-class Creds:
-    user: str
-    passw: str
 
 
 @dataclass
 class Target:
     ip: str
-    port: int
+    port: int = 0
 
 
-class ArgsWithBruteforce(BaseArgs):
-    user: str | list[str] | None
-    users: str | None  # renamed from users_file
-    password: str | None  # renamed from passw
-    passwords: str | None  # renamed from passw_file
-    spray: bool
-    threads: int
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
-def add_bruteforce_args(
-    parser: argparse.ArgumentParser,
-    *,
-    user_nargs: str | None = None,
-    user_help: str | None = None,
-    mutually_exclusive_user_and_users: bool = True,
-):
-    """
-    Adds bruteforce arguments to ArgumentParser
-    - username or file with usernames
-    - password or file with passwords
-    - spray option
-    - number of threads
-
-    Args:
-        parser (argparse.ArgumentParser)
-        user_nargs: if "+", -u accepts one or more usernames (list); else single string.
-        user_help: override help for -u (default: "username" or "username(s)" when user_nargs="+").
-        mutually_exclusive_user_and_users: if False, -u and -U may both be set (e.g. SMTP -e + file).
-    """
-    bruteforce = parser.add_argument_group(
-        "LOGIN / BRUTEFORCE",
-        "user/users + password/passwords",
-    )
-
-    _u_help = user_help or (
-        "username(s); with -e, merged with lines from -U (optional username file)"
-        if user_nargs == "+"
-        else "username"
-    )
-    _users_help = (
-        "file with usernames (bruteforce with -p/-P; also name list for -e, -ae, -rl)"
-        if not mutually_exclusive_user_and_users
-        else "file containing usernames"
-    )
-
-    if mutually_exclusive_user_and_users:
-        bruteuser = bruteforce.add_mutually_exclusive_group()
-        bruteuser.title = "bruteuser"
-        if user_nargs == "+":
-            bruteuser.add_argument(
-                "-u",
-                "--user",
-                nargs="+",
-                metavar="NAME",
-                help=_u_help,
-            )
-        else:
-            bruteuser.add_argument("-u", "--user", type=str, help=_u_help)
-        bruteuser.add_argument("-U", "--users", type=str, help=_users_help)
-    else:
-        if user_nargs == "+":
-            bruteforce.add_argument(
-                "-u",
-                "--user",
-                nargs="+",
-                metavar="NAME",
-                help=_u_help,
-            )
-        else:
-            bruteforce.add_argument("-u", "--user", type=str, help=_u_help)
-        bruteforce.add_argument("-U", "--users", type=str, help=_users_help)
-
-    # password / passwords file
-    brutepass = bruteforce.add_mutually_exclusive_group()
-    brutepass.title = "brutepass"
-    brutepass.add_argument("-p", "--password", type=str, help="password")
-    brutepass.add_argument("-P", "--passwords", type=str, help="file containing passwords")
-
-    # other configuration
-    bruteforce.add_argument(
-        "--spray",
-        action="store_true",
-        help="try 1 password/key for all users (instead of trying all passwords/keys for 1 user)",
-    )
-    bruteforce.add_argument(
-        "--brute-threads",
-        type=int,
-        default=10,
-        nargs="?",
-        dest="threads",
-        help="number of threads for bruteforce (default: 10)",
+def _valid_hostname(host: str) -> bool:
+    candidate = host.rstrip(".")
+    return (
+        bool(candidate)
+        and len(candidate) <= 253
+        and all(_HOST_LABEL.fullmatch(label) for label in candidate.split("."))
     )
 
 
-def check_if_brute(args: ArgsWithBruteforce) -> bool:
+def valid_target(value: str) -> Target:
+    """Parse an IPv4 address or hostname with an optional TCP port.
+
+    DNS resolution deliberately happens once in :class:`MSRPC`, not while
+    argparse is reading the command line.
     """
-    Decides whether to perfrom bruteforce operations
-    based on the module arguments
+    raw = value.strip()
+    if not raw:
+        raise argparse.ArgumentTypeError("target must not be empty")
+    if raw.count(":") > 1:
+        raise argparse.ArgumentTypeError("target must be HOST[:PORT] (IPv6 is not supported)")
 
-    Args:
-        args (ArgsWithBruteforce): module arguments
-
-    Returns:
-        bool: whether to perform bruteforce
-    """
-    if (args.user or args.users) and (args.password or args.passwords):
-        return True
-    else:
-        return False
-
-
-def threaded_bruteforce(
-    creds: list,
-    try_login: Callable,
-    threads: int,
-    on_success: Callable | None = None,
-) -> set:
-    """
-    Generic bruteforce with custom creds list and on_success callback.
-    Used by modules (e.g. SSH) that need custom credential types (SSHCreds).
-
-    Args:
-        creds: list of credentials to try
-        try_login: function(cred) -> cred or None
-        threads: number of threads
-        on_success: optional callback(cred) when login succeeds
-
-    Returns:
-        set of successfully logged-in credentials
-    """
-    def _wrapped(c):
-        r = try_login(c)
-        if r is not None and on_success is not None:
-            on_success(r)
-        return r
-
-    pt = ptthreads.PtThreads(True)
-    result = pt.threads(creds, _wrapped, threads)
-    found = set(result)
-    found.discard(None)
-    return found
-
-
-def simple_bruteforce(
-    try_login: Callable[[Creds], Creds | None],
-    user: str | None,
-    userf: str | None,
-    passw: str | None,
-    passwf: str | None,
-    spray: bool,
-    threads: int,
-    on_success: Callable[[Creds], None] | None = None,
-) -> set[Creds]:
-    """
-    Performs a login bruteforce attack using an arbitrary login functino.
-    Also decides chooses the appropriate values from the provided arguments.
-
-    Args:
-        try_login (Callable[[Creds], Creds  |  None]): login function
-        user (str | None): username argument
-        userf (str | None): users file argument
-        passw (str | None): password argument
-        passwf (str | None): passwords file argument
-        spray (bool): spray argument
-        threads (int): threads argument
-        on_success (Callable[[Creds], None] | None): optional callback for real-time
-            streaming when a credential is found (called from worker thread)
-
-    Returns:
-        set[Creds]: a set of valid login credentials
-    """
-    users = text_or_file(user, userf)
-    passwords = text_or_file(passw, passwf)
-
-    if spray:
-        creds = [Creds(u, p) for p in passwords for u in users]
-    else:
-        creds = [Creds(u, p) for u in users for p in passwords]
-
-    def _wrapped_try(cred: Creds) -> Creds | None:
-        result = try_login(cred)
-        if result is not None and on_success is not None:
-            on_success(result)
-        return result
-
-    # TODO maybe custom without ptthreads because of missing stop-on-success functionality
-    pt_threads = ptthreads.PtThreads(True)
-    result = pt_threads.threads(creds, _wrapped_try, threads)
-    found_creds: set[Creds] = set(result)
-
-    found_creds.discard(None)
-
-    return found_creds
-
-
-def valid_target(target: str, port_required: bool = False, domain_allowed: bool = False) -> Target:
-    """
-    Decides whether the target argument is a valid IP address or hostname
-    with optional valid port definition. Designed for automatic usage by argparse.
-
-    Args:
-        target (str): target argument
-        port_required (bool, optional): whether to require port definition. Defaults to False.
-        domain_allowed (bool, optional): whether to allow hostnames. Defaults to False.
-
-    Raises:
-        argparse.ArgumentError: invalid format
-        argparse.ArgumentError: missing port number
-        argparse.ArgumentError: invalid ip address
-        argparse.ArgumentError: unresolvable hostname
-        argparse.ArgumentError: invalid port number
-
-    Returns:
-        Target: parsed Target
-    """
-    split = target.split(":")
-    if not port_required and len(split) > 2:
-        raise argparse.ArgumentError(None, "The target has to be IP[:PORT]")
-
-    if port_required and len(split) != 2:
-        raise argparse.ArgumentError(None, "The target has to be IP:PORT")
-
+    host, separator, port_text = raw.partition(":")
     try:
-        ipaddress.ip_address(split[0])
-    except:
-        if domain_allowed:
-            try:
-                socket.gethostbyname(split[0])
-            except Exception:
-                raise argparse.ArgumentError(
-                    None, f"Cannot resolve target name '{split[0]}' into IP address"
-                )
-        else:
-            raise argparse.ArgumentError(None, "Invalid target IP address")
+        ipaddress.IPv4Address(host)
+    except ipaddress.AddressValueError:
+        if not _valid_hostname(host):
+            raise argparse.ArgumentTypeError("target must contain a valid IPv4 address or hostname")
 
-    if len(split) > 1:
+    port = 0
+    if separator:
         try:
-            port = int(split[1])
-            if port <= 0 or port >= 65536:
-                raise ValueError
-        except:
-            raise argparse.ArgumentError(None, "Invalid PORT number")
-    else:
-        port = 0
-
-    return Target(split[0], port)
+            port = int(port_text)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("target port must be an integer") from exc
+        if not 1 <= port <= 65535:
+            raise argparse.ArgumentTypeError("target port must be between 1 and 65535")
+    return Target(host, port)
 
 
-def get_mode(args: argparse.Namespace) -> str:
-    """Decides what TLS mode is implied by the module arguments
-
-    Args:
-        args (argparse.Namespace): module arguments
-
-    Returns:
-        str: TLS / STARTTLS / PLAIN
-    """
-    if args.tls:
-        return "TLS"
-    elif args.starttls:
-        return "STARTTLS"
-    else:
-        return "PLAIN"
-
-
-def text_or_file(text: str | list[str] | None, filepath: str | None) -> list[str]:
-    """Returns either `text` or `filepath` contents while prefering `text`
-
-    Args:
-        text (str | list[str] | None): single value or list (e.g. SMTP -u with nargs+)
-        filepath (str | None): file with values
-
-    Returns:
-        list[str]: list of picked value(s)
-    """
-    result = []
+def text_or_file(text: str | None, filepath: str | None) -> list[str]:
+    """Return one direct value or non-empty lines from a wordlist."""
     if text is not None:
-        if isinstance(text, list):
-            result = [str(t).strip() for t in text if t is not None and str(t).strip()]
-        else:
-            result = [text]
-    elif filepath is not None:
-        _encodings = ("utf-8", "cp1250", "iso-8859-2", "cp1252", "latin-1")
-        try:
-            with open(filepath, "rb") as f:
-                raw = f.read()
-        except FileNotFoundError:
-            raise argparse.ArgumentError(None, f"File not found: '{filepath}'")
-        except PermissionError:
-            raise argparse.ArgumentError(None, f"Cannot read file (permission denied): '{filepath}'")
-        except OSError as e:
-            raise argparse.ArgumentError(None, f"Cannot read file '{filepath}': {e}")
-        for enc in _encodings:
-            try:
-                result = raw.decode(enc).splitlines()
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            result = raw.decode("utf-8", errors="replace").splitlines()
+        value = str(text).strip()
+        return [value] if value else []
+    if filepath is None:
+        return []
 
-    return result
-
-
-def filepaths(directory: str, ext: str) -> list[str]:
-    """
-    Finds files of given extension in a given directory
-    and returns their paths
-
-    Args:
-        directory (str): search directory
-        ext (str): search file extension
-
-    Returns:
-        list[str]: list of file paths
-    """
-    files: list[str] = []
-    for f in os.listdir(directory):
-        fullpath = os.path.join(directory, f)
-        if os.path.isfile(fullpath) and f.endswith(ext):
-            files.append(fullpath)
-
-    return files
-
-
-def text(data: bytes) -> str | None:
-    """
-    Attempts to decode bytes as a string
-
-    Args:
-        data (bytes): bytes to decode
-
-    Returns:
-        str | None: decoded string or None
-    """
     try:
-        return data.decode()
-    except:
-        return None
+        with open(filepath, "rb") as stream:
+            raw = stream.read()
+    except FileNotFoundError as exc:
+        raise argparse.ArgumentError(None, f"File not found: '{filepath}'") from exc
+    except PermissionError as exc:
+        raise argparse.ArgumentError(
+            None, f"Cannot read file (permission denied): '{filepath}'"
+        ) from exc
+    except OSError as exc:
+        raise argparse.ArgumentError(None, f"Cannot read file '{filepath}': {exc}") from exc
+
+    for encoding in ("utf-8", "cp1250", "iso-8859-2", "cp1252", "latin-1"):
+        try:
+            decoded = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:  # latin-1 always succeeds; retained as a defensive fallback.
+        decoded = raw.decode("utf-8", errors="replace")
+    return [line.strip() for line in decoded.splitlines() if line.strip()]
+
+
+__all__ = ["Target", "text_or_file", "valid_target"]

@@ -3,9 +3,8 @@ __MODULELABEL__ = "Brute RPC over HTTP"
 __MODULECODE__ = "BRUTEHTTP"
 __ORDER__ = 80
 
-from ._common import eng
+from ._common import run_probe
 
 
 def run(ctx):
-    e = eng(ctx)
-    e.results.HTTP_Brute = e.http_brute()
+    run_probe(ctx, __MODULECODE__, "HTTP_Brute", "http_brute")

@@ -38,6 +38,8 @@ ptsrvtester ftp -ts BANNER,CMD,ANON -tg 127.0.0.1
 ptsrvtester ftp -ts ALL -tg 127.0.0.1
 ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1
 ptsrvtester ftp -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:21
+ptsrvtester msrpc -ts ALL -tg 192.168.1.10
+ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.10 --pipe svcctl -u auditor -pw secret
 ptsrvtester <module> -h     for help for module use
 ```
 
@@ -93,12 +95,11 @@ ptsrvtester <module> -h     for help for module use
 - Write permission testing
 
 **MSRPC Module**
-- Endpoint mapper enumeration
-- MGMT interface enumeration
-- Named pipe brute-force
-- SMB/TCP/HTTP credential brute-force
-- Anonymous SMB access testing
-- Named pipe enumeration
+- Endpoint Mapper, MGMT interface and named-pipe enumeration
+- Anonymous SMB and IPC$ access testing
+- Explicit named-pipe, SMB, RPC/TCP and RPC-over-HTTP Proxy credential testing
+- Transport-aware defaults: RPC 135, SMB 445 and HTTPS RPC Proxy 443
+- Credential attempts are bounded by `--max-attempts` (default 1,000) and `--timeout-seconds`
 
 **FTP Module**
 - Banner and Service Identification

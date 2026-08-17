@@ -3,9 +3,8 @@ __MODULELABEL__ = "Brute named pipe creds"
 __MODULECODE__ = "BRUTEPIPE"
 __ORDER__ = 50
 
-from ._common import eng
+from ._common import run_probe
 
 
 def run(ctx):
-    e = eng(ctx)
-    e.results.PipesCreds = e.pipe_dictionary_attack()
+    run_probe(ctx, __MODULECODE__, "PipesCreds", "pipe_dictionary_attack")

@@ -1,7 +1,7 @@
 import argparse
 
 from ptlibs.ptprinthelper import get_colored_text
-from ptsrvtester.protocols.smtp.utils.helpers import Target, valid_target
+from ptsrvtester.protocols.dhcp.utils.registry import TargetDHCP, valid_interface
 from ptsrvtester.protocols._base import BaseArgs
 
 __all__ = ['DHCPArgs']
@@ -97,8 +97,8 @@ def _dhcp_test_help(codes: list[str]):
         out.append({"usage": [usage]})
     return out
 
-def valid_target_dhcp(target: str) -> Target:
-    return valid_target(target, domain_allowed=False)
+def valid_target_dhcp(target: str) -> TargetDHCP:
+    return valid_interface(target)
 
 class DHCPArgs(BaseArgs):
     interface: str
@@ -169,7 +169,7 @@ class DHCPArgs(BaseArgs):
             raise TypeError
 
         dhcp_subparsers.add_argument("-i", "--interface",
-                                     #type=valid_target_dhcp,
+                                     type=valid_target_dhcp,
                                      help="Network interface to use",
                                      required=True
                                      )

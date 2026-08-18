@@ -26,6 +26,12 @@ class VULNS(Enum):
     DHCP_STARVATION = "PTV-DHCP-STARVATION"
     DHCP_ROGUE = "PTV-DHCP-ROGUE"
 
+@dataclass
+class TargetDHCP:
+    i_name: str
+
+def valid_interface(interface: str) -> TargetDHCP:
+    return TargetDHCP(interface)
 
 @dataclass
 class DHCPResults:

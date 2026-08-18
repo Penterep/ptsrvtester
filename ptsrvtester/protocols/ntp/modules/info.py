@@ -41,9 +41,65 @@ __MODULELABEL__ = "Info"
 __MODULECODE__ = "INFO"
 __ORDER__ = 10
 
+import socket
+from datetime import datetime, timezone, timedelta
+from scapy.layers.ntp import NTP
+
+_NTP_EPOCH = datetime(1900, 1, 1, tzinfo=timezone.utc)
+
+def _ntp_to_utc(ts) -> str:
+    return (_NTP_EPOCH + timedelta(seconds=float(ts))).strftime("%Y-%m-%d %H:%M:%S UTC")
+
 
 def run(ctx):
+    mode_translate = {
+        0: "Reserved",
+        1: "Symmetric active",
+        2: "Symmetric passive",
+        3: "Client",
+        4: "Server",
+        5: "Broadcast",
+        6: "Control",
+        7: "Private",
+    }
+
     ip, port = ctx.target
-    ctx.out(f"Would check {ip}:{port} here.", "TEXT")
-    # For JSON mode, add structured findings instead of text, e.g.:
-    #   ctx.ptjsonlib.add_vulnerability("PTV-SMTP-...")
+    host = ctx.host
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # opens an IPv4 socket for UDP
+    sock.settimeout(4)
+    try:
+        # NTP creates a packet which states it is a query (mode=3)
+        sock.sendto(bytes(NTP(version=4, mode=3)), (ip, port))
+        data, _ = sock.recvfrom(1024)  # server address and port are discarded
+    finally:
+        sock.close()
+
+    if data:
+        ntp = NTP(data)
+        ctx.out(f"NTP version:              {ntp.version}", "INFO", indent=4)
+        ctx.out(f"Mode:                 {mode_translate[ntp.mode]} ({ntp.mode})", "INFO", indent=4)
+
+        stratum_status = "Unsynchronized"
+        if ntp.stratum == 0:
+            stratum_status = "Invalid"
+        elif ntp.stratum == 1:
+            stratum_status = "Primary"
+        elif ntp.stratum >= 2 and ntp.stratum < 16:
+            stratum_status = "Secondary"
+        ctx.out(f"Stratum:              {stratum_status} ({ntp.stratum})", "INFO", indent=4)
+
+        leap_status = "Unknown (unsynchronized)"
+        if ntp.leap == 0:
+            leap_status = "No warning"
+        elif ntp.leap == 1:
+            leap_status = "Last minute had 61s"
+        elif ntp.leap == 2:
+            leap_status = "Last minute had 59s"
+        ctx.out(f"Leap indicator:       {leap_status} ({ntp.leap})", "INFO", indent=4)
+
+        precision_sec = 2 ** int(ntp.precision)
+        ctx.out(f"Precision:            2^{ntp.precision} = {precision_sec * 1e6:.3f} µs", "INFO", indent=4)
+        ctx.out(f"Reference ID:         {ntp.id}", "INFO", indent=4)
+        ctx.out(f"Reference timestamp:  {_ntp_to_utc(ntp.ref)}", "INFO", indent=4)
+        ctx.out(f"Transmit timestamp:   {_ntp_to_utc(ntp.sent)}", "INFO", indent=4)

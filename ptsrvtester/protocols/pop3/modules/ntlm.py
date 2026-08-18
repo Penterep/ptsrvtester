@@ -8,7 +8,7 @@ __ORDER__ = 40
 
 
 def run(ctx):
-    result = auth_ntlm(ctx.args)
+    result = auth_ntlm(ctx.args, debug=ctx.debug)
     if not result.success or result.ntlm is None:
         ctx.out("Not available", "NOTVULN", indent=4)
         ctx.report.update_properties(ntlmInfoStatus="failed")

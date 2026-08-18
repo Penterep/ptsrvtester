@@ -242,9 +242,9 @@ class SNMPArgs(ArgsWithBruteforce):
             {"description": ["SNMP Testing Module"]},
             {"usage": ["ptsrvtester snmp <command> <options>"]},
             {"usage_example": [
-                "ptsrvtester snmp version --ip 192.168.1.1",
-                "ptsrvtester snmp v2brute --community-file communities.txt --ip 192.168.1.1",
-                "ptsrvtester snmp v3brute --username-file users.txt --password-file passwords.txt --ip 192.168.1.1"
+                "ptsrvtester snmp version -tg 192.168.1.1:161",
+                "ptsrvtester snmp v2brute --community-file communities.txt -tg 192.168.1.1:161",
+                "ptsrvtester snmp v3brute --username-file users.txt --password-file passwords.txt -tg 192.168.1.1:161"
             ]},
             {"options": options}
         ]
@@ -275,6 +275,10 @@ class SNMPArgs(ArgsWithBruteforce):
                                      type=valid_target_snmp,
                                      help="IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:25)"
                                      )
+
+        snmp_subparsers.add_argument("-w", "--write-to-file", help="File to save the output results.",
+                                                                          default=None,
+                                                                          type=str)
 
         snmp_subparsers.add_argument(
             "-ts",

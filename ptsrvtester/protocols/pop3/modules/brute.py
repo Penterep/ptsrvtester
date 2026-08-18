@@ -19,7 +19,7 @@ def run(ctx):
 
     # Catch-all lives inside BRUTE (not a separate -ts code).
     ctx.out("Catch-all test", "INFO", colortext=True)
-    catch_all = test_catch_all(ctx.args)
+    catch_all = test_catch_all(ctx.args, debug=ctx.debug)
     if catch_all == "unreachable":
         ctx.out("Could not reach server for catch-all / bruteforce", "ERROR", indent=4)
         return
@@ -40,7 +40,7 @@ def run(ctx):
             sys.stdout.flush()
 
     creds = simple_bruteforce(
-        lambda c: try_login(ctx.args, c),
+        lambda c: try_login(ctx.args, c, debug=ctx.debug),
         ctx.args.user,
         ctx.args.users,
         ctx.args.password,

@@ -15,7 +15,12 @@ import socket
 from collections.abc import Iterable
 
 from .._base import BaseArgs, BaseMain
-from .utils.cli import RDPArgs, RDP_TEST_ALIASES, RDP_TEST_ORDER
+from .utils.cli import (
+    RDP_EXPLICIT_ONLY_TESTS,
+    RDP_TEST_ALIASES,
+    RDP_TEST_ORDER,
+    RDPArgs,
+)
 
 
 class RDP(BaseMain):
@@ -35,6 +40,10 @@ class RDP(BaseMain):
         # Import lazily so importing CLI/help metadata does not eagerly load the
         # sizeable RDP protocol implementation and its optional dependencies.
         from .utils.engine import RDP as RDPEngine
+
+        # Reuse BaseMain's one-time DNS result for connection-pressure tests so
+        # baseline, load and recovery cannot drift across round-robin targets.
+        self.args._rdp_resolved_ip = self.target[0]
 
         # Exactly one coordinator/engine is shared by every discovered module.
         self.rdp_engine = RDPEngine(args, ptjsonlib)
@@ -99,7 +108,9 @@ class RDP(BaseMain):
             chosen = [
                 code
                 for code in RDP_TEST_ORDER
-                if code != "AUTH" and code in discovered
+                if code != "AUTH"
+                and code not in RDP_EXPLICIT_ONLY_TESTS
+                and code in discovered
             ]
             if (
                 getattr(self.args, "login", None) is not None
@@ -109,10 +120,14 @@ class RDP(BaseMain):
                 chosen.append("AUTH")
             return self._remember_selection(chosen)
 
-        # ALL is an explicit request, so it includes AUTH.  Without complete
-        # credentials AUTH preserves the legacy harmless warning result.
+        # ALL retains the legacy single AUTH check but never implies the active
+        # RATELIMIT test. Naming RATELIMIT alongside ALL remains explicit.
         if "ALL" in tokens:
-            chosen = [code for code in RDP_TEST_ORDER if code in discovered]
+            chosen = [
+                code
+                for code in RDP_TEST_ORDER
+                if code in discovered and code not in RDP_EXPLICIT_ONLY_TESTS
+            ]
             known = set(chosen)
             chosen.extend(
                 code
@@ -120,8 +135,10 @@ class RDP(BaseMain):
                     discovered.items(),
                     key=lambda item: (item[1].order, item[0]),
                 )
-                if code not in known
+                if code not in known and code not in RDP_EXPLICIT_ONLY_TESTS
             )
+            if "RATELIMIT" in tokens and "RATELIMIT" in discovered:
+                chosen.append("RATELIMIT")
             return self._remember_selection(chosen)
 
         chosen: list[str] = []
@@ -145,6 +162,10 @@ class RDP(BaseMain):
                 self.use_json,
             )
             return self._remember_selection([])
+        if "RATELIMIT" in chosen:
+            chosen = [code for code in chosen if code != "RATELIMIT"] + [
+                "RATELIMIT"
+            ]
         return self._remember_selection(chosen)
 
     def _remember_selection(self, chosen: list[str]) -> list[str]:

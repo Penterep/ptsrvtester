@@ -193,6 +193,7 @@ def _SNMP_test_help(codes: list[str]):
         has_opts = bool(rows or req)
 
         usage = [f"ptsrvtester SNMP -ts {code} " + example + '\n ' for example in spec.get("usage", "")]
+        usage[-1] = usage[-1].rstrip("\n ")
         out.append({"usage": [usage]})
     return out
 

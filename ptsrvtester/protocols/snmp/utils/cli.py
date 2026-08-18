@@ -24,102 +24,146 @@ SNMP_TEST_GROUPS = [
 SNMP_TESTS: dict[str, dict] = {
     "VERSION": {
         "desc": "Detect SNMP versions",
-        "long": ["Determines which SNMP versions are supported by a host"],
-        "flags": {"version_detection": True}
+        "long": "",
+        "flags": {"version_detection": True},
+        "requires": [
+          ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "usage": ["-tg 192.168.15.53:161"]
     },
     "V2BRUTE": {
         "desc": "SNMPv2 dictionary attack",
-        "long": ["Performs a dictionary attack on SNMPv2/1 to find valid communities"],
+        "long": "",
+        "flags": {"v2_brute_force": True},
         "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
             ["-c", "--single-community", "", "Single community string"],
-            ["or"],
-            ["-cf", "--community-file", "", "Filename containing community strings"]
+            ["-cf", "--community-file", "", "File containing community strings"]
         ],
         "mods": [
-            ["-w", "--write-to-file", "", "Save results to a provided file"]
+            ["-w", "--write-to-file", "<file>", "File to write output to"]
         ],
-        "flags": {"v2_brute_force": True}
+        "usage": [
+            "-tg 192.168.15.53:161 -c private",
+            "-tg 192.168.15.53:161 -cf c_strings.txt",
+            "-tg 192.168.15.53:161 -c private -o creds.txt"
+        ]
     },
     "V2WRITE": {
         "desc": "Test SNMPv2 write permission",
-        "long": ["Tests to see if we have write permission on the target"],
-        "mods": [
-            ["-v", "--value", "", "Value to write to the specified OID (default: 'Testvalue123)'"]
+        "long": "",
+        "flags": {"v2_write": True},
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+            ["-c", "--single-community", "", "Single community string"],
+            ["-cf", "--community-file", "", "File containing community strings"]
         ],
-        "flags": {"v2_write": True}
+        "mods": [
+            ["-v", "--value", "<value>", "Value to write to the specified OID (default: 'Testvalue123')"]
+        ],
+        "usage": [
+            "-tg 192.168.15.53:161 -c private",
+            "-tg 192.168.15.53:161 -cf c_strings.txt",
+            "-tg 192.168.15.53:161 -c private -v Value55"
+        ]
     },
     "V2WALK": {
         "desc": "SNMPv2 MIB walk",
-        "long": ["Uses SNMP GETNEXT requests to collect SNMP data from",
-                 "network and infrastructure SNMP-enabled devices"],
+        "long": "",
+        "flags": {"v2_walk": True},
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+            ["-c", "--single-community", "", "Single community string"],
+            ["-cf", "--community-file", "", "File containing community strings"]
+        ],
         "mods": [
-            ["-oid", "--oid", "", "OID to start from"],
+            ["-o", "--oid", "<oid>", "OID to start from. Default: 1.3.6"],
             ["-of", "--oid-format", "", "Use human readable OID format"],
-            ["-w", "--write-to-file", "", "Save results to a provided file"]
-            ],
-        "flags": {"v2_walk": True}
+            ["-w", "--write-to-file", "<file>", "File to write output to"]
+        ],
+        "usage": [
+            "-tg 192.168.15.53:161 -c private",
+            "-tg 192.168.15.53:161 -cf c_strings.txt",
+            "-tg 192.168.15.53:161 -c private -o 1.3.8 -of",
+        ]
     },
     "V3ENUM": {
         "desc": "SNMPv3 user enumeration",
-        "long": ["Enumerates SNMPv3 users on a target"],
-        "mods": [
-            ["-w", "--write-to-file", "", "Save results to a provided file"]
+        "long": "",
+        "flags": {"v3_enum": True},
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+            ["-u", "--single-username", "", "Single username"],
+            ["-uf", "--username-file", "", "File containing usernames"]
         ],
-        "flags": {"v3_enum": True}
+        "mods": [
+            ["-w", "--write-to-file", "<file>", "File to write output to"]
+        ],
+        "usage": [
+            "-tg 192.168.15.53:161 -u user123",
+            "-tg 192.168.15.53:161 -uf users.txt",
+        ]
     },
     "V3BRUTE": {
         "desc": "SNMPv3 credentials bruteforce",
-        "long": ["Performs a dictionary attack on SNMPv3 to find valid credentials"],
+        "long": "",
+        "flags": {"v3_brute_force": True},
         "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
             ["-u", "--single-username", "", "Single username"],
-            ["or"],
-            ["-uf", "--username-file", "", "Username file"],
-            [""],
-            ["AND"],
-            [""],
-            ["-pw", "--single-password", "", "Single password"],
-            ["or"],
-            ["-pf", "--password-file", "Password file"]
+            ["-uf", "--username-file", "", "File containing usernames"],
+            ["-p", "--single-password", "", "Single password"],
+            ["-pf", "--password-file", "", "File containing passwords"]
         ],
         "mods": [
             ["-ap", "--auth-protocols", "", "Authentication protocol"],
             ["-pp", "--priv-protocols", "", "Private protocol"],
             ["-s", "--spray", "", "Enable spray mode"],
-            ["-w", "--write-to-file", "", "Save results to a provided file"]
+            ["-w", "--write-to-file", "<file>", "File to write output to"]
         ],
-        "flags": {"v3_brute_force": True}
+        "usage": [
+            "-tg 192.168.15.53:161 -u user123 -p letm3in",
+            "-tg 192.168.15.53:161 -uf users.txtm -pf passwords.txt",
+            "-tg 192.168.15.53:161 -u user123 -p letm3in -ap usmHMACSHAAuthProtocol -pp usmAesCfb128Protocol -s",
+        ]
     },
     "V3WALK": {
         "desc": "SNMPv3 MIB walk",
-        "long": ["Uses SNMP GETNEXT requests to collect SNMP data from",
-                 "network and infrastructure SNMP-enabled devices"],
+        "long": "",
+        "flags": {"v3_walk": True},
         "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
             ["-u", "--single-username", "", "Single username"],
-            ["-pw", "--single-password", "", "Single password"],
+            ["-p", "--single-password", "", "Single password"]
         ],
         "mods": [
             ["-ap", "--auth-protocols", "", "Authentication protocol"],
             ["-pp", "--priv-protocols", "", "Private protocol"],
-            ["-w", "--write-to-file", "", "Save results to a provided file"]
+            ["-w", "--write-to-file", "<file>", "File to write output to"],
+            ["-o", "--oid", "<oid>", "OID to start from. Default: 1.3.6"],
+            ["-of", "--oid-format", "", "Use human readable OID format"],
         ],
-        "flags": {"v3_walk": True}
+        "usage": [
+            "-tg 192.168.15.53:161 -u user123 -p letm3in",
+            "-tg 192.168.15.53:161 -u user123 -p letm3in -ap usmHMACSHAAuthProtocol -pp usmAesCfb128Protocol",
+            "-tg 192.168.15.53:161 -u user123 -p letm3in -o 1.4.5 -of",
+        ]
     },
     "V3WRITE": {
         "desc": "Test SNMPv3 write permissions",
-        "long": ["Tests SNMPv3 write permissions by attempting to set a value on the target device"],
+        "long": "",
+        "flags": {"v3_write": True},
         "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
             ["-u", "--single-username", "", "Single username"],
-            ["-pw", "--single-password", "", "Single password"],
-            "",
-            ["or"],
-            "",
-            ["-cred", "--valid-credentials-file", "", "File containing valid credentials"]
+            ["-p", "--single-password", "", "Single password"],
+            ["-cred", "--valid-credentials-file",  "", "File containing valid credentials"]
         ],
         "mods": [
             ["-ap", "--auth-protocols", "", "Authentication protocol"],
             ["-pp", "--priv-protocols", "", "Private protocol"],
-        ],
-        "flags": {"v3_write": True}
+            ["-v", "--value", "<value>", "Value to write to the specified OID (default: 'Testvalue123')"]
+        ]
     }
 }
 
@@ -147,7 +191,9 @@ def _SNMP_test_help(codes: list[str]):
         if rows:
             out.append({"test_options": rows})
         has_opts = bool(rows or req)
-        usage = f"ptsrvtester SNMP -ts {code} " + ("<options> <target>" if has_opts else "<target>")
+
+        usage = [f"ptsrvtester SNMP -ts {code} " + example + '\n ' for example in spec.get("usage", "")]
+        usage[-1] = usage[-1].rstrip("\n ")
         out.append({"usage": [usage]})
     return out
 
@@ -188,7 +234,9 @@ class SNMPArgs(ArgsWithBruteforce):
         options += [
             ["", "", "", ""],
             ["-h", "--help", "", "Show this help message and exit"],
-            ["-vv", "--verbose", "", "Enable verbose mode"]
+            ["-vv", "--verbose", "", "Enable verbose mode"],
+            ["-j", "--json", "", "Output in JSON format"],
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
             ]
 
         return [
@@ -210,9 +258,9 @@ class SNMPArgs(ArgsWithBruteforce):
         """Adds a subparser of SNMP arguments"""
 
         examples = """example usage:
-    ptsrvtester snmp version -tg 192.168.1.1:161
-    ptsrvtester snmp snmpv2-brute --community-file communities.txt -tg 192.168.1.1:161
-    ptsrvtester snmp snmpv3-brute --username-file users.txt --password-file passwords.txt -tg 192.168.1.1:161"""
+    ptsrvtester snmp -ts version -tg 192.168.1.1:161
+    ptsrvtester snmp -ts v2brute --community-file communities.txt -tg 192.168.1.1:161
+    ptsrvtester snmp -ts v3brute --username-file users.txt --password-file passwords.txt -tg 192.168.1.1:161"""
 
         snmp_subparsers = subparsers.add_parser(
             name,
@@ -247,9 +295,9 @@ class SNMPArgs(ArgsWithBruteforce):
         # SNMPv2 Brute Force
         snmpv2_brute_parser = snmp_subparsers.add_argument_group(title="v2brute",
                                                                  description="SNMPv2 dictionary attack")
-        #snmpv2_brute_parser.add_argument("-o", "--output", help="File to save the output results.",
-        #                                 default=None,
-        #                                 type=str)
+        snmp_subparsers.add_argument("-w", "--write-to-file", help="File to save the output results.",
+                                         default=None,
+                                         type=str)
 
         # user_group1 = snmpv2_brute_parser.add_mutually_exclusive_group(required=True)
         snmp_subparsers.add_argument("-c", "--single-community", "--community", help="Single community string")

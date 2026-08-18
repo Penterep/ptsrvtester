@@ -18,8 +18,6 @@ DHCP_TEST_GROUPS = [
 #   flags     dict dest->value applied to the args namespace when selected
 #   value     (dest, default) for tests whose flag carries a value (default set if None)
 #   requires  human-readable prerequisite strings (per-test help)
-#   common    True -> append common outbound message options to per-test help
-#   mods      test-specific option rows [short, long, metavar, help] (per-test help)
 DHCP_TESTS: dict[str, dict] = {
     "SERVER_INFO": {
         "desc": "DHCP server enumeration",
@@ -27,15 +25,29 @@ DHCP_TESTS: dict[str, dict] = {
         "mods": [
             ["-t", "--timeout", "", "Timeout for DHCP offer reply (default: 10s)"]
         ],
+        "requires": [
+            ["-i", "--interface", "", "Network interface to use"]
+        ],
+        "usage": [
+            "-i eth0",
+            "-i eth0 -t 5",
+        ],
         "flags": {"server_info": True}
     },
     "DENIAL": {
         "desc": "DHCP flood attack",
         "long": ["Floods the target with DHCPDISCOVER packets to overwhelm him"],
-    "mods": [
-        ["-c", "--count", "", "Number of IP addresses to obtain (omit for unlimited)"]
-    ],
-    "flags": {"denial": True}
+        "mods": [
+            ["-c", "--count", "", "Number of IP addresses to obtain (omit for unlimited)"]
+        ],
+        "requires": [
+            ["-i", "--interface", "", "Network interface to use"]
+        ],
+        "usage": [
+            "-i eth0",
+            "-i eth0 -c 4",
+        ],
+        "flags": {"denial": True}
     },
     "STARVATION": {
         "desc": "DHCP starvation attack",
@@ -43,9 +55,18 @@ DHCP_TESTS: dict[str, dict] = {
         "mods": [
             ["-d", "--duration", "", "Duration in seconds (omit for unlimited)"]
         ],
+        "requires": [
+            ["-i", "--interface", "", "Network interface to use"]
+        ],
+        "usage": [
+            "-i eth0",
+            "-i eth0 -d 5",
+        ],
         "flags": {"starvation": True}
     }
 }
+#   common    True -> append common outbound message options to per-test help
+#   mods      test-specific option rows [short, long, metavar, help] (per-test help)
 
 def _dhcp_test_help(codes: list[str]):
     """Build a help object (for ptprinthelper.help_print) describing given test codes."""
@@ -71,7 +92,8 @@ def _dhcp_test_help(codes: list[str]):
         if rows:
             out.append({"test_options": rows})
         has_opts = bool(rows or req)
-        usage = f"ptsrvtester DHCP -ts {code} " + ("<options> <target>" if has_opts else "<target>")
+        usage = [f"ptsrvtester SNMP -ts {code} " + example + '\n ' for example in spec.get("usage", "")]
+        usage[-1] = usage[-1].rstrip("\n ")
         out.append({"usage": [usage]})
     return out
 
@@ -100,7 +122,7 @@ class DHCPArgs(BaseArgs):
     @staticmethod
     def get_help():
         options: list[list[str]] = [
-            ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,AV); ALL runs everything:"],
+            ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. SERVER_INFO, STARVATION); ALL runs everything:"],
         ]
 
         for group_title, codes in DHCP_TEST_GROUPS:
@@ -113,7 +135,8 @@ class DHCPArgs(BaseArgs):
                 ["", "", "", ""],
                 ["-h", "--help", "", "Show this help message and exit"],
                 ["-vv", "--verbose", "", "Enable verbose mode"],
-                ["-i", "--interface", "", "Network interface to use"]
+                ["-i", "--interface", "", "Network interface to use"],
+                ["-j", "--json", "", "Output in JSON format"],
         ]
 
         return [

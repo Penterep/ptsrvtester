@@ -64,9 +64,10 @@ def run(ctx):
     }
 
     ip, port = ctx.target
-    host = ctx.host
+    # host = ctx.host
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # opens an IPv4 socket for UDP
+    # TODO: add IPv6 support
     sock.settimeout(4)
     data = None
     try:
@@ -91,6 +92,8 @@ def run(ctx):
         ctx.out(f"Server sent a KoD (Kiss of Death) packet", "WARNING", indent=4)
         return
 
+    # fake or misconfigured servers can return a weird combination of stratum and refID
+    # TODO: check if server is correctly configured or maliciously set up
     stratum_status = "Unsynchronized"
     if ntp.stratum == 0:
         stratum_status = "Invalid"
@@ -100,6 +103,8 @@ def run(ctx):
         stratum_status = "Secondary"
     ctx.out(f"Stratum:              {stratum_status} ({ntp.stratum})", "INFO", indent=4)
 
+    # leap could be potentially misconfigured or malfunctioning
+    # TODO: check if leap seconds coincide with global events (very low priority)
     leap_status = "Unknown (unsynchronized)"
     if ntp.leap == 0:
         leap_status = "No warning"

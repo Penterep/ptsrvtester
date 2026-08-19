@@ -26,7 +26,7 @@ Contract:
 """
 
 __MODULELABEL__ = "Encryption status information"
-__MODULECODE__ = ""
+__MODULECODE__ = "ENCRYPTION"
 __ORDER__ = 12
 
 from ..smb_utils.helpers import SMBContext

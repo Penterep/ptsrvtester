@@ -26,7 +26,7 @@ Contract:
 """
 
 __MODULELABEL__ = "Information about the target system"
-__MODULECODE__ = ""
+__MODULECODE__ = "INFO"
 __ORDER__ = 10
 
 from ..smb_utils.server_connection import ServerConnection

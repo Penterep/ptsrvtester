@@ -52,16 +52,18 @@ def run(ctx: SMBContext) -> None:
         if out is not None:
             if dialect == SMB2_DIALECT_30:
                 ctx.v30_encryption = out["v30_encryption"]
+                ctx.successful_dialects.append("SMBv3.0")
             elif dialect == SMB2_DIALECT_311:
                 ctx.v311_encryption = out["v311_encryption"]
+                ctx.successful_dialects.append("SMBv3.1.1")
             else:
                 assert(False)
     
     if "SMBv3.0" not in ctx.successful_dialects and "SMBv3.1.1" not in ctx.successful_dialects:
         ctx.out("Encryption is only supported on SMBv3 and above. The server doensn't use them", category="INFO", condition=True, indent=4)
     else:
-        ctx.out(f"SMBv3.0: {ctx.v30_encryption if ctx.v30_encryption is not None else "unknown"}",
+        ctx.out(f"SMBv3.0:    {ctx.v30_encryption if ctx.v30_encryption is not None else "Unknown"}",
                 category="INFO", condition="SMBv3.0" in ctx.successful_dialects, indent=4)
 
-        ctx.out(f"SMBv3.1.1: {ctx.v311_encryption if ctx.v311_encryption is not None else "unknown"}",
+        ctx.out(f"SMBv3.1.1:  {ctx.v311_encryption if ctx.v311_encryption is not None else "Unknown"}",
                 category="INFO", condition="SMBv3.1.1" in ctx.successful_dialects, indent=4)

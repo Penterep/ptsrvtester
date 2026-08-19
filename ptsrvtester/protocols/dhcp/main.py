@@ -57,4 +57,6 @@ class DHCP(BaseMain):
             "timeout": getattr(self.args, "timeout", None),
             "duration": getattr(self.args, "duration", None),
             "count": getattr(self.args, "count", None),
+            "xid": getattr(self.args, "transaction_id", None),
+            "mac": getattr(self.args, "mac_address", None)
         }

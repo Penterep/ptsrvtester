@@ -1,7 +1,7 @@
 import argparse
 
 from ptlibs.ptprinthelper import get_colored_text
-from ptsrvtester.protocols.dhcp.utils.registry import TargetDHCP, valid_interface
+from ptsrvtester.protocols.dhcp.utils.registry import TargetDHCP, valid_interface, is_valid_mac_address, is_valid_xid
 from ptsrvtester.protocols._base import BaseArgs
 
 __all__ = ['DHCPArgs']
@@ -189,6 +189,22 @@ class DHCPArgs(BaseArgs):
             help="Comma-separated test codes (e.g. version,v2brute) or ALL; 'smtp -ts <TEST> -h' for test options",
         )
 
+
+        dhcp_subparsers.add_argument(
+            "-xid",
+            "--transaction-id",
+            default=None,
+            help="Transaction ID to use",
+            type=is_valid_xid
+        )
+
+        dhcp_subparsers.add_argument(
+            "-mac",
+            "--mac-address",
+            default=None,
+            help="MAC address to use",
+            type=is_valid_mac_address
+        )
 
         # DHCP info
         dhcp_info = dhcp_subparsers.add_argument_group("info", description="Display DHCP server information")

@@ -14,10 +14,19 @@ Steps to stand up a new protocol ``<proto>``:
 """
 
 import argparse
+import importlib
 import socket
 
 from .._base import BaseMain, BaseArgs
 from .smb_utils.cli import SMBArgs
+
+from impacket.smbconnection import (
+    SMB_DIALECT,
+    SMB2_DIALECT_002,
+    SMB2_DIALECT_21,
+    SMB2_DIALECT_30,
+    SMB2_DIALECT_311,
+)
 
 
 class SMB(BaseMain):
@@ -28,6 +37,14 @@ class SMB(BaseMain):
     def module_args() -> BaseArgs:
         return SMBArgs()
         raise NotImplementedError
+
+    def _import_module_file(self, name: str, path: str):
+        """Import as a real package member so ``from ..smb_utils`` works in modules.
+
+        BaseMain's file-location loader sets no ``__package__``, which breaks
+        relative imports; POP3 and RDP override this the same way.
+        """
+        return importlib.import_module(f"ptsrvtester.protocols.smb.modules.{name}")
 
     def _prepare_target(self) -> None:
         """Resolve self.target = (ip, port) before any module runs.
@@ -61,6 +78,24 @@ class SMB(BaseMain):
         """
         return {
             "host": self.target_host,
-            "ip": self.target[0],
-            "port": self.target[1],
+            # "ip": self.target[0],
+            # "port": self.target[1],
+            "mapping": {  # bool represents if dialect has been tried
+                SMB_DIALECT:        False,
+                SMB2_DIALECT_002:   False,
+                SMB2_DIALECT_21:    False,
+                SMB2_DIALECT_30:    False,
+                SMB2_DIALECT_311:   False,
+            },
+            "server_name": "",
+            "os_version": "",
+            "dns_domain_name": "",
+            "dns_host_name": "",
+            "ntlmv2_support": None,
+            "login_required": None,
+            "signing_required": None,
+            "successful_dialects": [],
+            "v30_encryption": "",
+            "v311_encryption": "",
+            "error": None
         }

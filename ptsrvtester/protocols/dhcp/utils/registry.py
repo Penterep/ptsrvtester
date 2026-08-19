@@ -1,6 +1,8 @@
 from enum import Enum
 from dataclasses import dataclass
 from typing import Optional
+import re
+import argparse
 
 # DHCP dependencies
 try:
@@ -32,6 +34,29 @@ class TargetDHCP:
 
 def valid_interface(interface: str) -> TargetDHCP:
     return TargetDHCP(interface)
+
+def is_valid_mac_address(mac_a: str) -> str:
+    # Regular expression pattern for a MAC address
+    pattern = r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$'
+
+    # Use re.match to check if the MAC address matches the pattern
+    if re.match(pattern, mac_a):
+        return mac_a
+    else:
+        raise argparse.ArgumentError(None, "Invalid MAC address")
+
+
+def is_valid_xid(xid: str) -> int:
+    try:
+        xid = int(xid)
+
+        if not 0 <= xid <= 2**32-1:
+            raise argparse.ArgumentError(None, "Invalid transaction ID")
+
+        return xid
+    except ValueError as e:
+        raise argparse.ArgumentError(None, f"Cannot convert XID to int: {e}")
+
 
 @dataclass
 class DHCPResults:

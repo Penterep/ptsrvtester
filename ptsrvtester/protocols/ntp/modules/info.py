@@ -38,7 +38,7 @@ Contract:
 """
 
 __MODULELABEL__ = "Information about server:"
-__MODULECODE__ = "INFO"
+__MODULECODE__ = ""
 __ORDER__ = 10
 
 import socket

@@ -25,8 +25,8 @@ Contract:
     aborting the other selected modules.
 """
 
-__TESTLABEL__ = "The dialects used by the target system"
-__TESTCODE__ = ""
+__MODULELABEL__ = "The dialects used by the target system"
+__MODULECODE__ = ""
 __ORDER__ = 11
 
 from ..smb_utils.helpers import SMBContext

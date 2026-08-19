@@ -25,8 +25,8 @@ Contract:
     aborting the other selected modules.
 """
 
-__TESTLABEL__ = "Encryption status information"
-__TESTCODE__ = ""
+__MODULELABEL__ = "Encryption status information"
+__MODULECODE__ = ""
 __ORDER__ = 12
 
 from ..smb_utils.helpers import SMBContext

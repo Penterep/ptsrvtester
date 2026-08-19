@@ -86,22 +86,15 @@ def run(ctx: SMBContext) -> None:
     
     # Printing
     # ctx.out("SMB server info:")
-    ctx.out(f"Server name: {ctx.server_name}", category="INFO",
-                indent=4, condition=True)
-    ctx.out(f"Server version: {os_version}", category="INFO",
-                indent=4, condition=True)
-    ctx.out(f"DNS domain name: {ctx.dns_domain_name}", category="INFO",
-                indent=4, condition=True)
-    ctx.out(f"DNS host name: {ctx.dns_host_name}", category="INFO",
-                indent=4, condition=ctx.dns_host_name != ctx.dns_domain_name)
-    ctx.out(f"Lowest dialect version: {dialect}",
-                category="VULN" if dialect == "SMBv1" else "NOTVULN",
-                indent=4, condition=True)
-    ctx.out(f"Login required: {ctx.login_required}",
-                category="WARNING" if not ctx.login_required else "OK",
-                indent=4, condition=True)
-    ctx.out(f"Signing required: {ctx.signing_required}",
-                category="VULN" if not ctx.signing_required else "NOTVULN",
-                indent=4, condition=True)
-    ctx.out(f"NTLMv2 supported: {ctx.ntlmv2_support}", category="INFO",
-                indent=4, condition=True)
+    ctx.out(f"Server name:             {ctx.server_name}", "INFO", indent=4)
+    ctx.out(f"Server version:          {os_version}", "INFO", indent=4)
+    ctx.out(f"DNS domain name:         {ctx.dns_domain_name}", "INFO", indent=4)
+    ctx.out(f"DNS host name:           {ctx.dns_host_name}", "INFO", indent=4,
+                condition=ctx.dns_host_name != ctx.dns_domain_name)
+    ctx.out(f"Lowest dialect version:  {dialect}",
+                "VULN" if dialect == "SMBv1" else "NOTVULN", indent=4)
+    ctx.out(f"Login required:          {ctx.login_required}",
+                "WARNING" if not ctx.login_required else "OK", indent=4)
+    ctx.out(f"Signing required:        {ctx.signing_required}",
+                "VULN" if not ctx.signing_required else "NOTVULN", indent=4)
+    ctx.out(f"NTLMv2 supported:        {ctx.ntlmv2_support}", "INFO", indent=4)

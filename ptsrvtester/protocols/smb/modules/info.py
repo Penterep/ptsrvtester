@@ -1,16 +1,4 @@
-"""TEMPLATE — copy this file to modules/<yourmodule>.py to add a module.
-
-The generic main (main.py) discovers every ``modules/*.py`` that is NOT
-prefixed with ``_`` and exposes a callable ``run(ctx)``. This file starts with
-``_`` on purpose, so it is documentation only and is never executed.
-
-Required / optional module-level attributes
---------------------------------------------
-    __MODULELABEL__  (str, required)  one-line label; the main prints it as the
-                                    section header before your run() executes.
-    __MODULECODE__   (str, optional)  the -ts code; defaults to FILENAME.upper().
-    __ORDER__      (int, optional)  run/print order; smaller runs first (default 100).
-
+"""
 The run(ctx) entry point
 ------------------------
 ``ctx`` carries everything you need — you do NOT manage threads, output ordering
@@ -41,8 +29,79 @@ __TESTLABEL__ = "Information about the target system"
 __TESTCODE__ = ""
 __ORDER__ = 10
 
-def run(ctx):
+from ..smb_utils.server_connection import ServerConnection
+from ..smb_utils.helpers import SMBContext
+
+
+def run(ctx: SMBContext) -> None:
     ip, port = ctx.target
-    ctx.out(f"Would check {ip}:{port} here.", "TEXT")
+    raw_dialects = ctx.mapping.keys()
+    # ctx.out(f"Would check {ip}:{port} here.", "TEXT")
     # For JSON mode, add structured findings instead of text, e.g.:
     #   ctx.ptjsonlib.add_vulnerability("PTV-SMTP-...")
+    
+    sc = ServerConnection(ctx)
+    output = None
+    dialect = 0
+    for dialect in raw_dialects:
+        output = sc.connect(dialect)
+        ctx.mapping[dialect] = True
+        if output is not None:
+            break
+    
+    if output is None:
+        ctx.out("Could not connect to server", "ERROR")
+        ctx.error = True
+        return
+    
+    dialect = sc.dial_str_converter(dialect)
+    
+    ctx.successful_dialects.append(dialect)
+    ctx.server_name = output["server_name"]
+    ctx.dns_domain_name = output["server_DNS_domain_name"]
+    ctx.dns_host_name = output["server_DNS_hostname"]
+
+    # OS version parsing
+    os_name = output["server_OS"]
+    os_info = [output["server_OS_major"], output["server_OS_minor"], output["server_OS_build"]]
+    
+    os_version = ""
+    for piece in os_info:
+        if piece != "unknown":
+            os_version += "." + str(piece)
+        else:
+            break
+    
+    if os_version == "":
+        os_version = "unknown"
+    else:
+        os_version = os_version[1:]
+    
+    ctx.os_version = os_version if os_name == "unknown" else f"{os_name} (build: {os_version})"
+    
+    ctx.ntlmv2_support = output["does_support_NTLMv2"]
+    ctx.login_required = output["is_login_required"]
+    ctx.signing_required = output["is_signing_required"]
+    
+    
+    # Printing
+    # ctx.out("SMB server info:")
+    ctx.out(f"Server name: {ctx.server_name}", category="INFO",
+                indent=4, condition=True)
+    ctx.out(f"Server version: {os_version}", category="INFO",
+                indent=4, condition=True)
+    ctx.out(f"DNS domain name: {ctx.dns_domain_name}", category="INFO",
+                indent=4, condition=True)
+    ctx.out(f"DNS host name: {ctx.dns_host_name}", category="INFO",
+                indent=4, condition=ctx.dns_host_name != ctx.dns_domain_name)
+    ctx.out(f"Lowest dialect version: {dialect}",
+                category="VULN" if dialect == "SMBv1" else "NOTVULN",
+                indent=4, condition=True)
+    ctx.out(f"Login required: {ctx.login_required}",
+                category="WARNING" if not ctx.login_required else "OK",
+                indent=4, condition=True)
+    ctx.out(f"Signing required: {ctx.signing_required}",
+                category="VULN" if not ctx.signing_required else "NOTVULN",
+                indent=4, condition=True)
+    ctx.out(f"NTLMv2 supported: {ctx.ntlmv2_support}", category="INFO",
+                indent=4, condition=True)

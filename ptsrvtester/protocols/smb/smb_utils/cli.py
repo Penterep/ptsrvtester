@@ -1,15 +1,11 @@
 import argparse
 from ptsrvtester.protocols._base import BaseArgs
 
-from .helpers import Target  #TODO: add valid_target func
-
-OPTIONS = ["info", "dialects", "encryption"]
-# bad solution since they're generated automatically; will change once the system is settled
+from .helpers import Target, valid_target_smb
 
 
 class SMBArgs(BaseArgs):
     target: Target
-    get_version: bool
 
     @staticmethod
     def get_help():
@@ -17,12 +13,13 @@ class SMBArgs(BaseArgs):
             {"description": ["SMB Testing Module"]},
             {"usage": ["ptsrvtesNTPArgster smb <IP:PORT> <command> <options>"]},
             {"usage_example": [
-                "ptsrvtester smb 192.168.1.1 -ts info",
+                "ptsrvtester smb 192.168.1.1 -ts info,dialects",
+                "ptsrvtester smb localhost:1234 -ts encryption"
                 "ptsrvtester smb -h",
             ]},
             {"options": [
                 ["-h", "--help", "", "Prints this menu"],
-                ["-ts", "--test", "<option>", "Gets information about server", "Options: info, dialects, encryption"]
+                ["-ts", "--tests", "<test>", "Comma-separated test codes (e.g. info,dialects) or ALL", "Options: info, dialects, encryption"]
             ]},
         ]
 
@@ -41,7 +38,7 @@ ptsrvtester smb -h"""
         
         parser.add_argument(
             "target",
-            # type=valid_target_smb,  # used to be a test for target validity; left in in case of errors
+            type=valid_target_smb,
             help="""IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 445 is default""",
         )
         
@@ -50,5 +47,7 @@ ptsrvtester smb -h"""
             "Toolbox of non-invasive tests on a specified target server"
         )
         
-        tests.add_argument("-ts", "--test", help="Testing toolbox for SMB",
-                           choices=OPTIONS, nargs='*')
+        tests.add_argument(
+            "-ts", "--tests", type=str, default=None, metavar="<test>", dest="tests",
+            help="Comma-separated test codes (e.g. info,dialects) or ALL. Options: info, dialects, encryption",
+        )

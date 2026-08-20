@@ -1,5 +1,11 @@
+import time
+
 from ptsrvtester.protocols.dhcp.utils.registry import (random_xid, random_mac,
-                                                       sendp, prepare_discover_packet, DHCP, sniff, BOOTP)
+                                                       sendp, prepare_discover_packet, DHCP, sniff, BOOTP,
+                                                       prepare_discover_packet_unicast, get_gateway_mac, get_interface_ip,
+                                                       )
+from scapy.sendrecv import AsyncSniffer
+from scapy.layers.inet import UDP
 
 
 __MODULELABEL__ = "DHCP server information enumeration"
@@ -7,10 +13,29 @@ __MODULECODE__ = "server_info"
 __ORDER__ = 100
 
 
-def _check_lease(lease):
+def _check_lease(lease) -> bool:
+    """Checks if lease duration is 30 days or more"""
     return int(lease) >= 2592000
 
+def _print_options(ctx, options) -> None:
+    for o in range(1, len(options)):
+        b_type = "INFO"
+        if options[o] == "end":
+            break
+        option = options[o]
+        if isinstance(option, tuple):
+            key, *values = option
+            value_str = ", ".join(str(v) for v in values)
+        else:
+            key, value_str = str(option), ""
+
+        if key == "lease_time" and _check_lease(value_str):
+            b_type = "WARN"
+
+        ctx.out(f"{key + ':':<24}{value_str}", b_type, indent=8)
+
 def _is_relay(offered_ip: str|None, server_ip: str, subnet_mask: str|None):
+    """Checks if the offered IP address is on the same network as the DHCP server"""
     if offered_ip is None or subnet_mask is None:
         return False
 
@@ -19,14 +44,55 @@ def _is_relay(offered_ip: str|None, server_ip: str, subnet_mask: str|None):
     return offered_ip.split('.')[:n_octets] != server_ip.split('.')[:n_octets]
 
 
-def _get_subnet_mask(options: list) -> str|None:
+def _get_option(options: list, search_term: str) -> str|None:
+    """Returns the value of an option from the DHCP OFFER"""
     for o in options:
         if isinstance(o, tuple):
             key, value = o
-            if key == "subnet_mask":
+            if key == search_term:
                 return value
 
     return None
+
+
+def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
+    gw_mac = get_gateway_mac(router_ip, ctx.interface)
+    if_ip = get_interface_ip(ctx.interface)
+    offer_filter = "udp and src port 67"
+
+    if gw_mac is None:
+        ctx.out(f"Failed fetching MAC address of gateway", "ERROR", indent=16)
+        return
+    try:
+        def is_offer_packet(packet):
+            if packet.haslayer(DHCP) and packet.haslayer(UDP) and packet[UDP].sport == 67:
+                _print_options(ctx, packet[DHCP].options)
+                return True
+
+            return False
+
+        sniffer = AsyncSniffer(
+            iface=ctx.interface,
+            filter=offer_filter,
+            promisc=True,
+            stop_filter=is_offer_packet,
+            timeout=ctx.timeout
+        ) # Use async sniffer to prevent race conditions
+
+        sniffer.start()
+        time.sleep(0.05)
+
+        sendp(prepare_discover_packet_unicast(src_mac, gw_mac, if_ip, server_ip, xid), iface=ctx.interface,
+              verbose=False)
+
+        sniffer.join()
+        res = sniffer.results
+
+        if res is None or len(res) == 0:
+            ctx.out("Could not contact the DHCP server", "OK", indent=16)
+
+    except Exception as e:
+        ctx.out(f"Error sending DHCP discover to server on a different subnet: {e}", "ERROR", indent=8)
 
 
 def _get_server_info(ctx):
@@ -44,26 +110,15 @@ def _get_server_info(ctx):
                 offered_ip = packet[BOOTP].yiaddr if packet.haslayer(BOOTP) else None
                 options = packet[DHCP].options
                 ctx.out("DHCP Server Information", "VULN", indent=4)
+                global d_options
+                d_options = options
+                _print_options(ctx, options)
 
-                for o in range(1, len(options)):
-                    b_type = "INFO"
-                    if options[o] == "end":
-                        break
-                    option = options[o]
-                    if isinstance(option, tuple):
-                        key, *values = option
-                        value_str = ", ".join(str(v) for v in values)
-                    else:
-                        key, value_str = str(option), ""
-
-                    if key == "lease_time" and _check_lease(value_str):
-                        b_type = "WARN"
-
-                    ctx.out(f"{key + ':':<24}{value_str}", b_type, indent=8)
-
-                    if key == "server_id":
-                        if _is_relay(offered_ip, value_str, _get_subnet_mask(options)):
-                            ctx.out(f"DHCP relay detected", "INFO", indent=12)
+                if server_ip := _get_option(options, "server_id"):
+                    if _is_relay(offered_ip, server_ip, _get_option(options, "subnet_mask")):
+                        ctx.out(f"DHCP relay detected", "INFO", indent=12)
+                        _contact_server(ctx, src_mac, _get_option(d_options, "router"),
+                                        _get_option(d_options, "server_id"), transaction_id)
 
                 return True
 

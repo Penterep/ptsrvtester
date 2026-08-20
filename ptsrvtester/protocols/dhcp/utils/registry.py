@@ -3,12 +3,13 @@ from dataclasses import dataclass
 from typing import Optional
 import re
 import argparse
+import netifaces as ni
 
 # DHCP dependencies
 try:
     from dhcppython.utils import random_mac
     from scapy.layers.dhcp import BOOTP, DHCP
-    from scapy.layers.l2 import Ether
+    from scapy.layers.l2 import Ether, arping, ARPingResult
     from scapy.layers.inet import IP, UDP
     from scapy.sendrecv import sendp, sniff
     DHCP_AVAILABLE = True
@@ -44,6 +45,10 @@ def is_valid_mac_address(mac_a: str) -> str:
         return mac_a
     else:
         raise argparse.ArgumentError(None, "Invalid MAC address")
+
+
+def get_interface_ip(interface: str) -> str:
+    return ni.ifaddresses(interface)[ni.AF_INET][0]['addr']
 
 
 def is_valid_xid(xid: str) -> int:
@@ -87,6 +92,20 @@ def prepare_bootp(src_mac, dst_mac, sport, dport, src_ip, dst_ip, transaction_id
 def prepare_discover_packet(src_mac, transaction_id):
     dhcp = DHCP(options=[("message-type", "discover"), "end"])
     return prepare_bootp(src_mac, MAC_BROADCAST, 68, 67, "0.0.0.0", IP_BROADCAST, transaction_id) / dhcp
+
+def prepare_discover_packet_unicast(src_mac, dst_mac, src_ip, dst_ip, transaction_id):
+    dhcp = DHCP(options=[("message-type", "discover"), "end"])
+    return prepare_bootp(src_mac, dst_mac, 68, 67, src_ip, dst_ip, transaction_id) / dhcp
+
+def get_gateway_mac(ip: str, interface: str) -> str|None:
+    res = arping(ip, iface=interface, verbose=0)
+
+    if res[0].res is None or len(res[0].res) == 0:
+        return None
+
+    query, answer = res[0].res[0]
+
+    return answer[Ether].src
 
 
 def prepare_request_packet(src_mac, transaction_id, requested_ip):

@@ -43,8 +43,11 @@ def _is_relay(offered_ip: str|None, server_ip: str, subnet_mask: str|None):
     return offered_ip.split('.')[:n_octets] != server_ip.split('.')[:n_octets]
 
 
-def _get_option(options: list, search_term: str) -> str|None:
+def _get_option(options: list|None, search_term: str) -> str|None:
     """Returns the value of an option from the DHCP OFFER"""
+    if options is None:
+        return None
+
     for o in options:
         if isinstance(o, tuple):
             key, value = o
@@ -96,7 +99,6 @@ def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
 
 def _get_server_info(ctx):
     """Retrieve DHCP server information"""
-
     src_mac = ctx.mac or random_mac()
     transaction_id = ctx.xid or random_xid()
     offer_filter = f"udp and src port 67 and (ether dst ff:ff:ff:ff:ff:ff or ether dst {src_mac})"
@@ -107,15 +109,13 @@ def _get_server_info(ctx):
                 offered_ip = packet[BOOTP].yiaddr if packet.haslayer(BOOTP) else None
                 options = packet[DHCP].options
                 ctx.out("DHCP Server Information", "VULN", indent=4)
-                global d_options
-                d_options = options
                 _print_options(ctx, options)
 
                 if server_ip := _get_option(options, "server_id"):
                     if _is_relay(offered_ip, server_ip, _get_option(options, "subnet_mask")):
                         ctx.out(f"DHCP relay detected", "INFO", indent=12)
-                        _contact_server(ctx, src_mac, _get_option(d_options, "router"),
-                                        _get_option(d_options, "server_id"), transaction_id)
+                        _contact_server(ctx, src_mac, _get_option(options, "router"),
+                                        _get_option(options, "server_id"), transaction_id)
 
                 return True
 
@@ -137,7 +137,7 @@ def _get_server_info(ctx):
         sniffer.join()
         res = sniffer.results
 
-        if res in None or len(res) == 0:
+        if res is None or len(res) == 0:
             ctx.out("No DHCP server information accessible", "OK", indent=4)
     except Exception as e:
         ctx.out(f"Error retrieving DHCP information: {str(e)}", "ERROR", indent=4)

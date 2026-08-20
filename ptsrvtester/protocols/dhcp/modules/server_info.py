@@ -103,8 +103,6 @@ def _get_server_info(ctx):
     offer_filter = f"udp and src port 67 and (ether dst ff:ff:ff:ff:ff:ff or ether dst {src_mac})"
 
     try:
-        sendp(prepare_discover_packet(src_mac, transaction_id), ctx.interface, verbose=False)
-
         def is_offer_packet(packet):
             if packet.haslayer(DHCP):
                 offered_ip = packet[BOOTP].yiaddr if packet.haslayer(BOOTP) else None
@@ -124,11 +122,23 @@ def _get_server_info(ctx):
 
             return False
 
+        sniffer = AsyncSniffer(
+            iface=ctx.interface,
+            filter=offer_filter,
+            promisc=True,
+            stop_filter=is_offer_packet,
+            timeout=ctx.timeout
+        )  # Use async sniffer to prevent race conditions
 
-        res = sniff(iface=ctx.interface, filter=offer_filter, promisc=True,
-                    timeout=ctx.timeout, stop_filter=is_offer_packet)
+        sniffer.start()
+        time.sleep(0.05)
 
-        if len(res) == 0:
+        sendp(prepare_discover_packet(src_mac, transaction_id), ctx.interface, verbose=False)
+
+        sniffer.join()
+        res = sniffer.results
+
+        if res in None or len(res) == 0:
             ctx.out("No DHCP server information accessible", "OK", indent=4)
     except Exception as e:
         ctx.out(f"Error retrieving DHCP information: {str(e)}", "ERROR", indent=4)

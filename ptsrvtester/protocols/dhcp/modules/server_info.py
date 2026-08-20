@@ -1,7 +1,6 @@
 import time
-
 from ptsrvtester.protocols.dhcp.utils.registry import (random_xid, random_mac,
-                                                       sendp, prepare_discover_packet, DHCP, sniff, BOOTP,
+                                                       sendp, prepare_discover_packet, DHCP, BOOTP,
                                                        prepare_discover_packet_unicast, get_gateway_mac, get_interface_ip,
                                                        )
 from scapy.sendrecv import AsyncSniffer

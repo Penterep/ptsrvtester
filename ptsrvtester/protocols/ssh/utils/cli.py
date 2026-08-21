@@ -41,6 +41,8 @@ class SSHArgs(ArgsWithBruteforce):
     @staticmethod
     def get_help():
         options: list[list[str]] = [
+            ["-tg", "--target", "<target>", "IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or ssh.example.com:22)"],
+            ["", "", "", ""],
             ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,KEX); ALL runs everything:"],
         ]
         for group_title, codes in SSH_TEST_GROUPS:
@@ -77,14 +79,14 @@ class SSHArgs(ArgsWithBruteforce):
 
         return [
             {"description": ["SSH Testing Module"]},
-            {"usage": ["ptsrvtester ssh -ts <test>[,<test>...] <options> <target>"]},
+            {"usage": ["ptsrvtester ssh -tg <target> -ts <test>[,<test>...] <options>"]},
             {"usage_example": [
-                "ptsrvtester ssh 127.0.0.1",
-                "ptsrvtester ssh -ts BANNER,HOSTKEY,AUTHM 127.0.0.1:22",
-                "ptsrvtester ssh -ts KEX,ENC,MAC 127.0.0.1",
-                "ptsrvtester ssh -ts BADHOSTKEY -H ./hostkeys/ 127.0.0.1",
-                "ptsrvtester ssh -ts BRUTE -u admin -P passwords.txt 127.0.0.1:22",
-                "ptsrvtester ssh -ts DHEAT --dheat 10 --dheat-duration 30 127.0.0.1",
+                "ptsrvtester ssh -tg 127.0.0.1",
+                "ptsrvtester ssh -tg 127.0.0.1:22 -ts BANNER,HOSTKEY,AUTHM",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts KEX,ENC,MAC",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts BADHOSTKEY -H ./hostkeys/",
+                "ptsrvtester ssh -tg 127.0.0.1:22 -ts BRUTE -u admin -P passwords.txt",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts DHEAT --dheat 10 --dheat-duration 30",
                 "ptsrvtester ssh -ts BRUTE -h",
             ]},
             {"options": options},
@@ -98,11 +100,11 @@ class SSHArgs(ArgsWithBruteforce):
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """example usage:
   ptsrvtester ssh -h
-  ptsrvtester ssh 127.0.0.1
-  ptsrvtester ssh -ts BANNER,HOSTKEY,AUTHM 127.0.0.1:22
-  ptsrvtester ssh -ts KEX,ENC,MAC 127.0.0.1
-  ptsrvtester ssh -ts BADHOSTKEY -H ./hostkeys/ 127.0.0.1
-  ptsrvtester -j ssh -ts BRUTE -u admin -P passwords.txt --brute-threads 20 127.0.0.1:22
+  ptsrvtester ssh -tg 127.0.0.1
+  ptsrvtester ssh -tg 127.0.0.1:22 -ts BANNER,HOSTKEY,AUTHM
+  ptsrvtester ssh -tg 127.0.0.1 -ts KEX,ENC,MAC
+  ptsrvtester ssh -tg 127.0.0.1 -ts BADHOSTKEY -H ./hostkeys/
+  ptsrvtester -j ssh -tg 127.0.0.1:22 -ts BRUTE -u admin -P passwords.txt --brute-threads 20
   ptsrvtester ssh -ts BRUTE -h"""
 
         parser = subparsers.add_parser(
@@ -116,8 +118,12 @@ class SSHArgs(ArgsWithBruteforce):
             raise TypeError  # IDE typing
 
         parser.add_argument(
-            "target",
+            "-tg",
+            "--target",
+            required=True,
             type=valid_target_ssh,
+            metavar="<target>",
+            dest="target",
             help="IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or ssh.example.com:22)",
         )
 

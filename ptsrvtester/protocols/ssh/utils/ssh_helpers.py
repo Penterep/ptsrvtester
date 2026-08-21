@@ -4,10 +4,12 @@ Pure functions (no ``self``) lifted from the old flat ``protocols/ssh.py`` so th
 per-test ``modules/*.py`` can reuse them. Imports are absolute on purpose: the
 modules are loaded dynamically by ``BaseMain`` with no package parent.
 """
+import logging
 import socket
 
 import paramiko
 import paramiko.ssh_exception
+from paramiko.message import Message
 
 from ptsrvtester.protocols.ssh.utils.helpers import filepaths, text_or_file
 from ptsrvtester.protocols.ssh.utils.results import (
@@ -17,6 +19,124 @@ from ptsrvtester.protocols.ssh.utils.results import (
 )
 
 BANNER_TIMEOUT = 10.0
+
+
+class _LegacyDSSKey(paramiko.PKey):
+    """Minimal ``ssh-dss`` (DSA/SHA-1) *host* key for verifying legacy servers.
+
+    paramiko 4/5 deleted its ``DSSKey`` class outright, so it can no longer talk
+    to servers whose only host key is ``ssh-dss``. We only ever act as an SSH
+    *client* verifying the server's host key, so this re-implements just the two
+    things paramiko's ``Transport._verify_key`` needs — parse the public key
+    blob and verify the exchange-hash signature — on top of ``cryptography``
+    (which still supports DSA). Signing is intentionally not implemented.
+    """
+
+    name = "ssh-dss"
+
+    def __init__(self, msg=None, data=None):
+        if msg is None and data is not None:
+            msg = Message(data)
+        if msg is None:
+            raise paramiko.SSHException("ssh-dss key blob is missing")
+        # Blob layout: string "ssh-dss", then mpints p, q, g, y.
+        if msg.get_text() != "ssh-dss":
+            raise paramiko.SSHException("not an ssh-dss key")
+        self.p = msg.get_mpint()
+        self.q = msg.get_mpint()
+        self.g = msg.get_mpint()
+        self.y = msg.get_mpint()
+
+    def asbytes(self) -> bytes:
+        m = Message()
+        m.add_string("ssh-dss")
+        m.add_mpint(self.p)
+        m.add_mpint(self.q)
+        m.add_mpint(self.g)
+        m.add_mpint(self.y)
+        return m.asbytes()
+
+    def get_name(self) -> str:
+        return "ssh-dss"
+
+    @classmethod
+    def identifiers(cls):
+        return ["ssh-dss"]
+
+    def get_bits(self) -> int:
+        return self.p.bit_length()
+
+    def verify_ssh_sig(self, data, msg) -> bool:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import dsa
+        from cryptography.hazmat.primitives.asymmetric.utils import (
+            encode_dss_signature,
+        )
+
+        # Signature is either the bare 40-byte r||s or the SSH-wrapped
+        # (string "ssh-dss", string <40 bytes>) form; accept both.
+        raw = msg.asbytes()
+        if len(raw) == 40:
+            sig = raw
+        else:
+            if msg.get_text() != "ssh-dss":
+                return False
+            sig = msg.get_binary()
+        if len(sig) != 40:
+            return False
+
+        r = int.from_bytes(sig[:20], "big")
+        s = int.from_bytes(sig[20:], "big")
+        public_key = dsa.DSAPublicNumbers(
+            y=self.y,
+            parameter_numbers=dsa.DSAParameterNumbers(p=self.p, q=self.q, g=self.g),
+        ).public_key()
+        try:
+            public_key.verify(encode_dss_signature(r, s), data, hashes.SHA1())
+            return True
+        except InvalidSignature:
+            return False
+
+
+def _silence_paramiko_logging() -> None:
+    """Stop paramiko dumping negotiation tracebacks to stderr.
+
+    On a failed key exchange paramiko logs the exception (and its traceback) at
+    ERROR level from its own transport thread. With no handler attached to the
+    ``paramiko`` logger, Python's last-resort handler prints those records to
+    stderr — that is the double ``Exception (client): Incompatible ssh peer``
+    traceback. We render our own per-module errors, so a NullHandler keeps
+    paramiko's internal noise out of the report.
+    """
+    logging.getLogger("paramiko").addHandler(logging.NullHandler())
+
+
+def _enable_legacy_host_keys() -> None:
+    """Re-enable the legacy ``ssh-rsa`` and ``ssh-dss`` host-key algorithms.
+
+    paramiko 4/5 dropped ``ssh-rsa`` (SHA-1) and ``ssh-dss`` from its default
+    host-key tables (``Transport._preferred_keys`` / ``Transport._key_info``),
+    so it refuses old servers that only offer them with
+    ``IncompatiblePeer: no acceptable host key``. ``RSAKey`` still understands
+    the ``ssh-rsa`` wire format, and :class:`_LegacyDSSKey` reimplements
+    ``ssh-dss`` verification on ``cryptography``, so we register both again as
+    the *least*-preferred host keys — modern algorithms are still chosen first,
+    but legacy SSH servers can be audited again.
+    """
+    transport = paramiko.Transport
+    legacy = {"ssh-rsa": paramiko.RSAKey, "ssh-dss": _LegacyDSSKey}
+
+    key_info = dict(transport._key_info)
+    key_info.update({name: cls for name, cls in legacy.items() if name not in key_info})
+    transport._key_info = key_info
+
+    added = tuple(name for name in legacy if name not in transport._preferred_keys)
+    transport._preferred_keys = tuple(transport._preferred_keys) + added
+
+
+_silence_paramiko_logging()
+_enable_legacy_host_keys()
 
 
 def is_reachable(ip: str, port: int, timeout: float = 5.0) -> bool:

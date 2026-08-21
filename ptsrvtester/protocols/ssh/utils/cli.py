@@ -42,7 +42,6 @@ class SSHArgs(ArgsWithBruteforce):
     def get_help():
         options: list[list[str]] = [
             ["-tg", "--target", "<target>", "IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or ssh.example.com:22)"],
-            ["", "", "", ""],
             ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,KEX); ALL runs everything:"],
         ]
         for group_title, codes in SSH_TEST_GROUPS:

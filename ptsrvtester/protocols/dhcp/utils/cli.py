@@ -76,6 +76,24 @@ DHCP_TESTS: dict[str, dict] = {
             "-i eth0 -d 5",
         ],
         "flags": {"starvation": True}
+    },
+    "REQUEST": {
+        "desc": "DHCP REQUEST sender",
+        "long": ["Sends a DHCP REQUEST to the server without previous DISCOVER and",
+                 "OFFER messages to see if the server assigns an IP address or not"],
+        "mods": [
+            ["-mac", "--mac-address", "", "Source MAC address to use"],
+            ["-xid", "--transaction-id", "", "Transaction ID to use"]
+        ],
+        "requires": [
+            ["-i", "--interface", "", "Network interface to use"],
+            ["-ip", "--requested-ip", "", "IP address to request from the server"]
+        ],
+        "usage": [
+            "-i eth0 -ip 172.16.14.54",
+            "-i eth0 -ip 172.16.14.54 -mac 00:11:22:33:44:55 -xid 5",
+        ],
+        "flags": {"request": True}
     }
 }
 #   common    True -> append common outbound message options to per-test help
@@ -241,5 +259,8 @@ class DHCPArgs(BaseArgs):
         dhcp_denial = dhcp_subparsers.add_argument_group("denial", description="Run DHCP DoS flood attack")
         #dhcp_denial.add_argument("--interface", "-i", required=True, help="Network interface to use")
         dhcp_denial.add_argument("--duration", "-d", type=int, help="Duration in seconds (omit for unlimited)")
+
+        dhcp_request = dhcp_subparsers.add_argument_group("request", description="Send DHCP REQUEST to server")
+        dhcp_request.add_argument("-ip", "--requested-ip", type=is_valid_ip, help="IP address to request from a DHCP server")
 
 # endregion

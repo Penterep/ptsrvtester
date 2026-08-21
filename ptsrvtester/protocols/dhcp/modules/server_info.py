@@ -1,37 +1,26 @@
 import time
-from ptsrvtester.protocols.dhcp.utils.registry import (random_xid, random_mac,
-                                                       sendp, prepare_discover_packet, DHCP, BOOTP,
-                                                       prepare_discover_packet_unicast, get_gateway_mac, get_interface_ip,
-                                                       )
+from ptsrvtester.protocols.dhcp.utils.registry import (
+    random_xid,
+    random_mac,
+    sendp,
+    prepare_discover_packet,
+    DHCP,
+    BOOTP,
+    prepare_discover_packet_unicast,
+    get_gateway_mac,
+    get_interface_ip,
+    print_dhcp_options,
+    get_option
+)
+
 from scapy.sendrecv import AsyncSniffer
 from scapy.layers.inet import UDP
 
 
 __MODULELABEL__ = "DHCP server information enumeration"
-__MODULECODE__ = "server_info"
+__MODULECODE__ = "  server_info"
 __ORDER__ = 100
 
-
-def _check_lease(lease) -> bool:
-    """Checks if lease duration is 30 days or more"""
-    return int(lease) >= 2592000
-
-def _print_options(ctx, options) -> None:
-    for o in range(1, len(options)):
-        b_type = "INFO"
-        if options[o] == "end":
-            break
-        option = options[o]
-        if isinstance(option, tuple):
-            key, *values = option
-            value_str = ", ".join(str(v) for v in values)
-        else:
-            key, value_str = str(option), ""
-
-        if key == "lease_time" and _check_lease(value_str):
-            b_type = "WARN"
-
-        ctx.out(f"{key + ':':<24}{value_str}", b_type, indent=8)
 
 def _is_relay(offered_ip: str|None, server_ip: str, subnet_mask: str|None):
     """Checks if the offered IP address is on the same network as the DHCP server"""
@@ -41,20 +30,6 @@ def _is_relay(offered_ip: str|None, server_ip: str, subnet_mask: str|None):
     n_octets = len(list(filter(lambda a: a != '0', subnet_mask.split('.'))))
 
     return offered_ip.split('.')[:n_octets] != server_ip.split('.')[:n_octets]
-
-
-def _get_option(options: list|None, search_term: str) -> str|None:
-    """Returns the value of an option from the DHCP OFFER"""
-    if options is None:
-        return None
-
-    for o in options:
-        if isinstance(o, tuple):
-            key, value = o
-            if key == search_term:
-                return value
-
-    return None
 
 
 def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
@@ -68,7 +43,7 @@ def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
     try:
         def is_offer_packet(packet):
             if packet.haslayer(DHCP) and packet.haslayer(UDP) and packet[UDP].sport == 67:
-                _print_options(ctx, packet[DHCP].options)
+                print_dhcp_options(ctx, packet[DHCP].options, 8)
                 return True
 
             return False
@@ -109,13 +84,13 @@ def _get_server_info(ctx):
                 offered_ip = packet[BOOTP].yiaddr if packet.haslayer(BOOTP) else None
                 options = packet[DHCP].options
                 ctx.out("DHCP Server Information", "VULN", indent=4)
-                _print_options(ctx, options)
+                print_dhcp_options(ctx, options, 4)
 
-                if server_ip := _get_option(options, "server_id"):
-                    if _is_relay(offered_ip, server_ip, _get_option(options, "subnet_mask")):
+                if server_ip := get_option(options, "server_id"):
+                    if _is_relay(offered_ip, server_ip, get_option(options, "subnet_mask")):
                         ctx.out(f"DHCP relay detected", "INFO", indent=12)
-                        _contact_server(ctx, src_mac, _get_option(options, "router"),
-                                        _get_option(options, "server_id"), transaction_id)
+                        _contact_server(ctx, src_mac, get_option(options, "router"),
+                                        get_option(options, "server_id"), transaction_id)
 
                 return True
 

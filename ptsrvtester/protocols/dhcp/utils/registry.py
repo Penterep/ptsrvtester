@@ -1,4 +1,4 @@
-from enum import Enum
+from enum import Enum, IntEnum
 from dataclasses import dataclass
 from typing import Optional
 import re
@@ -28,6 +28,21 @@ class VULNS(Enum):
     DHCP_DOS = "PTV-DHCP-DOS"
     DHCP_STARVATION = "PTV-DHCP-STARVATION"
     DHCP_ROGUE = "PTV-DHCP-ROGUE"
+
+class DHCPTypes(IntEnum):
+    DISCOVER = 1
+    OFFER = 2
+    REQUEST = 3
+    DECLINE = 4
+    ACK = 5
+    NAK = 6
+    RELEASE = 7
+    INFORM = 8
+    FORCE_RENEW = 9
+    LEASE_QUERY = 10
+    LEASE_UNASSIGNED = 11
+    LEASE_UNKNOWN = 12
+    LEASE_ACTIVE = 13
 
 @dataclass
 class TargetDHCP:
@@ -157,3 +172,40 @@ def prepare_ack_packet(src_mac, dst_mac, transaction_id, offered_ip, netmask, ga
     bootp.getlayer(BOOTP).flags = BROADCAST_FLAG
     bootp.getlayer(BOOTP).chaddr = bytes.fromhex(mac_remove_colons(dst_mac))
     return bootp / dhcp
+
+
+def check_lease(lease) -> bool:
+    """Checks if lease duration is 30 days or more"""
+    return int(lease) >= 2592000
+
+
+def print_dhcp_options(ctx, options, base_indent) -> None:
+    for o in range(1, len(options)):
+        b_type = "INFO"
+        if options[o] == "end":
+            break
+        option = options[o]
+        if isinstance(option, tuple):
+            key, *values = option
+            value_str = ", ".join(str(v) for v in values)
+        else:
+            key, value_str = str(option), ""
+
+        if key == "lease_time" and check_lease(value_str):
+            b_type = "WARN"
+
+        ctx.out(f"{key + ':':<24}{value_str}", b_type, indent=base_indent+4)
+
+
+def get_option(options: list|None, search_term: str) -> str|None:
+    """Returns the value of an option from the DHCP OFFER"""
+    if options is None:
+        return None
+
+    for o in options:
+        if isinstance(o, tuple):
+            key, value = o
+            if key == search_term:
+                return value
+
+    return None

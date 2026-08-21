@@ -107,6 +107,16 @@ def get_gateway_mac(ip: str, interface: str) -> str|None:
 
     return answer[Ether].src
 
+def is_valid_ip(ip: str) -> str:
+    split_ip = [int(octet) for octet in ip.split('.')]
+
+    if len(split_ip) != 4:
+        raise argparse.ArgumentError(None, f"{ip} is not a valid IP address")
+
+    if any([not 0 <= octet <= 255 for octet in split_ip]):
+        raise argparse.ArgumentError(None, f"{ip} is not a valid IP address")
+
+    return ip
 
 def prepare_request_packet(src_mac, transaction_id, requested_ip):
     dhcp = DHCP(options=[("message-type", "request"), ("requested_addr", requested_ip), "end"])

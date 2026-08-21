@@ -1,7 +1,13 @@
 import argparse
 
 from ptlibs.ptprinthelper import get_colored_text
-from ptsrvtester.protocols.dhcp.utils.registry import TargetDHCP, valid_interface, is_valid_mac_address, is_valid_xid
+from ptsrvtester.protocols.dhcp.utils.registry import (
+    TargetDHCP,
+    valid_interface,
+    is_valid_mac_address,
+    is_valid_xid,
+    is_valid_ip
+)
 from ptsrvtester.protocols._base import BaseArgs
 
 __all__ = ['DHCPArgs']
@@ -211,6 +217,14 @@ class DHCPArgs(BaseArgs):
             default=None,
             help="MAC address to use",
             type=is_valid_mac_address
+        )
+
+        dhcp_subparsers.add_argument(
+            "-giaddr",
+            "--gateway-ip-address",
+            default=None,
+            help="Gateway IP address to use",
+            type=is_valid_ip
         )
 
         # DHCP info

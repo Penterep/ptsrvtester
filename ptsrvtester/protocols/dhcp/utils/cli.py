@@ -23,7 +23,9 @@ DHCP_TESTS: dict[str, dict] = {
         "desc": "DHCP server enumeration",
         "long": ["Discovers information about a DHCP server"],
         "mods": [
-            ["-t", "--timeout", "", "Timeout for DHCP offer reply (default: 10s)"]
+            ["-t", "--timeout", "", "Timeout for DHCP offer reply (default: 10s)"],
+            ["-mac", "--mac-address", "", "Source MAC address to use"],
+            ["-xid", "--transaction-id", "", "Transaction ID to use"]
         ],
         "requires": [
             ["-i", "--interface", "", "Network interface to use"]
@@ -31,6 +33,7 @@ DHCP_TESTS: dict[str, dict] = {
         "usage": [
             "-i eth0",
             "-i eth0 -t 5",
+            "-i eth0 -t5 -mac 01:23:45:67:89:aa -xid 5"
         ],
         "flags": {"server_info": True}
     },
@@ -38,7 +41,9 @@ DHCP_TESTS: dict[str, dict] = {
         "desc": "DHCP flood attack",
         "long": ["Floods the target with DHCPDISCOVER packets to overwhelm him"],
         "mods": [
-            ["-c", "--count", "", "Number of IP addresses to obtain (omit for unlimited)"]
+            ["-c", "--count", "", "Number of IP addresses to obtain (omit for unlimited)"],
+            ["-mac", "--mac-address", "", "Source MAC address to use"],
+            ["-xid", "--transaction-id", "", "Transaction ID to use"]
         ],
         "requires": [
             ["-i", "--interface", "", "Network interface to use"]
@@ -53,7 +58,9 @@ DHCP_TESTS: dict[str, dict] = {
         "desc": "DHCP starvation attack",
         "long": ["Starves the available IP address pool of a DHCP server"],
         "mods": [
-            ["-d", "--duration", "", "Duration in seconds (omit for unlimited)"]
+            ["-d", "--duration", "", "Duration in seconds (omit for unlimited)"],
+            ["-mac", "--mac-address", "", "Source MAC address to use"],
+            ["-xid", "--transaction-id", "", "Transaction ID to use"]
         ],
         "requires": [
             ["-i", "--interface", "", "Network interface to use"]

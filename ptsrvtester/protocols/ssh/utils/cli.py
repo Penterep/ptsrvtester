@@ -37,6 +37,8 @@ class SSHArgs(ArgsWithBruteforce):
     privkeys: str | None
     dheat: str | None
     dheat_duration: float | None
+    lockout_attempts: int
+    lockout_cooldown: float
 
     @staticmethod
     def get_help():
@@ -68,6 +70,12 @@ class SSHArgs(ArgsWithBruteforce):
             [get_colored_text("DHEat DoS (DHEAT)", "TITLE")],
             ["", "--dheat", "<N[:kex[:e_len]]>", "DHEat attack params: N concurrent sockets, optional kex + e length (default: 10)"],
             ["", "--dheat-duration", "<seconds>", "How long to run the DHEat attack before stopping (default: 20)"],
+            ["", "", "", ""],
+            [get_colored_text("Password-guessing lockout (LOCKOUT)", "TITLE")],
+            ["-u", "--user", "<username>", "Target account (required for LOCKOUT)"],
+            ["-p", "--password", "<password>", "VALID password of a canary account (enables account-lockout test)"],
+            ["", "--lockout-attempts", "<n>", "Failed logins to attempt (default: 8)"],
+            ["", "--lockout-cooldown", "<seconds>", "Wait & re-probe to see if a lockout/ban clears (default: 0)"],
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
             ["-j", "--json", "", "Output in JSON format"],
@@ -167,6 +175,31 @@ class SSHArgs(ArgsWithBruteforce):
             metavar="<seconds>",
             dest="dheat_duration",
             help="how long to run the DHEat attack before stopping it and reading the verdict (default: 20)",
+        )
+
+        lockout = parser.add_argument_group(
+            "LOCKOUT (aggressive)",
+            "Password-guessing lockout test — only runs with -ts LOCKOUT. Deliberately "
+            "makes failed logins; may lock the target account and/or ban this IP. Uses "
+            "-u/--user (target account); add -p/--password (a VALID password for a canary "
+            "account) to also test account lockout.",
+        )
+        lockout.add_argument(
+            "--lockout-attempts",
+            type=int,
+            default=8,
+            metavar="<n>",
+            dest="lockout_attempts",
+            help="number of failed login attempts to make (default: 8; range 1-100)",
+        )
+        lockout.add_argument(
+            "--lockout-cooldown",
+            type=float,
+            default=0.0,
+            metavar="<seconds>",
+            dest="lockout_cooldown",
+            help="if a lockout/ban is found, wait this long and re-probe to see if it "
+                 "clears (0 = skip recovery probe; default: 0)",
         )
 
         add_bruteforce_args(parser)

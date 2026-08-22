@@ -12,6 +12,7 @@ SSH_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Known static keys", ["BADHOSTKEY", "BADAUTHKEY"]),
     ("Credentials", ["BRUTE"]),
     ("Denial of service (aggressive)", ["DHEAT"]),
+    ("Brute-force protection (aggressive)", ["LOCKOUT"]),
 ]
 
 SSH_TESTS: dict[str, dict] = {
@@ -97,6 +98,21 @@ SSH_TESTS: dict[str, dict] = {
         "mods": [
             ["", "--dheat", "<N[:kex[:e_len]]>", "N concurrent sockets, optional kex + fake-e length (default: 10)"],
             ["", "--dheat-duration", "<seconds>", "How long to run the attack before stopping (default: 20)"],
+        ],
+    },
+    "LOCKOUT": {
+        "desc": "Brute-force lockout: account lockout & IP blocking (aggressive)",
+        "long": ["Make repeated failed logins and check whether password guessing is",
+                 "throttled: does the target ACCOUNT get locked, and/or does this",
+                 "attacker IP get blocked (fail2ban)? Aggressive — deliberately locks",
+                 "accounts / triggers bans; runs only when named in -ts."],
+        "requires": ["-u/--user (target account)",
+                     "-p/--password (a VALID password of a canary account) to also test account lockout"],
+        "mods": [
+            ["-u", "--user", "<username>", "Target account (required)"],
+            ["-p", "--password", "<password>", "VALID password of a canary account (enables account-lockout test)"],
+            ["", "--lockout-attempts", "<n>", "Failed logins to attempt (default: 8)"],
+            ["", "--lockout-cooldown", "<seconds>", "Wait & re-probe to see if a lockout/ban clears (default: 0)"],
         ],
     },
 }

@@ -18,7 +18,7 @@ from scapy.layers.inet import UDP
 
 
 __MODULELABEL__ = "DHCP server information enumeration"
-__MODULECODE__ = "  server_info"
+__MODULECODE__ = "server_info"
 __ORDER__ = 100
 
 

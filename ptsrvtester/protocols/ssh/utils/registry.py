@@ -12,6 +12,7 @@ SSH_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Known static keys", ["BADHOSTKEY", "BADAUTHKEY"]),
     ("Credentials", ["BRUTE"]),
     ("Denial of service (aggressive)", ["DHEAT"]),
+    ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
 ]
 
 SSH_TESTS: dict[str, dict] = {
@@ -97,6 +98,23 @@ SSH_TESTS: dict[str, dict] = {
         "mods": [
             ["", "--dheat", "<N[:kex[:e_len]]>", "N concurrent sockets, optional kex + fake-e length (default: 10)"],
             ["", "--dheat-duration", "<seconds>", "How long to run the attack before stopping (default: 20)"],
+        ],
+    },
+    "RATELIMIT": {
+        "desc": "Connection rate-limiting test (aggressive)",
+        "long": ["Detect whether connection rate limiting is deployed, how many",
+                 "concurrent connections can be held, the connect/disconnect rate,",
+                 "and how long an idle connection survives (sshd MaxStartups /",
+                 "LoginGraceTime). Active load test — runs only when named in -ts,",
+                 "never in the default/ALL sweep."],
+        "mods": [
+            ["", "--rate-count", "<n>", "Connections per scenario (default: 30)"],
+            ["", "--rate-concurrency", "<n>", "Parallel connections (default: 10)"],
+            ["", "--rate-timeout", "<seconds>", "Per-connection timeout (default: 5)"],
+            ["", "--rate-hold-seconds", "<seconds>", "Hold time in concurrency check (default: 2)"],
+            ["", "--rate-cooldown-seconds", "<seconds>", "Recovery delay after burst (default: 3)"],
+            ["", "--rate-idle-max", "<seconds>", "Max wait for idle drop; 0 disables (default: 30)"],
+            ["", "--rate-idle-poll", "<seconds>", "Idle liveness poll interval (default: 1)"],
         ],
     },
 }

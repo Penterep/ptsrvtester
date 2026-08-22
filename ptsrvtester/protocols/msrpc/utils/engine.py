@@ -12,9 +12,9 @@ from itertools import product
 from typing import NamedTuple
 
 from impacket import uuid
-from impacket.dcerpc.v5 import epm, mgmt, transport
+from impacket.dcerpc.v5 import epm, mgmt, samr, transport
 from impacket.dcerpc.v5.epm import MSRPC_UUID_PORTMAP
-from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_WINNT
+from impacket.dcerpc.v5.rpcrt import DCERPCException, RPC_C_AUTHN_WINNT
 from impacket.dcerpc.v5.rpch import RPCProxyClientException
 from impacket.http import AUTH_NTLM
 from impacket.nt_errors import (
@@ -26,6 +26,10 @@ from impacket.nt_errors import (
     STATUS_INVALID_WORKSTATION,
     STATUS_LOGON_FAILURE,
     STATUS_LOGON_TYPE_NOT_GRANTED,
+    STATUS_ACCESS_DENIED,
+    STATUS_INVALID_INFO_CLASS,
+    STATUS_MORE_ENTRIES,
+    STATUS_NOT_SUPPORTED,
     STATUS_NO_SUCH_USER,
     STATUS_PASSWORD_EXPIRED,
     STATUS_PASSWORD_MUST_CHANGE,
@@ -35,6 +39,7 @@ from impacket.nt_errors import (
 from impacket.smbconnection import SMBConnection, SessionError
 
 from .helpers import text_or_file
+from .samr_policy import format_interval, parse_lockout_policy, parse_password_policy
 
 
 class Out(Enum):
@@ -79,6 +84,7 @@ class MSRPCResult:
     Pipes: list[str] | None = None
     PipesCreds: list[Credential] | None = None
     Anonymous: list[str] | None = None
+    SamrPolicy: dict | None = None
     SMB_Brute: list[Credential] | None = None
     TCP_Brute: list[Credential] | None = None
     HTTP_Brute: list[Credential] | None = None
@@ -508,6 +514,352 @@ class MsrpcEngine(_PrintMixin):
             self.write_to_file(found)
         return found
 
+    @staticmethod
+    def _samr_error_code(exc: Exception) -> int | None:
+        code = getattr(exc, "error_code", None)
+        if code is not None:
+            return int(code)
+        getter = getattr(exc, "get_error_code", None)
+        if callable(getter):
+            value = getter()
+            return int(value) if value is not None else None
+        getter = getattr(exc, "getErrorCode", None)
+        if callable(getter):
+            value = getter()
+            return int(value) if value is not None else None
+        return None
+
+    @classmethod
+    def _samr_access_denied(cls, exc: Exception) -> bool:
+        if cls._samr_error_code(exc) in {5, STATUS_ACCESS_DENIED}:
+            return True
+        return (
+            isinstance(exc, DCERPCException)
+            and getattr(exc, "error_string", None) == "rpc_s_access_denied"
+        )
+
+    @staticmethod
+    def _close_samr_handle(dce, handle) -> None:
+        if dce is None or handle is None:
+            return
+        try:
+            samr.hSamrCloseHandle(dce, handle)
+        except Exception:
+            pass
+
+    @classmethod
+    def _enumerate_samr_domain_names(cls, dce, server_handle) -> list[str]:
+        names: list[str] = []
+        seen_names: set[str] = set()
+        seen_contexts: set[int] = set()
+        context = 0
+
+        while True:
+            try:
+                response = samr.hSamrEnumerateDomainsInSamServer(
+                    dce, server_handle, enumerationContext=context
+                )
+            except samr.DCERPCSessionError as exc:
+                if cls._samr_error_code(exc) != STATUS_MORE_ENTRIES:
+                    raise
+                response = exc.get_packet()
+                if response is None:
+                    raise
+
+            try:
+                entries = response["Buffer"]["Buffer"]
+            except (KeyError, TypeError):
+                entries = []
+            for entry in entries:
+                name = str(entry["Name"]).rstrip("\x00")
+                folded = name.casefold()
+                if name and folded not in seen_names:
+                    names.append(name)
+                    seen_names.add(folded)
+
+            status = int(response["ErrorCode"])
+            if status != STATUS_MORE_ENTRIES:
+                break
+            next_context = int(response["EnumerationContext"])
+            if next_context == context or next_context in seen_contexts:
+                raise RuntimeError("SAMR domain enumeration did not advance")
+            seen_contexts.add(context)
+            context = next_context
+
+        return names
+
+    def _print_samr_policy(self, result: dict) -> list[str]:
+        lines: list[str] = []
+        self.ptprint(f"SAMR policy query status: {result['status']}", out=Out.INFO)
+        for domain in result["domains"]:
+            name = domain.get("name", "unknown")
+            sid = domain.get("sid", "unknown")
+            self.ptprint(f"Domain: {name} ({sid})")
+            lines.append(f"Domain: {name} ({sid})")
+            if domain["status"] == "denied":
+                self.ptprint("Policy access denied", out=Out.WARNING)
+                lines.append("Policy access denied")
+                continue
+
+            password = domain.get("passwordPolicy")
+            if password is not None:
+                password_lines = [
+                    f"Minimum password length: {password['minimumPasswordLength']}",
+                    f"Password history length: {password['passwordHistoryLength']}",
+                    "Password complexity required: "
+                    + ("yes" if password["passwordComplexityRequired"] else "no"),
+                    "Reversible encryption enabled: "
+                    + ("yes" if password["reversibleEncryptionEnabled"] else "no"),
+                    f"Minimum password age: {format_interval(password['minimumPasswordAge'])}",
+                    f"Maximum password age: {format_interval(password['maximumPasswordAge'])}",
+                ]
+                for line in password_lines:
+                    self.ptprint(line)
+                lines.extend(password_lines)
+
+            lockout = domain.get("lockoutPolicy")
+            if lockout is not None:
+                duration = lockout["lockoutDuration"]
+                duration_text = (
+                    "until administrator unlocks"
+                    if duration.get("untilAdministratorUnlock")
+                    else format_interval(duration)
+                )
+                lockout_lines = [
+                    "Account lockout enabled: "
+                    + ("yes" if lockout["lockoutEnabled"] else "no"),
+                    f"Lockout threshold: {lockout['lockoutThreshold']}",
+                    f"Lockout duration: {duration_text}",
+                    "Lockout observation window: "
+                    + format_interval(lockout["lockoutObservationWindow"]),
+                ]
+                for line in lockout_lines:
+                    self.ptprint(line)
+                lines.extend(lockout_lines)
+
+            for error in domain.get("errors", []):
+                self.ptprint(
+                    f"{error['section']} unavailable: {error['reason']}", out=Out.WARNING
+                )
+                lines.append(f"{error['section']} unavailable: {error['reason']}")
+            lines.append("")
+        return lines
+
+    def _sanitized_samr_error(self, exc: Exception) -> str:
+        message = str(exc)
+        for value in (
+            getattr(self.args, "password", None),
+            getattr(self.args, "username", None),
+            getattr(self.args, "domain", None),
+        ):
+            if value:
+                message = message.replace(str(value), "[redacted]")
+        return f"{type(exc).__name__}: {message}"
+
+    def query_samr_policy(self) -> dict:
+        result: dict[str, object] = {
+            "status": "error",
+            "reason": None,
+            "domains": [],
+        }
+        smb = None
+        dce = None
+        server_handle = None
+        logged_in = False
+        try:
+            smb = SMBConnection(
+                self.args.ip,
+                self.args.ip,
+                sess_port=self.smb_port,
+                timeout=self.connect_timeout,
+            )
+            try:
+                smb.login(
+                    self.args.username,
+                    self.args.password,
+                    getattr(self.args, "domain", "") or "",
+                    ntlmFallback=False,
+                )
+                logged_in = True
+            except SessionError as exc:
+                if self._samr_error_code(exc) in (
+                    _AUTH_REJECTION_STATUSES | {STATUS_ACCESS_DENIED}
+                ):
+                    result.update(status="denied", reason="authentication_denied")
+                    self.ptprint("SAMR authentication was denied", out=Out.WARNING)
+                    return result
+                raise
+
+            if smb.isGuestSession():
+                result.update(status="denied", reason="guest_session")
+                self.ptprint(
+                    "SAMR policy was not queried because authentication mapped to Guest",
+                    out=Out.WARNING,
+                )
+                return result
+
+            binding = f"ncacn_np:{self.args.ip}[\\pipe\\samr]"
+            rpc_transport = transport.DCERPCTransportFactory(binding)
+            rpc_transport.set_dport(self.smb_port)
+            rpc_transport.set_connect_timeout(self.connect_timeout)
+            rpc_transport.setRemoteHost(self.args.ip)
+            rpc_transport.set_smb_connection(smb)
+            dce = rpc_transport.get_dce_rpc()
+            dce.connect()
+            dce.bind(samr.MSRPC_UUID_SAMR)
+
+            server_access = (
+                samr.SAM_SERVER_ENUMERATE_DOMAINS | samr.SAM_SERVER_LOOKUP_DOMAIN
+            )
+            try:
+                connected = samr.hSamrConnect5(dce, desiredAccess=server_access)
+            except Exception as exc:
+                if self._samr_access_denied(exc):
+                    result.update(status="denied", reason="sam_server_access_denied")
+                    self.ptprint("SAM server policy access was denied", out=Out.WARNING)
+                    return result
+                raise
+            server_handle = connected["ServerHandle"]
+            domain_names = self._enumerate_samr_domain_names(dce, server_handle)
+            if not domain_names:
+                result.update(status="complete", reason="no_account_domains")
+                self._print_samr_policy(result)
+                return result
+
+            domain_results: list[dict[str, object]] = []
+            result["domains"] = domain_results
+            for domain_name in domain_names:
+                domain_handle = None
+                lookup = samr.hSamrLookupDomainInSamServer(
+                    dce, server_handle, domain_name
+                )
+                domain_sid = lookup["DomainId"]
+                sid_text = domain_sid.formatCanonical()
+                if sid_text == "S-1-5-32":
+                    continue
+
+                domain_result: dict[str, object] = {
+                    "status": "complete",
+                    "name": domain_name,
+                    "sid": sid_text,
+                    "passwordPolicy": None,
+                    "lockoutPolicy": None,
+                    "errors": [],
+                }
+                try:
+                    domain_access = samr.DOMAIN_READ_PASSWORD_PARAMETERS
+                    try:
+                        opened = samr.hSamrOpenDomain(
+                            dce,
+                            server_handle,
+                            desiredAccess=domain_access,
+                            domainId=domain_sid,
+                        )
+                    except Exception as exc:
+                        if self._samr_access_denied(exc):
+                            domain_result.update(status="denied")
+                            domain_result["errors"].append(
+                                {"section": "domain", "reason": "access_denied"}
+                            )
+                            domain_results.append(domain_result)
+                            continue
+                        raise
+                    domain_handle = opened["DomainHandle"]
+
+                    sections = (
+                        (
+                            "passwordPolicy",
+                            samr.DOMAIN_INFORMATION_CLASS.DomainPasswordInformation,
+                            "Password",
+                            parse_password_policy,
+                        ),
+                        (
+                            "lockoutPolicy",
+                            samr.DOMAIN_INFORMATION_CLASS.DomainLockoutInformation,
+                            "Lockout",
+                            parse_lockout_policy,
+                        ),
+                    )
+                    for section, info_class, union_name, parser in sections:
+                        try:
+                            response = samr.hSamrQueryInformationDomain(
+                                dce, domain_handle, info_class
+                            )
+                            domain_result[section] = parser(
+                                response["Buffer"][union_name]
+                            )
+                        except samr.DCERPCSessionError as exc:
+                            code = self._samr_error_code(exc)
+                            if code not in {
+                                STATUS_ACCESS_DENIED,
+                                STATUS_INVALID_INFO_CLASS,
+                                STATUS_NOT_SUPPORTED,
+                            }:
+                                raise
+                            reason = (
+                                "access_denied"
+                                if code == STATUS_ACCESS_DENIED
+                                else "not_supported"
+                            )
+                            domain_result["status"] = "partial"
+                            domain_result["errors"].append(
+                                {"section": section, "reason": reason}
+                            )
+                    if (
+                        domain_result["passwordPolicy"] is None
+                        and domain_result["lockoutPolicy"] is None
+                    ):
+                        reasons = {
+                            error["reason"] for error in domain_result["errors"]
+                        }
+                        domain_result["status"] = (
+                            "denied"
+                            if reasons and reasons == {"access_denied"}
+                            else "partial"
+                        )
+                    domain_results.append(domain_result)
+                finally:
+                    self._close_samr_handle(dce, domain_handle)
+
+            if not domain_results:
+                result.update(status="complete", reason="no_account_domains")
+                self._print_samr_policy(result)
+                return result
+            statuses = {domain["status"] for domain in domain_results}
+            if statuses == {"denied"}:
+                result.update(status="denied", reason="policy_access_denied")
+            elif statuses == {"complete"}:
+                result.update(status="complete", reason=None)
+            else:
+                result.update(status="partial", reason="some_policy_data_unavailable")
+
+            output_lines = self._print_samr_policy(result)
+            if getattr(self.args, "output", None) and output_lines:
+                self.write_to_file(output_lines)
+            return result
+        except Exception as exc:
+            if self._samr_access_denied(exc):
+                result.update(status="denied", reason="samr_access_denied")
+                self.ptprint("SAMR policy access was denied", out=Out.WARNING)
+                return result
+            result.update(status="error", reason="operational_error")
+            safe_error = self._sanitized_samr_error(exc)
+            self.record_module_error("SAMRPOLICY", safe_error)
+            self.ptprint(f"SAMR policy query failed: {safe_error}", out=Out.ERROR)
+            return result
+        finally:
+            self._close_samr_handle(dce, server_handle)
+            self._disconnect(dce)
+            if smb is not None and logged_in:
+                self._close_smb(smb)
+            elif smb is not None:
+                close = getattr(smb, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
     def _run_credential_attempts(self, code: str, attempt) -> list[Credential]:
         usernames, passwords = self._credential_sources()
         total = len(usernames) * len(passwords)
@@ -831,6 +1183,7 @@ class MsrpcEngine(_PrintMixin):
             "anonymous": (
                 ",".join(self.results.Anonymous) if self.results.Anonymous else None
             ),
+            "samrPolicy": self.results.SamrPolicy,
             "pipesCreds": self._credentials_to_string(self.results.PipesCreds),
             "smbBrute": self._credentials_to_string(self.results.SMB_Brute),
             "tcpBrute": self._credentials_to_string(self.results.TCP_Brute),

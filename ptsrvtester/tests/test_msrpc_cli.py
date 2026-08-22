@@ -158,6 +158,103 @@ class MSRPCCLIParserTests(unittest.TestCase):
                     )
                     self.assertEqual(args.tests, code)
 
+    def test_samrpolicy_requires_one_direct_username_and_password(self):
+        base = ("-tg", "192.0.2.10", "-ts", "SAMRPOLICY")
+        for credentials in (
+            (),
+            ("-u", "audit-user"),
+            ("-pw", "audit-password"),
+            ("-u", "", "-pw", "audit-password"),
+        ):
+            with self.subTest(credentials=credentials):
+                self.assert_selection_rejected(*base, *credentials)
+
+        args = validated_args(
+            *base,
+            "-u",
+            "audit-user",
+            "-pw",
+            "audit-password",
+            "-d",
+            "EXAMPLE",
+        )
+        self.assertEqual(args.username, "audit-user")
+        self.assertEqual(args.password, "audit-password")
+        self.assertEqual(args.domain, "EXAMPLE")
+
+    def test_samrpolicy_accepts_an_explicit_blank_direct_password(self):
+        args = validated_args(
+            "-tg",
+            "192.0.2.10",
+            "-ts",
+            "SAMRPOLICY",
+            "-u",
+            "audit-user",
+            "-pw",
+            "",
+        )
+
+        self.assertEqual(args.username, "audit-user")
+        self.assertEqual(args.password, "")
+
+    def test_samrpolicy_rejects_wordlists_alone_and_in_mixed_selections(self):
+        wordlist_forms = (
+            ("-ul", "users.txt", "-pl", "passwords.txt"),
+            ("-u", "audit-user", "-pl", "passwords.txt"),
+            ("-ul", "users.txt", "-pw", "audit-password"),
+        )
+
+        for selection in ("SAMRPOLICY", "SAMRPOLICY,BRUTESMB"):
+            for credentials in wordlist_forms:
+                with self.subTest(
+                    selection=selection,
+                    credentials=credentials,
+                ):
+                    self.assert_selection_rejected(
+                        "-tg",
+                        "192.0.2.10",
+                        "-ts",
+                        selection,
+                        *credentials,
+                    )
+
+    def test_samrpolicy_can_share_one_direct_pair_with_a_brute_test(self):
+        args = validated_args(
+            "-tg",
+            "192.0.2.10",
+            "-ts",
+            "SAMRPOLICY,BRUTESMB",
+            "-u",
+            "audit-user",
+            "-pw",
+            "audit-password",
+        )
+
+        self.assertEqual(args.tests, "SAMRPOLICY,BRUTESMB")
+        self.assertIsNone(args.username_file)
+        self.assertIsNone(args.password_file)
+
+    def test_samrpolicy_custom_port_is_valid_only_for_smb_only_selections(self):
+        credentials = ("-u", "audit-user", "-pw", "audit-password")
+        for selection in ("SAMRPOLICY", "SAMRPOLICY,ANONSMB"):
+            with self.subTest(selection=selection):
+                args = validated_args(
+                    "-tg",
+                    "192.0.2.10:1445",
+                    "-ts",
+                    selection,
+                    *credentials,
+                )
+                self.assertEqual(args.target.port, 1445)
+
+        self.assert_selection_rejected(
+            "-tg",
+            "192.0.2.10:1445",
+            "-ts",
+            "SAMRPOLICY,ENUMEPM",
+            *credentials,
+        )
+
     def test_brutepipe_requires_a_pipe_name(self):
         credentials = ("-u", "audit-user", "-pw", "audit-password")
         self.assert_selection_rejected(
@@ -299,8 +396,35 @@ class MSRPCCLIParserTests(unittest.TestCase):
         self.assertEqual(args.tests, "ALL,BRUTESMB")
         self.assertEqual(
             MSRPC_EXPLICIT_ONLY_TESTS,
-            frozenset({"BRUTEPIPE", "BRUTESMB", "BRUTETCP", "BRUTEHTTP"}),
+            frozenset(
+                {
+                    "SAMRPOLICY",
+                    "BRUTEPIPE",
+                    "BRUTESMB",
+                    "BRUTETCP",
+                    "BRUTEHTTP",
+                }
+            ),
         )
+
+    def test_all_plus_samrpolicy_still_requires_direct_credentials(self):
+        self.assert_selection_rejected(
+            "-tg",
+            "192.0.2.10",
+            "-ts",
+            "ALL,SAMRPOLICY",
+        )
+        args = validated_args(
+            "-tg",
+            "192.0.2.10",
+            "-ts",
+            "ALL,SAMRPOLICY",
+            "-u",
+            "audit-user",
+            "-pw",
+            "audit-password",
+        )
+        self.assertEqual(args.tests, "ALL,SAMRPOLICY")
 
 
 if __name__ == "__main__":

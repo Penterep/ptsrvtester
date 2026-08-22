@@ -1,4 +1,5 @@
 import io
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -11,14 +12,79 @@ from ptsrvtester.protocols.msrpc.utils.engine import (
 )
 
 
-def output_args(*, json: bool = False) -> MSRPCArgs:
+LEGACY_VULNERABILITY_CODES = [
+    "PTV-MSRCP-SMBNULLSESSION",
+    "PTV-MSRPC-WEAKPIPECREDS",
+    "PTV-MSRPC-WEAKSMBCREDS",
+    "PTV-MSRPC-WEAKRPCCREDS",
+    "PTV-MSRPC-WEAKHTTPCREDS",
+]
+
+
+def complete_samr_policy() -> dict:
+    return {
+        "status": "complete",
+        "reason": None,
+        "domains": [
+            {
+                "status": "complete",
+                "name": "LAB",
+                "sid": "S-1-5-21-1-2-3",
+                "passwordPolicy": {
+                    "minimumPasswordLength": 12,
+                    "passwordHistoryLength": 24,
+                    "passwordProperties": 17,
+                    "unknownPasswordPropertyBits": 0,
+                    "passwordPropertyFlags": [
+                        "DOMAIN_PASSWORD_COMPLEX",
+                        "DOMAIN_PASSWORD_STORE_CLEARTEXT",
+                    ],
+                    "passwordComplexityRequired": True,
+                    "reversibleEncryptionEnabled": True,
+                    "minimumPasswordAge": {
+                        "raw100ns": -864000000000,
+                        "seconds": 86400,
+                        "unlimited": False,
+                    },
+                    "maximumPasswordAge": {
+                        "raw100ns": -36288000000000,
+                        "seconds": 3628800,
+                        "unlimited": False,
+                    },
+                },
+                "lockoutPolicy": {
+                    "lockoutEnabled": True,
+                    "lockoutThreshold": 5,
+                    "lockoutDuration": {
+                        "raw100ns": -6000000000,
+                        "seconds": 600,
+                        "unlimited": False,
+                    },
+                    "lockoutObservationWindow": {
+                        "raw100ns": -3000000000,
+                        "seconds": 300,
+                        "unlimited": False,
+                    },
+                },
+                "errors": [],
+            }
+        ],
+    }
+
+
+def output_args(
+    *,
+    json: bool = False,
+    username: str | None = None,
+    password: str | None = None,
+) -> MSRPCArgs:
     return MSRPCArgs(
         module="msrpc",
         target=SimpleNamespace(ip="192.0.2.25", port=0),
         tests="ALL",
         pipes=None,
-        username=None,
-        password=None,
+        username=username,
+        password=password,
         username_file=None,
         password_file=None,
         pipe=None,
@@ -60,12 +126,21 @@ def populated_results() -> MSRPCResult:
     return results
 
 
-def output_engine(*, json: bool = False) -> tuple[MsrpcEngine, Mock]:
+def output_engine(
+    *,
+    json: bool = False,
+    results: MSRPCResult | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> tuple[MsrpcEngine, Mock]:
     ptjsonlib = Mock()
     ptjsonlib.create_node_object.return_value = {"key": "msrpc-node"}
     ptjsonlib.get_result_json.return_value = '{"status":"finished"}'
-    engine = MsrpcEngine(output_args(json=json), ptjsonlib)
-    engine.results = populated_results()
+    engine = MsrpcEngine(
+        output_args(json=json, username=username, password=password),
+        ptjsonlib,
+    )
+    engine.results = populated_results() if results is None else results
     return engine, ptjsonlib
 
 
@@ -98,13 +173,7 @@ class MSRPCOutputTests(unittest.TestCase):
         )
         self.assertEqual(
             vulnerability_codes(ptjsonlib),
-            [
-                "PTV-MSRCP-SMBNULLSESSION",
-                "PTV-MSRPC-WEAKPIPECREDS",
-                "PTV-MSRPC-WEAKSMBCREDS",
-                "PTV-MSRPC-WEAKRPCCREDS",
-                "PTV-MSRPC-WEAKHTTPCREDS",
-            ],
+            LEGACY_VULNERABILITY_CODES,
         )
         responses = [
             recorded.kwargs["vuln_response"]
@@ -171,6 +240,108 @@ class MSRPCOutputTests(unittest.TestCase):
         ptjsonlib.set_status.assert_called_once_with(
             "error", "MSRPC module failure(s): ANONSMB, ENUMMGMT"
         )
+
+    def test_samr_policy_not_run_is_preserved_as_none(self):
+        engine, ptjsonlib = output_engine(results=MSRPCResult())
+
+        engine.output()
+
+        properties = ptjsonlib.create_node_object.call_args.args[3]
+        self.assertIsNone(properties["samrPolicy"])
+        self.assertNotIn("moduleErrors", properties)
+        ptjsonlib.add_vulnerability.assert_not_called()
+        ptjsonlib.set_status.assert_called_once_with("finished", "")
+
+    def test_complete_samr_policy_is_preserved_without_a_new_vulnerability(self):
+        results = populated_results()
+        results.SamrPolicy = complete_samr_policy()
+        engine, ptjsonlib = output_engine(results=results)
+
+        engine.output()
+
+        properties = ptjsonlib.create_node_object.call_args.args[3]
+        self.assertEqual(properties["samrPolicy"], results.SamrPolicy)
+        self.assertEqual(vulnerability_codes(ptjsonlib), LEGACY_VULNERABILITY_CODES)
+        self.assertEqual(len(ptjsonlib.add_vulnerability.call_args_list), 5)
+        ptjsonlib.set_status.assert_called_once_with("finished", "")
+
+    def test_denied_samr_policy_is_preserved_as_a_clean_result(self):
+        denied = {
+            "status": "denied",
+            "reason": "samr_access_denied",
+            "domains": [],
+        }
+        engine, ptjsonlib = output_engine(
+            results=MSRPCResult(SamrPolicy=denied)
+        )
+
+        engine.output()
+
+        properties = ptjsonlib.create_node_object.call_args.args[3]
+        self.assertEqual(properties["samrPolicy"], denied)
+        self.assertNotIn("moduleErrors", properties)
+        ptjsonlib.add_vulnerability.assert_not_called()
+        ptjsonlib.set_status.assert_called_once_with("finished", "")
+
+    def test_error_samr_policy_and_module_error_are_preserved(self):
+        error_result = {
+            "status": "error",
+            "reason": "operational_error",
+            "domains": [],
+        }
+        results = MSRPCResult(SamrPolicy=error_result)
+        results.module_errors = {
+            "SAMRPOLICY": "OSError: SAMR transport failed"
+        }
+        engine, ptjsonlib = output_engine(results=results)
+
+        engine.output()
+
+        properties = ptjsonlib.create_node_object.call_args.args[3]
+        self.assertEqual(properties["samrPolicy"], error_result)
+        self.assertEqual(
+            properties["moduleErrors"],
+            [
+                {
+                    "test": "SAMRPOLICY",
+                    "error": "OSError: SAMR transport failed",
+                }
+            ],
+        )
+        ptjsonlib.add_vulnerability.assert_not_called()
+        ptjsonlib.set_status.assert_called_once_with(
+            "error", "MSRPC module failure(s): SAMRPOLICY"
+        )
+
+    def test_samr_policy_json_does_not_serialize_supplied_credentials(self):
+        username = "SensitiveAuditUser"
+        password = "NeverPrint-7f9!"
+        results = MSRPCResult(SamrPolicy=complete_samr_policy())
+        engine, ptjsonlib = output_engine(
+            json=True,
+            results=results,
+            username=username,
+            password=password,
+        )
+
+        def serialized_result() -> str:
+            properties = ptjsonlib.create_node_object.call_args.args[3]
+            return json.dumps({"properties": properties}, sort_keys=True)
+
+        ptjsonlib.get_result_json.side_effect = serialized_result
+        stdout = io.StringIO()
+        with patch("sys.stdout", new=stdout):
+            engine.output()
+
+        serialized = stdout.getvalue()
+        properties = ptjsonlib.create_node_object.call_args.args[3]
+        self.assertEqual(properties["samrPolicy"], results.SamrPolicy)
+        self.assertNotIn(username, serialized)
+        self.assertNotIn(password, serialized)
+        self.assertNotIn(username, json.dumps(properties, sort_keys=True))
+        self.assertNotIn(password, json.dumps(properties, sort_keys=True))
+        ptjsonlib.add_vulnerability.assert_not_called()
+        ptjsonlib.get_result_json.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from .registry import (
     MSRPC_TESTS,
     expand_msrpc_selection,
     selection_families,
+    tests_with_credential_mode,
 )
 
 _INTERFACE_VERSION = re.compile(r"^[0-9]+\.[0-9]+$")
@@ -114,6 +115,7 @@ class MSRPCArgs(BaseArgs):
                 "ptsrvtester msrpc -ts ENUMEPM -tg 192.168.1.1",
                 "ptsrvtester msrpc -ts ALL -tg server.example.test",
                 "ptsrvtester msrpc -ts ENUMPIPES -tg 192.168.1.1 -u auditor -pw secret",
+                "ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.1 -u auditor -pw secret",
                 "ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.1 --pipe svcctl -ul users.txt -pl passwords.txt",
                 "ptsrvtester msrpc -ts BRUTETCP -tg 192.168.1.1:49154 --uuid 367abb81-9844-35f1-ad32-98f038001003:2.0 -u auditor -pw secret",
             ]},
@@ -144,7 +146,7 @@ class MSRPCArgs(BaseArgs):
             add_help=True,
             formatter_class=argparse.RawTextHelpFormatter,
             epilog=(
-                "Bruteforce tests are explicit-only: ALL never selects them.\n"
+                "Credential and policy tests marked explicit-only are never selected by ALL.\n"
                 "An explicit target port is valid for one transport family at a time."
             ),
         )
@@ -195,7 +197,7 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
             "run each transport family separately",
         )
 
-    brute = set(selected) & MSRPC_EXPLICIT_ONLY_TESTS
+    brute = tests_with_credential_mode(selected, "product_required")
     if brute:
         if not (getattr(args, "username", None) or getattr(args, "username_file", None)):
             raise argparse.ArgumentError(
@@ -204,6 +206,22 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
         if not (getattr(args, "password", None) or getattr(args, "password_file", None)):
             raise argparse.ArgumentError(
                 None, f"{', '.join(sorted(brute))} requires -pw/--password or -pl/--password-file"
+            )
+
+    direct = tests_with_credential_mode(selected, "direct_required")
+    if direct:
+        direct_names = ", ".join(sorted(direct))
+        if not getattr(args, "username", None):
+            raise argparse.ArgumentError(
+                None, f"{direct_names} requires one direct -u/--username value"
+            )
+        if getattr(args, "password", None) is None:
+            raise argparse.ArgumentError(
+                None, f"{direct_names} requires one direct -pw/--password value"
+            )
+        if getattr(args, "username_file", None) or getattr(args, "password_file", None):
+            raise argparse.ArgumentError(
+                None, f"{direct_names} does not accept credential wordlists; run it separately"
             )
     if "BRUTEPIPE" in selected and not getattr(args, "pipe", None):
         raise argparse.ArgumentError(None, "BRUTEPIPE requires --pipe")

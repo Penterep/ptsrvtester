@@ -21,6 +21,7 @@ EXPECTED_TEST_ORDER = (
     "ENUMMGMT",
     "ENUMPIPES",
     "ANONSMB",
+    "SAMRPOLICY",
     "BRUTEPIPE",
     "BRUTESMB",
     "BRUTETCP",
@@ -32,8 +33,8 @@ EXPECTED_SAFE_SUITE = (
     "ENUMPIPES",
     "ANONSMB",
 )
-EXPECTED_BRUTE_TESTS = frozenset(
-    {"BRUTEPIPE", "BRUTESMB", "BRUTETCP", "BRUTEHTTP"}
+EXPECTED_EXPLICIT_ONLY_TESTS = frozenset(
+    {"SAMRPOLICY", "BRUTEPIPE", "BRUTESMB", "BRUTETCP", "BRUTEHTTP"}
 )
 
 
@@ -73,7 +74,7 @@ def structure_main(**overrides) -> MSRPC:
 
 
 class MSRPCStructureTests(unittest.TestCase):
-    def test_public_entrypoint_and_registry_expose_exactly_eight_tests(self):
+    def test_public_entrypoint_and_registry_expose_exactly_nine_tests(self):
         self.assertIs(MSRPC, MSRPCMain)
         self.assertEqual(
             MODULES["msrpc"][0],
@@ -81,7 +82,10 @@ class MSRPCStructureTests(unittest.TestCase):
         )
         self.assertEqual(MSRPC_TEST_ORDER, EXPECTED_TEST_ORDER)
         self.assertEqual(MSRPC_DEFAULT_SUITE, EXPECTED_SAFE_SUITE)
-        self.assertEqual(MSRPC_EXPLICIT_ONLY_TESTS, EXPECTED_BRUTE_TESTS)
+        self.assertEqual(
+            MSRPC_EXPLICIT_ONLY_TESTS,
+            EXPECTED_EXPLICIT_ONLY_TESTS,
+        )
 
         module = structure_main()
         discovered = module._discover_modules()
@@ -91,8 +95,8 @@ class MSRPCStructureTests(unittest.TestCase):
 
         self.assertEqual(discovered_in_order, EXPECTED_TEST_ORDER)
         self.assertEqual(set(discovered), set(EXPECTED_TEST_ORDER))
-        self.assertEqual(len(discovered), 8)
-        self.assertEqual(len({entry.order for entry in discovered.values()}), 8)
+        self.assertEqual(len(discovered), 9)
+        self.assertEqual(len({entry.order for entry in discovered.values()}), 9)
 
     def test_modules_package_is_included_by_setuptools_discovery(self):
         self.assertIn("ptsrvtester.protocols.msrpc.modules", find_packages())
@@ -118,11 +122,35 @@ class MSRPCStructureTests(unittest.TestCase):
             [*EXPECTED_SAFE_SUITE, "BRUTESMB"],
         )
 
-    def test_brute_tests_are_never_implicitly_selected(self):
+    def test_all_plus_named_samrpolicy_keeps_it_explicit(self):
+        module = structure_main(
+            tests="ALL,SAMRPOLICY",
+            username="audit-user",
+            password="audit-password",
+        )
+
+        self.assertEqual(
+            module._select_codes(module._discover_modules()),
+            [*EXPECTED_SAFE_SUITE, "SAMRPOLICY"],
+        )
+
+    def test_explicit_only_tests_are_never_implicitly_selected(self):
         module = structure_main(tests="ALL")
         selected = module._select_codes(module._discover_modules())
 
         self.assertTrue(MSRPC_EXPLICIT_ONLY_TESTS.isdisjoint(selected))
+
+    def test_samrpolicy_is_an_smb_test_and_honours_a_custom_smb_port(self):
+        module = structure_main(
+            tests="SAMRPOLICY,ANONSMB",
+            target=SimpleNamespace(ip="192.0.2.10", port=1445),
+            username="audit-user",
+            password="audit-password",
+        )
+
+        self.assertEqual(module.target, ("192.0.2.10", 1445))
+        self.assertEqual(module.transport_ports["smb"], 1445)
+        self.assertEqual(module.build_context()["ports"]["smb"], 1445)
 
     def test_shared_engine_is_reused_and_module_execution_is_forced_serial(self):
         module = structure_main(module_threads=100)
@@ -139,6 +167,28 @@ class MSRPCStructureTests(unittest.TestCase):
             with self.assertRaises(argparse.ArgumentError):
                 MSRPC(structure_args(tests="BRUTESMB"), Mock())
 
+        engine_class.assert_not_called()
+
+    def test_main_rejects_invalid_samrpolicy_before_dns_or_engine(self):
+        with (
+            patch("ptsrvtester.protocols.msrpc.main.socket.gethostbyname") as resolve,
+            patch("ptsrvtester.protocols.msrpc.main.MsrpcEngine") as engine_class,
+            self.assertRaises(argparse.ArgumentError),
+        ):
+            MSRPC(
+                structure_args(
+                    tests="SAMRPOLICY",
+                    target=SimpleNamespace(
+                        ip="unresolved.example.test",
+                        port=0,
+                    ),
+                    username_file="users.txt",
+                    password_file="passwords.txt",
+                ),
+                Mock(),
+            )
+
+        resolve.assert_not_called()
         engine_class.assert_not_called()
 
     def test_selected_adapter_import_failure_is_reported_not_silently_skipped(self):

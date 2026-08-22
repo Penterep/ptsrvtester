@@ -34,3 +34,6 @@ class VULNS(Enum):
     WeakCreds = "PTV-GENERAL-WEAKCREDENTIALS"
     Banner = "PTV-SVC-BANNER"
     DHEat = "PTV-SSH-DHEAT"
+    # Missing brute-force protection (LOCKOUT test):
+    NoAccountLockout = "PTV-SSH-NOACCOUNTLOCKOUT"
+    NoIpBlocking = "PTV-SSH-NOIPBLOCKING"

@@ -18,13 +18,16 @@ def run(ctx):
         ctx.out("ssh-audit reported no host-key fingerprints", "NOTVULN", indent=4)
         return
 
+    # Align the host-key and hash-label columns so the fingerprints line up.
+    host_width = max(len(fp.get("hostkey", "?")) for fp in fingerprints)
+    label_width = max(len(f"{fp.get('hash_alg', '?')}:") for fp in fingerprints) + 1
     for fp in fingerprints:
         hostkey = fp.get("hostkey", "?")
         hash_alg = fp.get("hash_alg", "?")
         value = fp.get("hash", "")
-        # Host key on one line; its fingerprint on the next, one indent level deeper.
-        ctx.out(hostkey, "TEXT", indent=4)
-        ctx.out(f"{hash_alg}:{value}", "TEXT", indent=8)
+        # One line per fingerprint: "<hostkey> <HASH>: <value>", columns aligned.
+        label = f"{hash_alg}:"
+        ctx.out(f"{hostkey.ljust(host_width)} {label.ljust(label_width)}{value}", "TEXT", indent=4)
 
     with ctx.results_lock:
         ctx.properties["fingerprints"] = [

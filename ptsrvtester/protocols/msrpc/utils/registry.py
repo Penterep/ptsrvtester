@@ -29,6 +29,13 @@ MSRPC_TESTS: dict[str, dict[str, object]] = {
         "explicit_only": True,
         "credential_mode": "direct_required",
     },
+    "SAMRUSERS": {
+        "description": "Enumerate normal SAM user accounts and account-state flags",
+        "family": "smb",
+        "order": 46,
+        "explicit_only": True,
+        "credential_mode": "direct_required",
+    },
     "BRUTEPIPE": {
         "description": "Test supplied credentials against one SMB named pipe",
         "family": "smb",

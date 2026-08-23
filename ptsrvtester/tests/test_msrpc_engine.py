@@ -3,6 +3,7 @@ import io
 import socket
 import threading
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
 
@@ -59,6 +60,7 @@ def msrpc_args(**overrides) -> MSRPCArgs:
         "output": None,
         "threads": 1,
         "max_attempts": 1000,
+        "samr_max_users": 1000,
         "timeout_seconds": 5.0,
         "module_threads": 1,
         "ip": TEST_IP,
@@ -127,6 +129,54 @@ def canonical_sid(value: str) -> Mock:
     sid = Mock(name=f"sid-{value}")
     sid.formatCanonical.return_value = value
     return sid
+
+
+def samr_enum_user(name: str, rid: int) -> dict[str, object]:
+    return {
+        "RelativeId": rid,
+        "Name": name,
+    }
+
+
+def samr_enum_page(
+    entries: list[dict[str, object]],
+    *,
+    context: int = 0,
+    status: int = 0,
+) -> dict[str, object]:
+    return {
+        "EnumerationContext": context,
+        "Buffer": {
+            "EntriesRead": len(entries),
+            "Buffer": entries,
+        },
+        "CountReturned": len(entries),
+        "ErrorCode": status,
+    }
+
+
+def samr_user_control(account_control: int) -> dict[str, object]:
+    return {
+        "Buffer": {
+            "Control": {
+                "UserAccountControl": account_control,
+            }
+        },
+        "ErrorCode": 0,
+    }
+
+
+def samr_more_users(
+    entries: list[dict[str, object]], context: int
+) -> samr.DCERPCSessionError:
+    return samr.DCERPCSessionError(
+        error_code=STATUS_MORE_ENTRIES,
+        packet=samr_enum_page(
+            entries,
+            context=context,
+            status=STATUS_MORE_ENTRIES,
+        ),
+    )
 
 
 class MSRPCPortRoutingTests(unittest.TestCase):
@@ -1299,6 +1349,645 @@ class MSRPCSamrPolicyEngineTests(unittest.TestCase):
             self.assertNotIn(secret, observable)
         self.assertIn("[redacted]", recorded_error)
 
+        close_handle.assert_not_called()
+        dce.disconnect.assert_called_once_with()
+        smb.logoff.assert_called_once_with()
+        smb.close.assert_called_once_with()
+
+
+class MSRPCSamrUsersEngineTests(unittest.TestCase):
+    def _run_enumeration(
+        self,
+        enumeration_side_effect,
+        *,
+        user_controls=None,
+        open_user_errors=None,
+        domain_names=("EXAMPLE",),
+        domain_sids=("S-1-5-21-1-2-3",),
+        max_users=1000,
+        target_port=0,
+    ):
+        module, _ = msrpc_main(
+            tests="SAMRUSERS",
+            samr_max_users=max_users,
+            target=SimpleNamespace(ip=TEST_IP, port=target_port),
+        )
+        module.engine.ptprint = Mock()
+        smb = Mock()
+        smb.isGuestSession.return_value = False
+        rpc_mock, dce = rpc_transport()
+        server_handle = "server-handle"
+        sid_objects = [canonical_sid(value) for value in domain_sids]
+        domain_handles = [f"domain-handle-{index}" for index in range(len(domain_names))]
+        domain_enumeration = {
+            "Buffer": {
+                "Buffer": [{"Name": f"{name}\x00"} for name in domain_names]
+            },
+            "EnumerationContext": 0,
+            "ErrorCode": 0,
+        }
+        user_controls = user_controls or {}
+        open_user_errors = open_user_errors or {}
+
+        def open_user_result(_dce, _domain_handle, *, desiredAccess, userId):
+            outcome = open_user_errors.get(userId)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return {"UserHandle": f"user-handle-{userId}"}
+
+        def query_user_result(_dce, user_handle, *, userInformationClass):
+            rid = int(str(user_handle).rsplit("-", 1)[1])
+            outcome = user_controls.get(rid, samr.USER_NORMAL_ACCOUNT)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            if isinstance(outcome, dict):
+                return outcome
+            return samr_user_control(int(outcome))
+
+        with ExitStack() as stack:
+            connection = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.SMBConnection",
+                    return_value=smb,
+                )
+            )
+            factory = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.transport.DCERPCTransportFactory",
+                    return_value=rpc_mock,
+                )
+            )
+            connect5 = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrConnect5",
+                    return_value={"ServerHandle": server_handle},
+                )
+            )
+            enumerate_domains = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrEnumerateDomainsInSamServer",
+                    return_value=domain_enumeration,
+                )
+            )
+            lookup_domain = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrLookupDomainInSamServer",
+                    side_effect=[{"DomainId": sid} for sid in sid_objects],
+                )
+            )
+            open_domain = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrOpenDomain",
+                    side_effect=[
+                        {"DomainHandle": handle} for handle in domain_handles
+                    ],
+                )
+            )
+            enumerate_users = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrEnumerateUsersInDomain",
+                    side_effect=enumeration_side_effect,
+                )
+            )
+            open_user = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrOpenUser",
+                    side_effect=open_user_result,
+                )
+            )
+            query_user = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrQueryInformationUser",
+                    side_effect=query_user_result,
+                )
+            )
+            close_handle = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrCloseHandle"
+                )
+            )
+            set_user = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrSetInformationUser"
+                )
+            )
+            set_user2 = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrSetInformationUser2"
+                )
+            )
+            delete_user = stack.enter_context(
+                patch(
+                    "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrDeleteUser"
+                )
+            )
+            result = module.engine.enumerate_samr_users()
+
+        return SimpleNamespace(
+            module=module,
+            result=result,
+            smb=smb,
+            rpc=rpc_mock,
+            dce=dce,
+            server_handle=server_handle,
+            sid_objects=sid_objects,
+            domain_handles=domain_handles,
+            connection=connection,
+            factory=factory,
+            connect5=connect5,
+            enumerate_domains=enumerate_domains,
+            lookup_domain=lookup_domain,
+            open_domain=open_domain,
+            enumerate_users=enumerate_users,
+            open_user=open_user,
+            query_user=query_user,
+            close_handle=close_handle,
+            set_user=set_user,
+            set_user2=set_user2,
+            delete_user=delete_user,
+        )
+
+    def test_complete_query_uses_normal_account_filter_and_minimal_read_access(self):
+        guest_control = samr.USER_ACCOUNT_DISABLED | samr.USER_NORMAL_ACCOUNT
+        admin_control = (
+            samr.USER_NORMAL_ACCOUNT
+            | samr.USER_DONT_EXPIRE_PASSWORD
+            | samr.USER_ACCOUNT_AUTO_LOCKED
+            | 0x80000000
+        )
+        run = self._run_enumeration(
+            [
+                samr_enum_page(
+                    [
+                        samr_enum_user("Administrator\x00", 500),
+                        samr_enum_user("Guest", 501),
+                    ]
+                )
+            ],
+            user_controls={500: admin_control, 501: guest_control},
+            domain_names=("localized-builtin", "EXAMPLE"),
+            domain_sids=("S-1-5-32", "S-1-5-21-1-2-3"),
+            target_port=1445,
+        )
+
+        self.assertEqual(run.result["status"], "complete")
+        self.assertIsNone(run.result["reason"])
+        self.assertEqual(run.result["limit"], 1000)
+        self.assertEqual(run.result["returned"], 2)
+        self.assertFalse(run.result["truncated"])
+        self.assertEqual(len(run.result["domains"]), 1)
+        domain = run.result["domains"][0]
+        self.assertEqual(domain["name"], "EXAMPLE")
+        self.assertEqual(domain["sid"], "S-1-5-21-1-2-3")
+        self.assertEqual(domain["status"], "complete")
+        self.assertEqual(domain["returned"], 2)
+        self.assertFalse(domain["truncated"])
+
+        administrator, guest = domain["users"]
+        self.assertEqual(
+            administrator,
+            {
+                "name": "Administrator",
+                "rid": 500,
+                "sid": "S-1-5-21-1-2-3-500",
+                "stateStatus": "complete",
+                "stateReason": None,
+                "accountControl": admin_control,
+                "accountControlFlags": [
+                    "USER_NORMAL_ACCOUNT",
+                    "USER_DONT_EXPIRE_PASSWORD",
+                    "USER_ACCOUNT_AUTO_LOCKED",
+                ],
+                "unknownAccountControlBits": 0x80000000,
+                "disabled": False,
+                "lockedOut": True,
+            },
+        )
+        self.assertTrue(guest["disabled"])
+        self.assertFalse(guest["lockedOut"])
+
+        run.connection.assert_called_once_with(
+            TEST_IP, TEST_IP, sess_port=1445, timeout=5.0
+        )
+        run.smb.login.assert_called_once_with(
+            "alice", "secret", "EXAMPLE", ntlmFallback=False
+        )
+        run.smb.isGuestSession.assert_called_once_with()
+        run.factory.assert_called_once_with(f"ncacn_np:{TEST_IP}[\\pipe\\samr]")
+        run.rpc.set_dport.assert_called_once_with(1445)
+        run.rpc.set_connect_timeout.assert_called_once_with(5.0)
+        run.rpc.setRemoteHost.assert_called_once_with(TEST_IP)
+        run.rpc.set_smb_connection.assert_called_once_with(run.smb)
+        run.dce.connect.assert_called_once_with()
+        run.dce.bind.assert_called_once_with(samr.MSRPC_UUID_SAMR)
+        run.connect5.assert_called_once_with(
+            run.dce,
+            desiredAccess=(
+                samr.SAM_SERVER_ENUMERATE_DOMAINS
+                | samr.SAM_SERVER_LOOKUP_DOMAIN
+            ),
+        )
+        run.open_domain.assert_called_once_with(
+            run.dce,
+            run.server_handle,
+            desiredAccess=(samr.DOMAIN_LIST_ACCOUNTS | samr.DOMAIN_LOOKUP),
+            domainId=run.sid_objects[1],
+        )
+        run.enumerate_users.assert_called_once()
+        enumeration_call = run.enumerate_users.call_args
+        self.assertEqual(enumeration_call.args, (run.dce, run.domain_handles[0]))
+        self.assertEqual(
+            enumeration_call.kwargs["userAccountControl"],
+            samr.USER_NORMAL_ACCOUNT,
+        )
+        self.assertEqual(enumeration_call.kwargs["enumerationContext"], 0)
+        self.assertGreater(enumeration_call.kwargs["preferedMaximumLength"], 0)
+        self.assertLess(
+            enumeration_call.kwargs["preferedMaximumLength"], 0xFFFFFFFF
+        )
+        self.assertEqual(
+            run.open_user.call_args_list,
+            [
+                call(
+                    run.dce,
+                    run.domain_handles[0],
+                    desiredAccess=samr.USER_READ_ACCOUNT,
+                    userId=500,
+                ),
+                call(
+                    run.dce,
+                    run.domain_handles[0],
+                    desiredAccess=samr.USER_READ_ACCOUNT,
+                    userId=501,
+                ),
+            ],
+        )
+        self.assertEqual(
+            run.query_user.call_args_list,
+            [
+                call(
+                    run.dce,
+                    "user-handle-500",
+                    userInformationClass=(
+                        samr.USER_INFORMATION_CLASS.UserControlInformation
+                    ),
+                ),
+                call(
+                    run.dce,
+                    "user-handle-501",
+                    userInformationClass=(
+                        samr.USER_INFORMATION_CLASS.UserControlInformation
+                    ),
+                ),
+            ],
+        )
+        self.assertEqual(
+            run.close_handle.call_args_list,
+            [
+                call(run.dce, "user-handle-500"),
+                call(run.dce, "user-handle-501"),
+                call(run.dce, run.domain_handles[0]),
+                call(run.dce, run.server_handle),
+            ],
+        )
+        run.dce.disconnect.assert_called_once_with()
+        run.smb.logoff.assert_called_once_with()
+        run.smb.close.assert_called_once_with()
+        for forbidden in (run.set_user, run.set_user2, run.delete_user):
+            forbidden.assert_not_called()
+
+    def test_paging_uses_enumeration_context_and_deduplicates_users(self):
+        run = self._run_enumeration(
+            [
+                samr_more_users(
+                    [samr_enum_user("alice", 1000), samr_enum_user("bob", 1001)],
+                    7,
+                ),
+                samr_enum_page(
+                    [samr_enum_user("bob", 1001), samr_enum_user("carol", 1002)],
+                    context=9,
+                ),
+            ]
+        )
+
+        self.assertEqual(run.result["status"], "complete")
+        self.assertEqual(run.result["returned"], 3)
+        self.assertEqual(
+            [user["name"] for user in run.result["domains"][0]["users"]],
+            ["alice", "bob", "carol"],
+        )
+        self.assertEqual(
+            [
+                item.kwargs["enumerationContext"]
+                for item in run.enumerate_users.call_args_list
+            ],
+            [0, 7],
+        )
+        self.assertEqual(
+            [item.kwargs["userId"] for item in run.open_user.call_args_list],
+            [1000, 1001, 1002],
+        )
+
+    def test_global_limit_stops_before_an_additional_account_domain(self):
+        run = self._run_enumeration(
+            [
+                samr_enum_page(
+                    [samr_enum_user("one", 1000), samr_enum_user("two", 1001)]
+                )
+            ],
+            domain_names=("FIRST", "localized-builtin", "SECOND"),
+            domain_sids=("S-1-5-21-1", "S-1-5-32", "S-1-5-21-2"),
+            max_users=2,
+        )
+
+        self.assertEqual(run.result["status"], "partial")
+        self.assertEqual(run.result["reason"], "limit_reached")
+        self.assertEqual(run.result["limit"], 2)
+        self.assertEqual(run.result["returned"], 2)
+        self.assertTrue(run.result["truncated"])
+        self.assertEqual(len(run.result["domains"]), 1)
+        self.assertEqual(
+            [user["name"] for user in run.result["domains"][0]["users"]],
+            ["one", "two"],
+        )
+        self.assertEqual(run.lookup_domain.call_count, 3)
+        run.enumerate_users.assert_called_once()
+        run.open_domain.assert_called_once()
+
+    def test_exact_limit_ignores_a_later_builtin_domain(self):
+        run = self._run_enumeration(
+            [samr_enum_page([samr_enum_user("one", 1000)])],
+            domain_names=("EXAMPLE", "localized-builtin"),
+            domain_sids=("S-1-5-21-1", "S-1-5-32"),
+            max_users=1,
+        )
+
+        self.assertEqual(run.result["status"], "complete")
+        self.assertIsNone(run.result["reason"])
+        self.assertEqual(run.result["returned"], 1)
+        self.assertFalse(run.result["truncated"])
+        self.assertEqual(len(run.result["domains"]), 1)
+        self.assertEqual(run.lookup_domain.call_count, 2)
+        run.open_domain.assert_called_once()
+        run.enumerate_users.assert_called_once()
+
+    def test_limit_boundary_uses_terminal_status_and_more_entries_signal(self):
+        exact = self._run_enumeration(
+            [
+                samr_enum_page(
+                    [samr_enum_user("one", 1000), samr_enum_user("two", 1001)],
+                )
+            ],
+            max_users=2,
+        )
+        self.assertEqual(exact.result["status"], "complete")
+        self.assertIsNone(exact.result["reason"])
+        self.assertEqual(exact.result["returned"], 2)
+        self.assertFalse(exact.result["truncated"])
+        exact.enumerate_users.assert_called_once()
+
+        continued = self._run_enumeration(
+            [
+                samr_more_users(
+                    [samr_enum_user("one", 1000), samr_enum_user("two", 1001)],
+                    2,
+                )
+            ],
+            max_users=2,
+        )
+        self.assertEqual(continued.result["status"], "partial")
+        self.assertEqual(continued.result["reason"], "limit_reached")
+        self.assertEqual(continued.result["returned"], 2)
+        self.assertTrue(continued.result["truncated"])
+        continued.enumerate_users.assert_called_once()
+        self.assertIn(
+            "Reason: limit reached",
+            [item.args[0] for item in continued.module.engine.ptprint.call_args_list],
+        )
+
+        overflow = self._run_enumeration(
+            [
+                samr_enum_page(
+                    [
+                        samr_enum_user("one", 1000),
+                        samr_enum_user("two", 1001),
+                        samr_enum_user("three", 1002),
+                    ]
+                )
+            ],
+            max_users=2,
+        )
+        self.assertEqual(overflow.result["status"], "partial")
+        self.assertEqual(overflow.result["reason"], "limit_reached")
+        self.assertEqual(overflow.result["returned"], 2)
+        self.assertTrue(overflow.result["truncated"])
+        self.assertEqual(
+            [user["name"] for user in overflow.result["domains"][0]["users"]],
+            ["one", "two"],
+        )
+        self.assertEqual(
+            [item.kwargs["userId"] for item in overflow.open_user.call_args_list],
+            [1000, 1001],
+        )
+        self.assertEqual(overflow.query_user.call_count, 2)
+
+    def test_domain_access_denial_is_clean_denied_and_not_module_error(self):
+        denied = samr.DCERPCSessionError(error_code=STATUS_ACCESS_DENIED)
+        run = self._run_enumeration([denied])
+
+        self.assertEqual(run.result["status"], "denied")
+        self.assertEqual(run.result["returned"], 0)
+        self.assertFalse(run.result["truncated"])
+        domain = run.result["domains"][0]
+        self.assertEqual(domain["status"], "denied")
+        self.assertEqual(domain["users"], [])
+        self.assertEqual(run.module.engine.results.module_errors, {})
+        run.open_user.assert_not_called()
+        run.query_user.assert_not_called()
+        self.assertEqual(
+            run.close_handle.call_args_list,
+            [
+                call(run.dce, run.domain_handles[0]),
+                call(run.dce, run.server_handle),
+            ],
+        )
+        run.dce.disconnect.assert_called_once_with()
+        run.smb.logoff.assert_called_once_with()
+        run.smb.close.assert_called_once_with()
+
+    def test_user_query_denial_preserves_identity_and_closes_user_handle(self):
+        denied = samr.DCERPCSessionError(error_code=STATUS_ACCESS_DENIED)
+        run = self._run_enumeration(
+            [
+                samr_enum_page(
+                    [samr_enum_user("alice", 1000), samr_enum_user("bob", 1001)]
+                )
+            ],
+            user_controls={1001: denied},
+        )
+
+        self.assertEqual(run.result["status"], "partial")
+        self.assertEqual(run.result["reason"], "some_account_data_unavailable")
+        self.assertEqual(run.result["returned"], 2)
+        self.assertEqual(run.result["domains"][0]["status"], "partial")
+        self.assertEqual(
+            run.result["domains"][0]["reason"], "some_account_state_unavailable"
+        )
+        self.assertEqual(
+            [user["name"] for user in run.result["domains"][0]["users"]],
+            ["alice", "bob"],
+        )
+        self.assertEqual(
+            run.result["domains"][0]["users"][1],
+            {
+                "name": "bob",
+                "rid": 1001,
+                "sid": "S-1-5-21-1-2-3-1001",
+                "stateStatus": "denied",
+                "stateReason": "access_denied",
+                "accountControl": None,
+                "accountControlFlags": [],
+                "unknownAccountControlBits": None,
+                "disabled": None,
+                "lockedOut": None,
+            },
+        )
+        self.assertEqual(run.module.engine.results.module_errors, {})
+        self.assertEqual(
+            run.close_handle.call_args_list,
+            [
+                call(run.dce, "user-handle-1000"),
+                call(run.dce, "user-handle-1001"),
+                call(run.dce, run.domain_handles[0]),
+                call(run.dce, run.server_handle),
+            ],
+        )
+
+    def test_repeated_enumeration_context_is_operational_error_and_cleans_handles(self):
+        run = self._run_enumeration(
+            [
+                samr_more_users([samr_enum_user("alice", 1000)], 7),
+                samr_more_users([samr_enum_user("bob", 1001)], 7),
+            ]
+        )
+
+        self.assertEqual(run.result["status"], "error")
+        self.assertEqual(run.result["reason"], "operational_error")
+        self.assertIn("SAMRUSERS", run.module.engine.results.module_errors)
+        self.assertEqual(
+            [
+                item.kwargs["enumerationContext"]
+                for item in run.enumerate_users.call_args_list
+            ],
+            [0, 7],
+        )
+        self.assertEqual(run.close_handle.call_args_list[-2:], [
+            call(run.dce, run.domain_handles[0]),
+            call(run.dce, run.server_handle),
+        ])
+        run.dce.disconnect.assert_called_once_with()
+        run.smb.logoff.assert_called_once_with()
+        run.smb.close.assert_called_once_with()
+
+    def test_duplicate_only_page_is_rejected_as_no_progress(self):
+        run = self._run_enumeration(
+            [
+                samr_more_users([samr_enum_user("alice", 1000)], 7),
+                samr_more_users([samr_enum_user("alice", 1000)], 8),
+            ]
+        )
+
+        self.assertEqual(run.result["status"], "error")
+        self.assertEqual(run.result["reason"], "operational_error")
+        self.assertEqual(run.result["returned"], 1)
+        self.assertIn("SAMRUSERS", run.module.engine.results.module_errors)
+        self.assertEqual(run.open_user.call_count, 1)
+        self.assertEqual(
+            [
+                item.kwargs["enumerationContext"]
+                for item in run.enumerate_users.call_args_list
+            ],
+            [0, 7],
+        )
+
+    def test_malformed_enumeration_response_is_error_not_empty_success(self):
+        malformed = {
+            "EnumerationContext": 0,
+            "Buffer": {},
+            "CountReturned": 1,
+            "ErrorCode": 0,
+        }
+        run = self._run_enumeration([malformed])
+
+        self.assertEqual(run.result["status"], "error")
+        self.assertEqual(run.result["reason"], "operational_error")
+        self.assertEqual(run.result["returned"], 0)
+        self.assertFalse(run.result["truncated"])
+        self.assertIn("SAMRUSERS", run.module.engine.results.module_errors)
+
+    def test_malformed_control_response_closes_user_and_parent_handles(self):
+        run = self._run_enumeration(
+            [samr_enum_page([samr_enum_user("alice", 1000)])],
+            user_controls={1000: {"Buffer": {}, "ErrorCode": 0}},
+        )
+
+        self.assertEqual(run.result["status"], "error")
+        self.assertEqual(run.result["reason"], "operational_error")
+        self.assertEqual(run.result["returned"], 0)
+        self.assertIn("SAMRUSERS", run.module.engine.results.module_errors)
+        self.assertEqual(
+            run.close_handle.call_args_list,
+            [
+                call(run.dce, "user-handle-1000"),
+                call(run.dce, run.domain_handles[0]),
+                call(run.dce, run.server_handle),
+            ],
+        )
+
+    def test_operational_error_redacts_secrets_from_result_log_and_module_error(self):
+        username = "samr-user-leak-marker"
+        password = "samr-password-leak-marker"
+        domain = "samr-domain-leak-marker"
+        module, _ = msrpc_main(
+            tests="SAMRUSERS",
+            username=username,
+            password=password,
+            domain=domain,
+            samr_max_users=1000,
+        )
+        module.engine.ptprint = Mock()
+        smb = Mock()
+        smb.isGuestSession.return_value = False
+        rpc_mock, dce = rpc_transport()
+        dce.connect.side_effect = OSError(f"{username} {password} {domain}")
+
+        with (
+            patch(
+                "ptsrvtester.protocols.msrpc.utils.engine.SMBConnection",
+                return_value=smb,
+            ),
+            patch(
+                "ptsrvtester.protocols.msrpc.utils.engine.transport.DCERPCTransportFactory",
+                return_value=rpc_mock,
+            ),
+            patch(
+                "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrCloseHandle"
+            ) as close_handle,
+        ):
+            result = module.engine.enumerate_samr_users()
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["reason"], "operational_error")
+        recorded_error = module.engine.results.module_errors["SAMRUSERS"]
+        printed = " ".join(
+            str(argument)
+            for recorded_call in module.engine.ptprint.call_args_list
+            for argument in recorded_call.args
+        )
+        observable = f"{result!r} {recorded_error} {printed}"
+        for secret in (username, password, domain):
+            self.assertNotIn(secret, observable)
+        self.assertIn("[redacted]", recorded_error)
         close_handle.assert_not_called()
         dce.disconnect.assert_called_once_with()
         smb.logoff.assert_called_once_with()

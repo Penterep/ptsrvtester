@@ -331,13 +331,18 @@ def report_algorithm_section(ctx, section: str, *, vuln_request: str) -> None:
         ctx.out("ssh-audit reported no algorithms for this section", "NOTVULN", indent=4)
         return
 
+    from ptlibs.ptprinthelper import get_colored_text
+
     weak: list[str] = []
     for entry in entries:
         alg = entry.get("algorithm", "?")
         severity, note = classify_algorithm(entry)
-        ctx.out(alg, severity, indent=4)
+        # Algorithm and its reason on one line; the reason goes in grey parentheses.
         if note:
-            ctx.out(f'-{note}', "TEXT", indent=8)
+            line = f"{alg} {get_colored_text(f'({note})', 'ADDITIONS')}"
+        else:
+            line = alg
+        ctx.out(line, severity, indent=4)
         if severity != "OK":
             weak.append(f"{alg}: {note}" if note else alg)
 

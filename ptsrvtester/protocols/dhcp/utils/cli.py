@@ -1,7 +1,13 @@
 import argparse
 
 from ptlibs.ptprinthelper import get_colored_text
-from ptsrvtester.protocols.smtp.utils.helpers import Target, valid_target
+from ptsrvtester.protocols.dhcp.utils.registry import (
+    TargetDHCP,
+    valid_interface,
+    is_valid_mac_address,
+    is_valid_xid,
+    is_valid_ip
+)
 from ptsrvtester.protocols._base import BaseArgs
 
 __all__ = ['DHCPArgs']
@@ -23,7 +29,9 @@ DHCP_TESTS: dict[str, dict] = {
         "desc": "DHCP server enumeration",
         "long": ["Discovers information about a DHCP server"],
         "mods": [
-            ["-t", "--timeout", "", "Timeout for DHCP offer reply (default: 10s)"]
+            ["-t", "--timeout", "", "Timeout for DHCP offer reply (default: 10s)"],
+            ["-mac", "--mac-address", "", "Source MAC address to use"],
+            ["-xid", "--transaction-id", "", "Transaction ID to use"]
         ],
         "requires": [
             ["-i", "--interface", "", "Network interface to use"]
@@ -31,6 +39,7 @@ DHCP_TESTS: dict[str, dict] = {
         "usage": [
             "-i eth0",
             "-i eth0 -t 5",
+            "-i eth0 -t5 -mac 01:23:45:67:89:aa -xid 5"
         ],
         "flags": {"server_info": True}
     },
@@ -38,7 +47,9 @@ DHCP_TESTS: dict[str, dict] = {
         "desc": "DHCP flood attack",
         "long": ["Floods the target with DHCPDISCOVER packets to overwhelm him"],
         "mods": [
-            ["-c", "--count", "", "Number of IP addresses to obtain (omit for unlimited)"]
+            ["-c", "--count", "", "Number of IP addresses to obtain (omit for unlimited)"],
+            ["-mac", "--mac-address", "", "Source MAC address to use"],
+            ["-xid", "--transaction-id", "", "Transaction ID to use"]
         ],
         "requires": [
             ["-i", "--interface", "", "Network interface to use"]
@@ -53,7 +64,9 @@ DHCP_TESTS: dict[str, dict] = {
         "desc": "DHCP starvation attack",
         "long": ["Starves the available IP address pool of a DHCP server"],
         "mods": [
-            ["-d", "--duration", "", "Duration in seconds (omit for unlimited)"]
+            ["-d", "--duration", "", "Duration in seconds (omit for unlimited)"],
+            ["-mac", "--mac-address", "", "Source MAC address to use"],
+            ["-xid", "--transaction-id", "", "Transaction ID to use"]
         ],
         "requires": [
             ["-i", "--interface", "", "Network interface to use"]
@@ -63,6 +76,47 @@ DHCP_TESTS: dict[str, dict] = {
             "-i eth0 -d 5",
         ],
         "flags": {"starvation": True}
+    },
+    "REQUEST": {
+        "desc": "DHCP REQUEST sender",
+        "long": ["Sends a DHCP REQUEST to the server without previous DISCOVER and",
+                 "OFFER messages to see if the server assigns an IP address or not"],
+        "mods": [
+            ["-mac", "--mac-address", "", "Source MAC address to use"],
+            ["-xid", "--transaction-id", "", "Transaction ID to use"]
+        ],
+        "requires": [
+            ["-i", "--interface", "", "Network interface to use"],
+            ["-ip", "--requested-ip", "", "IP address to request from the server"]
+        ],
+        "usage": [
+            "-i eth0 -ip 172.16.14.54",
+            "-i eth0 -ip 172.16.14.54 -mac 00:11:22:33:44:55 -xid 5",
+        ],
+        "flags": {"request": True}
+    },
+    "ACK": {
+        "desc": "DHCP ACK spoofer",
+        "long": ["Spoofs a DHCP ACK packet and sends it to the client to try and change his IP address"],
+        "mods": [
+            ["-mac", "--mac-address", "", "Source MAC address to use"],
+            ["-xid", "--transaction-id", "", "Transaction ID to use"]
+        ],
+        "requires": [
+            ["-i", "--interface", "", "Network interface to use"],
+            ["-cip", "--client-ip", "", "IP address to set for the client"],
+            ["-cmac", "--client-mac", "", "MAC address of the client"],
+            ["-nm", "--netmask", "", "Netmask to set in DHCP options"],
+            ["-l", "--lease", "", "Lease time to set in DHCP options"],
+            ["-rn", "--renewal-time", "", "Renewal time to set in DHCP options"],
+            ["-rb", "--rebinding-time", "Rebinding time to set in DHCP options"],
+            ["-sip", "--server-ip", "", "DHCP server IP to spoof the ACK packet from"]
+        ],
+        "usage": [
+            "-i eth0 -ip 172.16.14.54 -cmac 99:88:77:66:55:44",
+            "-i eth0 -ip 172.16.14.54 -cmac 99:88:77:66:55:44 -mac 00:11:22:33:44:55 -xid 5",
+        ],
+        "flags": {"ack": True}
     }
 }
 #   common    True -> append common outbound message options to per-test help
@@ -92,13 +146,13 @@ def _dhcp_test_help(codes: list[str]):
         if rows:
             out.append({"test_options": rows})
         has_opts = bool(rows or req)
-        usage = [f"ptsrvtester SNMP -ts {code} " + example + '\n ' for example in spec.get("usage", "")]
+        usage = [f"ptsrvtester DHCP -ts {code} " + example + '\n ' for example in spec.get("usage", "")]
         usage[-1] = usage[-1].rstrip("\n ")
         out.append({"usage": [usage]})
     return out
 
-def valid_target_dhcp(target: str) -> Target:
-    return valid_target(target, domain_allowed=False)
+def valid_target_dhcp(target: str) -> TargetDHCP:
+    return valid_interface(target)
 
 class DHCPArgs(BaseArgs):
     interface: str
@@ -169,7 +223,7 @@ class DHCPArgs(BaseArgs):
             raise TypeError
 
         dhcp_subparsers.add_argument("-i", "--interface",
-                                     #type=valid_target_dhcp,
+                                     type=valid_target_dhcp,
                                      help="Network interface to use",
                                      required=True
                                      )
@@ -190,6 +244,30 @@ class DHCPArgs(BaseArgs):
         )
 
 
+        dhcp_subparsers.add_argument(
+            "-xid",
+            "--transaction-id",
+            default=None,
+            help="Transaction ID to use",
+            type=is_valid_xid
+        )
+
+        dhcp_subparsers.add_argument(
+            "-mac",
+            "--mac-address",
+            default=None,
+            help="MAC address to use",
+            type=is_valid_mac_address
+        )
+
+        dhcp_subparsers.add_argument(
+            "-giaddr",
+            "--gateway-ip-address",
+            default=None,
+            help="Gateway IP address to use",
+            type=is_valid_ip
+        )
+
         # DHCP info
         dhcp_info = dhcp_subparsers.add_argument_group("info", description="Display DHCP server information")
         #dhcp_info.add_argument("--interface", "-i", required=True, help="Network interface to use")
@@ -204,5 +282,18 @@ class DHCPArgs(BaseArgs):
         dhcp_denial = dhcp_subparsers.add_argument_group("denial", description="Run DHCP DoS flood attack")
         #dhcp_denial.add_argument("--interface", "-i", required=True, help="Network interface to use")
         dhcp_denial.add_argument("--duration", "-d", type=int, help="Duration in seconds (omit for unlimited)")
+
+        dhcp_request = dhcp_subparsers.add_argument_group("request", description="Send DHCP REQUEST to server")
+        dhcp_request.add_argument("-ip", "--requested-ip", type=is_valid_ip, help="IP address to request from a DHCP server")
+
+        dhcp_ack_sender = dhcp_subparsers.add_argument_group("ack_sender", description="DHCP ACK packet sender")
+        dhcp_ack_sender.add_argument("-cmac", "--client-mac", type=is_valid_mac_address, help="MAC address of the client")
+        dhcp_ack_sender.add_argument("-cip", "--client-ip", type=is_valid_ip,
+                                     help="IP Address to set for the client")
+        dhcp_ack_sender.add_argument("-nm", "--netmask", help="Netmask to set in DHCP options")
+        dhcp_ack_sender.add_argument("-l", "--lease", help="Lease time to set in DHCP options")
+        dhcp_ack_sender.add_argument("-rn", "--renewal-time", help="Renewal time to set in DHCP options")
+        dhcp_ack_sender.add_argument("-rb", "--rebinding-time", help="Rebinding time to set in DHCP options")
+        dhcp_ack_sender.add_argument("-sip", "--server-ip", help="DHCP server IP to spoof the ACK packet from")
 
 # endregion

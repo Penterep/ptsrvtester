@@ -18,8 +18,8 @@ def _run_starvation(ctx):
         max_count = ctx.count if hasattr(ctx, 'count') and ctx.count else None
 
         while max_count is None or count < max_count:
-            src_mac = random_mac()
-            transaction_id = random_xid()
+            src_mac = ctx.mac or random_mac()
+            transaction_id = ctx.xid or random_xid()
             requested_ip = None
 
             # Send DISCOVER

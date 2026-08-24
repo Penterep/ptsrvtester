@@ -38,6 +38,10 @@ class DHCP(BaseMain):
         If you don't override this, BaseMain's default takes (ip, port) straight
         from args.target.
         """
+
+        self.target_host = None
+        self.target = ("", 67)
+
         self.interface = self.args.interface
 
 
@@ -48,9 +52,20 @@ class DHCP(BaseMain):
         """
 
         return {
-            "interface": self.interface,
+            "interface": self.interface.i_name,
             "write_to_file": getattr(self.args, "output", None),
             "timeout": getattr(self.args, "timeout", None),
             "duration": getattr(self.args, "duration", None),
             "count": getattr(self.args, "count", None),
+            "xid": getattr(self.args, "transaction_id", None),
+            "mac": getattr(self.args, "mac_address", None),
+            "giaddr": getattr(self.args, "gateway_ip_address", None),
+            "requested_ip": getattr(self.args, "requested_ip", None),
+            "client_ip": getattr(self.args, "client_ip", None),
+            "client_mac": getattr(self.args, "client_mac", None),
+            "netmask": getattr(self.args, "netmask", None),
+            "lease": getattr(self.args, "lease", None),
+            "renewal_time": getattr(self.args, "renewal_time", None),
+            "rebinding_time": getattr(self.args, "rebinding_time", None),
+            "server_ip": getattr(self.args, "server_ip", None)
         }

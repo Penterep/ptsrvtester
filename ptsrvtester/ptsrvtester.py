@@ -26,17 +26,13 @@ import sys
 
 from ptlibs import ptprinthelper, ptjsonlib
 from ptlibs.ptprinthelper import out_if, out_ifnot, ptprint
+from .protocols._shared.utils.cli import add_shared_rate_limit_args
 
 from ._version import __version__
 from .protocols._base import BaseArgs
 
 SCRIPTNAME = "ptsrvtester"
 
-# Single source of truth for the available modules.
-#   name -> ("dotted.module.path:ClassName", "one-line description")
-# The class is imported lazily (see load_module) so a single-module run — and
-# `-h`/`--version`/unknown-module — never import the other 11 protocols and
-# their heavy dependencies (scapy, impacket, paramiko, …).
 MODULES: dict[str, tuple[str, str]] = {
     "snmp":  ("ptsrvtester.protocols.snmp:SNMP",   "SNMP testing module"),
     "dns":   ("ptsrvtester.protocols.dns:DNS",     "DNS testing module"),
@@ -81,8 +77,6 @@ class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
         os._exit(1)
 
 
-# argparse parser that captures its error message instead of printing argparse's
-# own usage text, so parse_args() can render it in the Penterep banner+error style.
 _LAST_ERROR: dict[str, str | None] = {"message": None}
 
 
@@ -98,10 +92,8 @@ class Ptsrvtester:
 
     def run(self) -> None:
         """Runs selected module with its configured arguments"""
-        # Initialize JSON data (PtsrvtesterJsonLib for unified error format)
         ptjson = PtsrvtesterJsonLib()
 
-        # Run the selected module
         module = load_module(self.args.module)(self.args, ptjson)
         module.run()
         module.output()
@@ -158,7 +150,6 @@ def _print_main_help() -> None:
 
 def _print_module_help(name: str, argv: list[str]) -> None:
     module_args = load_module(name).module_args()
-    # Per-test help: `smtp -ts <TEST> -h` shows options for that test only.
     test_help = _extract_test_help(module_args, argv)
     help_obj = test_help if test_help is not None else module_args.get_help()
     ptprinthelper.help_print(help_obj, f"{SCRIPTNAME} {name}", __version__)
@@ -201,7 +192,6 @@ def parse_args() -> BaseArgs:
     """
     argv = sys.argv[1:]
 
-    # No arguments at all -> main help.
     if not argv:
         _print_main_help()
         sys.exit(0)
@@ -210,12 +200,10 @@ def parse_args() -> BaseArgs:
     wants_help = any(tok in ("-h", "--help", "--h", "-help") for tok in argv)
     wants_version = any(tok in ("-v", "--version") for tok in argv)
 
-    # Version is a global action; no module needed.
     if wants_version:
         print(f"{SCRIPTNAME} {__version__}")
         sys.exit(0)
 
-    # Help flag: module-specific help if a known module was named, else main help.
     if wants_help:
         if module in MODULES:
             _print_module_help(module, argv)
@@ -223,31 +211,25 @@ def parse_args() -> BaseArgs:
             _print_main_help()
         sys.exit(0)
 
-    # Only flags, no module -> main help.
     if module is None:
         _print_main_help()
         sys.exit(0)
 
-    # Unknown module -> banner + error.
     if module not in MODULES:
         _error_unknown_module(module)
         sys.exit(2)
 
-    # Bare module (no further arguments) -> that module's help.
     if len(argv) == 1:
         _print_module_help(module, argv)
         sys.exit(0)
 
-    # Build a parser for this one module and parse into its typed namespace.
     parser = CustomArgumentParser(add_help=True, parents=[_global_parent()])
     subparsers = parser.add_subparsers(required=True, dest="module", parser_class=CustomArgumentParser)
     module_args = load_module(module).module_args()
     module_args.add_subparser(module, subparsers)
-    # Global options must be on the subparser too, so they are also accepted AFTER
-    # the module name. default=SUPPRESS: when absent here they leave the value set
-    # by the parent parser intact (so `-j` before the module name is not clobbered).
     subparsers.choices[module].add_argument("-j", "--json", action="store_true", default=argparse.SUPPRESS, help="use Penterep JSON output format")
     subparsers.choices[module].add_argument("-vv", "--verbose", action="store_true", dest="debug", default=argparse.SUPPRESS, help="Enable verbose mode")
+    add_shared_rate_limit_args(subparsers.choices[module])
 
     _LAST_ERROR["message"] = None
     try:
@@ -271,12 +253,10 @@ def main() -> None:
     try:
         script.run()
     except argparse.ArgumentError as e:
-        # Module raised ArgumentError - error only (banner already printed after parse_args)
         print(f"\n\033[31m[✗]\033[0m Error: {e.message}")
         print()
         sys.exit(2)
     except OSError as e:
-        # Connection failed (e.g. connection refused, timeout) - show message without traceback
         print(f"\n\033[31m[✗]\033[0m {e}")
         print()
         sys.exit(1)

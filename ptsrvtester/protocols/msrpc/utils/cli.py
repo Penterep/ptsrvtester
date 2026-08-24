@@ -14,6 +14,7 @@ from .registry import (
     MSRPC_TESTS,
     expand_msrpc_selection,
     selection_families,
+    tests_with_credential_mode,
 )
 
 _INTERFACE_VERSION = re.compile(r"^[0-9]+\.[0-9]+$")
@@ -46,6 +47,18 @@ def _bounded_timeout(value: str) -> float:
         raise argparse.ArgumentTypeError("timeout must be a number") from exc
     if not 1 <= parsed <= 60:
         raise argparse.ArgumentTypeError("timeout must be between 1 and 60 seconds")
+    return parsed
+
+
+def _bounded_samr_users(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("SAMR user limit must be an integer") from exc
+    if not 1 <= parsed <= 10_000:
+        raise argparse.ArgumentTypeError(
+            "SAMR user limit must be between 1 and 10000"
+        )
     return parsed
 
 
@@ -98,6 +111,7 @@ class MSRPCArgs(BaseArgs):
     output: str | None
     threads: int
     max_attempts: int
+    samr_max_users: int
     timeout_seconds: float
     module_threads: int
     debug: bool
@@ -114,6 +128,8 @@ class MSRPCArgs(BaseArgs):
                 "ptsrvtester msrpc -ts ENUMEPM -tg 192.168.1.1",
                 "ptsrvtester msrpc -ts ALL -tg server.example.test",
                 "ptsrvtester msrpc -ts ENUMPIPES -tg 192.168.1.1 -u auditor -pw secret",
+                "ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.1 -u auditor -pw secret",
+                "ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.1 -u auditor -pw secret",
                 "ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.1 --pipe svcctl -ul users.txt -pl passwords.txt",
                 "ptsrvtester msrpc -ts BRUTETCP -tg 192.168.1.1:49154 --uuid 367abb81-9844-35f1-ad32-98f038001003:2.0 -u auditor -pw secret",
             ]},
@@ -130,6 +146,7 @@ class MSRPCArgs(BaseArgs):
                 ["-pl", "--password-file", "<file>", "Password wordlist"],
                 ["", "--threads", "<1-100>", "Credential-test concurrency (default 10)"],
                 ["", "--max-attempts", "<1-100000>", "Reject larger credential products (default 1000)"],
+                ["", "--samr-max-users", "<1-10000>", "SAMRUSERS: maximum returned users (default 1000)"],
                 ["", "--timeout-seconds", "<1-60>", "Per-connection timeout (default 5)"],
                 ["-o", "--output", "<file>", "Append positive enumeration/credential results"],
                 ["-j", "--json", "", "JSON output"],
@@ -144,7 +161,7 @@ class MSRPCArgs(BaseArgs):
             add_help=True,
             formatter_class=argparse.RawTextHelpFormatter,
             epilog=(
-                "Bruteforce tests are explicit-only: ALL never selects them.\n"
+                "Authenticated and credential tests marked explicit-only are never selected by ALL.\n"
                 "An explicit target port is valid for one transport family at a time."
             ),
         )
@@ -166,6 +183,12 @@ class MSRPCArgs(BaseArgs):
 
         parser.add_argument("--threads", type=_bounded_threads, default=10)
         parser.add_argument("--max-attempts", type=_bounded_attempts, default=1000)
+        parser.add_argument(
+            "--samr-max-users",
+            type=_bounded_samr_users,
+            default=1000,
+            dest="samr_max_users",
+        )
         parser.add_argument("--timeout-seconds", type=_bounded_timeout, default=5.0)
         parser.add_argument("-o", "--output", default=None)
         parser.add_argument(
@@ -195,7 +218,7 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
             "run each transport family separately",
         )
 
-    brute = set(selected) & MSRPC_EXPLICIT_ONLY_TESTS
+    brute = tests_with_credential_mode(selected, "product_required")
     if brute:
         if not (getattr(args, "username", None) or getattr(args, "username_file", None)):
             raise argparse.ArgumentError(
@@ -204,6 +227,22 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
         if not (getattr(args, "password", None) or getattr(args, "password_file", None)):
             raise argparse.ArgumentError(
                 None, f"{', '.join(sorted(brute))} requires -pw/--password or -pl/--password-file"
+            )
+
+    direct = tests_with_credential_mode(selected, "direct_required")
+    if direct:
+        direct_names = ", ".join(sorted(direct))
+        if not getattr(args, "username", None):
+            raise argparse.ArgumentError(
+                None, f"{direct_names} requires one direct -u/--username value"
+            )
+        if getattr(args, "password", None) is None:
+            raise argparse.ArgumentError(
+                None, f"{direct_names} requires one direct -pw/--password value"
+            )
+        if getattr(args, "username_file", None) or getattr(args, "password_file", None):
+            raise argparse.ArgumentError(
+                None, f"{direct_names} does not accept credential wordlists; run it separately"
             )
     if "BRUTEPIPE" in selected and not getattr(args, "pipe", None):
         raise argparse.ArgumentError(None, "BRUTEPIPE requires --pipe")

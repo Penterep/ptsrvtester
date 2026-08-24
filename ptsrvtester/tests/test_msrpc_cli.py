@@ -22,6 +22,7 @@ BRUTE_REQUIREMENTS = {
     ),
     "BRUTEHTTP": (),
 }
+DIRECT_SAMR_TESTS = ("SAMRPOLICY", "SAMRUSERS")
 
 
 def parse_msrpc_args(*arguments: str) -> MSRPCArgs:
@@ -125,6 +126,23 @@ class MSRPCCLIParserTests(unittest.TestCase):
                     "-tg", "192.0.2.10", "--timeout-seconds", value
                 )
 
+    def test_samr_max_users_default_and_bounds_are_enforced(self):
+        defaults = parse_msrpc_args("-tg", "192.0.2.10")
+        self.assertEqual(defaults.samr_max_users, 1000)
+
+        for value in ("1", "10000"):
+            with self.subTest(samr_max_users=value):
+                args = parse_msrpc_args(
+                    "-tg", "192.0.2.10", "--samr-max-users", value
+                )
+                self.assertEqual(args.samr_max_users, int(value))
+
+        for value in ("0", "10001", "-1", "not-an-integer"):
+            with self.subTest(invalid_samr_max_users=value):
+                self.assert_parse_rejected(
+                    "-tg", "192.0.2.10", "--samr-max-users", value
+                )
+
     def test_every_brute_test_requires_a_user_and_password_source(self):
         for code, extra in BRUTE_REQUIREMENTS.items():
             target = "192.0.2.10:49152" if code == "BRUTETCP" else "192.0.2.10"
@@ -157,6 +175,115 @@ class MSRPCCLIParserTests(unittest.TestCase):
                         *credentials,
                     )
                     self.assertEqual(args.tests, code)
+
+    def test_authenticated_samr_tests_require_one_direct_username_and_password(self):
+        for code in DIRECT_SAMR_TESTS:
+            base = ("-tg", "192.0.2.10", "-ts", code)
+            for credentials in (
+                (),
+                ("-u", "audit-user"),
+                ("-pw", "audit-password"),
+                ("-u", "", "-pw", "audit-password"),
+            ):
+                with self.subTest(code=code, credentials=credentials):
+                    self.assert_selection_rejected(*base, *credentials)
+
+            with self.subTest(code=code, credentials="direct"):
+                args = validated_args(
+                    *base,
+                    "-u",
+                    "audit-user",
+                    "-pw",
+                    "audit-password",
+                    "-d",
+                    "EXAMPLE",
+                )
+                self.assertEqual(args.username, "audit-user")
+                self.assertEqual(args.password, "audit-password")
+                self.assertEqual(args.domain, "EXAMPLE")
+
+    def test_authenticated_samr_tests_accept_an_explicit_blank_direct_password(self):
+        for code in DIRECT_SAMR_TESTS:
+            with self.subTest(code=code):
+                args = validated_args(
+                    "-tg",
+                    "192.0.2.10",
+                    "-ts",
+                    code,
+                    "-u",
+                    "audit-user",
+                    "-pw",
+                    "",
+                )
+
+                self.assertEqual(args.username, "audit-user")
+                self.assertEqual(args.password, "")
+                self.assertEqual(args.domain, "")
+
+    def test_authenticated_samr_tests_reject_wordlists_in_all_selections(self):
+        wordlist_forms = (
+            ("-ul", "users.txt"),
+            ("-pl", "passwords.txt"),
+            ("-ul", "users.txt", "-pl", "passwords.txt"),
+            ("-u", "audit-user", "-pl", "passwords.txt"),
+            ("-ul", "users.txt", "-pw", "audit-password"),
+        )
+
+        for code in DIRECT_SAMR_TESTS:
+            for selection in (code, f"{code},BRUTESMB"):
+                for credentials in wordlist_forms:
+                    with self.subTest(
+                        selection=selection,
+                        credentials=credentials,
+                    ):
+                        self.assert_selection_rejected(
+                            "-tg",
+                            "192.0.2.10",
+                            "-ts",
+                            selection,
+                            *credentials,
+                        )
+
+    def test_authenticated_samr_tests_can_share_one_direct_pair_with_a_brute(self):
+        for code in DIRECT_SAMR_TESTS:
+            selection = f"{code},BRUTESMB"
+            with self.subTest(code=code):
+                args = validated_args(
+                    "-tg",
+                    "192.0.2.10",
+                    "-ts",
+                    selection,
+                    "-u",
+                    "audit-user",
+                    "-pw",
+                    "audit-password",
+                )
+
+                self.assertEqual(args.tests, selection)
+                self.assertIsNone(args.username_file)
+                self.assertIsNone(args.password_file)
+
+    def test_authenticated_samr_custom_port_requires_smb_only_selections(self):
+        credentials = ("-u", "audit-user", "-pw", "audit-password")
+        for code in DIRECT_SAMR_TESTS:
+            for selection in (code, f"{code},ANONSMB"):
+                with self.subTest(selection=selection):
+                    args = validated_args(
+                        "-tg",
+                        "192.0.2.10:1445",
+                        "-ts",
+                        selection,
+                        *credentials,
+                    )
+                    self.assertEqual(args.target.port, 1445)
+
+            self.assert_selection_rejected(
+                "-tg",
+                "192.0.2.10:1445",
+                "-ts",
+                f"{code},ENUMEPM",
+                *credentials,
+            )
 
     def test_brutepipe_requires_a_pipe_name(self):
         credentials = ("-u", "audit-user", "-pw", "audit-password")
@@ -299,8 +426,40 @@ class MSRPCCLIParserTests(unittest.TestCase):
         self.assertEqual(args.tests, "ALL,BRUTESMB")
         self.assertEqual(
             MSRPC_EXPLICIT_ONLY_TESTS,
-            frozenset({"BRUTEPIPE", "BRUTESMB", "BRUTETCP", "BRUTEHTTP"}),
+            frozenset(
+                {
+                    "SAMRPOLICY",
+                    "SAMRUSERS",
+                    "BRUTEPIPE",
+                    "BRUTESMB",
+                    "BRUTETCP",
+                    "BRUTEHTTP",
+                }
+            ),
         )
+
+    def test_all_plus_authenticated_samr_still_requires_direct_credentials(self):
+        for code in DIRECT_SAMR_TESTS:
+            selection = f"ALL,{code}"
+            with self.subTest(code=code, credentials="missing"):
+                self.assert_selection_rejected(
+                    "-tg",
+                    "192.0.2.10",
+                    "-ts",
+                    selection,
+                )
+            with self.subTest(code=code, credentials="direct"):
+                args = validated_args(
+                    "-tg",
+                    "192.0.2.10",
+                    "-ts",
+                    selection,
+                    "-u",
+                    "audit-user",
+                    "-pw",
+                    "audit-password",
+                )
+                self.assertEqual(args.tests, selection)
 
 
 if __name__ == "__main__":

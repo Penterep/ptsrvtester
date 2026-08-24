@@ -22,29 +22,47 @@ MSRPC_TESTS: dict[str, dict[str, object]] = {
         "family": "smb",
         "order": 40,
     },
+    "SAMRPOLICY": {
+        "description": "Read SAM password and account-lockout policy",
+        "family": "smb",
+        "order": 45,
+        "explicit_only": True,
+        "credential_mode": "direct_required",
+    },
+    "SAMRUSERS": {
+        "description": "Enumerate normal SAM user accounts and account-state flags",
+        "family": "smb",
+        "order": 46,
+        "explicit_only": True,
+        "credential_mode": "direct_required",
+    },
     "BRUTEPIPE": {
         "description": "Test supplied credentials against one SMB named pipe",
         "family": "smb",
         "order": 50,
         "explicit_only": True,
+        "credential_mode": "product_required",
     },
     "BRUTESMB": {
         "description": "Test supplied credentials against SMB authentication",
         "family": "smb",
         "order": 60,
         "explicit_only": True,
+        "credential_mode": "product_required",
     },
     "BRUTETCP": {
         "description": "Test supplied credentials against one RPC/TCP interface",
         "family": "rpc",
         "order": 70,
         "explicit_only": True,
+        "credential_mode": "product_required",
     },
     "BRUTEHTTP": {
         "description": "Test supplied credentials against RPC over HTTP",
         "family": "http",
         "order": 80,
         "explicit_only": True,
+        "credential_mode": "product_required",
     },
 }
 
@@ -72,10 +90,10 @@ def test_tokens(raw: str | None) -> list[str]:
 
 
 def expand_msrpc_selection(raw: str | None) -> list[str]:
-    """Expand an empty selection or ``ALL`` to the non-bruteforce suite.
+    """Expand an empty selection or ``ALL`` to the default-safe suite.
 
-    Explicit-only tests named alongside ``ALL`` remain selected.  This makes
-    ``ALL,BRUTESMB`` useful while ensuring ``ALL`` alone never guesses a password.
+    Explicit-only tests named alongside ``ALL`` remain selected. This allows
+    ``ALL,SAMRPOLICY`` while keeping every explicit test out of ``ALL`` alone.
     Unknown tokens are kept so validation can report them precisely.
     """
     tokens = test_tokens(raw)
@@ -99,6 +117,14 @@ def selection_families(codes: list[str]) -> set[str]:
     }
 
 
+def tests_with_credential_mode(codes: list[str], mode: str) -> set[str]:
+    return {
+        code
+        for code in codes
+        if code in MSRPC_TESTS and MSRPC_TESTS[code].get("credential_mode") == mode
+    }
+
+
 __all__ = [
     "MSRPC_DEFAULT_SUITE",
     "MSRPC_EXPLICIT_ONLY_TESTS",
@@ -107,4 +133,5 @@ __all__ = [
     "expand_msrpc_selection",
     "selection_families",
     "test_tokens",
+    "tests_with_credential_mode",
 ]

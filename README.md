@@ -39,6 +39,8 @@ ptsrvtester ftp -ts ALL -tg 127.0.0.1
 ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1
 ptsrvtester ftp -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:21
 ptsrvtester msrpc -ts ALL -tg 192.168.1.10
+ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.10 -u auditor -pw secret
+ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.10 -u auditor -pw secret
 ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.10 --pipe svcctl -u auditor -pw secret
 ptsrvtester <module> -h     for help for module use
 ```
@@ -97,6 +99,8 @@ ptsrvtester <module> -h     for help for module use
 **MSRPC Module**
 - Endpoint Mapper, MGMT interface and named-pipe enumeration
 - Anonymous SMB and IPC$ access testing
+- Explicit read-only SAM password and account-lockout policy retrieval
+- Explicit read-only normal SAM user and account-state enumeration
 - Explicit named-pipe, SMB, RPC/TCP and RPC-over-HTTP Proxy credential testing
 - Transport-aware defaults: RPC 135, SMB 445 and HTTPS RPC Proxy 443
 - Credential attempts are bounded by `--max-attempts` (default 1,000) and `--timeout-seconds`

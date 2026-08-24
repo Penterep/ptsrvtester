@@ -9,9 +9,9 @@ __ORDER__ = 60
 
 def run(ctx):
     try:
-        pop3 = ctx.connect()
+        pop3 = ctx.connect(debug=ctx.debug)
         try:
-            enabled = auth_anonymous(pop3)
+            enabled = auth_anonymous(pop3, debug=ctx.debug)
         finally:
             pop3.close()
     except Exception as e:

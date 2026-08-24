@@ -5,6 +5,8 @@ import argparse
 import importlib
 import socket
 
+from ptlibs.threads import printlock
+
 from .._base import BaseArgs, BaseMain
 from .utils.cli import POP3Args, validate_brute_selection
 from .utils.connection import ServerInfoCache, connect_pop3
@@ -39,6 +41,24 @@ class POP3(BaseMain):
         relative imports. POP3 modules live under ``protocols.pop3.modules``.
         """
         return importlib.import_module(f"ptsrvtester.protocols.pop3.modules.{name}")
+
+    def _run_module(self, code: str, discovered, extras: dict) -> None:
+        """Like BaseMain, but skip auto-header when ``__MODULELABEL__`` is empty.
+
+        CAPA prints its own ``[+] CAPA command (PLAIN/STLS)`` headings; an extra
+        ``[+] CAPA`` would be redundant. Shared ``_base.BaseMain`` stays unchanged.
+        """
+        entry = discovered[code]
+        lock = printlock.PrintLock()
+        ctx = self._make_context(lock, extras)
+        if entry.label.strip():
+            ctx.out(entry.label, "INFO", colortext=True)
+        try:
+            entry.module.run(ctx)
+        except Exception as e:
+            ctx.out(f"Error in module {code}: {e}", "ERROR")
+        with self._lock:
+            self._outputs[code] = lock.get_output_string()
 
     def _prepare_target(self) -> None:
         target = self.args.target
@@ -78,7 +98,7 @@ class POP3(BaseMain):
             "port": self.target[1],
             "tls": bool(getattr(self.args, "tls", False)),
             "starttls": bool(getattr(self.args, "starttls", False)),
-            "connect": lambda: connect_pop3(self.args),
+            "connect": lambda debug=None: connect_pop3(self.args, debug=debug),
             "server_info": cache,
             "report": self.report,
         }

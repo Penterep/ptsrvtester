@@ -143,4 +143,13 @@ class SSHBannerAdapter(TcpConnectionAdapter):
         )
 
 
-__all__ = ["SocketHandle", "TcpConnectionAdapter", "SSHBannerAdapter"]
+def banner_tcp_adapter(host: str, port: int, args) -> TcpConnectionAdapter:
+    """TCP adapter that reads a greeting unless the port is implicit TLS."""
+    timeout = getattr(args, "rate_timeout", 5.0) or 5.0
+    expect_banner = not bool(getattr(args, "tls", False))
+    return TcpConnectionAdapter(
+        host, port, timeout_seconds=timeout, expect_banner=expect_banner
+    )
+
+
+__all__ = ["SocketHandle", "TcpConnectionAdapter", "SSHBannerAdapter", "banner_tcp_adapter"]

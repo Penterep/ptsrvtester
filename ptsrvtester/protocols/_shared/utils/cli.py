@@ -15,12 +15,12 @@ import argparse
 def add_shared_rate_limit_args(parser: argparse.ArgumentParser) -> None:
     """Add the shared RATELIMIT options unless the protocol has its own rate CLI.
 
-    Skipped for protocols that ship their own rate-limit options — RDP
-    (``--rate-count``) and SMTP (``--rate-limit`` for its own ``RATELIM`` test) —
-    so we neither clobber them nor add inert flags a protocol never reads.
+    Skipped only when the protocol already defines ``--rate-count`` (RDP keeps
+    its specialised options and engine). SMTP's ``-rt/--rate-limit`` belongs to
+    the separate ``RATELIM`` test and does not clash with these ``--rate-*`` flags.
     """
     existing = parser._option_string_actions
-    if "--rate-count" in existing or "--rate-limit" in existing:
+    if "--rate-count" in existing:
         return
 
     group = parser.add_argument_group(
@@ -76,4 +76,29 @@ def rate_limit_help_rows(get_colored_text=None) -> list[list[str]]:
     ]
 
 
-__all__ = ["add_shared_rate_limit_args", "rate_limit_help_rows"]
+def rate_limit_test_spec(*, flags: dict | None = None) -> dict:
+    """Registry entry for ``RATELIMIT`` (help text + optional SMTP dest flags)."""
+    spec: dict = {
+        "desc": "Connection rate-limiting test (aggressive)",
+        "long": [
+            "Detect whether connection rate limiting is deployed, how many",
+            "concurrent connections can be held, the connect/disconnect rate,",
+            "and how long an idle connection survives. Active load test —",
+            "runs only when named in -ts, never in the default/ALL sweep.",
+        ],
+        "mods": [
+            ["", "--rate-count", "<n>", "Connections per scenario (default: 30)"],
+            ["", "--rate-concurrency", "<n>", "Parallel connections (default: 10)"],
+            ["", "--rate-timeout", "<seconds>", "Per-connection timeout (default: 5)"],
+            ["", "--rate-hold-seconds", "<seconds>", "Hold time in concurrency check (default: 2)"],
+            ["", "--rate-cooldown-seconds", "<seconds>", "Recovery delay after burst (default: 3)"],
+            ["", "--rate-idle-max", "<seconds>", "Max wait for idle drop; 0 disables (default: 30)"],
+            ["", "--rate-idle-poll", "<seconds>", "Idle liveness poll interval (default: 1)"],
+        ],
+    }
+    if flags:
+        spec["flags"] = flags
+    return spec
+
+
+__all__ = ["add_shared_rate_limit_args", "rate_limit_help_rows", "rate_limit_test_spec"]

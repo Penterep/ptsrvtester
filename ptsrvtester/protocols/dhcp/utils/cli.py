@@ -109,7 +109,7 @@ DHCP_TESTS: dict[str, dict] = {
             ["-nm", "--netmask", "", "Netmask to set in DHCP options"],
             ["-l", "--lease", "", "Lease time to set in DHCP options"],
             ["-rn", "--renewal-time", "", "Renewal time to set in DHCP options"],
-            ["-rb", "--rebinding-time", "Rebinding time to set in DHCP options"],
+            ["-rb", "--rebinding-time", "", "Rebinding time to set in DHCP options"],
             ["-sip", "--server-ip", "", "DHCP server IP to spoof the ACK packet from"]
         ],
         "usage": [
@@ -117,6 +117,26 @@ DHCP_TESTS: dict[str, dict] = {
             "-i eth0 -ip 172.16.14.54 -cmac 99:88:77:66:55:44 -mac 00:11:22:33:44:55 -xid 5",
         ],
         "flags": {"ack": True}
+    },
+    "ROGUE_DHCP": {
+        "desc": "Rogue DHCP server",
+        "long": ["Listens for DHCP REQUEST/DISCOVER packets and responds with OFFER/ACK packets and user-defined options"],
+        "mods": [
+            #["-mac", "--mac-address", "", "Source MAC address to use"]
+            #["-xid", "--transaction-id", "", "Transaction ID to use"]
+        ],
+        "requires": [
+            ["-i", "--interface", "", "Network interface to use"],
+            ["-cip", "--client-ip", "", "IP address to set for the client"],
+            ["-cmac", "--client-mac", "", "MAC address of the client"],
+            ["-nm", "--netmask", "", "Netmask to set in DHCP options"],
+            ["-l", "--lease", "", "Lease time to set in DHCP options"],
+            ["-rn", "--renewal-time", "", "Renewal time to set in DHCP options"],
+            ["-rb", "--rebinding-time", "", "Rebinding time to set in DHCP options"]
+        ],
+        "usage": [
+            "-i eth0 -cmac 99:88:77:66:55:44 -cip 192.168.1.54 -nm 255.255.255.0 -l 7200 -rn 3600 -rb 7200"
+        ]
     }
 }
 #   common    True -> append common outbound message options to per-test help

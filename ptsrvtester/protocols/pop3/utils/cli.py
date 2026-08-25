@@ -7,6 +7,7 @@ from .capa import valid_target_pop3
 from .helpers import ArgsWithBruteforce, Target, add_bruteforce_args, check_if_brute
 from .ptprinthelper import get_colored_text
 from .registry import POP3_TEST_GROUPS, POP3_TESTS, pop3_test_help
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_help_rows
 
 __all__ = ["POP3Args"]
 
@@ -43,6 +44,7 @@ class POP3Args(ArgsWithBruteforce):
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            *rate_limit_help_rows(get_colored_text),
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
             ["-j", "--json", "", "Output in JSON format"],
@@ -59,6 +61,7 @@ class POP3Args(ArgsWithBruteforce):
                 "ptsrvtester pop3 -ts ENCRYPT -tg 127.0.0.1",
                 "ptsrvtester pop3 -ts ALL --tls -tg 127.0.0.1:995",
                 "ptsrvtester pop3 -ts ANON,HELPINFO -tg 127.0.0.1",
+                "ptsrvtester pop3 -ts RATELIMIT -tg 127.0.0.1",
                 "ptsrvtester pop3 -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:110",
                 "ptsrvtester pop3 -ts BRUTE -h",
             ]},

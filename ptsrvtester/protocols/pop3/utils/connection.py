@@ -81,7 +81,7 @@ def fetch_info(
     get_capa: bool = True,
     debug: DebugFn | None = None,
 ) -> InfoResult:
-    """Banner + optional CAPA (and CAPA after STLS upgrade when applicable)."""
+    """Banner + optional CAPA (post-STLS CAPA is fetched later by the CAPA module)."""
     banner = bytes_to_text(pop3.welcome)
     capability = None
     capability_stls = None
@@ -96,26 +96,41 @@ def fetch_info(
             capability = None
             if debug:
                 debug(f"CAPA failed: {e}")
-        if (
-            capability
-            and "STLS" in capability
-            and args.target.port != 995
-            and not args.tls
-            and not isinstance(pop3, poplib.POP3_SSL)
-        ):
-            try:
-                if debug:
-                    debug("STLS available — upgrading for post-STLS CAPA")
-                pop3.stls()
-                capability_stls = pop3.capa()
-                if debug:
-                    debug("CAPA after STLS:")
-                    for line in _capa_lines(capability_stls):
-                        debug(line, indent=8)
-            except Exception as e:
-                if debug:
-                    debug(f"STLS / CAPA after STLS failed: {e}")
     return InfoResult(banner, capability, capability_stls)
+
+
+def fetch_capa_after_stls(args, *, debug: DebugFn | None = None) -> dict | None:
+    """Reconnect, STLS-upgrade, and return post-STLS CAPA (None if unavailable)."""
+    if args.tls or args.target.port == 995:
+        return None
+    pop3 = connect_pop3(args)
+    try:
+        try:
+            caps = pop3.capa()
+        except poplib.error_proto:
+            caps = None
+        if not caps or "STLS" not in caps:
+            if debug:
+                debug("STLS not advertised in CAPA")
+            return None
+        if debug:
+            debug("STLS available — upgrading for post-STLS CAPA")
+        pop3.stls()
+        capability_stls = pop3.capa()
+        if debug:
+            debug("CAPA after STLS:")
+            for line in _capa_lines(capability_stls):
+                debug(line, indent=8)
+        return capability_stls
+    except Exception as e:
+        if debug:
+            debug(f"STLS / CAPA after STLS failed: {e}")
+        return None
+    finally:
+        try:
+            pop3.close()
+        except Exception:
+            pass
 
 
 def probe_server_info(args, *, debug: DebugFn | None = None) -> InfoResult:

@@ -1,6 +1,8 @@
 """FTP -ts registry — help text only (execution is module discovery)."""
 from __future__ import annotations
 
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
+
 FTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "CMD", "ENCRYPT"]),
     ("Authentication & access", ["ANON", "ACCESS", "BRUTE", "USRENUM"]),
@@ -10,6 +12,7 @@ FTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Rate limiting & stress", ["CONNLIM", "DOS"]),
     ("Access control", ["CHROOT"]),
     ("Content security", ["EICAR"]),
+    ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
 ]
 
 FTP_DEFAULT_SUITE: tuple[str, ...] = ("BANNER", "CMD", "ANON")
@@ -168,6 +171,7 @@ FTP_TESTS: dict[str, dict] = {
             ["", "--eicar-post-stor-delay", "<sec>", "Wait after STOR before verify (default 0.5)"],
         ],
     },
+    "RATELIMIT": rate_limit_test_spec(),
 }
 
 

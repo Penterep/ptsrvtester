@@ -20,6 +20,7 @@ except ImportError:
 from .helpers import *
 from .results import *
 from .registry import *
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_help_rows
 
 __all__ = ['SMTPArgs']
 
@@ -92,6 +93,7 @@ class SMTPArgs(ArgsWithBruteforce):
             ["-t", "--threads", "<n>", "Threads for enumeration (default: 1)"],
             ["-d", "--domain", "<domain>", "Recipient domain for RCPT limit tests"],
             ["-R", "--role", "<mta|submission>", "Expected server role"],
+            *rate_limit_help_rows(get_colored_text),
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
             ["-j", "--json", "", "Output in JSON format"],
@@ -111,6 +113,7 @@ class SMTPArgs(ArgsWithBruteforce):
                 "ptsrvtester smtp -ts BOMB -r victim@example.com -tg smtp.example.com:587",
                 "ptsrvtester smtp -ts AV,SSRF,ZIPXXE -r victim@example.com --ssrf-canary-url http://cb --zipxxe-canary-url http://cb -tg smtp.example.com:25",
                 "ptsrvtester smtp -ts ENUM -e ALL -U wordlist.txt -tg mail.example.com:25",
+                "ptsrvtester smtp -ts RATELIMIT -tg mail.example.com:25",
                 "ptsrvtester smtp -ts SPOOF -r victim@example.com -tg smtp.example.com:25",
                 "ptsrvtester smtp -ts BCC -r to@example.com --cc cc@example.com --bcc bcc@example.com -tg smtp.example.com:25",
                 "ptsrvtester smtp -ts AV -h",

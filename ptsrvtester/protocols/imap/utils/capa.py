@@ -67,11 +67,14 @@ IMAP_AUTH_METHOD_LEVEL = {
 }
 
 
-def _parse_capability_commands(capability_list: list[str]) -> list[tuple[str, str]]:
+def _parse_capability_commands(
+    capability_list: list[str], connection_encrypted: bool = False
+) -> list[tuple[str, str]]:
     """
     Parse IMAP CAPABILITY list into (display_string, level) for output.
     Level is OK, WARNING, or ERROR. Expands AUTH=X into separate entries.
-    If STARTTLS is not advertised, appends [✗] STARTTLS (is not allowed).
+    When connection_encrypted is True (TLS or STARTTLS), AUTH= methods are not
+    flagged as cleartext and "STARTTLS (is not allowed)" is not appended.
     """
     if not capability_list:
         return []
@@ -89,7 +92,11 @@ def _parse_capability_commands(capability_list: list[str]) -> list[tuple[str, st
 
         if capa_upper.startswith("AUTH="):
             method = capa_upper[5:].strip()
-            level = IMAP_AUTH_METHOD_LEVEL.get(method, "OK")
+            level = (
+                "OK"
+                if connection_encrypted
+                else IMAP_AUTH_METHOD_LEVEL.get(method, "OK")
+            )
             result.append((capa, level))
             continue
 
@@ -102,7 +109,7 @@ def _parse_capability_commands(capability_list: list[str]) -> list[tuple[str, st
 
         result.append((capa, level))
 
-    if not seen_starttls:
+    if not seen_starttls and not connection_encrypted:
         result.append(("STARTTLS (is not allowed)", "ERROR"))
 
     return result

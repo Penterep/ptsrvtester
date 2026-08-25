@@ -8,7 +8,7 @@ try:
 except ImportError:
     NtlmContext = None
 
-from .._base import BaseModule, BaseArgs, Out
+from .._base import BaseModule, BaseArgs, Out, ModuleContext
 from .utils.helpers import check_if_brute, simple_bruteforce, text_or_file
 
 try:
@@ -852,11 +852,41 @@ class SMTP(ReconMixin, ProtocolMixin, AuthMixin, EnumMixin, RelayMixin, Delivery
                 )
                 self._stream_brute_result()
 
+        if getattr(self.args, "shared_rate_limit", False):
+            self._run_shared_rate_limit()
+
+    def _run_shared_rate_limit(self) -> None:
+        """Run the cross-protocol RATELIMIT module (explicit ``-ts RATELIMIT`` only)."""
+        from ptlibs.threads import printlock
+
+        from .._shared.modules import ratelimit
+        from .._shared.utils.connection import banner_tcp_adapter
+
+        lock = printlock.PrintLock()
+        ctx = ModuleContext(
+            args=self.args,
+            ptjsonlib=self.ptjsonlib,
+            target=(self.target_ip, self.port),
+            print_lock=lock,
+        )
+        ctx.rate_limit_adapter = banner_tcp_adapter(self.target_ip, self.port, self.args)
+        if not self.use_json:
+            self.ptprint("Connection rate limiting", Out.INFO)
+        try:
+            ratelimit.run(ctx)
+        except Exception as e:
+            ctx.out(f"Error in module RATELIMIT: {e}", "ERROR")
+        chunk = lock.get_output_string()
+        if chunk and not self.use_json:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+
     def _run_all_tests(self) -> None:
         """Run all tests in sequence. On failure: print error, continue with next.
 
         Excluded from run-all (use flags explicitly):
         - rate_limit (-rt): opens many connections simultaneously, triggers rate limits (421).
+        - RATELIMIT (-ts RATELIMIT): shared connection rate-limit probe; never part of ALL.
         - rcpt_limit (-rl): many RCPT TO probes per session; use -rl explicitly if needed.
         - rcpt_duplicate (-rdd): repeated RCPT TO for the same address; use -rdd explicitly if needed.
         - invalid_commands (-iv): high server load (fuzzing, long inputs, many connections).

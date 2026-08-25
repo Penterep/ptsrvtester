@@ -224,6 +224,53 @@ class EicarAppendResult(NamedTuple):
     vulnerable: bool
 
 
+# Same titles / payload filenames as SMTP ZIPXXE (terminal + JSON stay aligned).
+ZIPXXE_VARIANT_TITLES: dict[str, str] = {
+    "billion_laughs_attach": "Billion laughs attachment test",
+    "billion_laughs_body": "Billion laughs body test",
+    "xxe_zip": "XXE in ZIP test",
+    "xxe_docx": "XXE in DOCX test",
+    "xxe_body": "XXE in body test",
+    "zip_bomb": "Zip bomb test",
+    "zip_bomb_full": "Zip bomb full test",
+}
+
+ZIPXXE_VARIANT_PAYLOAD_LABELS: dict[str, str] = {
+    "billion_laughs_attach": "billion_laughs.xml",
+    "billion_laughs_body": "body (XML)",
+    "xxe_zip": "report.zip",
+    "xxe_docx": "document.docx",
+    "xxe_body": "body (XML)",
+    "zip_bomb": "zipbomb.zip",
+    "zip_bomb_full": "zipbomb_full.zip",
+}
+
+
+class ZipxxeVariantResult(NamedTuple):
+    """One ZIPXXE APPEND variant (PTL-SVC-IMAP-ZIPXXE; manual verification)."""
+    variant: str
+    sent: int
+    accepted: int
+    rejected: int
+    error: int
+    imap_trace: tuple[str, ...]
+    detail: str | None
+    test_id: str = ""
+
+
+class ZipxxeResult(NamedTuple):
+    """ZIPXXE via APPEND: zip bomb / Billion Laughs / XXE (PTL-SVC-IMAP-ZIPXXE)."""
+    manual_verification_required: bool
+    canary_url: str
+    mailbox: str
+    variants: tuple[ZipxxeVariantResult, ...]
+    elapsed_sec: float
+    auth_used: bool
+    detail: str | None
+    verification_instructions: str
+    all_rejected_at_append: bool
+
+
 class ImapResourceLoadPhase(NamedTuple):
     """One phase of the bounded APPEND / SEARCH resource probe."""
 
@@ -400,6 +447,8 @@ class IMAPResults:
     conn_limits: "ImapConnLimitsResult | None" = None
     conn_limits_error: str | None = None
     eicar: EicarAppendResult | None = None
+    zipxxe: ZipxxeResult | None = None
+    zipxxe_error: str | None = None
     imap_usrenum: ImapUserEnumResult | None = None
     imap_usrenum_error: str | None = None
     imap_usrenum_plain: ImapUserEnumResult | None = None
@@ -423,6 +472,7 @@ class VULNS(Enum):
     ConnLong = "PTV-SVC-IMAP-CONNLONG"
     ConnRate = "PTV-SVC-IMAP-CONNRATE"
     Eicar = "PTV-SVC-IMAP-EICAR"
+    Zipxxe = "PTL-SVC-IMAP-ZIPXXE"
     UserEnumLogin = "PTV-SVC-IMAP-USRENUM"
     ResourceLoad = "PTV-SVC-IMAP-RESLOAD"
     AuthzBypass = "PTV-SVC-IMAP-AUTHZ-BYPASS"

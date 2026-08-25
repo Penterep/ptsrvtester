@@ -7,6 +7,7 @@ from .ftp_types import valid_target_bounce, valid_target_ftp
 from .helpers import ArgsWithBruteforce, Target, add_bruteforce_args, check_if_brute
 from .ptprinthelper import get_colored_text
 from .registry import FTP_TEST_GROUPS, FTP_TESTS, ftp_test_help
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_help_rows
 
 __all__ = ["FTPArgs"]
 
@@ -71,6 +72,7 @@ class FTPArgs(ArgsWithBruteforce):
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            *rate_limit_help_rows(get_colored_text),
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
             ["-j", "--json", "", "Output in JSON format"],
@@ -90,6 +92,7 @@ class FTPArgs(ArgsWithBruteforce):
                 "ptsrvtester ftp -ts ENUMPATH -w paths.txt -u user -p pass -tg 127.0.0.1",
                 "ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1",
                 "ptsrvtester ftp -ts CONNLIM,DOS -u user -p pass -tg 127.0.0.1",
+                "ptsrvtester ftp -ts RATELIMIT -tg 127.0.0.1",
                 "ptsrvtester ftp -ts USRENUM -h",
             ]},
             {"options": options},

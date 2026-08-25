@@ -7,6 +7,7 @@ from .capa import valid_target_imap
 from .helpers import ArgsWithBruteforce, Target, add_bruteforce_args, check_if_brute
 from .ptprinthelper import get_colored_text
 from .registry import IMAP_TEST_GROUPS, IMAP_TESTS, imap_test_help
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_help_rows
 from .results import (
     CONN_LIMIT_DEFAULT_ATTEMPTS,
     _IMAP_LOAD_APPEND_MAX_DEFAULT,
@@ -24,8 +25,13 @@ class IMAPArgs(ArgsWithBruteforce):
     tests: str | None
     module_threads: int
     eicar_mailbox: str
+    zipxxe_canary_url: str | None
+    zipxxe_variants: str | None
+    zipxxe_zip_bomb: bool
+    zipxxe_zip_bomb_full: bool
+    zipxxe_mailbox: str
+    zipxxe_timeout: float
     conn_limits_max: int | None
-    imap_usrenum_wordlist: str | None
     imap_usrenum_password: str | None
     imap_usrenum_max: int
     imap_usrenum_threads: int
@@ -60,6 +66,7 @@ class IMAPArgs(ArgsWithBruteforce):
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            *rate_limit_help_rows(get_colored_text),
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
             ["-j", "--json", "", "Output in JSON format"],
@@ -76,8 +83,10 @@ class IMAPArgs(ArgsWithBruteforce):
                 "ptsrvtester imap -ts ALL --tls -tg 127.0.0.1:993",
                 "ptsrvtester imap -ts ENCRYPT,SNIFF -tg 127.0.0.1:143",
                 "ptsrvtester imap -ts EICAR -u user -p pass -tg 127.0.0.1:143",
-                "ptsrvtester imap -ts USRENUM --usrenum-wordlist users.txt --usrenum-threads 4 -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts ZIPXXE -u user -p pass --zipxxe-canary-url http://cb -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts USRENUM -U users.txt --usrenum-threads 4 -tg 127.0.0.1:143",
                 "ptsrvtester imap -ts TLSAUDIT -tg mail.example.com:993",
+                "ptsrvtester imap -ts RATELIMIT -tg 127.0.0.1",
                 "ptsrvtester imap -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:143",
                 "ptsrvtester imap -ts USRENUM -h",
             ]},
@@ -97,11 +106,12 @@ class IMAPArgs(ArgsWithBruteforce):
   ptsrvtester imap -ts ENCRYPT,SNIFF -tg 127.0.0.1:143
   ptsrvtester imap -ts CONNLIM --cl-max 50 -tg mail.example.com
   ptsrvtester imap -ts EICAR -u user -p pass -tg 127.0.0.1:143
+  ptsrvtester imap -ts ZIPXXE -u user -p pass --zipxxe-canary-url http://cb -tg 127.0.0.1:143
   ptsrvtester imap -ts RESLOAD -u user -p pass -tg 127.0.0.1:143
   ptsrvtester imap -ts MBOXISO -u user -p pass -tg 127.0.0.1:143
   ptsrvtester imap -ts TLSAUDIT -tg mail.example.com:993
-  ptsrvtester imap -ts USRENUM --usrenum-wordlist users.txt --usrenum-threads 4 -tg 127.0.0.1:143
-  ptsrvtester imap -ts USRENUMPLAIN --usrenum-wordlist users.txt -tg 127.0.0.1:143
+  ptsrvtester imap -ts USRENUM -U users.txt --usrenum-threads 4 -tg 127.0.0.1:143
+  ptsrvtester imap -ts USRENUMPLAIN -U users.txt -tg 127.0.0.1:143
   ptsrvtester -j imap -ts BRUTE -u admin -P passwords.txt --brute-threads 20 -tg 127.0.0.1:143
   ptsrvtester imap -ts USRENUM -h"""
 
@@ -133,10 +143,20 @@ class IMAPArgs(ArgsWithBruteforce):
         mods = parser.add_argument_group("TEST OPTIONS")
         mods.add_argument("--eicar-mailbox", default="INBOX", metavar="NAME", dest="eicar_mailbox",
                           help="EICAR: mailbox name for APPEND (default INBOX)")
+        mods.add_argument("--zipxxe-canary-url", metavar="URL", dest="zipxxe_canary_url", default=None,
+                          help="ZIPXXE: canary URL for xxe_zip / xxe_docx / xxe_body")
+        mods.add_argument("--zipxxe-variants", metavar="LIST", dest="zipxxe_variants", default=None,
+                          help="ZIPXXE variants: billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx,xxe_body (default: all). Use --zipxxe-canary-url for xxe_*.")
+        mods.add_argument("--zipxxe-zip-bomb", action="store_true", dest="zipxxe_zip_bomb",
+                          help="ZIPXXE: include zip_bomb (minimal ~200KB; DoS risk)")
+        mods.add_argument("--zipxxe-zip-bomb-full", action="store_true", dest="zipxxe_zip_bomb_full",
+                          help="ZIPXXE: include zip_bomb_full (~100KB→~100MB; extreme DoS risk)")
+        mods.add_argument("--zipxxe-mailbox", default="INBOX", metavar="NAME", dest="zipxxe_mailbox",
+                          help="ZIPXXE: mailbox name for APPEND (default INBOX)")
+        mods.add_argument("--zipxxe-timeout", type=float, default=30.0, metavar="SEC", dest="zipxxe_timeout",
+                          help="ZIPXXE: timeout per message (default: 30)")
         mods.add_argument("--cl-max", type=int, default=None, metavar="N", dest="conn_limits_max",
                           help=f"CONNLIM: max concurrent connections in ramp-up (default {CONN_LIMIT_DEFAULT_ATTEMPTS})")
-        mods.add_argument("--usrenum-wordlist", metavar="FILE", dest="imap_usrenum_wordlist", default=None,
-                          help="USRENUM/USRENUMPLAIN: path to username list (required)")
         mods.add_argument("--usrenum-password", metavar="STR", dest="imap_usrenum_password", default=None,
                           help=f"USRENUM/USRENUMPLAIN: wrong password (default {_IMAP_USRENUM_DEFAULT_PASSWORD!r})")
         mods.add_argument("--usrenum-max", type=int, default=0, metavar="N", dest="imap_usrenum_max",
@@ -178,10 +198,14 @@ def validate_imap_selection(args) -> None:
             None, "BRUTE requires -u/--user or -U/--users; -p/--password or -P/--passwords",
         )
 
-    if ("USRENUM" in codes or "USRENUMPLAIN" in codes) and not getattr(args, "imap_usrenum_wordlist", None):
-        raise argparse.ArgumentError(None, "--usrenum-wordlist is required with USRENUM / USRENUMPLAIN")
+    if ("USRENUM" in codes or "USRENUMPLAIN" in codes) and not (
+        getattr(args, "user", None) or getattr(args, "users", None)
+    ):
+        raise argparse.ArgumentError(
+            None, "USRENUM / USRENUMPLAIN requires -u/--user or -U/--users",
+        )
 
-    need_single_login = {"EICAR", "RESLOAD", "MBOXISO"} & set(codes)
+    need_single_login = {"EICAR", "RESLOAD", "MBOXISO", "ZIPXXE"} & set(codes)
     if need_single_login:
         u = getattr(args, "user", None)
         p = getattr(args, "password", None)
@@ -189,6 +213,28 @@ def validate_imap_selection(args) -> None:
             raise argparse.ArgumentError(
                 None, f"{', '.join(sorted(need_single_login))} requires -u/--user and -p/--password (no wordlists)",
             )
+
+    if "ZIPXXE" in codes:
+        variants_arg = getattr(args, "zipxxe_variants", None)
+        zipxxe_variants = [
+            v.strip().lower()
+            for v in (variants_arg or "billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx,xxe_body").split(",")
+            if v.strip()
+        ]
+        if getattr(args, "zipxxe_zip_bomb", False):
+            zipxxe_variants.append("zip_bomb")
+        if getattr(args, "zipxxe_zip_bomb_full", False):
+            zipxxe_variants.append("zip_bomb_full")
+        if any(v in {"xxe_zip", "xxe_docx", "xxe_body"} for v in zipxxe_variants):
+            canary = getattr(args, "zipxxe_canary_url", None) or ""
+            if not str(canary).strip():
+                raise argparse.ArgumentError(
+                    None,
+                    "ZIPXXE with xxe_zip/xxe_docx/xxe_body requires --zipxxe-canary-url (canary/callback URL)",
+                )
+        mb = (getattr(args, "zipxxe_mailbox", None) or "INBOX").strip()
+        if not mb:
+            raise argparse.ArgumentError(None, "--zipxxe-mailbox must be non-empty after trim")
 
     if "USRENUM" in codes or "USRENUMPLAIN" in codes:
         if int(getattr(args, "imap_usrenum_threads", 1) or 1) < 1:

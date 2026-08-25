@@ -12,10 +12,12 @@ def ensure_info(ctx, *, get_commands: bool = True):
     if e.results.info is not None or getattr(e.results, "info_error", None):
         return e
     try:
-        e.imap = e.connect()
+        e._dbg("Initial server information")
+        e.imap = e.connect(trace=True)
         e.results.info = e.info(get_commands=get_commands)
     except Exception as ex:
         msg = str(ex)
+        e._dbg(f"Initial server probe failed: {e._snip(msg)}")
         e.results.info_error = msg
         ctx.report.set_connect_error(msg)
         ctx.out(msg, "ERROR", indent=4)

@@ -1,9 +1,12 @@
 """POP3 -ts registry — used for help text only (execution is module discovery)."""
 from __future__ import annotations
 
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
+
 POP3_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "NTLM", "HELPINFO"]),
     ("Authentication & credentials", ["ANON", "BRUTE"]),
+    ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
 ]
 
 # Default suite when -ts is omitted or ALL (preserves previous POP3 behaviour).
@@ -68,6 +71,7 @@ POP3_TESTS: dict[str, dict] = {
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
         ],
     },
+    "RATELIMIT": rate_limit_test_spec(),
 }
 
 

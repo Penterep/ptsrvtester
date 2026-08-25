@@ -1,13 +1,16 @@
 """IMAP -ts registry — help text only (execution is module discovery)."""
 from __future__ import annotations
 
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
+
 IMAP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "NTLM"]),
     ("Protocol & validation", ["SNIFF", "INVCMD"]),
     ("Authentication & enumeration", ["ANON", "USRENUM", "USRENUMPLAIN", "BRUTE"]),
-    ("Content security", ["EICAR"]),
+    ("Content security", ["EICAR", "ZIPXXE"]),
     ("Rate limiting & stress", ["CONNLIM", "RESLOAD"]),
     ("Access control & TLS", ["MBOXISO", "TLSAUDIT"]),
+    ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
 ]
 
 # Default suite when -ts omitted or ALL (matches previous IMAP default recon behaviour).
@@ -68,12 +71,13 @@ IMAP_TESTS: dict[str, dict] = {
     "USRENUM": {
         "desc": "LOGIN user enumeration",
         "long": [
-            "LOGIN each name from the wordlist with a fixed wrong password and",
+            "LOGIN each name from -u/-U with a fixed wrong password and",
             "compare errors against non-existent baselines.",
         ],
-        "requires": ["--usrenum-wordlist <file>"],
+        "requires": ["-u/--user or -U/--users"],
         "mods": [
-            ["", "--usrenum-wordlist", "<file>", "Username list (required)"],
+            ["-u", "--user", "<name>", "Single candidate username"],
+            ["-U", "--users", "<wordlist>", "Username wordlist (required unless -u)"],
             ["", "--usrenum-password", "<str>", "Wrong password for every probe"],
             ["", "--usrenum-max", "<n>", "Limit names read from wordlist (0 = no limit)"],
             ["", "--usrenum-threads", "<n>", "Parallel TCP sessions (default 1)"],
@@ -82,12 +86,13 @@ IMAP_TESTS: dict[str, dict] = {
     "USRENUMPLAIN": {
         "desc": "AUTHENTICATE PLAIN user enumeration",
         "long": [
-            "AUTHENTICATE PLAIN (SASL) each name from the wordlist with a wrong",
+            "AUTHENTICATE PLAIN (SASL) each name from -u/-U with a wrong",
             "password; use when CAPABILITY lists LOGINDISABLED.",
         ],
-        "requires": ["--usrenum-wordlist <file>"],
+        "requires": ["-u/--user or -U/--users"],
         "mods": [
-            ["", "--usrenum-wordlist", "<file>", "Username list (required)"],
+            ["-u", "--user", "<name>", "Single candidate username"],
+            ["-U", "--users", "<wordlist>", "Username wordlist (required unless -u)"],
             ["", "--usrenum-password", "<str>", "Wrong password for every probe"],
             ["", "--usrenum-max", "<n>", "Limit names read from wordlist (0 = no limit)"],
             ["", "--usrenum-threads", "<n>", "Parallel TCP sessions (default 1)"],
@@ -116,6 +121,24 @@ IMAP_TESTS: dict[str, dict] = {
         "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [
             ["", "--eicar-mailbox", "<name>", "Mailbox name for APPEND (default INBOX)"],
+        ],
+    },
+    "ZIPXXE": {
+        "desc": "Zip bomb, Billion Laughs, XXE",
+        "long": [
+            "After LOGIN, APPEND RFC 822 messages with Zip bomb, Billion Laughs",
+            "and XXE payloads (same variants as SMTP ZIPXXE). APPEND is valid in",
+            "authenticated state (RFC 3501 §6.3.11); SELECT is not required.",
+            "XXE variants require a canary URL. Impact is manual (CPU / canary).",
+        ],
+        "requires": ["-u/--user and -p/--password (no wordlists)", "--zipxxe-canary-url for xxe_* variants"],
+        "mods": [
+            ["", "--zipxxe-canary-url", "<URL>", "Canary URL for xxe_zip / xxe_docx / xxe_body"],
+            ["", "--zipxxe-variants", "<v1,v2,...>", "billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx,xxe_body (default: all)"],
+            ["", "--zipxxe-zip-bomb", "", "Include zip_bomb (minimal ~200KB; DoS risk!)"],
+            ["", "--zipxxe-zip-bomb-full", "", "Include zip_bomb_full (~100KB→~100MB; extreme DoS risk!)"],
+            ["", "--zipxxe-mailbox", "<name>", "Mailbox name for APPEND (default INBOX)"],
+            ["", "--zipxxe-timeout", "<sec>", "Per-message timeout (default: 30)"],
         ],
     },
     "CONNLIM": {
@@ -161,6 +184,7 @@ IMAP_TESTS: dict[str, dict] = {
             "Implicit TLS on 993 (or --tls), otherwise STARTTLS when advertised.",
         ],
     },
+    "RATELIMIT": rate_limit_test_spec(),
 }
 
 

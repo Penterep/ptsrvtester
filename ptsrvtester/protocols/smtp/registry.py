@@ -19,6 +19,8 @@ except ImportError:
 from .helpers import *
 from .results import *
 
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
+
 __all__ = ['_smtp_users_file_supplies_name_list', '_rcpt_limit_active', '_rcpt_limit_send_mode', '_rcpt_limit_max_attempts', '_normalize_smtp_role', '_TS_COMMON_MSG', 'SMTP_TEST_GROUPS', 'SMTP_TESTS', 'SMTP_SEND_REQUIRED', 'SMTP_TEST_DESTS', 'SMTP_VALUE_DESTS', '_smtp_parse_test_codes', '_apply_smtp_tests', '_smtp_test_help']
 
 
@@ -85,7 +87,7 @@ SMTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Protocol & validation", ["HELOVAL", "HELOONLY", "HELOBYP", "INVCMD"]),
     ("Relay & addressing", ["OPENREL", "PROBEDOM", "ALIAS", "BCC", "SPOOF", "BOUNCE"]),
     ("Enumeration & credentials", ["ENUM", "BRUTE"]),
-    ("Rate limiting & stress", ["RATELIM", "RCPTLIM", "RCPTDUP", "NOOP1", "NOOP2", "BOMB", "FLOOD"]),
+    ("Rate limiting & stress", ["RATELIM", "RATELIMIT", "RCPTLIM", "RCPTDUP", "NOOP1", "NOOP2", "BOMB", "FLOOD"]),
     ("Content security", ["AV", "SSRF", "ZIPXXE"]),
     ("Indirect (no direct SMTP connection)", ["BLACKLIST", "SPF"]),
     ("Utility", ["INTERACT"]),
@@ -282,6 +284,7 @@ SMTP_TESTS: dict[str, dict] = {
             ["-rt", "--rate-limit", "<n>", f"Max simultaneous connections to attempt (default: {RATE_LIMIT_DEFAULT_ATTEMPTS})"],
         ],
     },
+    "RATELIMIT": rate_limit_test_spec(flags={"shared_rate_limit": True}),
     "RCPTLIM": {
         "desc": "Test RCPT TO recipient limit",
         "long": ["Storm RCPT TO in one message to find the per-message recipient",
@@ -436,6 +439,7 @@ SMTP_TEST_DESTS: tuple[str, ...] = (
     "spoof_headers", "alias_test", "isencrypt", "ntlm", "noop_flood1",
     "probe_accepted_domain", "open_relay", "role_identify", "interactive",
     "blacklist_test", "spf_test", "bomb", "antivirus", "ssrf", "flood", "zipxxe",
+    "shared_rate_limit",
 )
 
 # Value-carrying tests whose dest doubles as the selection signal (``None`` means

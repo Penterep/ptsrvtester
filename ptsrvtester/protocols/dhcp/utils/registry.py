@@ -4,6 +4,7 @@ from typing import Optional
 import re
 import argparse
 import netifaces as ni
+from ptlibs.ptjsonlib import PtJsonLib
 
 # DHCP dependencies
 try:
@@ -209,3 +210,23 @@ def get_option(options: list|None, search_term: str) -> str|None:
                 return value
 
     return None
+
+def add_options_to_json(options: list|None):
+    opt_dict = {}
+
+    if options is None:
+        return {}
+
+    for o in range(1, len(options)):
+        if options[o] == "end":
+            break
+        option = options[o]
+        if isinstance(option, tuple):
+            key, *values = option
+            value_str = ", ".join(str(v) for v in values)
+        else:
+            key, value_str = str(option), ""
+
+        opt_dict.update({key: value_str})
+
+    return opt_dict

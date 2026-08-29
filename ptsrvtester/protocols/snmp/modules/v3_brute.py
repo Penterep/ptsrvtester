@@ -164,8 +164,12 @@ async def snmpv3_brute(ctx) -> list[Credential] | None:
     if found_credentials:
         # self.ctx.out("\n")
         ctx.out("Found credentials:", "INFO",  indent=4)
+        creds_dict = {}
         for cred in found_credentials:
             ctx.out(f"Username: {cred.username}, Password: {cred.password}", "VULN",  indent=8)
+            creds_dict.update({cred.username: cred.password})
+        cred_node = ctx.ptjsonlib.create_node_object("found_v3_credentials", properties=creds_dict)
+        ctx.ptjsonlib.add_node(cred_node)
 
     if successful_protocol:
         auth_name = PROTOCOL_NAMES.get(successful_protocol.auth_protocols, "Unknown Protocol")
@@ -173,6 +177,12 @@ async def snmpv3_brute(ctx) -> list[Credential] | None:
         # self.ctx.out("\n")
         ctx.out(f"Successful Authentication and Private protocols are: {auth_name} and {priv_name}", "INFO",
                  indent=4)
+        proto_node = ctx.ptjsonlib.create_node_object("auth_priv_protocols",
+                                                      properties={
+                                                          "auth_proto": auth_name,
+                                                          "priv_proto": priv_name
+                                                      })
+        ctx.ptjsonlib.add_node(proto_node)
 
     else:
         # self.ctx.out("\n")

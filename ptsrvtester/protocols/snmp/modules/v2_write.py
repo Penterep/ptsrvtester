@@ -1,3 +1,5 @@
+from venv import create
+
 from ptsrvtester.protocols.snmp.utils.registry import text_or_file, WriteTestResult
 from pysnmp.hlapi.v3arch.asyncio import *
 import asyncio
@@ -62,6 +64,12 @@ async def test_snmpv2_write_permission(ctx) -> list[WriteTestResult]:
 
         except Exception as e:
             ctx.out(f"Exception occurred: {e}", "ERROR", indent=8)
+
+    if results:
+        json_results = [{"OID": res.OID, "creds": res.creds, "value": res.value} for res in results]
+        node = ctx.ptjsonlib.create_node_object("snmpv2_write_test_results", properties={"results": json_results})
+        ctx.ptjsonlib.add_node(node)
+        ctx.ptjsonlib.add_vulnerability("PTV-SNMP-V2-WRITE-ACCESS")
 
     return results
 

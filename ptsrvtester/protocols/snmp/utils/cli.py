@@ -295,9 +295,6 @@ class SNMPArgs(ArgsWithBruteforce):
         # SNMPv2 Brute Force
         snmpv2_brute_parser = snmp_subparsers.add_argument_group(title="v2brute",
                                                                  description="SNMPv2 dictionary attack")
-        snmp_subparsers.add_argument("-w", "--write-to-file", help="File to save the output results.",
-                                         default=None,
-                                         type=str)
 
         # user_group1 = snmpv2_brute_parser.add_mutually_exclusive_group(required=True)
         snmp_subparsers.add_argument("-c", "--single-community", "--community", help="Single community string")

@@ -56,6 +56,9 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
             for community in valid_communities:
                 write_to_file(ctx.write_to_file, community)
 
+        node = ctx.ptjsonlib.create_node_object("valid_community_strings", properties={"valid": valid_communities})
+        ctx.ptjsonlib.add_node(node)
+
     else:
         ctx.out("No valid communities found", "OK", indent=4)
 

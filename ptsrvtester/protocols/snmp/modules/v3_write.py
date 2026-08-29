@@ -4,7 +4,7 @@ from ptsrvtester.protocols.snmp.utils.registry import (WriteTestResult, PROTOCOL
                                                        AuthPrivProtocols, Credential)
 
 __MODULELABEL__ = "SNMPv3 Write Permission Test"
-__MODULECODE__ = "v2_write"
+__MODULECODE__ = "v3_write"
 __ORDER__ = 100
 
 

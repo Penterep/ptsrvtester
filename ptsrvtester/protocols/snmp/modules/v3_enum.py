@@ -16,6 +16,7 @@ async def user_enum(ctx) -> list[str]:
     # self.ctx.out("Starting username enumeration...", title=True)
     # self.drawDoubleLine()
     valid_usernames = set()
+    potentially_valid_usernames = set()
 
     for username in users:
         try:
@@ -33,7 +34,7 @@ async def user_enum(ctx) -> list[str]:
                 valid_usernames.add(username)
             elif "Wrong SNMP PDU digest" in str(errorIndication):
                 ctx.out(f"Potential valid username: {username}", "WARNING",  indent=4)
-                valid_usernames.add(username)
+                potentially_valid_usernames.add(username)
             else:
 
                 ctx.out(f"Error for username {username}: {errorIndication or errorStatus}", "ERROR",
@@ -42,17 +43,35 @@ async def user_enum(ctx) -> list[str]:
         except Exception as e:
             ctx.out(f"Error for username {username}: {e}", "ERROR",  indent=4)
 
+    user_dict = {}
+
     if valid_usernames:
         # self.ctx.out("\n")
-        ctx.out(f"Potential valid usernames:", "INFO",
+        user_dict.update({"valid_usernames": list(valid_usernames)})
+        ctx.out(f"Valid usernames:", "INFO",
                 indent=4)
         for username in valid_usernames:
             ctx.out(username, "VULN",  indent=8)
         if ctx.write_to_file:
             for username in valid_usernames:
                 write_to_file(ctx.write_to_file, username)
+
+    elif potentially_valid_usernames:
+        ctx.out(f"Potentially valid usernames:", "INFO",
+                indent=4)
+        for username in potentially_valid_usernames:
+            ctx.out(username, "VULN",  indent=8)
+        if ctx.write_to_file:
+            for username in potentially_valid_usernames:
+                write_to_file(ctx.write_to_file, username)
+        user_dict.update({"potentially_valid_usernames": list(potentially_valid_usernames)})
+
     else:
         ctx.out("No valid usernames found", "OK",  indent=4)
+
+    if valid_usernames or potentially_valid_usernames:
+        node = ctx.ptjsonlib.create_node_object("snmpv3_users", properties=user_dict)
+        ctx.ptjsonlib.add_node(node)
 
     return list(valid_usernames)
 

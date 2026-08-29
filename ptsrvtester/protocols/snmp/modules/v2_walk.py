@@ -50,6 +50,8 @@ async def _getBulk_SNMPv2(ctx) -> str:
                 ObjectType(ObjectIdentity(ctx.oid))
             )
 
+            oids = {}
+
             # Iterate over the returned OID-value pairs
             async for errorIndication, errorStatus, errorIndex, varBinds in objects:
                 if errorIndication:
@@ -80,14 +82,18 @@ async def _getBulk_SNMPv2(ctx) -> str:
 
                         # Construct the final formatted string
                         formatted_output = f"{oid} = {value_output}"
+                        oids.update({str(oid): value_output})
                         ctx.out(formatted_output, "TEXT", indent=8)
                         results.append(formatted_output)
 
             # Stop the loop if results are found
             if results:
+                node = ctx.ptjsonlib.create_node_object("snmpv2_walk_results", properties=oids)
+                ctx.ptjsonlib.add_node(node)
                 ctx.out(f"Results found with community '{community}', stopping further attempts.", "VULN",
                         indent=8)
                 result = "success"
+                ctx.ptjsonlib.add_vulnerability("PTV-SNMP-V2-WALK")
                 break
 
 

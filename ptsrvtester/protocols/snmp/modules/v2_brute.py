@@ -23,11 +23,6 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
        - list[Credential]: A list of valid communities found during the attack.
        - None: If no credentials are found or required inputs are missing.
     """
-
-    if not ctx.community_file and not ctx.single_community:
-        ctx.out("Error: Neither a community file nor a single community string was provided.", "WARNING",
-                indent=4)
-        return []
         
     communities = text_or_file(ctx.single_community, ctx.community_file)
     valid_communities = []
@@ -42,10 +37,12 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
         errorIndication, errorStatus, errorIndex, varBinds = await iterator
 
         if not errorIndication and not errorStatus:
-            ctx.out(f"Valid community string found: {community}", "VULN", indent=4)
+            ctx.out(f"Valid community string found: {community}", "ADDITIONS", indent=4, condition=ctx.verbose,
+                    colortext=True)
             valid_communities.append(community)
         else:
-            ctx.out(f"Error: {errorIndication or errorStatus} for {community}", "ERROR", indent=4)
+            ctx.out(f"Error: {errorIndication or errorStatus} for {community}", "ADDITIONS", indent=4,
+                    condition=ctx.verbose, colortext=True)
 
     if valid_communities:
         #self.ptprint("\n")

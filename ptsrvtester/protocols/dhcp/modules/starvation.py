@@ -54,6 +54,7 @@ def _run_starvation(ctx):
         ctx.out(f"[-] Error during starvation: {str(e)}", "ERROR", indent=4)
 
     ctx.out(f"[*] Total IPs obtained: {count}", "INFO", indent=4)
+    ctx.ptjsonlib.add_vulnerabiltiy("PTV-DHCP-STARVATION")
 
 def run(ctx):
     _run_starvation(ctx)

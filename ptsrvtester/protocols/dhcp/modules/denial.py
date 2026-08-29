@@ -31,6 +31,7 @@ def _run_denial(ctx):
         ctx.out(f"[-] Error during DoS: {str(e)}", "ERROR", indent=4)
 
     ctx.out(f"[*] Total packets sent: {count}", "INFO", indent=4)
+    ctx.ptjsonlib.add_vulnerabiltiy("PTV-DHCP-DOS")
     
 def run(ctx):
     _run_denial(ctx)

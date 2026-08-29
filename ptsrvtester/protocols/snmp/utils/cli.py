@@ -302,7 +302,7 @@ class SNMPArgs(ArgsWithBruteforce):
 
         # SNMPv2 Write Permission
         snmpv2_write_parser = snmp_subparsers.add_argument_group("v2write", description="Test SNMPv2 write permission")
-        snmpv2_write_parser.add_argument("-v", "--value", default="Testvalue123",
+        snmpv2_write_parser.add_argument("-val", "--value", default="Testvalue123",
                                          help="Value to write to the specified OID (default: 'Testvalue123')")
 
         # SNMPv2 GetBulk (Walk)

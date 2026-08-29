@@ -46,7 +46,7 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
     errorIndication, errorStatus, errorIndex, varBinds = iterator
 
     if errorIndication:
-        ctx.out(f"Error!: {errorIndication}", "ERROR", indent=4)
+        ctx.out(f"SNMPv1 detection error: {errorIndication}", "ERROR", indent=4)
     elif errorStatus:
         ctx.out(
             "{} at {}".format(
@@ -60,7 +60,7 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
         versions.update({"v1": True})
         for varBind in varBinds:
             ctx.out(
-                f"Success!: {' = '.join([x.prettyPrint() for x in varBind])}",
+                f"SNMPv1 detection success!: {' = '.join([x.prettyPrint() for x in varBind])}",
                 "OK",
                 indent=4,
             )
@@ -79,9 +79,9 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
     errorIndication, errorStatus, errorIndex, varBinds = iterator
 
     if errorIndication:
-        ctx.out(f"Error!: {errorIndication}", "ERROR", indent=4)
+        ctx.out(f"SNMPv2c detection error: {errorIndication}", "ERROR", indent=4)
     elif errorStatus:
-        ctx.out(f"Error!: {errorIndication}", "ERROR", indent=4)
+        ctx.out(f"SNMPv2c detection error: {errorIndication}", "ERROR", indent=4)
         ctx.out(
             "{} at {}".format(
                 errorStatus.prettyPrint(),
@@ -94,7 +94,7 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
         versions.update({"v2c": True})
         for varBind in varBinds:
             ctx.out(
-                f"Success!: {' = '.join([x.prettyPrint() for x in varBind])}",
+                f"SNMPv2c detection success: {' = '.join([x.prettyPrint() for x in varBind])}",
                 "OK",
                 indent=4,
             )
@@ -113,9 +113,9 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
 
     if errorIndication:
         if isinstance(errorIndication, RequestTimedOut):
-            ctx.out(f"Error!: {errorIndication}", "ERROR", indent=4)
+            ctx.out(f"SNMPv3 detection error: {errorIndication}", "ERROR", indent=4)
         else:
-            ctx.out(f"Success!: {errorIndication}", "OK", indent=4)
+            ctx.out(f"SNMPv3 detection success: {errorIndication}", "OK", indent=4)
             versions.update({"v3": True})
     elif errorStatus:
         ctx.out(
@@ -135,7 +135,6 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
                 indent=4
             )
 
-    print(versions.values())
     if not any(versions.values()):
         ctx.out("No SNMP version detected", "OK", indent=4)
         return SNMPVersion(**versions)

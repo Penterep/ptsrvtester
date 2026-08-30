@@ -10,7 +10,8 @@ from ptsrvtester.protocols.dhcp.utils.registry import (
     get_gateway_mac,
     get_interface_ip,
     print_dhcp_options,
-    get_option
+    get_option,
+    add_options_to_json
 )
 
 from scapy.sendrecv import AsyncSniffer
@@ -84,11 +85,16 @@ def _get_server_info(ctx):
                 offered_ip = packet[BOOTP].yiaddr if packet.haslayer(BOOTP) else None
                 options = packet[DHCP].options
                 ctx.out("DHCP Server Information", "VULN", indent=4)
+                ctx.ptjsonlib.add_vulnerability("PTV-DHCP-SERVER-INFO")
+                opt_dict = add_options_to_json(options)
+                node = ctx.ptjsonlib.create_node_object("dhcp_server_info", properties=opt_dict)
+                ctx.ptjsonlib.add_node(node)
                 print_dhcp_options(ctx, options, 4)
 
                 if server_ip := get_option(options, "server_id"):
                     if _is_relay(offered_ip, server_ip, get_option(options, "subnet_mask")):
                         ctx.out(f"DHCP relay detected", "INFO", indent=12)
+                        ctx.ptjsonlib.add_vulnerability("PTV-DHCP-RELAY")
                         _contact_server(ctx, src_mac, get_option(options, "router"),
                                         get_option(options, "server_id"), transaction_id)
 

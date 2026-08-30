@@ -291,9 +291,9 @@ class DHCPArgs(BaseArgs):
         dhcp_ack_sender.add_argument("-cip", "--client-ip", type=is_valid_ip,
                                      help="IP Address to set for the client")
         dhcp_ack_sender.add_argument("-nm", "--netmask", help="Netmask to set in DHCP options")
-        dhcp_ack_sender.add_argument("-l", "--lease", help="Lease time to set in DHCP options")
-        dhcp_ack_sender.add_argument("-rn", "--renewal-time", help="Renewal time to set in DHCP options")
-        dhcp_ack_sender.add_argument("-rb", "--rebinding-time", help="Rebinding time to set in DHCP options")
+        dhcp_ack_sender.add_argument("-l", "--lease", help="Lease time to set in DHCP options", type=int)
+        dhcp_ack_sender.add_argument("-rn", "--renewal-time", help="Renewal time to set in DHCP options", type=int)
+        dhcp_ack_sender.add_argument("-rb", "--rebinding-time", help="Rebinding time to set in DHCP options", type=int)
         dhcp_ack_sender.add_argument("-sip", "--server-ip", help="DHCP server IP to spoof the ACK packet from")
 
 # endregion

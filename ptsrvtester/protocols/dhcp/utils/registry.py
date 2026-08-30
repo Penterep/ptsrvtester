@@ -174,6 +174,16 @@ def prepare_ack_packet(src_mac, dst_mac, transaction_id, offered_ip, netmask, ga
     bootp.getlayer(BOOTP).chaddr = bytes.fromhex(mac_remove_colons(dst_mac))
     return bootp / dhcp
 
+def prepare_nack_packet(src_mac, dst_mac, server_ip, transaction_id):
+    dhcp = DHCP(options=[("message-type", "nak"),
+                         ("server_id", server_ip),
+                         "end"])
+    bootp = prepare_bootp(src_mac, MAC_BROADCAST, 67, 68, server_ip, IP_BROADCAST, transaction_id)
+    bootp.getlayer(BOOTP).yiaddr = "0.0.0.0"
+    bootp.getlayer(BOOTP).op = 2
+    bootp.getlayer(BOOTP).flags = BROADCAST_FLAG
+    bootp.getlayer(BOOTP).chaddr = bytes.fromhex(mac_remove_colons(dst_mac))
+    return bootp / dhcp
 
 def check_lease(lease) -> bool:
     """Checks if lease duration is 30 days or more"""

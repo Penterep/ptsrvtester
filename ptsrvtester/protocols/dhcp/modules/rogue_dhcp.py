@@ -148,5 +148,4 @@ def _spoof_dhcp(ctx):
 
 
 def run(ctx):
-    print(ctx.args)
     _spoof_dhcp(ctx)

@@ -19,6 +19,16 @@ def structure_args(**overrides) -> RDPArgs:
         "login": None,
         "password": None,
         "insecure_auth": False,
+        "auth_methods": None,
+        "realm": None,
+        "kdc": None,
+        "spn_host": None,
+        "users": None,
+        "allow_auth_failures": False,
+        "guess_attempts": 10,
+        "guess_delay_ms": 100,
+        "lockout_test": False,
+        "lockout_attempts": 3,
         "allow_load_test": False,
         "rate_mode": "both",
         "rate_count": 30,
@@ -48,7 +58,7 @@ def parse_rdp_args(*arguments: str) -> RDPArgs:
     )
 
 
-class RDPRateLimitCLIParserTests(unittest.TestCase):
+class RDPCLIParserTests(unittest.TestCase):
     def assert_parse_rejected(self, *arguments: str) -> None:
         with (
             patch("sys.stderr", new=io.StringIO()),
@@ -57,10 +67,20 @@ class RDPRateLimitCLIParserTests(unittest.TestCase):
             parse_rdp_args(*arguments)
         self.assertNotEqual(raised.exception.code, 0)
 
-    def test_rate_options_have_safe_defaults_and_no_implicit_opt_in(self):
+    def test_active_options_have_safe_defaults_and_no_implicit_opt_in(self):
         args = parse_rdp_args()
 
         self.assertIsNone(args.tests)
+        self.assertIsNone(args.auth_methods)
+        self.assertIsNone(args.realm)
+        self.assertIsNone(args.kdc)
+        self.assertIsNone(args.spn_host)
+        self.assertIsNone(args.users)
+        self.assertFalse(args.allow_auth_failures)
+        self.assertEqual(args.guess_attempts, 10)
+        self.assertEqual(args.guess_delay_ms, 100)
+        self.assertFalse(args.lockout_test)
+        self.assertEqual(args.lockout_attempts, 3)
         self.assertFalse(args.allow_load_test)
         self.assertEqual(args.rate_mode, "both")
         self.assertEqual(args.rate_count, 30)
@@ -110,6 +130,77 @@ class RDPRateLimitCLIParserTests(unittest.TestCase):
         self.assertEqual(args.rate_hold_seconds, 0.0)
         self.assertEqual(args.rate_cooldown_seconds, 0.0)
 
+    def test_authentication_options_parse_at_upper_safety_boundaries(self):
+        args = parse_rdp_args(
+            "-ts",
+            "AUTHMETHODS",
+            "USERENUM",
+            "BRUTEPROT",
+            "--auth-methods",
+            "ntlm",
+            "kerberos",
+            "--realm",
+            "EXAMPLE.TEST",
+            "--kdc",
+            "192.0.2.20",
+            "--spn-host",
+            "rdp.example.test",
+            "--users",
+            "users.txt",
+            "--allow-auth-failures",
+            "--guess-attempts",
+            "100",
+            "--guess-delay-ms",
+            "60000",
+            "--lockout-test",
+            "--lockout-attempts",
+            "20",
+        )
+
+        self.assertEqual(
+            args.tests,
+            ["AUTHMETHODS", "USERENUM", "BRUTEPROT"],
+        )
+        self.assertEqual(args.auth_methods, ["ntlm", "kerberos"])
+        self.assertEqual(args.realm, "EXAMPLE.TEST")
+        self.assertEqual(args.kdc, "192.0.2.20")
+        self.assertEqual(args.spn_host, "rdp.example.test")
+        self.assertEqual(args.users, "users.txt")
+        self.assertTrue(args.allow_auth_failures)
+        self.assertEqual(args.guess_attempts, 100)
+        self.assertEqual(args.guess_delay_ms, 60_000)
+        self.assertTrue(args.lockout_test)
+        self.assertEqual(args.lockout_attempts, 20)
+
+    def test_authentication_options_accept_lower_safety_boundaries(self):
+        args = parse_rdp_args(
+            "--guess-attempts",
+            "2",
+            "--guess-delay-ms",
+            "0",
+            "--lockout-attempts",
+            "1",
+        )
+
+        self.assertEqual(args.guess_attempts, 2)
+        self.assertEqual(args.guess_delay_ms, 0)
+        self.assertEqual(args.lockout_attempts, 1)
+
+    def test_invalid_authentication_choices_and_ranges_are_rejected(self):
+        invalid_values = (
+            ("--auth-methods", "certificate"),
+            ("--guess-attempts", "1"),
+            ("--guess-attempts", "101"),
+            ("--guess-attempts", "many"),
+            ("--guess-delay-ms", "-1"),
+            ("--guess-delay-ms", "60001"),
+            ("--lockout-attempts", "0"),
+            ("--lockout-attempts", "21"),
+        )
+        for option, value in invalid_values:
+            with self.subTest(option=option, value=value):
+                self.assert_parse_rejected(option, value)
+
     def test_invalid_rate_choices_and_ranges_are_rejected(self):
         invalid_values = (
             ("--rate-mode", "burst"),
@@ -128,12 +219,27 @@ class RDPRateLimitCLIParserTests(unittest.TestCase):
             with self.subTest(option=option, value=value):
                 self.assert_parse_rejected(option, value)
 
-    def test_load_opt_in_does_not_accept_a_boolean_value(self):
-        self.assert_parse_rejected("--allow-load-test=false")
+    def test_boolean_opt_ins_do_not_accept_values(self):
+        for argument in (
+            "--allow-auth-failures=false",
+            "--lockout-test=false",
+            "--allow-load-test=false",
+        ):
+            with self.subTest(argument=argument):
+                self.assert_parse_rejected(argument)
+
+    def test_help_states_active_authentication_scope_and_risks(self):
+        help_text = str(RDPArgs.get_help())
+
+        self.assertIn("can contribute to lockout", help_text)
+        self.assertIn("random nonexistent identities", help_text)
+        self.assertIn("may lock the supplied disposable account", help_text)
+        self.assertIn("BRUTEPROT --allow-auth-failures", help_text)
+        self.assertIn("--lockout-test", help_text)
 
 
 class RDPStructureTests(unittest.TestCase):
-    def test_public_entrypoint_and_discovery_expose_all_ten_tests(self):
+    def test_public_entrypoint_and_discovery_expose_all_thirteen_tests(self):
         self.assertIs(RDP, RDPMain)
         self.assertEqual(MODULES["rdp"][0], "ptsrvtester.protocols.rdp:RDP")
 
@@ -145,7 +251,14 @@ class RDPStructureTests(unittest.TestCase):
             sorted(discovered, key=lambda code: (discovered[code].order, code)),
             list(RDP_TEST_ORDER),
         )
-        self.assertEqual(len({entry.order for entry in discovered.values()}), 10)
+        self.assertEqual(len(discovered), 13)
+        self.assertEqual(len({entry.order for entry in discovered.values()}), 13)
+
+    def test_active_authentication_tests_are_explicit_only(self):
+        self.assertEqual(
+            RDP_EXPLICIT_ONLY_TESTS,
+            frozenset({"AUTHMETHODS", "USERENUM", "BRUTEPROT", "RATELIMIT"}),
+        )
 
     def test_selection_accepts_list_and_comma_forms_with_alias_and_deduplication(self):
         expected = ["SSL", "NTLMINFO", "NLA"]
@@ -187,7 +300,7 @@ class RDPStructureTests(unittest.TestCase):
                     expected,
                 )
 
-    def test_all_excludes_ratelimit_and_remembers_full_selection(self):
+    def test_all_excludes_every_explicit_only_test_and_remembers_selection(self):
         module = structure_main(tests="ALL")
 
         selected = module._select_codes(module._discover_modules())
@@ -201,13 +314,23 @@ class RDPStructureTests(unittest.TestCase):
             frozenset(expected),
         )
 
-    def test_ratelimit_named_alongside_all_remains_explicit(self):
-        module = structure_main(tests="ALL,RATELIMIT")
+    def test_explicit_tests_named_alongside_all_are_selected_once(self):
+        module = structure_main(
+            tests="ALL,USERENUM,AUTHMETHODS,BRUTEPROT,RATELIMIT,USERENUM"
+        )
 
         selected = module._select_codes(module._discover_modules())
 
+        implicit = [
+            code for code in RDP_TEST_ORDER if code not in RDP_EXPLICIT_ONLY_TESTS
+        ]
+        self.assertEqual(
+            selected,
+            implicit + ["USERENUM", "AUTHMETHODS", "BRUTEPROT", "RATELIMIT"],
+        )
+        for code in RDP_EXPLICIT_ONLY_TESTS:
+            self.assertEqual(selected.count(code), 1)
         self.assertEqual(selected[-1], "RATELIMIT")
-        self.assertEqual(selected.count("RATELIMIT"), 1)
 
     def test_ratelimit_is_forced_last_and_engine_uses_one_resolved_ip(self):
         module = structure_main(tests="RATELIMIT,NLA")

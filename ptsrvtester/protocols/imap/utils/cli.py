@@ -81,7 +81,8 @@ class IMAPArgs(ArgsWithBruteforce):
                 "ptsrvtester imap -ts BANNER,CAPA -tg 127.0.0.1",
                 "ptsrvtester imap -ts ALL -tg 127.0.0.1",
                 "ptsrvtester imap -ts ALL --tls -tg 127.0.0.1:993",
-                "ptsrvtester imap -ts ENCRYPT,SNIFF -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts AUTHLIST -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts SNIFF -u user -p pass -tg 127.0.0.1:143",
                 "ptsrvtester imap -ts EICAR -u user -p pass -tg 127.0.0.1:143",
                 "ptsrvtester imap -ts ZIPXXE -u user -p pass --zipxxe-canary-url http://cb -tg 127.0.0.1:143",
                 "ptsrvtester imap -ts USRENUM -U users.txt --usrenum-threads 4 -tg 127.0.0.1:143",
@@ -103,7 +104,8 @@ class IMAPArgs(ArgsWithBruteforce):
   ptsrvtester imap -ts BANNER,CAPA -tg 127.0.0.1
   ptsrvtester imap -ts ALL -tg 127.0.0.1
   ptsrvtester imap -ts ALL --tls -tg 127.0.0.1:993
-  ptsrvtester imap -ts ENCRYPT,SNIFF -tg 127.0.0.1:143
+  ptsrvtester imap -ts AUTHLIST -tg 127.0.0.1:143
+  ptsrvtester imap -ts SNIFF -u user -p pass -tg 127.0.0.1:143
   ptsrvtester imap -ts CONNLIM --cl-max 50 -tg mail.example.com
   ptsrvtester imap -ts EICAR -u user -p pass -tg 127.0.0.1:143
   ptsrvtester imap -ts ZIPXXE -u user -p pass --zipxxe-canary-url http://cb -tg 127.0.0.1:143
@@ -178,6 +180,24 @@ class IMAPArgs(ArgsWithBruteforce):
         mods.add_argument("--mailbox-iso-mailbox", default="INBOX", metavar="NAME",
                           dest="imap_mailbox_iso_mailbox",
                           help="MBOXISO: own baseline mailbox (default INBOX)")
+        parser.add_argument(
+            "--noop2-connections",
+            nargs="?",
+            type=int,
+            const=None,
+            default=None,
+            metavar="N",
+            dest="noop2_connections",
+            help=argparse.SUPPRESS,  # Shown in test-specific help via registry
+        )
+        parser.add_argument(
+            "-t", "--threads",
+            type=int,
+            default=1,
+            metavar="N",
+            dest="noop2_threads",
+            help=argparse.SUPPRESS,  # Shown in NOOP2 test help via registry
+        )
 
         add_bruteforce_args(parser)
 

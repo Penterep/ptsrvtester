@@ -39,6 +39,7 @@ from .helpers import (
 )
 from .ptntlmauth.ptntlmauth import NTLMInfo, decode_ChallengeMessage_blob, get_NegotiateMessage_data
 from .service_identification import identify_service
+from . import tls_audit
 
 try:
     from cryptography import x509
@@ -97,6 +98,7 @@ from .results import (  # noqa: F401 — star import skips leading-underscore na
     _IMAP_TLS_AUDIT_TIMEOUT_SEC,
     _IMAP_TLS_EXPIRY_VULN_DAYS,
     _IMAP_TLS_EXPIRY_WARN_DAYS,
+    ImapTlsVersionScan,
     _IMAP_USRENUM_DEFAULT_PASSWORD,
     _IMAP_USRENUM_MARKER_LABEL,
     _INVCOMM_INFO_LEAK_MARKERS,
@@ -173,7 +175,24 @@ class ImapEngine:
         self.debug = ctx.debug
         self.report = getattr(ctx, "report", self.report)
         self.use_json = bool(ctx.json)
+        self._ctx = ctx
         return self
+
+    def _flush_terminal(self) -> None:
+        """Flush PrintLock so verdicts appear before the next live -vv line."""
+        if self.use_json:
+            return
+        ctx = getattr(self, "_ctx", None)
+        if ctx is None:
+            return
+        lock = getattr(ctx, "print_lock", None)
+        if lock is None:
+            return
+        chunk = lock.get_output_string()
+        if chunk:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+            lock.output_string = ""
 
     @staticmethod
     def _snip(text: str | bytes | None, limit: int = 160) -> str:
@@ -194,13 +213,14 @@ class ImapEngine:
         except TypeError:
             self.debug(msg)
 
-    def _dbg_capa_list(self, title: str, capa: list[str] | None) -> None:
-        self._dbg(title)
+    def _dbg_capa_list(self, title: str, capa: list[str] | None, *, indent: int = 4) -> None:
+        self._dbg(title, indent=indent)
+        item_indent = indent + 4
         if not capa:
-            self._dbg("(none)", indent=8)
+            self._dbg("(none)", indent=item_indent)
             return
         for c in capa:
-            self._dbg(str(c), indent=8)
+            self._dbg(str(c), indent=item_indent)
 
     def _dbg_usrenum_row(self, method: str, row: "ImapUserEnumProbeRow") -> None:
         kind = row.probe_kind
@@ -1150,10 +1170,7 @@ class ImapEngine:
                 crypto_extra.extend(der_warns)
         except Exception:
             pass
-        self._dbg(
-            f"TLSAUDIT {mode}: handshake OK tls={vers} cipher={cname} "
-            f"subject={self._snip(subject)}"
-        )
+        self._dbg(f"{vers or 'n/a'} cipher={cname or 'n/a'}")
         return ImapTlsAuditProbeResult(
             mode=mode,
             attempted=attempted,
@@ -1181,198 +1198,253 @@ class ImapEngine:
             crypto_warnings=tuple(crypto_extra[:12]),
         )
 
-    def _imap_tls_audit_probe_implicit(self, host: str, port: int, timeout: float) -> ImapTlsAuditProbeResult:
-        ctx = ssl.create_default_context()
-        # Always pass server_hostname: for IP literals it enables SNI + matching against
-        # iPAddress subjectAltName; server_hostname=None breaks hostname checking on newer Python
-        # ("check_hostname requires server_hostname").
-        sni = host
-        sock: socket.socket | None = None
-        ssl_sock: ssl.SSLSocket | None = None
+    def _imap_tls_audit_close_sock(self, sock: socket.socket | ssl.SSLSocket | None) -> None:
+        if sock is None:
+            return
         try:
-            sock = socket.create_connection((host, port), timeout=timeout)
-            self._dbg(f"TLSAUDIT implicit TLS wrap (SNI={sni!r})")
-            ssl_sock = ctx.wrap_socket(sock, server_hostname=sni)
-            sock = None
-            ssl_sock.settimeout(timeout)
-            try:
-                ssl_sock.recv(4096)
-            except Exception:
-                pass
-            return self._imap_tls_audit_probe_from_ssl(
-                ssl_sock,
-                mode="implicit_tls",
-                attempted=True,
-                skipped_reason=None,
-                starttls_advertised=None,
-                handshake_ok=True,
-                handshake_error=None,
-            )
-        except ssl.SSLError as e:
-            self._dbg(f"TLSAUDIT implicit TLS handshake failed: {self._snip(str(e))}")
-            return self._imap_tls_audit_probe_failure(
-                "implicit_tls", True, None, None, False, str(e)[:500]
-            )
-        except Exception as e:
-            self._dbg(f"TLSAUDIT implicit TLS failed: {self._snip(str(e))}")
-            return self._imap_tls_audit_probe_failure(
-                "implicit_tls", True, None, None, False, str(e)[:500]
-            )
-        finally:
-            if ssl_sock is not None:
-                try:
-                    ssl_sock.close()
-                except Exception:
-                    pass
-            elif sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+            sock.close()
+        except Exception:
+            pass
 
-    def _imap_tls_audit_probe_starttls(self, host: str, port: int, timeout: float) -> ImapTlsAuditProbeResult:
-        imap: imaplib.IMAP4 | None = None
-        starttls_was_listed = False
+    def _imap_tls_audit_wrap(
+        self,
+        host: str,
+        port: int,
+        timeout: float,
+        *,
+        implicit: bool,
+        ctx: ssl.SSLContext,
+        trace: list[str],
+        read_banner: bool,
+    ) -> tuple[ssl.SSLSocket | None, bool | None, str | None]:
+        def log(msg: str) -> None:
+            self._dbg(msg)
+
+        sock, advertised, err = tls_audit.prepare_imap_for_tls(
+            host, port, timeout, implicit=implicit, trace=trace, log=log
+        )
+        if sock is None:
+            return None, advertised, err
+        if not implicit and advertised is False:
+            self._imap_tls_audit_close_sock(sock)
+            return None, False, err or "STARTTLS not advertised in CAPABILITY"
+        if not implicit and err:
+            self._imap_tls_audit_close_sock(sock)
+            return None, advertised, err
         try:
-            imap = imaplib.IMAP4(host, port, timeout=timeout)
-            imap.sock.settimeout(timeout)
-            _ = imap.welcome
-            try:
-                imap.capability()
-            except Exception:
-                pass
-            caps = [str(c).upper() for c in (imap.capabilities or [])]
-            st = any("STARTTLS" in c for c in caps)
-            starttls_was_listed = st
-            self._dbg(f"TLSAUDIT STARTTLS advertised={st}")
-            if not st:
-                try:
-                    imap.logout()
-                except Exception:
-                    pass
-                self._dbg("TLSAUDIT STARTTLS not advertised — skipping wrap")
-                return ImapTlsAuditProbeResult(
-                    mode="starttls",
-                    attempted=False,
-                    skipped_reason="STARTTLS not advertised in CAPABILITY",
-                    starttls_advertised=False,
-                    handshake_ok=False,
-                    handshake_error=None,
-                    tls_version=None,
-                    cipher_name=None,
-                    cipher_protocol=None,
-                    peer_subject=None,
-                    peer_issuer=None,
-                    san_dns=tuple(),
-                    not_before=None,
-                    not_after=None,
-                    days_until_expiry=None,
-                    cert_expired=False,
-                    cert_not_yet_valid=False,
-                    weak_tls_version=False,
-                    weak_cipher=False,
-                    expires_within_vuln_days=False,
-                    expires_within_warn_days=False,
-                    peer_key_summary=None,
-                    peer_signature_hash=None,
-                    crypto_warnings=tuple(),
-                )
-            ctx = ssl.create_default_context()
-            self._dbg("TLSAUDIT sending STARTTLS (strict context)")
-            imap.starttls(ssl_context=ctx)
-            ssl_sock = imap.sock
-            if not isinstance(ssl_sock, ssl.SSLSocket):
-                try:
-                    imap.logout()
-                except Exception:
-                    pass
-                return self._imap_tls_audit_probe_failure(
-                    "starttls", True, None, True, False, "socket is not TLS after STARTTLS"
-                )
+            hello = "TLS ClientHello (platform trust store + hostname check)"
+            trace.append(hello)
+            self._dbg(hello)
+            ssl_sock = tls_audit.wrap_and_greet(
+                sock,
+                ctx,
+                host,
+                timeout,
+                trace=trace,
+                log=log,
+                read_banner=read_banner,
+            )
+            return ssl_sock, (None if implicit else advertised), None
+        except Exception as e:
+            self._imap_tls_audit_close_sock(sock)
+            return None, (None if implicit else advertised), str(e)[:500]
+
+    def _imap_tls_audit_finish_probe(
+        self,
+        *,
+        host: str,
+        mode: str,
+        implicit: bool,
+        advertised: bool | None,
+        ssl_sock: ssl.SSLSocket | None,
+        handshake_ok: bool,
+        handshake_error: str | None,
+        skipped_reason: str | None,
+        attempted: bool,
+        cert_trust_ok: bool,
+        trace: list[str],
+        versions: tuple[ImapTlsVersionScan, ...],
+    ) -> ImapTlsAuditProbeResult:
+        if ssl_sock is None or not handshake_ok:
+            pr = self._imap_tls_audit_probe_failure(
+                mode, attempted, skipped_reason, advertised, False, handshake_error
+            )
+        else:
             pr = self._imap_tls_audit_probe_from_ssl(
                 ssl_sock,
-                mode="starttls",
+                mode=mode,
                 attempted=True,
                 skipped_reason=None,
-                starttls_advertised=True,
+                starttls_advertised=advertised,
                 handshake_ok=True,
                 handshake_error=None,
             )
-            try:
-                imap.logout()
-            except Exception:
-                try:
-                    imap.shutdown()
-                except Exception:
-                    pass
-            return pr
-        except ssl.SSLError as e:
-            if imap is not None:
-                try:
-                    imap.shutdown()
-                except Exception:
-                    pass
-            self._dbg(f"TLSAUDIT STARTTLS handshake failed: {self._snip(str(e))}")
-            return self._imap_tls_audit_probe_failure(
-                "starttls", True, None, starttls_was_listed, False, str(e)[:500]
-            )
-        except Exception as e:
-            if imap is not None:
-                try:
-                    imap.shutdown()
-                except Exception:
-                    pass
-            self._dbg(f"TLSAUDIT STARTTLS failed: {self._snip(str(e))}")
-            return self._imap_tls_audit_probe_failure(
-                "starttls", True, None, starttls_was_listed, False, str(e)[:500]
-            )
+            trace.append(f"{pr.tls_version or 'n/a'} cipher={pr.cipher_name or 'n/a'}")
+        cn = self._imap_tls_audit_terminal_subject_cn(pr.peer_subject)
+        id_ok, id_detail, id_wild = tls_audit.identity_matches(host, pr.san_dns, cn)
+        if not versions and pr.tls_version:
+            versions = tls_audit.fallback_version_scan(pr.tls_version, pr.cipher_name)
+        weak_ver = pr.weak_tls_version or any(v.rating == "bad" for v in versions)
+        weak_c = pr.weak_cipher or any(
+            c.rating == "bad" for v in versions for c in v.ciphers
+        )
+        conn_mode = tls_audit.connection_mode_label(
+            implicit=implicit,
+            starttls_advertised=advertised,
+            handshake_ok=pr.handshake_ok,
+        )
+        return pr._replace(
+            versions=versions,
+            imap_trace=tuple(trace),
+            identity_ok=id_ok if pr.handshake_ok else False,
+            identity_detail=id_detail if pr.handshake_ok else None,
+            identity_wildcard=id_wild if pr.handshake_ok else False,
+            cert_trust_ok=bool(cert_trust_ok and pr.handshake_ok),
+            connection_mode=conn_mode,
+            weak_tls_version=weak_ver,
+            weak_cipher=weak_c,
+        )
 
     def test_imap_tls_audit(self) -> ImapTlsAuditResult:
         """
-        Strict TLS + certificate audit for IMAP (PTV-SVC-IMAP-TLSAUDIT).
-        Uses ssl.create_default_context() (trusted anchors + hostname / RFC 7817 when SNI is set).
+        TLS + certificate audit for IMAP (PTV-SVC-IMAP-TLSAUDIT).
+
+        Enumerates offered TLS versions and cipher suites, then rates them
+        against RFC 8996, NIST SP 800-52 Rev. 2 and TLSRef Intermediate
+        (Mozilla Server Side TLS lineage). Certificate identity follows
+        RFC 9525 wildcard matching.
         """
         host = self.args.target.ip
         port = int(self.args.target.port)
         timeout = _IMAP_TLS_AUDIT_TIMEOUT_SEC
-        implicit_intended = bool(self.args.tls or port == 993)
-        self._dbg(f"TLS audit — host={host} port={port} implicit_tls={implicit_intended}")
-        probes: list[ImapTlsAuditProbeResult] = []
-        if implicit_intended:
-            probes.append(self._imap_tls_audit_probe_implicit(host, port, timeout))
-        else:
-            probes.append(self._imap_tls_audit_probe_starttls(host, port, timeout))
+        implicit = bool(self.args.tls or port == 993)
+        mode = "implicit_tls" if implicit else "starttls"
+        trace: list[str] = []
+        advertised: bool | None = True if implicit else None
+
+        strict_ctx = ssl.create_default_context()
+        ssl_sock, advertised, err = self._imap_tls_audit_wrap(
+            host, port, timeout, implicit=implicit, ctx=strict_ctx, trace=trace, read_banner=True
+        )
+        cert_trust_ok = ssl_sock is not None
+        handshake_ok = ssl_sock is not None
+        handshake_error = None if handshake_ok else err
+        skipped = None
+        attempted = True
+
+        if not implicit and advertised is False:
+            attempted = False
+            skipped = err or "STARTTLS not advertised in CAPABILITY"
+            handshake_ok = False
+            probe = self._imap_tls_audit_finish_probe(
+                host=host,
+                mode=mode,
+                implicit=implicit,
+                advertised=False,
+                ssl_sock=None,
+                handshake_ok=False,
+                handshake_error=None,
+                skipped_reason=skipped,
+                attempted=False,
+                cert_trust_ok=False,
+                trace=trace,
+                versions=tuple(),
+            )
+            return ImapTlsAuditResult(
+                host=host,
+                port=port,
+                implicit_tls_intended=implicit,
+                probes=(probe,),
+                vulnerable=False,
+                detail="STARTTLS not advertised; no certificate to audit on this path.",
+            )
+
+        if ssl_sock is None and err:
+            self._dbg("TLS handshake (platform trust store + hostname check)")
+            self._dbg(f"handshake failed: {self._snip(err)}")
+            handshake_error = err
+            unverified = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            unverified.check_hostname = False
+            unverified.verify_mode = ssl.CERT_NONE
+            retry_trace: list[str] = []
+            ssl_sock, advertised, unver_err = self._imap_tls_audit_wrap(
+                host,
+                port,
+                timeout,
+                implicit=implicit,
+                ctx=unverified,
+                trace=retry_trace,
+                read_banner=True,
+            )
+            handshake_ok = ssl_sock is not None
+            cert_trust_ok = False
+            if ssl_sock is None:
+                handshake_error = err or unver_err
+
+        versions: tuple[ImapTlsVersionScan, ...] = tuple()
+        if handshake_ok:
+            try:
+                versions = tls_audit.scan_tls_versions(
+                    host,
+                    port,
+                    timeout,
+                    implicit=implicit,
+                    sni=host,
+                    log=self._dbg,
+                )
+            except Exception as e:
+                self._dbg(f"TLS version/cipher scan failed: {self._snip(str(e))}")
+
+        try:
+            probe = self._imap_tls_audit_finish_probe(
+                host=host,
+                mode=mode,
+                implicit=implicit,
+                advertised=advertised,
+                ssl_sock=ssl_sock,
+                handshake_ok=handshake_ok,
+                handshake_error=handshake_error,
+                skipped_reason=skipped,
+                attempted=attempted,
+                cert_trust_ok=cert_trust_ok,
+                trace=trace,
+                versions=versions,
+            )
+        finally:
+            self._imap_tls_audit_close_sock(ssl_sock)
 
         reasons: list[str] = []
-        for p in probes:
-            if p.mode == "implicit_tls" and p.attempted and not p.handshake_ok:
-                reasons.append(f"implicit_tls: strict handshake failed ({p.handshake_error or 'n/a'})")
-            if p.mode == "starttls" and p.starttls_advertised and p.attempted and not p.handshake_ok:
-                reasons.append(f"starttls: strict handshake failed ({p.handshake_error or 'n/a'})")
-            if not p.handshake_ok:
-                continue
-            if p.weak_tls_version:
-                reasons.append(f"{p.mode}: weak TLS protocol ({p.tls_version or p.cipher_protocol})")
-            if p.weak_cipher:
-                reasons.append(f"{p.mode}: weak negotiated cipher ({p.cipher_name})")
-            if p.cert_expired:
-                reasons.append(f"{p.mode}: certificate expired")
-            if p.cert_not_yet_valid:
-                reasons.append(f"{p.mode}: certificate not yet valid")
-            if p.expires_within_vuln_days:
-                reasons.append(
-                    f"{p.mode}: certificate expires within {_IMAP_TLS_EXPIRY_VULN_DAYS} days ({p.days_until_expiry}d left)"
-                )
-            for w in p.crypto_warnings:
-                reasons.append(f"{p.mode}: {w}")
+        p = probe
+        if p.attempted and not p.handshake_ok:
+            reasons.append(f"{p.mode}: TLS handshake failed ({p.handshake_error or 'n/a'})")
+        if p.handshake_ok and not p.cert_trust_ok:
+            reasons.append(f"{p.mode}: certificate chain is not trusted")
+        if p.handshake_ok and not p.identity_ok:
+            reasons.append(p.identity_detail or "hostname mismatch")
+        if p.handshake_ok and p.cert_expired:
+            reasons.append(f"{p.mode}: certificate expired")
+        if p.handshake_ok and p.cert_not_yet_valid:
+            reasons.append(f"{p.mode}: certificate not yet valid")
+        if p.handshake_ok and p.expires_within_vuln_days:
+            reasons.append(
+                f"{p.mode}: certificate expires within {_IMAP_TLS_EXPIRY_VULN_DAYS} days ({p.days_until_expiry}d left)"
+            )
+        for w in p.crypto_warnings:
+            reasons.append(f"{p.mode}: {w}")
+        for v in p.versions:
+            if v.rating == "bad":
+                reasons.append(f"{v.version} offered ({v.rating_reason})")
+            for c in v.ciphers:
+                if c.rating == "bad":
+                    reasons.append(f"{v.version} {c.name}: {c.reason}")
 
         vuln = len(reasons) > 0
-        detail = "; ".join(reasons) if reasons else "Strict TLS/certificate checks passed for probed path(s)."
+        detail = "; ".join(reasons) if reasons else "No TLS/certificate issues on the probed path."
         return ImapTlsAuditResult(
             host=host,
             port=port,
-            implicit_tls_intended=implicit_intended,
-            probes=tuple(probes),
+            implicit_tls_intended=implicit,
+            probes=(p,),
             vulnerable=vuln,
             detail=detail,
         )
@@ -1403,27 +1475,11 @@ class ImapEngine:
         """Returns (level ok|bad|warn, message) for Identity line."""
         if not p.handshake_ok:
             return ("bad", "Not assessed (TLS handshake did not complete)")
-        try:
-            ipaddress.ip_address(host)
-        except ValueError:
-            hn = host.lower()
-            dns = [
-                s[4:].lower()
-                for s in p.san_dns
-                if len(s) > 4 and s.upper().startswith("DNS:")
-            ]
-            cn = ImapEngine._imap_tls_audit_terminal_subject_cn(p.peer_subject)
-            if cn and cn.lower() == hn:
-                return ("ok", "Hostname matches certificate SAN/CN")
-            if hn in dns:
-                return ("ok", "Hostname matches certificate SAN/CN")
-            cn_disp = cn or "(no CN in subject)"
-            return (
-                "bad",
-                f"Hostname mismatch (target: {host} not in SAN/CN; cert CN={cn_disp})",
-            )
-        else:
-            return ("ok", "IP target — verified under platform TLS certificate rules")
+        if p.identity_detail:
+            return ("ok" if p.identity_ok else "bad", p.identity_detail)
+        cn = ImapEngine._imap_tls_audit_terminal_subject_cn(p.peer_subject)
+        ok, detail, _ = tls_audit.identity_matches(host, p.san_dns, cn)
+        return ("ok" if ok else "bad", detail)
 
     @staticmethod
     def _imap_tls_audit_terminal_trust_level_msg(p: ImapTlsAuditProbeResult) -> tuple[str, str]:
@@ -1495,7 +1551,7 @@ class ImapEngine:
 
     def test_encryption(self) -> EncryptionResult:
         """
-        Test encryption options: plaintext (143), STARTTLS (143), implicit TLS (993).
+        Test encryption options: cleartext (143), STARTTLS (143), implicit TLS (993).
         Uses fresh connections; does not use self.args.tls/starttls.
         """
         host = self.args.target.ip
@@ -1513,10 +1569,10 @@ class ImapEngine:
                 imap.sock.settimeout(timeout)
                 _ = imap.welcome
                 plaintext_ok = True
-                self._dbg(f"Plaintext welcome: {self._snip(imap.welcome)}")
+                self._dbg(f"Cleartext welcome: {self._snip(imap.welcome)}")
                 imap.logout()
             except Exception as e:
-                self._dbg(f"Plaintext test failed: {e}")
+                self._dbg(f"Cleartext test failed: {e}")
 
             try:
                 imap = imaplib.IMAP4(host, port)
@@ -1571,22 +1627,18 @@ class ImapEngine:
         return EncryptionResult(plaintext_ok, starttls_ok, tls_ok)
 
     @staticmethod
-    def _sniffable_error_level_auth_methods(capability: list[str] | None) -> list[str]:
-        """AUTH= mechanisms from CAPABILITY that use credential-bearing cleartext SASL (ERROR tier)."""
-        if not capability:
-            return []
+    def _auth_methods_from_capa(capability: list[str] | None) -> list[str]:
         methods: list[str] = []
         seen: set[str] = set()
-        for c in capability:
+        for c in capability or []:
             u = str(c or "").strip()
-            if u.upper().startswith("AUTH="):
-                m = u.split("=", 1)[-1].strip().upper()
-                if not m or m in seen:
-                    continue
-                if IMAP_AUTH_METHOD_LEVEL.get(m, "OK") != "ERROR":
-                    continue
-                seen.add(m)
-                methods.append(m)
+            if not u.upper().startswith("AUTH="):
+                continue
+            m = u.split("=", 1)[-1].strip().upper()
+            if not m or m in seen:
+                continue
+            seen.add(m)
+            methods.append(m)
 
         def _prio(x: str) -> int:
             try:
@@ -1596,17 +1648,38 @@ class ImapEngine:
 
         return sorted(methods, key=lambda x: (_prio(x), x))
 
-    def _probe_authenticate_cleartext(self, method: str, timeout: float = 10.0) -> str:
-        """
-        Open a plain IMAP connection, run CAPABILITY, send AUTHENTICATE <method>.
-        Returns: continuation (server sent '+'), tagged_no, tagged_bad, not_advertised, io_error
-        """
+    def _imap_connect_auth_path(self, path: str, timeout: float) -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
+        """Open IMAP on cleartext, after STARTTLS, or implicit TLS (ENCRYPT-style)."""
         host = self.args.target.ip
-        port = self.args.target.port
-        try:
-            imap = imaplib.IMAP4(host, port)
+        port = int(self.args.target.port)
+        if path == "tls":
+            ctx = ssl._create_unverified_context()
+            imap = imaplib.IMAP4_SSL(host, port, timeout=timeout, ssl_context=ctx)
             imap.sock.settimeout(timeout)
-            _ = imap.welcome
+            return imap
+        imap = imaplib.IMAP4(host, port, timeout=timeout)
+        imap.sock.settimeout(timeout)
+        _ = imap.welcome
+        if path == "starttls":
+            try:
+                imap.capability()
+            except Exception:
+                pass
+            caps = [str(c).upper() for c in (imap.capabilities or [])]
+            if "STARTTLS" not in caps:
+                try:
+                    imap.logout()
+                except Exception:
+                    pass
+                raise RuntimeError("STARTTLS not advertised in CAPABILITY")
+            imap.starttls()
+        return imap
+
+    def _probe_authenticate_on_path(self, path: str, method: str, timeout: float = 10.0) -> tuple[str, str]:
+        """AUTHENTICATE <method> on path. Returns (outcome, reply snippet). Does not print."""
+        imap: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
+        try:
+            imap = self._imap_connect_auth_path(path, timeout)
             try:
                 imap.capability()
             except Exception:
@@ -1631,97 +1704,239 @@ class ImapEngine:
                     outcome = "tagged_no" if parts[1].upper() == b"NO" else "tagged_bad"
                 else:
                     outcome = "other_response"
-            self._dbg(f"AUTHENTICATE {method} → {outcome} {self._snip(res)}")
-            try:
-                imap.logout()
-            except Exception:
-                try:
-                    imap.shutdown()
-                except Exception:
-                    pass
-            return outcome
+            return outcome, self._snip(res)
         except Exception as e:
-            self._dbg(f"AUTHENTICATE {method} failed: {self._snip(str(e))}")
-            return "io_error"
+            return "io_error", self._snip(str(e))
+        finally:
+            if imap is not None:
+                try:
+                    imap.logout()
+                except Exception:
+                    try:
+                        imap.shutdown()
+                    except Exception:
+                        pass
 
-    def test_sniffable_plain_imap(self) -> SniffableResult:
-        """
-        Evaluate whether IMAP credentials or traffic can be exposed on an unencrypted TCP session
-        (standard cleartext port 143): missing STARTTLS and/or AUTHENTICATE continuation '+' on plain.
-        """
-        if self.args.tls:
-            self._dbg("SNIFF skipped: implicit TLS mode (--tls)")
-            return SniffableResult(
-                skipped=True,
-                skip_reason="implicit_tls_mode (--tls): use plain IMAP target without --tls",
-                plain_ok=False,
-                starttls_advertised=False,
-                auth_methods=tuple(),
-                probes=tuple(),
-                vulnerable=False,
-            )
+    def _authlist_emit_path_header(self, label: str) -> None:
+        if self.use_json:
+            return
+        self._ptprint_raw(label, bullet_type="TITLE", condition=True, indent=4)
+        self._flush_terminal()
+        self._authlist_terminal_emitted = True
 
-        host = self.args.target.ip
-        port = self.args.target.port
-        timeout = 10.0
-        capability: list[str] = []
-        plain_ok = False
+    def _authlist_emit_not_available(self) -> None:
+        if self.use_json:
+            return
+        self._ptprint_raw("Not available", bullet_type="NOTVULN", condition=True, indent=8)
+        self._flush_terminal()
+        self._authlist_terminal_emitted = True
+
+    def _authlist_emit_method_row(self, path: str, row: ImapAuthMechRow) -> None:
+        if self.use_json:
+            return
+        bullet, text = self._authlist_row_display(path, row)
+        self._ptprint_raw(text, bullet_type=bullet, condition=True, indent=8)
+        self._flush_terminal()
+        self._authlist_terminal_emitted = True
+
+    def _authlist_scan_path(self, path: str, timeout: float) -> ImapAuthListPath:
+        label = self._authlist_path_label(path)
+        self._authlist_emit_path_header(label)
+        imap = None
         try:
-            imap = imaplib.IMAP4(host, port)
-            imap.sock.settimeout(timeout)
-            _ = imap.welcome
-            self._dbg(f"Plain IMAP welcome: {self._snip(imap.welcome)}")
+            imap = self._imap_connect_auth_path(path, timeout)
+            banner = imap.welcome.decode(errors="replace") if imap.welcome else ""
+            self._dbg(f"{label} welcome: {self._snip(banner)}", indent=8)
             try:
                 imap.capability()
             except Exception:
                 pass
             capability = [str(c) for c in (imap.capabilities or [])]
-            self._dbg_capa_list("CAPABILITY (plain):", capability)
-            plain_ok = True
-            try:
-                imap.logout()
-            except Exception:
-                pass
+            self._dbg_capa_list(f"CAPABILITY ({label}):", capability, indent=8)
+            methods = self._auth_methods_from_capa(capability)
+            if not methods:
+                self._dbg("no AUTH= in CAPABILITY", indent=8)
         except Exception as e:
-            self._dbg(f"Plain IMAP connect failed: {e}")
-            plain_ok = False
+            self._dbg(f"{label} connect failed: {self._snip(str(e))}", indent=8)
+            self._authlist_emit_not_available()
+            return ImapAuthListPath(path=path, available=False, skip_reason=str(e)[:240], methods=tuple())
+        finally:
+            if imap is not None:
+                try:
+                    imap.logout()
+                except Exception:
+                    try:
+                        imap.shutdown()
+                    except Exception:
+                        pass
+        if not methods:
+            self._authlist_emit_not_available()
+            return ImapAuthListPath(path=path, available=True, skip_reason=None, methods=tuple())
+        rows: list[ImapAuthMechRow] = []
+        for m in methods:
+            outcome, reply = self._probe_authenticate_on_path(path, m, timeout=timeout)
+            usable = outcome == "continuation"
+            dangerous = IMAP_AUTH_METHOD_LEVEL.get(m, "OK") == "ERROR"
+            row = ImapAuthMechRow(name=m, usable=usable, outcome=outcome, dangerous=dangerous)
+            rows.append(row)
+            self._authlist_emit_method_row(path, row)
+            if outcome == "io_error":
+                self._dbg(f"AUTHENTICATE {m} failed: {reply}", indent=12)
+            else:
+                self._dbg(f"AUTHENTICATE {m} → {outcome} {reply}", indent=12)
+        return ImapAuthListPath(path=path, available=True, skip_reason=None, methods=tuple(rows))
 
-        if not plain_ok:
+    def test_imap_authlist(self) -> ImapAuthListResult:
+        """AUTH= mechanisms on cleartext, STARTTLS and implicit TLS (SMTP AUTHLIST idea)."""
+        timeout = 10.0
+        port = int(self.args.target.port)
+        tls_only = port == 993
+        self._authlist_terminal_emitted = False
+        paths: list[ImapAuthListPath] = []
+        if not tls_only:
+            paths.append(self._authlist_scan_path("cleartext", timeout))
+            paths.append(self._authlist_scan_path("starttls", timeout))
+        else:
+            for skip_path, skip_label in (("cleartext", "Cleartext"), ("starttls", "STARTTLS")):
+                self._authlist_emit_path_header(skip_label)
+                self._dbg("skipped (implicit TLS port 993)", indent=8)
+                self._authlist_emit_not_available()
+                paths.append(
+                    ImapAuthListPath(
+                        path=skip_path,
+                        available=False,
+                        skip_reason="implicit TLS port 993",
+                        methods=tuple(),
+                    )
+                )
+        paths.append(self._authlist_scan_path("tls", timeout))
+        reasons: list[str] = []
+        for p in paths:
+            if p.path != "cleartext" or not p.available:
+                continue
+            for m in p.methods:
+                if m.dangerous and m.usable:
+                    reasons.append(f"cleartext AUTH={m.name} usable ({m.outcome})")
+        vuln = bool(reasons)
+        detail = "; ".join(reasons) if reasons else "No usable dangerous AUTH= mechanisms on cleartext."
+        return ImapAuthListResult(paths=tuple(paths), vulnerable=vuln, detail=detail)
+
+    @staticmethod
+    def _sniff_cleartext_auth_disallowed(text: str) -> bool:
+        """True when the server refuses LOGIN because the session is not TLS (policy, not bad creds)."""
+        u = (text or "").upper()
+        return any(
+            k in u
+            for k in (
+                "PRIVACYREQUIRED",
+                "LOGINDISABLED",
+                "CLEARTEXT AUTHENTICATION DISALLOWED",
+                "CLEARTEXT AUTHENTICATION IS DISABLED",
+                "DISALLOWED ON NON-SECURE",
+                "PLAINTEXT AUTHENTICATION DISALLOWED",
+            )
+        )
+
+    def test_sniffable_plain_imap(self) -> SniffableResult:
+        """Cleartext LOGIN + SELECT INBOX (PTV-SVC-SNIFFABLE). Requires -u/-p, not --tls / 993."""
+        port = int(self.args.target.port)
+        if self.args.tls or port == 993:
+            reason = (
+                "implicit TLS mode (--tls); SNIFF applies to cleartext only"
+                if self.args.tls
+                else "implicit TLS port 993; SNIFF applies to cleartext only"
+            )
+            self._dbg(f"SNIFF skipped: {reason}")
+            return SniffableResult(
+                skipped=True,
+                skip_reason=reason,
+                login_ok=False,
+                select_ok=False,
+                select_typ=None,
+                select_detail=None,
+                vulnerable=False,
+                detail="skipped",
+            )
+        creds = self._imap_single_known_login()
+        if creds is None:
+            self._dbg("SNIFF skipped: requires single -u and -p (no wordlists)")
+            return SniffableResult(
+                skipped=True,
+                skip_reason="requires -u/--user and -p/--password (no wordlists)",
+                login_ok=False,
+                select_ok=False,
+                select_typ=None,
+                select_detail=None,
+                vulnerable=False,
+                detail="skipped",
+            )
+        user, password = creds
+        host = self.args.target.ip
+        timeout = 10.0
+        imap: imaplib.IMAP4 | None = None
+        login_ok = False
+        try:
+            imap = imaplib.IMAP4(host, port, timeout=timeout)
+            imap.sock.settimeout(timeout)
+            banner = imap.welcome.decode(errors="replace") if imap.welcome else ""
+            self._dbg(f"Cleartext welcome: {self._snip(banner)}")
+            self._dbg(f"LOGIN {user!r}")
+            imap.login(user, password)
+            login_ok = True
+            self._dbg("LOGIN → OK")
+            typ, data = imap.select("INBOX")
+            detail = ""
+            if data:
+                try:
+                    detail = " ".join(
+                        (x.decode(errors="replace") if isinstance(x, bytes) else str(x)) for x in data if x
+                    )[:200]
+                except Exception:
+                    detail = str(data)[:200]
+            self._dbg(f"SELECT INBOX → {typ} {self._snip(detail)}")
+            select_ok = str(typ).upper() == "OK"
             return SniffableResult(
                 skipped=False,
                 skip_reason=None,
-                plain_ok=False,
-                starttls_advertised=False,
-                auth_methods=tuple(),
-                probes=tuple(),
-                vulnerable=False,
+                login_ok=True,
+                select_ok=select_ok,
+                select_typ=str(typ) if typ else None,
+                select_detail=detail or None,
+                vulnerable=select_ok,
+                detail=(
+                    "SELECT INBOX succeeded after LOGIN on cleartext"
+                    if select_ok
+                    else "Not sniffable"
+                ),
             )
-
-        caps_upper = {c.upper() for c in capability}
-        starttls_advertised = "STARTTLS" in caps_upper
-        self._dbg(f"STARTTLS advertised={starttls_advertised}")
-        to_probe = self._sniffable_error_level_auth_methods(capability)
-        self._dbg(f"Cleartext AUTH methods to probe: {to_probe or '(none)'}")
-        probes_list: list[tuple[str, str]] = []
-        weak_continuation = False
-        for m in to_probe:
-            outcome = self._probe_authenticate_cleartext(m, timeout=timeout)
-            probes_list.append((m, outcome))
-            if outcome == "continuation":
-                weak_continuation = True
-                break
-
-        vulnerable = (not starttls_advertised) or weak_continuation
-
-        return SniffableResult(
-            skipped=False,
-            skip_reason=None,
-            plain_ok=True,
-            starttls_advertised=starttls_advertised,
-            auth_methods=tuple(to_probe),
-            probes=tuple(probes_list),
-            vulnerable=vulnerable,
-        )
+        except Exception as e:
+            msg = _imap_login_exception_text(e)
+            self._dbg(f"{'LOGIN' if not login_ok else 'SELECT INBOX'} → {self._snip(msg)}")
+            if not login_ok and self._sniff_cleartext_auth_disallowed(msg):
+                term = "Not sniffable"
+            elif not login_ok:
+                term = "LOGIN failed"
+            else:
+                term = "Not sniffable"
+            return SniffableResult(
+                skipped=False,
+                skip_reason=None,
+                login_ok=login_ok,
+                select_ok=False,
+                select_typ=None,
+                select_detail=msg[:240] or None,
+                vulnerable=False,
+                detail=term,
+            )
+        finally:
+            if imap is not None:
+                try:
+                    imap.logout()
+                except Exception:
+                    try:
+                        imap.shutdown()
+                    except Exception:
+                        pass
 
     @staticmethod
     def _imap_inv_extract_tag(cmd: bytes) -> bytes | None:
@@ -3991,25 +4206,61 @@ class ImapEngine:
             plaintext_only = enc.plaintext_ok and not enc.starttls_ok and not enc.tls_ok
             any_ok = enc.plaintext_ok or enc.starttls_ok or enc.tls_ok
             if plaintext_only:
-                pp("Plaintext only", bullet_type="VULN", condition=show, indent=4)
+                pp("Cleartext only", bullet_type="VULN", condition=show, indent=4)
             elif any_ok:
                 if enc.plaintext_ok:
                     bullet = "WARNING" if (enc.starttls_ok or enc.tls_ok) else "NOTVULN"
-                    pp("Plaintext", bullet_type=bullet, condition=show, indent=4)
+                    pp("Cleartext", bullet_type=bullet, condition=show, indent=4)
                 if enc.starttls_ok:
                     pp("STARTTLS", bullet_type="NOTVULN", condition=show, indent=4)
                 if enc.tls_ok:
                     pp("TLS", bullet_type="NOTVULN", condition=show, indent=4)
             else:
                 pp(
-                    "No connection mode available (plaintext, STARTTLS, TLS failed)",
+                    "No connection mode available (cleartext, STARTTLS, TLS failed)",
                     bullet_type="VULN",
                     condition=show,
                     indent=4,
                 )
 
+    @staticmethod
+    def _authlist_path_label(path: str) -> str:
+        return {"cleartext": "Cleartext", "starttls": "STARTTLS", "tls": "TLS"}.get(path, path)
+
+    @staticmethod
+    def _authlist_row_display(path: str, row: ImapAuthMechRow) -> tuple[str, str]:
+        encrypted = path in ("starttls", "tls")
+        if row.usable:
+            if row.dangerous and not encrypted:
+                return ("VULN", f"{row.name} (is advertised and can be used)")
+            return ("NOTVULN", row.name)
+        return ("WARNING", f"{row.name} (is advertised but cannot be used)")
+
+    def _stream_imap_authlist_result(self) -> None:
+        """Replay AUTHLIST if it was not streamed live (JSON / error path)."""
+        if getattr(self, "_authlist_terminal_emitted", False):
+            return
+        pp = self._ptprint_raw
+        show = not self.use_json
+        with self._output_lock:
+            if (err := getattr(self.results, "imap_authlist_error", None)) is not None:
+                pp(f"AUTHLIST failed: {err}", bullet_type="VULN", condition=show, indent=4)
+                return
+            al = getattr(self.results, "imap_authlist", None)
+            if al is None:
+                return
+            for p in al.paths:
+                label = self._authlist_path_label(p.path)
+                pp(label, bullet_type="TITLE", condition=show, indent=4)
+                if not p.available or not p.methods:
+                    pp("Not available", bullet_type="NOTVULN", condition=show, indent=8)
+                    continue
+                for row in p.methods:
+                    bullet, text = self._authlist_row_display(p.path, row)
+                    pp(text, bullet_type=bullet, condition=show, indent=8)
+
     def _stream_sniffable_result(self) -> None:
-        """Stream cleartext IMAP sniffable probe result (thread-safe)."""
+        """Stream cleartext LOGIN + SELECT INBOX (thread-safe)."""
         pp = self._ptprint_raw
         show = not self.use_json
         with self._output_lock:
@@ -4022,58 +4273,13 @@ class ImapEngine:
             if sn.skipped:
                 pp(f"Skipped: {sn.skip_reason or 'n/a'}", bullet_type="WARNING", condition=show, indent=4)
                 return
-            if not sn.plain_ok:
-                pp("Plain IMAP TCP session not available on target", bullet_type="NOTVULN", condition=show, indent=4)
-                return
-            if sn.starttls_advertised:
-                pp("STARTTLS advertised on cleartext port", bullet_type="NOTVULN", condition=show, indent=4)
-            else:
-                pp("STARTTLS not advertised on cleartext port", bullet_type="VULN", condition=show, indent=4)
-            if sn.auth_methods:
-                pp(
-                    f"Credential-bearing AUTH mechanisms seen: {', '.join(sn.auth_methods)}",
-                    bullet_type="TITLE",
-                    condition=show,
-                    indent=4,
-                )
-            else:
-                pp(
-                    "No credential-bearing AUTH= mechanisms advertised pre-TLS",
-                    bullet_type="TITLE",
-                    condition=show,
-                    indent=4,
-                )
-            for method, outcome in sn.probes:
-                if outcome == "continuation":
-                    bullet = "VULN"
-                    label = "server sent continuation (+) — cleartext SASL exchange possible"
-                elif outcome == "tagged_no":
-                    bullet = "NOTVULN"
-                    label = "AUTHENTICATE rejected (NO)"
-                elif outcome == "tagged_bad":
-                    bullet = "NOTVULN"
-                    label = "AUTHENTICATE rejected (BAD)"
-                elif outcome == "io_error":
-                    bullet = "WARNING"
-                    label = "probe I/O error"
-                else:
-                    bullet = "WARNING"
-                    label = outcome
-                pp(f"{method}: {label}", bullet_type=bullet, condition=show, indent=4)
             if sn.vulnerable:
-                pp(
-                    "Verdict: cleartext IMAP allows sniffable traffic or credentials",
-                    bullet_type="VULN",
-                    condition=show,
-                    indent=4,
-                )
-            else:
-                pp(
-                    "Verdict: no cleartext-only policy detected by this probe",
-                    bullet_type="NOTVULN",
-                    condition=show,
-                    indent=4,
-                )
+                pp(sn.detail, bullet_type="VULN", condition=show, indent=4)
+                return
+            if sn.detail == "LOGIN failed":
+                pp("LOGIN failed", bullet_type="WARNING", condition=show, indent=4)
+                return
+            pp("Not sniffable", bullet_type="NOTVULN", condition=show, indent=4)
 
     def _inv_comm_emit_terminal(self, ic: InvCommImapResult) -> None:
         """Shared text layout for invalid-command audit (stream + output replay)."""
@@ -4303,101 +4509,104 @@ class ImapEngine:
         pp = self._ptprint_raw
         show = not self.use_json
 
-        def line_level(level: str, text: str) -> None:
-            bullet = {"ok": "NOTVULN", "bad": "VULN"}.get(level, "WARNING")
-            pp(text, bullet_type=bullet, condition=show, indent=4)
+        def field(level: str, text: str, indent: int = 8) -> None:
+            pp(text, bullet_type=tls_audit.rating_to_bullet(level), condition=show, indent=indent)
 
-        pp(
-            f"Target {tr.host!r}:{tr.port} (implicit TLS path: {tr.implicit_tls_intended})",
-            bullet_type="TITLE",
-            condition=show,
-            indent=4,
-        )
-        for p in tr.probes:
-            mode_label = (
-                f"Implicit TLS (Port {tr.port})"
-                if p.mode == "implicit_tls"
-                else f"STARTTLS (Port {tr.port})"
-            )
-            pp(f"Connection mode: {mode_label}", bullet_type="TITLE", condition=show, indent=4)
-            if p.handshake_ok:
-                tls_l = p.tls_version or "n/a"
-                ciph = p.cipher_name or "n/a"
-                pp(f"TLS Version: {tls_l} | Cipher: {ciph}", bullet_type="TITLE", condition=show, indent=4)
+        p = tr.probes[0] if tr.probes else None
+        if tr.implicit_tls_intended:
+            target_line = f"Target: {tr.host}:{tr.port}"
+        else:
+            target_line = f"Target: '{tr.host}:{tr.port}' (implicit TLS: not configured)"
+        pp(target_line, bullet_type="TITLE", condition=show, indent=4)
+        if p is None:
+            pp("TLS audit produced no probe result", bullet_type="VULN", condition=show, indent=4)
+            return
+        pp(f"Connection mode: {p.connection_mode}", bullet_type="TITLE", condition=show, indent=4)
 
-            if p.handshake_ok and (p.peer_subject or p.peer_issuer or p.san_dns or p.not_after):
-                pp("Certificate Information:", bullet_type="TITLE", condition=show, indent=4)
-                if p.peer_subject:
-                    pp(f"- Subject:  {p.peer_subject}", bullet_type="TEXT", condition=show, indent=8)
-                if p.peer_issuer:
-                    pp(f"- Issuer:   {p.peer_issuer}", bullet_type="TEXT", condition=show, indent=8)
-                nb_d = self._imap_tls_audit_terminal_fmt_cert_date(p.not_before)
-                na_d = self._imap_tls_audit_terminal_fmt_cert_date(p.not_after)
-                days = p.days_until_expiry
-                if p.cert_expired:
-                    days_s = f"({days} days remaining)" if days is not None else "(expired)"
-                elif p.cert_not_yet_valid:
-                    days_s = "(not yet valid)"
-                elif days is not None:
-                    days_s = f"({days} days remaining)"
-                else:
-                    days_s = ""
-                validity_line = f"- Validity: {nb_d} to {na_d} {days_s}".rstrip()
-                pp(validity_line, bullet_type="TEXT", condition=show, indent=8)
-                if p.san_dns:
-                    pp(f"- SAN:      {', '.join(p.san_dns)}", bullet_type="TEXT", condition=show, indent=8)
-                key_bits: list[str] = []
-                if p.peer_key_summary:
-                    key_bits.append(p.peer_key_summary)
-                if p.peer_signature_hash:
-                    key_bits.append(f"Hash: {p.peer_signature_hash}")
-                if key_bits:
-                    pp(f"- Key:      {' | '.join(key_bits)}", bullet_type="TEXT", condition=show, indent=8)
-            elif p.attempted and not p.handshake_ok:
-                pp("Certificate Information:", bullet_type="TITLE", condition=show, indent=4)
-                pp(
-                    "- (Leaf certificate details unavailable — TLS handshake did not complete)",
-                    bullet_type="TEXT",
-                    condition=show,
-                    indent=8,
-                )
+        if p.versions:
+            pp("TLS Versions:", bullet_type="TITLE", condition=show, indent=4)
+            for v in p.versions:
+                order = ""
+                if v.version == "TLS 1.3":
+                    order = "  order: not configured"
+                elif v.cipher_order:
+                    order = f"  order: {v.cipher_order}"
+                    if v.cipher_order_note:
+                        order += f" -- {v.cipher_order_note}"
+                field(v.rating, f"{v.version}{order}", indent=8)
+                for c in v.ciphers:
+                    field(c.rating, c.name, indent=12)
+        elif p.handshake_ok and (p.tls_version or p.cipher_name):
+            pp("TLS Versions:", bullet_type="TITLE", condition=show, indent=4)
+            label = tls_audit.normalize_tls_label(p.tls_version) or (p.tls_version or "unknown")
+            vr, _ = tls_audit.rate_tls_version(label)
+            field(vr, label, indent=8)
+            if p.cipher_name:
+                cr, _ = tls_audit.rate_cipher(p.cipher_name, label)
+                field(cr, p.cipher_name, indent=12)
+        elif not p.attempted and p.skipped_reason:
+            pp("TLS Versions:", bullet_type="TITLE", condition=show, indent=4)
+            pp(p.skipped_reason, bullet_type="WARNING", condition=show, indent=8)
+
+        pp("Certificate Information:", bullet_type="TITLE", condition=show, indent=4)
+        if p.handshake_ok and (p.peer_subject or p.peer_issuer or p.san_dns or p.not_after):
+            subj = p.peer_subject or "(none)"
+            subj_note = "" if p.identity_ok else "  (hostname does not match)"
+            subj_level = "ok" if p.identity_ok else "bad"
+            field(subj_level, f"Subject:  {subj}{subj_note}")
+            issuer_level = "ok" if p.cert_trust_ok else "bad"
+            issuer_note = "" if p.cert_trust_ok else "  (chain not trusted)"
+            field(issuer_level, f"Issuer:   {p.peer_issuer or '(none)'}{issuer_note}")
+            nb_d = self._imap_tls_audit_terminal_fmt_cert_date(p.not_before)
+            na_d = self._imap_tls_audit_terminal_fmt_cert_date(p.not_after)
+            days = p.days_until_expiry
+            if p.cert_expired:
+                days_s = f"({days} days remaining)" if days is not None else "(expired)"
+            elif p.cert_not_yet_valid:
+                days_s = "(not yet valid)"
+            elif days is not None:
+                days_s = f"({days} days remaining)"
             else:
-                pp("Certificate Information:", bullet_type="TITLE", condition=show, indent=4)
-                pp(
-                    f"- (Not evaluated: {p.skipped_reason or 'n/a'})",
-                    bullet_type="TEXT",
-                    condition=show,
-                    indent=8,
-                )
-
-            tl, tm = self._imap_tls_audit_terminal_trust_level_msg(p)
-            line_level(tl, f"Trust: {tm}")
-            il, im = self._imap_tls_audit_terminal_identity_level_msg(tr.host, p)
-            line_level(il, f"Identity: {im}")
-            pl, pm = self._imap_tls_audit_terminal_protocol_level_msg(p)
-            line_level(pl, f"Protocol: {pm}")
-
-            warn_parts: list[str] = []
-            if p.handshake_ok and p.expires_within_vuln_days and p.days_until_expiry is not None:
-                warn_parts.append(
-                    f"Certificate expires in {p.days_until_expiry} days (Critical renewal window)"
-                )
-            elif p.handshake_ok and p.expires_within_warn_days and p.days_until_expiry is not None:
-                warn_parts.append(
-                    f"Certificate expires in {p.days_until_expiry} days (renewal recommended)"
-                )
-            if p.handshake_ok and p.weak_cipher and p.cipher_name:
-                warn_parts.append(f"Weak negotiated cipher suite ({p.cipher_name})")
-            if p.handshake_ok and p.crypto_warnings:
-                cw = " and ".join(p.crypto_warnings[:4])
-                if len(p.crypto_warnings) > 4:
-                    cw += f" (+{len(p.crypto_warnings) - 4} more)"
-                warn_parts.append(cw)
-            for w in warn_parts:
-                line_level("warn", f"Warning: {w}")
-
-            vl, vm = self._imap_tls_audit_terminal_verdict_level_msg(tr, p)
-            line_level(vl, f"Verdict: {vm}")
+                days_s = ""
+            val_level, _ = tls_audit.rate_validity(
+                expired=p.cert_expired,
+                not_yet_valid=p.cert_not_yet_valid,
+                days_left=p.days_until_expiry,
+                vuln_days=_IMAP_TLS_EXPIRY_VULN_DAYS,
+                warn_days=_IMAP_TLS_EXPIRY_WARN_DAYS,
+            )
+            field(val_level, f"Validity: {nb_d} to {na_d} {days_s}".rstrip())
+            if p.san_dns:
+                first, *rest = p.san_dns
+                san_label = "SAN: "
+                pp(f"{san_label}{first}", bullet_type="TITLE", condition=show, indent=8)
+                # TITLE bullet is "[*] " (4 chars); TEXT has none — pad so DNS: lines up.
+                pad = " " * (4 + len(san_label))
+                for extra in rest:
+                    pp(f"{pad}{extra}", bullet_type="TEXT", condition=show, indent=8)
+            rsa_bits = tls_audit.parse_rsa_bits(p.peer_key_summary)
+            if rsa_bits is not None:
+                klev, _ = tls_audit.rate_rsa_key(rsa_bits)
+                field(klev, f"Key: {p.peer_key_summary}")
+            elif p.peer_key_summary:
+                field("ok", f"Key: {p.peer_key_summary}")
+            if p.peer_signature_hash:
+                hlev, _ = tls_audit.rate_sig_hash(p.peer_signature_hash)
+                field(hlev, f"Hash: {p.peer_signature_hash}")
+        elif p.attempted and not p.handshake_ok:
+            pp(
+                "(Leaf certificate details unavailable — TLS handshake did not complete)",
+                bullet_type="TEXT",
+                condition=show,
+                indent=8,
+            )
+        else:
+            pp(
+                f"(Not evaluated: {p.skipped_reason or 'n/a'})",
+                bullet_type="TEXT",
+                condition=show,
+                indent=8,
+            )
 
     def _stream_imap_tls_audit_result(self) -> None:
         """Stream IMAP TLS audit result (thread-safe)."""
@@ -4406,13 +4615,13 @@ class ImapEngine:
                 pp = self._ptprint_raw
                 show = not self.use_json
                 implicit = bool(self.args.tls or int(self.args.target.port) == 993)
-                pp(
-                    f"Target {self.args.target.ip!r}:{int(self.args.target.port)} "
-                    f"(implicit TLS path: {implicit})",
-                    bullet_type="TITLE",
-                    condition=show,
-                    indent=4,
-                )
+                host = self.args.target.ip
+                port = int(self.args.target.port)
+                if implicit:
+                    target_line = f"Target: {host}:{port}"
+                else:
+                    target_line = f"Target: '{host}:{port}' (implicit TLS: not configured)"
+                pp(target_line, bullet_type="TITLE", condition=show, indent=4)
                 pp(f"TLS audit failed: {err}", bullet_type="VULN", condition=show, indent=4)
             return
         if (tr := self.results.imap_tls_audit) is None:
@@ -4569,40 +4778,28 @@ class ImapEngine:
         pp = self._ptprint_raw
         show = not self.use_json
         with self._output_lock:
+            if not (ntlm.success and ntlm.ntlm is not None):
+                pp("Not available", bullet_type="NOTVULN", condition=show, indent=4)
+                return
             if ntlm.auth_ntlm_advertised:
                 pp("Pre-login CAPABILITY lists AUTH=NTLM", bullet_type="WARNING", condition=show, indent=4)
-            else:
-                pp(
-                    "AUTH=NTLM not seen in merged pre-login CAPABILITY (still probing AUTHENTICATE)",
-                    bullet_type="TITLE",
-                    condition=show,
-                    indent=4,
-                )
-            if not ntlm.success:
-                pp(
-                    "AUTHENTICATE NTLM did not yield a decodable Challenge",
-                    bullet_type="NOTVULN",
-                    condition=show,
-                    indent=4,
-                )
-            elif ntlm.ntlm is not None:
-                pp(
-                    "NTLM Challenge decoded — infrastructure identifiers disclosed",
-                    bullet_type="VULN",
-                    condition=show,
-                    indent=4,
-                )
-                for line in (
-                    f"Target name: {ntlm.ntlm.target_name}",
-                    f"NetBios domain name: {ntlm.ntlm.netbios_domain}",
-                    f"NetBios computer name: {ntlm.ntlm.netbios_computer}",
-                    f"DNS domain name: {ntlm.ntlm.dns_domain}",
-                    f"DNS computer name: {ntlm.ntlm.dns_computer}",
-                    f"DNS tree: {ntlm.ntlm.dns_tree}",
-                    f"OS version: {ntlm.ntlm.os_version}",
-                ):
-                    for part in (line or "").replace("\r", "").splitlines():
-                        pp(part, bullet_type="TEXT", condition=show, indent=8)
+            pp(
+                "NTLM Challenge decoded — infrastructure identifiers disclosed",
+                bullet_type="VULN",
+                condition=show,
+                indent=4,
+            )
+            for line in (
+                f"Target name: {ntlm.ntlm.target_name}",
+                f"NetBios domain name: {ntlm.ntlm.netbios_domain}",
+                f"NetBios computer name: {ntlm.ntlm.netbios_computer}",
+                f"DNS domain name: {ntlm.ntlm.dns_domain}",
+                f"DNS computer name: {ntlm.ntlm.dns_computer}",
+                f"DNS tree: {ntlm.ntlm.dns_tree}",
+                f"OS version: {ntlm.ntlm.os_version}",
+            ):
+                for part in (line or "").replace("\r", "").splitlines():
+                    pp(part, bullet_type="TEXT", condition=show, indent=8)
 
     def _stream_brute_result(self) -> None:
         """Stream brute-force summary (credentials already streamed via on_success) (thread-safe)."""
@@ -4691,41 +4888,77 @@ class ImapEngine:
                     }
                 }
             )
-        # Cleartext / sniffable IMAP probe (PTV-SVC-SNIFFABLE)
+        # AUTHLIST (PTV-SVC-IMAP-AUTHMETHODS)
+        if (al_err := getattr(self.results, "imap_authlist_error", None)) is not None:
+            properties.update({"authListError": al_err})
+        elif (al := getattr(self.results, "imap_authlist", None)) is not None:
+            path_json = []
+            auth_lines: list[str] = []
+            for p in al.paths:
+                label = self._authlist_path_label(p.path)
+                path_json.append(
+                    {
+                        "path": p.path,
+                        "available": p.available,
+                        "skipReason": p.skip_reason,
+                        "methods": [
+                            {
+                                "name": m.name,
+                                "usable": m.usable,
+                                "outcome": m.outcome,
+                                "dangerous": m.dangerous,
+                            }
+                            for m in p.methods
+                        ],
+                    }
+                )
+                if not p.available or not p.methods:
+                    auth_lines.append(f"{label}: Not available")
+                    continue
+                for m in p.methods:
+                    _, text = self._authlist_row_display(p.path, m)
+                    auth_lines.append(f"{label}: {text}")
+            properties.update(
+                {
+                    "authList": {
+                        "vulnerable": al.vulnerable,
+                        "detail": al.detail,
+                        "paths": path_json,
+                    }
+                }
+            )
+            if al.vulnerable:
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.AuthMethods.value,
+                        "vuln_request": "CAPABILITY AUTH= + AUTHENTICATE probe (cleartext / STARTTLS / TLS)",
+                        "vuln_response": "\n".join(auth_lines) or al.detail,
+                    }
+                )
+        # Cleartext LOGIN + SELECT INBOX (PTV-SVC-SNIFFABLE)
         if (sniff_err := getattr(self.results, "sniffable_error", None)) is not None:
             properties.update({"sniffableError": sniff_err})
         elif (sn := self.results.sniffable) is not None:
-            probe_lines: list[str] = []
-            if sn.skipped:
-                probe_lines.append(f"skipped: {sn.skip_reason or 'yes'}")
-            elif not sn.plain_ok:
-                probe_lines.append("plain_imap_tcp: not available")
-            else:
-                probe_lines.append(f"starttls_advertised: {sn.starttls_advertised}")
-                if sn.auth_methods:
-                    probe_lines.append("auth_methods_pre_tls: " + ", ".join(sn.auth_methods))
-                for method, outcome in sn.probes:
-                    probe_lines.append(f"AUTHENTICATE {method}: {outcome}")
-                probe_lines.append(f"cleartext_sniffable: {sn.vulnerable}")
             properties.update(
                 {
                     "sniffableProbe": {
                         "skipped": sn.skipped,
                         "skipReason": sn.skip_reason,
-                        "plainOk": sn.plain_ok,
-                        "startTlsAdvertised": sn.starttls_advertised,
-                        "authMethodsPreTls": list(sn.auth_methods),
-                        "authenticateProbes": [{"mechanism": m, "outcome": o} for m, o in sn.probes],
+                        "loginOk": sn.login_ok,
+                        "selectOk": sn.select_ok,
+                        "selectTyp": sn.select_typ,
+                        "selectDetail": sn.select_detail,
                         "vulnerable": sn.vulnerable,
+                        "detail": sn.detail,
                     }
                 }
             )
-            if sn.vulnerable and not sn.skipped and sn.plain_ok:
+            if sn.vulnerable and not sn.skipped:
                 deferred_vulns.append(
                     {
                         "vuln_code": VULNS.Sniffable.value,
-                        "vuln_request": "cleartext IMAP TCP (CAPABILITY / AUTHENTICATE probe)",
-                        "vuln_response": "\n".join(probe_lines),
+                        "vuln_request": "LOGIN + SELECT INBOX on cleartext IMAP",
+                        "vuln_response": sn.detail,
                     }
                 )
         # Invalid / non-standard commands (PTV-SVC-IMAP-INVCOMM)
@@ -5094,6 +5327,31 @@ class ImapEngine:
                         "peerKeySummary": p.peer_key_summary,
                         "peerSignatureHash": p.peer_signature_hash,
                         "cryptoWarnings": list(p.crypto_warnings),
+                        "certTrustOk": p.cert_trust_ok,
+                        "identityOk": p.identity_ok,
+                        "identityDetail": p.identity_detail,
+                        "identityWildcard": p.identity_wildcard,
+                        "connectionMode": p.connection_mode,
+                        "imapTrace": list(p.imap_trace),
+                        "versions": [
+                            {
+                                "version": v.version,
+                                "offered": v.offered,
+                                "rating": v.rating,
+                                "ratingReason": v.rating_reason,
+                                "cipherOrder": v.cipher_order,
+                                "cipherOrderNote": v.cipher_order_note,
+                                "ciphers": [
+                                    {
+                                        "name": c.name,
+                                        "rating": c.rating,
+                                        "reason": c.reason,
+                                    }
+                                    for c in v.ciphers
+                                ],
+                            }
+                            for v in p.versions
+                        ],
                     }
                     for p in ta.probes
                 ],
@@ -5267,5 +5525,578 @@ class ImapEngine:
 
         ptjsonlib.set_status("finished", "")
         self._ptprint(ptjsonlib.get_result_json(), json=True)
+
+    # endregion
+
+    # region NOOP Connection Limit Tests
+
+    @staticmethod
+    def _imap_noop_safe(imap: imaplib.IMAP4 | imaplib.IMAP4_SSL, tag: str) -> tuple[bool, str | None]:
+        """Send NOOP and return (success, error_msg)."""
+        try:
+            typ, data = imap.noop()
+            return (typ == "OK", None)
+        except Exception as e:
+            return (False, ImapEngine._unwrap_imaplib_error(str(e)))
+
+    def test_noop_duration_preauth(self) -> NoopDurationResult:
+        """NOOP1: Keep a pre-auth connection alive with periodic NOOP."""
+        self.debug("NOOP duration test (pre-auth): connecting...")
+        
+        try:
+            imap = self._make_imap_connection(trace=False)
+            imap.sock.settimeout(IMAP_NOOP_PREAUTH_DUR_TIMEOUT_SECONDS)
+        except Exception as e:
+            return NoopDurationResult(
+                authenticated=False,
+                test_duration_seconds=IMAP_NOOP_PREAUTH_DUR_TEST_SECONDS,
+                maintained_seconds=0.0,
+                noops_sent=0,
+                noops_ok=0,
+                noops_error=0,
+                disconnected=True,
+                disconnect_after_seconds=None,
+                hit_test_cap=False,
+                error_message=f"Connection failed: {e}",
+            )
+        
+        start_time = time.perf_counter()
+        noops_sent = 0
+        noops_ok = 0
+        noops_error = 0
+        disconnected = False
+        disconnect_after_seconds = None
+        hit_test_cap = False
+        tag_counter = 0
+        
+        # Live progress setup
+        show_progress = not self.use_json
+        live_line_dirty = False
+        
+        def write_live(text: str):
+            nonlocal live_line_dirty
+            if not show_progress:
+                return
+            sys.stdout.write(f"\033[2K\r            {text:<100}")
+            sys.stdout.flush()
+            live_line_dirty = True
+        
+        def clear_live():
+            nonlocal live_line_dirty
+            if not show_progress or not live_line_dirty:
+                return
+            sys.stdout.write("\033[2K\r")
+            sys.stdout.flush()
+            live_line_dirty = False
+        
+        # Initial progress message
+        if show_progress:
+            write_live(f"Test started, sending first NOOP...")
+        
+        try:
+            while True:
+                elapsed = time.perf_counter() - start_time
+                if elapsed >= IMAP_NOOP_PREAUTH_DUR_TEST_SECONDS:
+                    hit_test_cap = True
+                    break
+                
+                # Send NOOP
+                tag_counter += 1
+                noops_sent += 1
+                tag = f"a{tag_counter:04d}"
+                success, error = self._imap_noop_safe(imap, tag)
+                if success:
+                    noops_ok += 1
+                    # Live progress every NOOP
+                    if show_progress:
+                        elapsed_min = int(elapsed / 60)
+                        elapsed_sec = int(elapsed % 60)
+                        write_live(f"NOOPs sent: {noops_sent} ({elapsed_min}m {elapsed_sec}s elapsed)")
+                    if noops_sent % 5 == 0:
+                        self.debug(f"NOOP #{noops_sent}: OK (elapsed: {int(elapsed)}s)")
+                else:
+                    noops_error += 1
+                    disconnected = True
+                    disconnect_after_seconds = elapsed
+                    self.debug(f"NOOP #{noops_sent}: failed — {error}")
+                    break
+                
+                # Wait for the next NOOP interval
+                time.sleep(IMAP_NOOP_PREAUTH_DUR_INTERVAL_SECONDS)
+        finally:
+            clear_live()
+            try:
+                imap.logout()
+            except Exception:
+                pass
+        
+        maintained_seconds = time.perf_counter() - start_time
+        
+        return NoopDurationResult(
+            authenticated=False,
+            test_duration_seconds=IMAP_NOOP_PREAUTH_DUR_TEST_SECONDS,
+            maintained_seconds=maintained_seconds,
+            noops_sent=noops_sent,
+            noops_ok=noops_ok,
+            noops_error=noops_error,
+            disconnected=disconnected,
+            disconnect_after_seconds=disconnect_after_seconds,
+            hit_test_cap=hit_test_cap,
+            error_message=None,
+        )
+
+    def test_noop_duration_postauth(self, username: str, password: str) -> NoopDurationResult:
+        """NOOP1: Keep a post-auth connection alive with periodic NOOP."""
+        self.debug(f"NOOP duration test (post-auth): connecting and logging in as {username!r}...")
+        
+        try:
+            imap = self._make_imap_connection(trace=False)
+            imap.sock.settimeout(IMAP_NOOP_POSTAUTH_DUR_TIMEOUT_SECONDS)
+            imap.login(username, password)
+        except Exception as e:
+            return NoopDurationResult(
+                authenticated=True,
+                test_duration_seconds=IMAP_NOOP_POSTAUTH_DUR_TEST_SECONDS,
+                maintained_seconds=0.0,
+                noops_sent=0,
+                noops_ok=0,
+                noops_error=0,
+                disconnected=True,
+                disconnect_after_seconds=None,
+                hit_test_cap=False,
+                error_message=f"Connection/login failed: {e}",
+            )
+        
+        start_time = time.perf_counter()
+        noops_sent = 0
+        noops_ok = 0
+        noops_error = 0
+        disconnected = False
+        disconnect_after_seconds = None
+        hit_test_cap = False
+        tag_counter = 0
+        
+        # Live progress setup
+        show_progress = not self.use_json
+        live_line_dirty = False
+        
+        def write_live(text: str):
+            nonlocal live_line_dirty
+            if not show_progress:
+                return
+            sys.stdout.write(f"\033[2K\r            {text:<100}")
+            sys.stdout.flush()
+            live_line_dirty = True
+        
+        def clear_live():
+            nonlocal live_line_dirty
+            if not show_progress or not live_line_dirty:
+                return
+            sys.stdout.write("\033[2K\r")
+            sys.stdout.flush()
+            live_line_dirty = False
+        
+        # Initial progress message
+        if show_progress:
+            write_live(f"Test started, sending first NOOP...")
+        
+        try:
+            while True:
+                elapsed = time.perf_counter() - start_time
+                if elapsed >= IMAP_NOOP_POSTAUTH_DUR_TEST_SECONDS:
+                    hit_test_cap = True
+                    break
+                
+                tag_counter += 1
+                noops_sent += 1
+                tag = f"a{tag_counter:04d}"
+                success, error = self._imap_noop_safe(imap, tag)
+                if success:
+                    noops_ok += 1
+                    # Live progress every NOOP
+                    if show_progress:
+                        elapsed_min = int(elapsed / 60)
+                        elapsed_sec = int(elapsed % 60)
+                        write_live(f"NOOPs sent: {noops_sent} ({elapsed_min}m {elapsed_sec}s elapsed)")
+                    if noops_sent % 5 == 0:
+                        self.debug(f"NOOP #{noops_sent}: OK (elapsed: {int(elapsed)}s)")
+                else:
+                    noops_error += 1
+                    disconnected = True
+                    disconnect_after_seconds = elapsed
+                    self.debug(f"NOOP #{noops_sent}: failed — {error}")
+                    break
+                
+                time.sleep(IMAP_NOOP_POSTAUTH_DUR_INTERVAL_SECONDS)
+        finally:
+            clear_live()
+            try:
+                imap.logout()
+            except Exception:
+                pass
+        
+        maintained_seconds = time.perf_counter() - start_time
+        
+        return NoopDurationResult(
+            authenticated=True,
+            test_duration_seconds=IMAP_NOOP_POSTAUTH_DUR_TEST_SECONDS,
+            maintained_seconds=maintained_seconds,
+            noops_sent=noops_sent,
+            noops_ok=noops_ok,
+            noops_error=noops_error,
+            disconnected=disconnected,
+            disconnect_after_seconds=disconnect_after_seconds,
+            hit_test_cap=hit_test_cap,
+            error_message=None,
+        )
+
+    def _noop2_ramp_threads(self) -> int:
+        return max(1, int(getattr(self.args, "noop2_threads", None) or 1))
+
+    @staticmethod
+    def _unwrap_imaplib_error(text: str) -> str:
+        """imaplib formats abort/error as ``command: NAME => detail`` — keep only the detail."""
+        marker = " => "
+        if text.startswith("command:") and marker in text:
+            return text.split(marker, 1)[1].strip()
+        return text
+
+    @staticmethod
+    def _noop2_classify_conn_failure(exc: BaseException) -> tuple[str, str]:
+        """Return ``(reason, detail)`` for -vv, matching SMTP NOOP2 wording."""
+        detail = ImapEngine._unwrap_imaplib_error(str(exc).strip() or type(exc).__name__)
+        if isinstance(exc, (socket.timeout, TimeoutError)):
+            return "timeout", detail
+        if isinstance(exc, (
+            ConnectionRefusedError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+            imaplib.IMAP4.abort,
+        )):
+            return "disconnect", detail
+        msg = detail.lower()
+        if "timed out" in msg or "timeout" in msg:
+            return "timeout", detail
+        if any(k in msg for k in ("refused", "reset", "disconnect", "closed", "broken pipe", "aborted", " bye")):
+            return "disconnect", detail
+        return "error", detail
+
+    def _noop2_establish_pool(self, max_connections: int, opener, *, write_live, show_progress, clear_live=None):
+        """Open connections sequentially or with ``-t`` worker threads.
+
+        Every requested slot is attempted (SMTP NOOP2 behaviour). Failures are
+        logged at -vv with classified reason and the server/socket text.
+        """
+        connections: list = []
+        fail_count = 0
+        ramp_threads = min(self._noop2_ramp_threads(), max_connections)
+        lock = threading.Lock()
+        next_index = 0
+
+        def progress_text() -> str:
+            extra = f" ({fail_count} failed)" if fail_count else ""
+            return f"Establishing connections: {len(connections)}/{max_connections}{extra}"
+
+        def emit_fail(idx: int, exc: BaseException) -> None:
+            nonlocal fail_count
+            fail_count += 1
+            reason, detail = self._noop2_classify_conn_failure(exc)
+            if clear_live:
+                clear_live()
+            self.debug(f"Connection #{idx + 1} failed — {reason} ({detail})")
+            if show_progress:
+                write_live(progress_text())
+
+        def record(conn, idx: int) -> None:
+            connections.append((conn, idx))
+            if show_progress:
+                write_live(progress_text())
+
+        def try_one(idx: int) -> None:
+            try:
+                conn = opener(idx)
+            except Exception as e:
+                with lock:
+                    emit_fail(idx, e)
+                return
+            with lock:
+                record(conn, idx)
+
+        if ramp_threads <= 1:
+            for i in range(max_connections):
+                try_one(i)
+            return connections
+
+        def worker() -> None:
+            nonlocal next_index
+            while True:
+                with lock:
+                    if next_index >= max_connections:
+                        return
+                    idx = next_index
+                    next_index += 1
+                try_one(idx)
+
+        workers = [
+            threading.Thread(target=worker, daemon=True)
+            for _ in range(ramp_threads)
+        ]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+        return connections
+
+    def test_noop_conn_count_preauth(self) -> NoopConnectionCountResult:
+        """NOOP2: How many pre-auth connections can be maintained with NOOP."""
+        max_connections = getattr(self.args, 'noop2_connections', None) or NOOP2_DEFAULT_CONNECTIONS
+        
+        ramp_threads = self._noop2_ramp_threads()
+        self.debug(
+            f"NOOP connection count test (pre-auth): attempting up to {max_connections} connections"
+            + (f" ({ramp_threads} threads)..." if ramp_threads > 1 else "...")
+        )
+        
+        lock = threading.Lock()
+        total_noops_sent = 0
+        total_noops_ok = 0
+        total_noops_error = 0
+        early_disconnect_count = 0
+        
+        # Live progress setup
+        show_progress = not self.use_json
+        live_line_dirty = False
+        
+        def write_live(text: str):
+            nonlocal live_line_dirty
+            if not show_progress:
+                return
+            sys.stdout.write(f"\033[2K\r            {text:<100}")
+            sys.stdout.flush()
+            live_line_dirty = True
+        
+        def clear_live():
+            nonlocal live_line_dirty
+            if not show_progress or not live_line_dirty:
+                return
+            sys.stdout.write("\033[2K\r")
+            sys.stdout.flush()
+            live_line_dirty = False
+
+        def opener(_idx: int):
+            imap = self._make_imap_connection(trace=False)
+            imap.sock.settimeout(IMAP_NOOP_PREAUTH_CONN_TIMEOUT_SECONDS)
+            return imap
+
+        connections = self._noop2_establish_pool(
+            max_connections, opener, write_live=write_live, show_progress=show_progress,
+            clear_live=clear_live,
+        )
+        established = len(connections)
+        
+        clear_live()
+        self.debug(
+            f"Phase 1 complete: {established}/{max_connections} connections established. "
+            f"Holding for {IMAP_NOOP_PREAUTH_CONN_TEST_SECONDS}s with NOOP..."
+        )
+        
+        # Phase 2: Hold connections with periodic NOOP
+        start_time = time.perf_counter()
+        stop_event = threading.Event()
+        
+        def noop_worker(imap, idx):
+            nonlocal total_noops_sent, total_noops_ok, total_noops_error, early_disconnect_count
+            tag_counter = 0
+            while not stop_event.is_set():
+                time.sleep(IMAP_NOOP_PREAUTH_CONN_INTERVAL_SECONDS)
+                if stop_event.is_set():
+                    break
+                with lock:
+                    total_noops_sent += 1
+                tag_counter += 1
+                tag = f"b{idx:04d}{tag_counter:04d}"
+                success, error = self._imap_noop_safe(imap, tag)
+                with lock:
+                    if success:
+                        total_noops_ok += 1
+                    else:
+                        total_noops_error += 1
+                        early_disconnect_count += 1
+                        break
+        
+        threads = []
+        for imap, idx in connections:
+            t = threading.Thread(target=noop_worker, args=(imap, idx), daemon=True)
+            t.start()
+            threads.append(t)
+        
+        # Wait for test duration with live progress
+        end_time = time.perf_counter() + IMAP_NOOP_PREAUTH_CONN_TEST_SECONDS
+        while time.perf_counter() < end_time:
+            time.sleep(1.0)
+            if show_progress:
+                active = established - early_disconnect_count
+                remaining = int(end_time - time.perf_counter())
+                write_live(f"Maintaining connections: {active}/{established} active, {remaining}s remaining, {total_noops_ok} NOOPs sent")
+        
+        stop_event.set()
+        clear_live()
+        
+        # Wait for all threads to finish
+        for t in threads:
+            t.join(timeout=2.0)
+        
+        # Close all connections
+        for imap, _ in connections:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+        
+        maintained = established - early_disconnect_count
+        test_duration = time.perf_counter() - start_time
+        
+        self.debug(f"Phase 2 complete: {maintained}/{established} connections maintained, {total_noops_ok} NOOPs OK")
+        
+        return NoopConnectionCountResult(
+            authenticated=False,
+            max_connections_attempted=max_connections,
+            connections_established=established,
+            connections_maintained=maintained,
+            test_duration_seconds=test_duration,
+            total_noops_sent=total_noops_sent,
+            total_noops_ok=total_noops_ok,
+            total_noops_error=total_noops_error,
+            early_disconnect_count=early_disconnect_count,
+            error_message=None,
+        )
+
+    def test_noop_conn_count_postauth(self, username: str, password: str) -> NoopConnectionCountResult:
+        """NOOP2: How many post-auth connections can be maintained with NOOP."""
+        # Use 4x the pre-auth default for post-auth (600 if pre-auth is 150)
+        default_postauth = (getattr(self.args, 'noop2_connections', None) or NOOP2_DEFAULT_CONNECTIONS) * 4
+        max_connections = min(default_postauth, IMAP_NOOP_POSTAUTH_CONN_MAX_ATTEMPTS)
+        
+        ramp_threads = self._noop2_ramp_threads()
+        self.debug(
+            f"NOOP connection count test (post-auth): attempting up to {max_connections} connections"
+            + (f" ({ramp_threads} threads)..." if ramp_threads > 1 else "...")
+        )
+        
+        lock = threading.Lock()
+        total_noops_sent = 0
+        total_noops_ok = 0
+        total_noops_error = 0
+        early_disconnect_count = 0
+        
+        # Live progress setup
+        show_progress = not self.use_json
+        live_line_dirty = False
+        
+        def write_live(text: str):
+            nonlocal live_line_dirty
+            if not show_progress:
+                return
+            sys.stdout.write(f"\033[2K\r            {text:<100}")
+            sys.stdout.flush()
+            live_line_dirty = True
+        
+        def clear_live():
+            nonlocal live_line_dirty
+            if not show_progress or not live_line_dirty:
+                return
+            sys.stdout.write("\033[2K\r")
+            sys.stdout.flush()
+            live_line_dirty = False
+
+        def opener(_idx: int):
+            imap = self._make_imap_connection(trace=False)
+            imap.sock.settimeout(IMAP_NOOP_POSTAUTH_CONN_TIMEOUT_SECONDS)
+            imap.login(username, password)
+            return imap
+
+        connections = self._noop2_establish_pool(
+            max_connections, opener, write_live=write_live, show_progress=show_progress,
+            clear_live=clear_live,
+        )
+        established = len(connections)
+        
+        clear_live()
+        self.debug(
+            f"Phase 1 complete: {established}/{max_connections} authenticated connections. "
+            f"Holding for {IMAP_NOOP_POSTAUTH_CONN_TEST_SECONDS}s with NOOP..."
+        )
+        
+        # Phase 2: Hold connections with periodic NOOP
+        start_time = time.perf_counter()
+        stop_event = threading.Event()
+        
+        def noop_worker(imap, idx):
+            nonlocal total_noops_sent, total_noops_ok, total_noops_error, early_disconnect_count
+            tag_counter = 0
+            while not stop_event.is_set():
+                time.sleep(IMAP_NOOP_POSTAUTH_CONN_INTERVAL_SECONDS)
+                if stop_event.is_set():
+                    break
+                with lock:
+                    total_noops_sent += 1
+                tag_counter += 1
+                tag = f"c{idx:04d}{tag_counter:04d}"
+                success, error = self._imap_noop_safe(imap, tag)
+                with lock:
+                    if success:
+                        total_noops_ok += 1
+                    else:
+                        total_noops_error += 1
+                        early_disconnect_count += 1
+                        break
+        
+        threads = []
+        for imap, idx in connections:
+            t = threading.Thread(target=noop_worker, args=(imap, idx), daemon=True)
+            t.start()
+            threads.append(t)
+        
+        # Wait for test duration with live progress
+        end_time = time.perf_counter() + IMAP_NOOP_POSTAUTH_CONN_TEST_SECONDS
+        while time.perf_counter() < end_time:
+            time.sleep(1.0)
+            if show_progress:
+                active = established - early_disconnect_count
+                remaining = int(end_time - time.perf_counter())
+                write_live(f"Maintaining connections: {active}/{established} active, {remaining}s remaining, {total_noops_ok} NOOPs sent")
+        
+        stop_event.set()
+        clear_live()
+        
+        # Wait for all threads to finish
+        for t in threads:
+            t.join(timeout=2.0)
+        
+        # Close all connections
+        for imap, _ in connections:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+        
+        maintained = established - early_disconnect_count
+        test_duration = time.perf_counter() - start_time
+        
+        self.debug(f"Phase 2 complete: {maintained}/{established} connections maintained, {total_noops_ok} NOOPs OK")
+        
+        return NoopConnectionCountResult(
+            authenticated=True,
+            max_connections_attempted=max_connections,
+            connections_established=established,
+            connections_maintained=maintained,
+            test_duration_seconds=test_duration,
+            total_noops_sent=total_noops_sent,
+            total_noops_ok=total_noops_ok,
+            total_noops_error=total_noops_error,
+            early_disconnect_count=early_disconnect_count,
+            error_message=None,
+        )
 
     # endregion

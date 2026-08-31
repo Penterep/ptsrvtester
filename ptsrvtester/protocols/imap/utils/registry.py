@@ -4,11 +4,11 @@ from __future__ import annotations
 from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
 
 IMAP_TEST_GROUPS: list[tuple[str, list[str]]] = [
-    ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "NTLM"]),
+    ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "AUTHLIST", "NTLM"]),
     ("Protocol & validation", ["SNIFF", "INVCMD"]),
     ("Authentication & enumeration", ["ANON", "USRENUM", "USRENUMPLAIN", "BRUTE"]),
     ("Content security", ["EICAR", "ZIPXXE"]),
-    ("Rate limiting & stress", ["CONNLIM", "RESLOAD"]),
+    ("Connection limits & stress", ["NOOP1", "NOOP2", "CONNLIM", "RESLOAD"]),
     ("Access control & TLS", ["MBOXISO", "TLSAUDIT"]),
     ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
 ]
@@ -34,10 +34,10 @@ IMAP_TESTS: dict[str, dict] = {
         ],
     },
     "ENCRYPT": {
-        "desc": "Test encryption options (plaintext / STARTTLS / TLS)",
+        "desc": "Test encryption options (cleartext / STARTTLS / TLS)",
         "long": [
-            "Inspect supported transport encryption on the port: plaintext",
-            "login, explicit STARTTLS upgrade and implicit TLS.",
+            "Inspect supported transport encryption on the port: cleartext",
+            "TCP, explicit STARTTLS upgrade and implicit TLS.",
         ],
     },
     "NTLM": {
@@ -47,12 +47,22 @@ IMAP_TESTS: dict[str, dict] = {
             "and decode the server Challenge for leaked domain / host info.",
         ],
     },
-    "SNIFF": {
-        "desc": "Cleartext sniffable probe",
+    "AUTHLIST": {
+        "desc": "List AUTH= mechanisms (cleartext / STARTTLS / TLS)",
         "long": [
-            "Probe cleartext IMAP: CAPABILITY, STARTTLS advertisement and",
-            "whether AUTHENTICATE accepts a continuation on plain TCP.",
+            "Read AUTH= from CAPABILITY on cleartext, STARTTLS and implicit TLS,",
+            "then probe AUTHENTICATE for each advertised method. A dangerous",
+            "method that is advertised but not usable is reported as a warning.",
         ],
+    },
+    "SNIFF": {
+        "desc": "Cleartext LOGIN + SELECT INBOX",
+        "long": [
+            "On a cleartext IMAP session, LOGIN with -u/-p and SELECT INBOX",
+            "to check whether mailbox access (and thus message traffic) is",
+            "possible without TLS. Skipped with --tls or on port 993.",
+        ],
+        "requires": ["-u/--user and -p/--password (no wordlists)"],
     },
     "INVCMD": {
         "desc": "Test invalid / non-standard commands",
@@ -141,6 +151,33 @@ IMAP_TESTS: dict[str, dict] = {
             ["", "--zipxxe-timeout", "<sec>", "Per-message timeout (default: 30)"],
         ],
     },
+    "NOOP1": {
+        "desc": "NOOP connection duration",
+        "long": [
+            "Test how long connections can be maintained with periodic NOOP.",
+            "Pre-authentication test always runs; post-authentication test runs",
+            "if -u/-p provided. IMAP4rev2 specifies 30-minute minimum for auth.",
+            "Note: NOOP is distinct from IDLE (which is for mailbox changes).",
+        ],
+        "mods": [
+            ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
+            ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
+        ],
+    },
+    "NOOP2": {
+        "desc": "NOOP connection count",
+        "long": [
+            "Test how many connections can be established and maintained with",
+            "periodic NOOP. Pre-authentication test always runs; post-authentication",
+            "test runs if -u/-p provided. Evaluates per-IP and per-account limits.",
+        ],
+        "mods": [
+            ["", "--noop2-connections", "<n>", "Max connections to attempt (default: 150)"],
+            ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
+            ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
+            ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
+        ],
+    },
     "CONNLIM": {
         "desc": "Connection limits / rate / idle probes",
         "long": [
@@ -177,10 +214,12 @@ IMAP_TESTS: dict[str, dict] = {
         ],
     },
     "TLSAUDIT": {
-        "desc": "Strict TLS handshake + certificate audit",
+        "desc": "TLS version / cipher enumeration + certificate audit",
         "long": [
-            "Strict TLS handshake with platform trust store and hostname check;",
-            "reports TLS version, cipher and certificate subject / issuer / SAN.",
+            "Enumerates offered TLS versions and cipher suites (not only the",
+            "negotiated pair) and rates them against RFC 8996, NIST SP 800-52r2",
+            "and TLSRef Intermediate (Mozilla Server Side TLS lineage).",
+            "Certificate identity uses RFC 9525 wildcard matching.",
             "Implicit TLS on 993 (or --tls), otherwise STARTTLS when advertised.",
         ],
     },

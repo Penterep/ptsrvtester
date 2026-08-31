@@ -1,4 +1,4 @@
-"""ENCRYPT — plaintext / STARTTLS / implicit TLS probes."""
+"""ENCRYPT — cleartext / STARTTLS / implicit TLS probes."""
 from ._common import eng
 
 __MODULELABEL__ = "Encryption"

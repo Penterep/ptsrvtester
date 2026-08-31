@@ -29,19 +29,44 @@ class EncryptionResult(NamedTuple):
     tls_ok: bool
 
 
+class ImapAuthMechRow(NamedTuple):
+    """One AUTH= mechanism: advertised in CAPABILITY, then AUTHENTICATE probe."""
+
+    name: str
+    usable: bool
+    outcome: str  # continuation | tagged_no | tagged_bad | io_error | other_response
+    dangerous: bool  # IMAP_AUTH_METHOD_LEVEL ERROR (cleartext credential/SASL risk)
+
+
+class ImapAuthListPath(NamedTuple):
+    path: str  # cleartext | starttls | tls
+    available: bool
+    skip_reason: str | None
+    methods: tuple[ImapAuthMechRow, ...]
+
+
+class ImapAuthListResult(NamedTuple):
+    """AUTHLIST: advertised AUTH= on cleartext / STARTTLS / implicit TLS."""
+
+    paths: tuple[ImapAuthListPath, ...]
+    vulnerable: bool  # dangerous mechanism usable on cleartext
+    detail: str
+
+
 class SniffableResult(NamedTuple):
     """
-    Cleartext IMAP probe for sniffable authentication (pre-STARTTLS).
-    PTV-SVC-SNIFFABLE when plain TCP IMAP is usable without STARTTLS upgrade path
-    or when a credential-bearing AUTHENTICATE exchange is accepted on cleartext (continuation '+').
+    Cleartext LOGIN + SELECT INBOX (PTV-SVC-SNIFFABLE).
+    Requires a single -u/-p. Meaningful only on plain TCP (not --tls).
     """
+
     skipped: bool
     skip_reason: str | None
-    plain_ok: bool
-    starttls_advertised: bool
-    auth_methods: tuple[str, ...]
-    probes: tuple[tuple[str, str], ...]  # (SASL mechanism, outcome label)
+    login_ok: bool
+    select_ok: bool
+    select_typ: str | None
+    select_detail: str | None
     vulnerable: bool
+    detail: str
 
 
 CatchAllResult = str  # "configured" | "not_configured" | "indeterminate"
@@ -122,7 +147,8 @@ _IMAP_MBOX_ISO_LIST_DICTIONARY_PATTERNS: tuple[str, ...] = (
 )
 _IMAP_MBOX_ISO_ENUM_MIN_TOTAL_LISTED = 15  # heuristic: many hits across guessed LIST patterns
 _IMAP_MBOX_ISO_ENUM_MIN_NONZERO_PATTERNS = 3
-# Strict TLS + certificate audit (PTV-SVC-IMAP-TLSAUDIT): RFC 7817 identity, OWASP-style transport review.
+# TLS + certificate audit (PTV-SVC-IMAP-TLSAUDIT): RFC 8996 / NIST SP 800-52r2 /
+# TLSRef Intermediate cipher policy; RFC 9525 identity.
 _IMAP_TLS_AUDIT_TIMEOUT_SEC = 12.0
 _IMAP_TLS_EXPIRY_WARN_DAYS = 30
 _IMAP_TLS_EXPIRY_VULN_DAYS = 14
@@ -360,8 +386,28 @@ class ImapMailboxIsoResult(NamedTuple):
     detail: str
 
 
+class ImapTlsCipherOffer(NamedTuple):
+    """One cipher suite the server accepted for a TLS version."""
+
+    name: str
+    rating: str  # ok | warn | bad
+    reason: str
+
+
+class ImapTlsVersionScan(NamedTuple):
+    """Offered TLS protocol version and the cipher suites accepted under it."""
+
+    version: str  # TLS 1.0 / TLS 1.1 / TLS 1.2 / TLS 1.3
+    offered: bool
+    rating: str  # ok | warn | bad
+    rating_reason: str
+    cipher_order: str | None  # server | client | mixed | None
+    cipher_order_note: str | None
+    ciphers: tuple[ImapTlsCipherOffer, ...]
+
+
 class ImapTlsAuditProbeResult(NamedTuple):
-    """One strict-verification TLS path (implicit TLS or STARTTLS), PTV-SVC-IMAP-TLSAUDIT."""
+    """One TLS path (implicit TLS or STARTTLS), PTV-SVC-IMAP-TLSAUDIT."""
 
     mode: str  # implicit_tls | starttls
     attempted: bool
@@ -387,6 +433,13 @@ class ImapTlsAuditProbeResult(NamedTuple):
     peer_key_summary: str | None
     peer_signature_hash: str | None
     crypto_warnings: tuple[str, ...]
+    versions: tuple[ImapTlsVersionScan, ...] = ()
+    imap_trace: tuple[str, ...] = ()
+    identity_ok: bool = False
+    identity_detail: str | None = None
+    identity_wildcard: bool = False
+    cert_trust_ok: bool = False
+    connection_mode: str = "No certificate"
 
 
 class ImapTlsAuditResult(NamedTuple):
@@ -428,6 +481,91 @@ class ImapUserEnumResult(NamedTuple):
     auth_plain_advertised: bool  # AUTH=PLAIN in merged pre-auth CAPABILITY / banner
 
 
+# ─── NOOP Connection Limit Tests ──────────────────────────────────────────────
+# IMAP4rev2: 30-minute minimum autologout for authenticated sessions; servers may
+# use shorter pre-auth timeouts for DoS protection. Pre-auth limits should be stricter.
+# Note: IDLE is distinct from NOOP — IDLE is for waiting on mailbox changes; NOOP
+# is a normal command that can reset the inactivity timer.
+
+# Pre-authentication duration test (NOOPLIM1)
+IMAP_NOOP_PREAUTH_DUR_TEST_SECONDS = 35 * 60  # Test for 35 minutes (captures "high" threshold)
+IMAP_NOOP_PREAUTH_DUR_INTERVAL_SECONDS = 4 * 60  # Send NOOP every 4 minutes (shorter pre-auth for DoS protection)
+IMAP_NOOP_PREAUTH_DUR_TIMEOUT_SECONDS = 30    # Socket recv timeout
+
+# Pre-authentication duration thresholds (in seconds)
+IMAP_NOOP_PREAUTH_DUR_INCREASED_MIN = 5 * 60   # >5 min → increased
+IMAP_NOOP_PREAUTH_DUR_SIGNIFICANT_MIN = 10 * 60 # >10 min → significant
+IMAP_NOOP_PREAUTH_DUR_HIGH_MIN = 30 * 60       # >30 min → high
+
+# Pre-authentication connection count test (NOOPLIM2)
+IMAP_NOOP_PREAUTH_CONN_TEST_SECONDS = 120     # Hold connections for 2 minutes
+IMAP_NOOP_PREAUTH_CONN_INTERVAL_SECONDS = 60  # Send NOOP every minute (short interval for connection count test)
+IMAP_NOOP_PREAUTH_CONN_TIMEOUT_SECONDS = 30
+IMAP_NOOP_PREAUTH_CONN_MAX_ATTEMPTS = 150     # Try up to 150 connections (safety cap)
+
+# CLI default for --noop2-connections
+NOOP2_DEFAULT_CONNECTIONS = IMAP_NOOP_PREAUTH_CONN_MAX_ATTEMPTS
+
+# Pre-authentication connection count thresholds
+IMAP_NOOP_PREAUTH_CONN_INCREASED_MIN = 20     # >20 connections → increased
+IMAP_NOOP_PREAUTH_CONN_SIGNIFICANT_MIN = 50   # >50 connections → significant
+IMAP_NOOP_PREAUTH_CONN_HIGH_MIN = 100         # >100 connections → high
+
+# Post-authentication duration test (NOOPLIM3)
+IMAP_NOOP_POSTAUTH_DUR_TEST_SECONDS = 130 * 60 # Test for 130 minutes (captures "high" threshold)
+IMAP_NOOP_POSTAUTH_DUR_INTERVAL_SECONDS = 20 * 60  # Send NOOP every 20 minutes (RFC: 30min minimum timeout)
+IMAP_NOOP_POSTAUTH_DUR_TIMEOUT_SECONDS = 30
+
+# Post-authentication duration thresholds (in seconds)
+IMAP_NOOP_POSTAUTH_DUR_INCREASED_MIN = 60 * 60  # >60 min → increased
+IMAP_NOOP_POSTAUTH_DUR_SIGNIFICANT_MIN = 120 * 60 # >120 min → significant
+IMAP_NOOP_POSTAUTH_DUR_HIGH_MIN = 180 * 60      # >180 min (unlimited) → high
+
+# Post-authentication connection count test (NOOPLIM4)
+IMAP_NOOP_POSTAUTH_CONN_TEST_SECONDS = 180
+IMAP_NOOP_POSTAUTH_CONN_INTERVAL_SECONDS = 60  # Send NOOP every minute (short interval for connection count test)
+IMAP_NOOP_POSTAUTH_CONN_TIMEOUT_SECONDS = 30
+IMAP_NOOP_POSTAUTH_CONN_MAX_ATTEMPTS = 600    # Try up to 600 connections (safety cap)
+
+# Post-authentication connection count thresholds (per IP)
+IMAP_NOOP_POSTAUTH_CONN_IP_INCREASED_MIN = 50
+IMAP_NOOP_POSTAUTH_CONN_IP_SIGNIFICANT_MIN = 100
+IMAP_NOOP_POSTAUTH_CONN_IP_HIGH_MIN = 500
+
+# Post-authentication connection count thresholds (per account)
+IMAP_NOOP_POSTAUTH_CONN_ACCT_INCREASED_MIN = 20
+IMAP_NOOP_POSTAUTH_CONN_ACCT_SIGNIFICANT_MIN = 50
+IMAP_NOOP_POSTAUTH_CONN_ACCT_HIGH_MIN = 100
+
+
+class NoopDurationResult(NamedTuple):
+    """NOOP connection duration test: keep one connection alive with periodic NOOP."""
+    authenticated: bool                # Pre-auth (False) or post-auth (True)
+    test_duration_seconds: float       # How long the test was configured to run
+    maintained_seconds: float          # How long the connection actually stayed alive
+    noops_sent: int                    # Number of NOOPs successfully sent
+    noops_ok: int                      # Number of OK replies
+    noops_error: int                   # Number of NO/BAD or timeout/socket errors
+    disconnected: bool                 # True if server closed the connection
+    disconnect_after_seconds: float | None  # When the disconnect happened
+    hit_test_cap: bool                 # True if we reached the test duration limit
+    error_message: str | None          # Error detail if test failed to start
+
+
+class NoopConnectionCountResult(NamedTuple):
+    """NOOP connection count test: how many connections can be maintained with NOOP."""
+    authenticated: bool                # Pre-auth (False) or post-auth (True)
+    max_connections_attempted: int     # How many connections we tried to open
+    connections_established: int       # How many got past the greeting
+    connections_maintained: int        # How many stayed alive for the test duration
+    test_duration_seconds: float       # How long we held the connections
+    total_noops_sent: int              # Total NOOPs across all connections
+    total_noops_ok: int
+    total_noops_error: int
+    early_disconnect_count: int        # Connections that died during the test
+    error_message: str | None
+
+
 @dataclass
 class IMAPResults:
     info: InfoResult | None = None
@@ -441,6 +579,8 @@ class IMAPResults:
     encryption_error: str | None = None
     sniffable: SniffableResult | None = None
     sniffable_error: str | None = None
+    imap_authlist: ImapAuthListResult | None = None
+    imap_authlist_error: str | None = None
     inv_comm: InvCommImapResult | None = None
     inv_comm_error: str | None = None
     catch_all: CatchAllResult | None = None
@@ -459,12 +599,21 @@ class IMAPResults:
     imap_mailbox_iso_error: str | None = None
     imap_tls_audit: ImapTlsAuditResult | None = None
     imap_tls_audit_error: str | None = None
+    noop_duration_preauth: NoopDurationResult | None = None
+    noop_duration_preauth_error: str | None = None
+    noop_conn_count_preauth: NoopConnectionCountResult | None = None
+    noop_conn_count_preauth_error: str | None = None
+    noop_duration_postauth: NoopDurationResult | None = None
+    noop_duration_postauth_error: str | None = None
+    noop_conn_count_postauth: NoopConnectionCountResult | None = None
+    noop_conn_count_postauth_error: str | None = None
 
 
 class VULNS(Enum):
     Anonymous = "PTL-SVC-IMAP-ANONYMOUS"
     NTLM = "PTL-SVC-IMAP-NTLMINFO"
     WeakCreds = "PTV-GENERAL-WEAKCREDENTIALS"
+    AuthMethods = "PTV-SVC-IMAP-AUTHMETHODS"
     Sniffable = "PTV-SVC-SNIFFABLE"
     InvComm = "PTV-SVC-IMAP-INVCOMM"
     ConnCntIp = "PTV-SVC-IMAP-CONNCNTIP"
@@ -477,5 +626,9 @@ class VULNS(Enum):
     ResourceLoad = "PTV-SVC-IMAP-RESLOAD"
     AuthzBypass = "PTV-SVC-IMAP-AUTHZ-BYPASS"
     TlsAudit = "PTV-SVC-IMAP-TLSAUDIT"
+    NoopDurationPreauth = "PTV-SVC-IMAP-NOOPLIMDUR-PREAUTH"
+    NoopDurationPostauth = "PTV-SVC-IMAP-NOOPLIMDUR-POSTAUTH"
+    NoopConnCountPreauth = "PTV-SVC-IMAP-NOOPLIMCONN-PREAUTH"
+    NoopConnCountPostauth = "PTV-SVC-IMAP-NOOPLIMCONN-POSTAUTH"
 
 

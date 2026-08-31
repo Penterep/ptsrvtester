@@ -9,6 +9,7 @@ import importlib.metadata
 import ipaddress
 import logging
 import math
+import secrets
 import socket
 import ssl
 import struct
@@ -36,6 +37,28 @@ except ModuleNotFoundError as exc:  # transitional compatibility before base reb
         raise
     from ptsrvtester.modules._base import BaseArgs, BaseModule, Out
 
+from .auth_analysis import (
+    AccountLockoutConfig,
+    BruteProtectionConfig,
+    BruteProtectionResult,
+    UserEnumerationConfig,
+    UserEnumerationResult,
+    load_user_wordlist,
+    run_brute_protection,
+    run_user_enumeration,
+)
+from .auth_attempts import (
+    AuthAttemptRequest,
+    AuthMechanism,
+    AuthOutcome,
+    AuthPhase,
+    CredentialKind,
+    CredentialSource,
+    TLSVerification,
+    run_auth_attempt,
+    sanitize_sensitive_text,
+)
+from .auth_attempts import AuthAttemptResult as FreshAuthAttemptResult
 from .cli import (
     IMPLEMENTED_TESTS,
     RDP_EXPLICIT_ONLY_TESTS,
@@ -479,6 +502,60 @@ class RDPAuthResult:
 
 
 @dataclass(frozen=True)
+class AuthMethodObservation:
+    mechanism: str
+    credential_source: str
+    status: str
+    attempt: FreshAuthAttemptResult | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class RDPAuthMethodsResult:
+    status: str
+    methods: tuple[AuthMethodObservation, ...] = ()
+    note: str | None = None
+
+
+@dataclass(frozen=True)
+class RDPBruteProtectionResult:
+    analysis: BruteProtectionResult
+    config: BruteProtectionConfig | None = None
+    service_recovery_probe: NegotiationProbe | None = None
+    valid_baseline: FreshAuthAttemptResult | None = None
+    valid_final: FreshAuthAttemptResult | None = None
+
+    @property
+    def overall_status(self) -> str:
+        lockout_status = self.analysis.account_lockout.status
+        if lockout_status == "lockout_observed":
+            return "account_lockout_observed"
+        if lockout_status in {
+            "blocked",
+            "inconclusive",
+            "skipped",
+        } and self.analysis.status not in {
+            "blocked",
+            "error",
+            "inconclusive",
+        }:
+            return "partial"
+        return self.analysis.status
+
+    @property
+    def overall_reason(self) -> str | None:
+        lockout = self.analysis.account_lockout
+        if lockout.status == "lockout_observed":
+            return lockout.reason or "the disposable account was locked"
+        if self.overall_status == "partial" and lockout.reason:
+            return (
+                f"random-identity series: {self.analysis.reason or self.analysis.status}; "
+                f"account-lockout check: {lockout.reason}"
+            )
+        return self.analysis.reason
+
+
+@dataclass(frozen=True)
 class RDPConnectionLimitResult:
     status: str
     scenarios: tuple[RateScenarioResult, ...] = ()
@@ -572,6 +649,9 @@ class RDPResults:
     ntlm_info: NTLMInfoResult | None = None
     ssl: SSLResult | None = None
     auth: RDPAuthResult | None = None
+    auth_methods: RDPAuthMethodsResult | None = None
+    user_enumeration: UserEnumerationResult | None = None
+    brute_protection: RDPBruteProtectionResult | None = None
     connection_limit: RDPConnectionLimitResult | None = None
     not_implemented: list[str] = field(default_factory=list)
     module_errors: dict[str, str] = field(default_factory=dict)
@@ -601,13 +681,19 @@ def _split_ntlm_login(login: str) -> tuple[str | None, str]:
 
 
 def _sanitize_auth_error(error: object, *sensitive_values: str | None) -> str:
-    message = str(error).strip() or error.__class__.__name__
-    for sensitive_value in sensitive_values:
-        if sensitive_value:
-            message = message.replace(sensitive_value, "<redacted>")
-    if len(message) > 500:
-        message = f"{message[:497]}..."
-    return message
+    expanded: list[str] = []
+    for sensitive in sensitive_values:
+        if not isinstance(sensitive, str) or not sensitive:
+            continue
+        expanded.append(sensitive)
+        try:
+            domain, username = _split_ntlm_login(sensitive)
+        except ValueError:
+            continue
+        expanded.append(username)
+        if domain:
+            expanded.append(domain)
+    return sanitize_sensitive_text(error, *dict.fromkeys(expanded))
 
 
 def _parse_bitmap_codec_guids(data: bytes) -> frozenset[str]:
@@ -1927,6 +2013,7 @@ class RDP(BaseModule):
         self.connect_host = getattr(args, "_rdp_resolved_ip", args.target.ip)
         self._security_probes: list[NegotiationProbe] | None = None
         self._basic_settings_result: BasicSettingsResult | None = None
+        self._ntlm_info_preflight_result: NTLMInfoResult | None = None
         self._auth_tls_validation_result: AuthTLSValidationResult | None = None
         self._authenticated_session_result: AuthenticatedSessionResult | None = None
         self._active_output_context = None
@@ -1986,11 +2073,17 @@ class RDP(BaseModule):
         elif canonical == "VERSION":
             self.results.version = self._run_version_test()
         elif canonical == "NTLMINFO":
-            self.results.ntlm_info = self._run_ntlminfo_test()
+            self.results.ntlm_info = self._get_ntlm_info_preflight()
         elif canonical == "SSL":
             self.results.ssl = self._run_ssl_test()
         elif canonical == "AUTH":
             self.results.auth = self._run_auth_test()
+        elif canonical == "AUTHMETHODS":
+            self.results.auth_methods = self._run_auth_methods_test()
+        elif canonical == "USERENUM":
+            self.results.user_enumeration = self._run_user_enumeration_test()
+        elif canonical == "BRUTEPROT":
+            self.results.brute_protection = self._run_brute_protection_test()
         elif canonical == "RATELIMIT":
             self.results.connection_limit = self._run_rate_limit_test()
         elif canonical not in self.results.not_implemented:
@@ -2031,6 +2124,9 @@ class RDP(BaseModule):
             "SSL": ("TLS / SSL configuration test", self.results.ssl, self._output_ssl_text),
             "NTLMINFO": ("RDP NTLM information", self.results.ntlm_info, self._output_ntlminfo_text),
             "AUTH": ("RDP authentication test", self.results.auth, self._output_auth_text),
+            "AUTHMETHODS": ("RDP authentication methods", self.results.auth_methods, self._output_auth_methods_text),
+            "USERENUM": ("RDP user enumeration", self.results.user_enumeration, self._output_user_enumeration_text),
+            "BRUTEPROT": ("RDP password-guessing protections", self.results.brute_protection, self._output_brute_protection_text),
             "RATELIMIT": ("RDP connection rate limiting", self.results.connection_limit, self._output_rate_limit_text),
         }
         entry = outputters.get(canonical)
@@ -2235,6 +2331,565 @@ class RDP(BaseModule):
             tls_verification=session.tls_verification,
             certificate_sha256=session.certificate_sha256,
             error=session.error,
+        )
+
+    def _run_fresh_auth_attempt(
+        self,
+        login: str,
+        password: str,
+        *,
+        mechanism: AuthMechanism = AuthMechanism.NTLM,
+        credential_source: CredentialSource = CredentialSource.PROVIDED,
+    ) -> FreshAuthAttemptResult:
+        """Run one non-cached password attempt after a shared TLS preflight."""
+
+        started = time.perf_counter()
+        tls_validation = self._get_auth_tls_validation_result()
+        if (
+            tls_validation.status == "error"
+            or tls_validation.certificate_sha256 is None
+        ):
+            return FreshAuthAttemptResult(
+                mechanism=mechanism,
+                credential_kind=CredentialKind.PASSWORD,
+                credential_source=credential_source,
+                outcome=AuthOutcome.TLS_ERROR,
+                phase=AuthPhase.TLS,
+                duration_ms=max(0.0, (time.perf_counter() - started) * 1000.0),
+                error=tls_validation.error,
+            )
+
+        request = AuthAttemptRequest(
+            host=self.connect_host,
+            port=self.args.target.port,
+            login=login,
+            password=password,
+            mechanism=mechanism,
+            expected_certificate_sha256=tls_validation.certificate_sha256,
+            server_hostname=self.args.target.ip,
+            tls_verification=TLSVerification(tls_validation.status),
+            timeout_seconds=self.timeout_seconds,
+            credential_source=credential_source,
+            realm=getattr(self.args, "realm", None),
+            kdc_ip=getattr(self.args, "kdc", None),
+            spn_hostname=getattr(self.args, "spn_host", None),
+        )
+        return run_auth_attempt(request)
+
+    @staticmethod
+    def _generated_password_credentials(
+        mechanism: AuthMechanism,
+        realm: str | None,
+    ) -> tuple[str, str]:
+        username = f"ptsrv-random-{secrets.token_hex(12)}"
+        if mechanism is AuthMechanism.KERBEROS and realm:
+            login = f"{username}@{realm}"
+        elif mechanism is AuthMechanism.NTLM and realm:
+            login = f"{realm}\\{username}"
+        else:
+            login = username
+        return login, f"!ptsrv-random-{secrets.token_hex(32)}!"
+
+    def _requested_auth_methods(self) -> tuple[AuthMechanism, ...]:
+        raw = getattr(self.args, "auth_methods", None)
+        if raw is None:
+            values = ["ntlm", "kerberos"]
+        elif isinstance(raw, str):
+            values = [
+                value.strip().lower()
+                for token in raw.split(",")
+                for value in token.split()
+                if value.strip()
+            ]
+        else:
+            values = [
+                str(value).strip().lower()
+                for value in raw
+                if str(value).strip()
+            ]
+
+        methods: list[AuthMechanism] = []
+        for value in values:
+            method = AuthMechanism(value)
+            if method not in methods:
+                methods.append(method)
+        return tuple(methods)
+
+    def _get_ntlm_info_preflight(self) -> NTLMInfoResult:
+        """Cache an internal NTLM challenge without publishing a finding."""
+
+        if self.results.ntlm_info is not None:
+            return self.results.ntlm_info
+        if self._ntlm_info_preflight_result is None:
+            self._ntlm_info_preflight_result = self._run_ntlminfo_test()
+        return self._ntlm_info_preflight_result
+
+    @staticmethod
+    def _auth_attempt_status_reason(
+        attempt: FreshAuthAttemptResult,
+    ) -> str | None:
+        status = attempt.server_error_name or attempt.server_error_hex
+        if status is None:
+            return attempt.error
+        if attempt.server_error_from_credssp:
+            return f"CredSSP server returned {status}"
+        return f"unverified status parsed from backend error: {status}"
+
+    def _run_auth_methods_test(self) -> RDPAuthMethodsResult:
+        try:
+            requested = self._requested_auth_methods()
+        except ValueError as exc:
+            return RDPAuthMethodsResult(status="error", note=str(exc))
+        if not requested:
+            return RDPAuthMethodsResult(
+                status="error",
+                note="no NTLM or Kerberos authentication method was selected",
+            )
+
+        provided_credentials = (
+            self.args.login is not None and self.args.password is not None
+        )
+        incomplete_credentials = (
+            (self.args.login is None) != (self.args.password is None)
+        )
+        realm = getattr(self.args, "realm", None)
+        observations: list[AuthMethodObservation] = []
+
+        for mechanism in requested:
+            if mechanism is AuthMechanism.KERBEROS:
+                missing = [
+                    option
+                    for option, value in (
+                        ("--realm", realm),
+                        ("--kdc", getattr(self.args, "kdc", None)),
+                        ("--spn-host", getattr(self.args, "spn_host", None)),
+                    )
+                    if not value
+                ]
+                if missing:
+                    observations.append(
+                        AuthMethodObservation(
+                            mechanism=mechanism.value,
+                            credential_source="not_used",
+                            status="prerequisite_error",
+                            reason="Kerberos requires " + ", ".join(missing),
+                        )
+                    )
+                    continue
+                if not provided_credentials:
+                    observations.append(
+                        AuthMethodObservation(
+                            mechanism=mechanism.value,
+                            credential_source="not_used",
+                            status="prerequisite_error",
+                            reason=(
+                                "valid --login and --password are required; random "
+                                "credentials would fail at the KDC before testing RDP"
+                            ),
+                        )
+                    )
+                    continue
+
+            if provided_credentials:
+                login = self.args.login or ""
+                password = self.args.password or ""
+                source = CredentialSource.PROVIDED
+            else:
+                login, password = self._generated_password_credentials(
+                    mechanism,
+                    realm,
+                )
+                source = CredentialSource.GENERATED
+
+            attempt = self._run_fresh_auth_attempt(
+                login,
+                password,
+                mechanism=mechanism,
+                credential_source=source,
+            )
+            if mechanism is AuthMechanism.NTLM:
+                ntlm_preflight = self._get_ntlm_info_preflight()
+                ntlm_negotiable = ntlm_preflight.status in {"ok", "empty"}
+            else:
+                ntlm_negotiable = False
+
+            if attempt.outcome is AuthOutcome.AUTHENTICATED:
+                status = "authenticated"
+                if attempt.session_established:
+                    reason = (
+                        "password authentication and full RDP session setup succeeded"
+                    )
+                elif attempt.credssp_authenticated:
+                    reason = (
+                        "password authentication succeeded through CredSSP; later "
+                        "RDP session setup did not complete"
+                    )
+                else:
+                    reason = "password authentication succeeded"
+            elif attempt.outcome is AuthOutcome.BLOCKED:
+                if attempt.server_error_from_credssp and (
+                    attempt.server_error_name or attempt.server_error_hex
+                ):
+                    status = "blocked"
+                    reason = self._auth_attempt_status_reason(attempt)
+                else:
+                    status = "indeterminate"
+                    reason = (
+                        "the authentication attempt indicated blocking, but the "
+                        "reported status was not decoded directly from a CredSSP "
+                        "server response"
+                    )
+            elif ntlm_negotiable:
+                if attempt.outcome is AuthOutcome.REJECTED:
+                    status = "negotiable"
+                    if (
+                        attempt.server_error_code is not None
+                        and not attempt.server_error_from_credssp
+                    ):
+                        reason = (
+                            "NTLM negotiation was confirmed independently by a Type "
+                            "2 challenge; the fresh attempt returned an unverified "
+                            "rejection status parsed from a backend error"
+                        )
+                    else:
+                        reason = (
+                            "NTLM was negotiated; the supplied credentials were "
+                            "rejected"
+                            if source is CredentialSource.PROVIDED
+                            else (
+                                "NTLM was negotiated; generated credentials were "
+                                "intentionally rejected"
+                            )
+                        )
+                else:
+                    status = "advertised"
+                    if (
+                        attempt.outcome is AuthOutcome.PREREQUISITE_ERROR
+                        and attempt.error
+                    ):
+                        reason = (
+                            "the server returned an NTLM Type 2 challenge; the fresh "
+                            f"credential attempt could not run: {attempt.error}"
+                        )
+                    else:
+                        reason = (
+                            "the server returned an NTLM Type 2 challenge, but the "
+                            "fresh credential attempt ended as "
+                            f"{attempt.outcome.value} during {attempt.phase.value}"
+                        )
+            elif attempt.outcome is AuthOutcome.NOT_SUPPORTED:
+                status = "not_supported"
+                reason = attempt.error
+            elif (
+                mechanism is AuthMechanism.KERBEROS
+                and attempt.phase
+                not in {AuthPhase.KDC, AuthPhase.VALIDATION, AuthPhase.DEPENDENCY}
+                and attempt.server_response_observed
+                and attempt.outcome is AuthOutcome.REJECTED
+                and (
+                    attempt.server_error_code is None
+                    or attempt.server_error_from_credssp
+                )
+            ):
+                status = "negotiable"
+                reason = "Kerberos reached RDP CredSSP but authentication was rejected"
+            elif (
+                attempt.server_error_code is not None
+                and not attempt.server_error_from_credssp
+                and attempt.outcome
+                in {AuthOutcome.REJECTED, AuthOutcome.PREREQUISITE_ERROR}
+            ):
+                status = "indeterminate"
+                reason = self._auth_attempt_status_reason(attempt)
+            else:
+                status = attempt.outcome.value
+                reason = self._auth_attempt_status_reason(attempt)
+
+            observations.append(
+                AuthMethodObservation(
+                    mechanism=mechanism.value,
+                    credential_source=source.value,
+                    status=status,
+                    attempt=attempt,
+                    reason=reason,
+                )
+            )
+
+        partial_statuses = {
+            "error",
+            "indeterminate",
+            "prerequisite_error",
+            "timeout",
+            "tls_error",
+            "transport_error",
+        }
+        status = (
+            "partial"
+            if any(
+                item.status in partial_statuses
+                or (
+                    item.attempt is not None
+                    and item.attempt.outcome
+                    in {
+                        AuthOutcome.ERROR,
+                        AuthOutcome.INDETERMINATE,
+                        AuthOutcome.PREREQUISITE_ERROR,
+                        AuthOutcome.TIMEOUT,
+                        AuthOutcome.TLS_ERROR,
+                        AuthOutcome.TRANSPORT_ERROR,
+                    }
+                )
+                for item in observations
+            )
+            else "complete"
+        )
+        note = None
+        if incomplete_credentials:
+            note = (
+                "only one credential option was supplied; generated credentials "
+                "were used for NTLM and the incomplete value was not used"
+                if AuthMechanism.NTLM in requested
+                else (
+                    "only one credential option was supplied; incomplete credentials "
+                    "were not used"
+                )
+            )
+        return RDPAuthMethodsResult(
+            status=status,
+            methods=tuple(observations),
+            note=note,
+        )
+
+    def _run_user_enumeration_test(self) -> UserEnumerationResult:
+        if self.args.login is None:
+            return UserEnumerationResult(
+                status="blocked",
+                reason="USERENUM requires a known valid --login",
+            )
+        if getattr(self.args, "allow_auth_failures", False) is not True:
+            return UserEnumerationResult(
+                status="blocked",
+                reason="USERENUM requires --allow-auth-failures",
+            )
+
+        tls_validation = self._get_auth_tls_validation_result()
+        if tls_validation.status == "error":
+            return UserEnumerationResult(
+                status="blocked",
+                reason=f"credentials were not used: {tls_validation.error}",
+            )
+
+        ntlm_preflight = self._get_ntlm_info_preflight()
+        if ntlm_preflight.status not in {"ok", "empty"}:
+            status = (
+                "not_applicable"
+                if ntlm_preflight.status == "not_supported"
+                else "inconclusive"
+            )
+            return UserEnumerationResult(
+                status=status,
+                reason="an NTLM challenge was not available for RDP CredSSP",
+            )
+
+        try:
+            candidates = (
+                load_user_wordlist(self.args.users, self.args.login)
+                if getattr(self.args, "users", None)
+                else ()
+            )
+            config = UserEnumerationConfig(
+                valid_login=self.args.login,
+                candidates=candidates,
+                allow_auth_failures=True,
+                inter_attempt_delay_ms=getattr(self.args, "guess_delay_ms", 100),
+            )
+        except (OSError, TypeError, UnicodeError, ValueError) as exc:
+            return UserEnumerationResult(
+                status="error",
+                reason=f"invalid USERENUM input: {exc}",
+            )
+
+        def fresh(
+            login: str,
+            password: str,
+            *,
+            source: CredentialSource = CredentialSource.GENERATED,
+        ) -> FreshAuthAttemptResult:
+            return self._run_fresh_auth_attempt(
+                login,
+                password,
+                mechanism=AuthMechanism.NTLM,
+                credential_source=source,
+            )
+
+        identity_note = "known login was supplied by the operator but not authenticated"
+        if self.args.password is not None:
+            valid_baseline = fresh(
+                self.args.login,
+                self.args.password,
+                source=CredentialSource.PROVIDED,
+            )
+            if valid_baseline.outcome is not AuthOutcome.AUTHENTICATED:
+                return UserEnumerationResult(
+                    status="blocked",
+                    reason=(
+                        "the supplied known-login baseline did not authenticate; "
+                        "no intentional failed login was sent"
+                    ),
+                    candidate_count_requested=len(candidates),
+                )
+            identity_note = "known login was verified with supplied credentials"
+
+        result = run_user_enumeration(config, fresh)
+        reason = f"{identity_note}; {result.reason}" if result.reason else identity_note
+        return replace(result, reason=reason)
+
+    def _run_brute_protection_test(self) -> RDPBruteProtectionResult:
+        allow_failures = getattr(self.args, "allow_auth_failures", False) is True
+        lockout_enabled = getattr(self.args, "lockout_test", False) is True
+        namespace_login = self.args.login or "ptsrv-brute-baseline"
+
+        if not allow_failures:
+            analysis = BruteProtectionResult(
+                status="blocked",
+                reason="BRUTEPROT requires --allow-auth-failures",
+            )
+            return RDPBruteProtectionResult(analysis=analysis)
+        if lockout_enabled and (
+            self.args.login is None or self.args.password is None
+        ):
+            analysis = BruteProtectionResult(
+                status="blocked",
+                reason=(
+                    "--lockout-test requires valid --login and --password for a "
+                    "disposable test account"
+                ),
+            )
+            return RDPBruteProtectionResult(analysis=analysis)
+
+        tls_validation = self._get_auth_tls_validation_result()
+        if tls_validation.status == "error":
+            analysis = BruteProtectionResult(
+                status="blocked",
+                reason=f"credentials were not used: {tls_validation.error}",
+            )
+            return RDPBruteProtectionResult(analysis=analysis)
+
+        ntlm_preflight = self._get_ntlm_info_preflight()
+        if ntlm_preflight.status not in {"ok", "empty"}:
+            status = (
+                "not_applicable"
+                if ntlm_preflight.status == "not_supported"
+                else "inconclusive"
+            )
+            analysis = BruteProtectionResult(
+                status=status,
+                reason="an NTLM challenge was not available for RDP CredSSP",
+            )
+            return RDPBruteProtectionResult(analysis=analysis)
+
+        try:
+            attempts = getattr(self.args, "guess_attempts", 10)
+            if isinstance(attempts, bool) or not isinstance(attempts, int):
+                raise TypeError("--guess-attempts must be an integer")
+            comparison_window = min(3, attempts // 2)
+            lockout_config = AccountLockoutConfig(
+                enabled=lockout_enabled,
+                valid_login=self.args.login,
+                valid_password=self.args.password,
+                bad_attempts=getattr(self.args, "lockout_attempts", 3),
+            )
+            config = BruteProtectionConfig(
+                namespace_login=namespace_login,
+                attempts=attempts,
+                comparison_window=comparison_window,
+                allow_auth_failures=True,
+                inter_attempt_delay_ms=getattr(self.args, "guess_delay_ms", 100),
+                account_lockout=lockout_config,
+            )
+        except (TypeError, ValueError) as exc:
+            analysis = BruteProtectionResult(
+                status="error",
+                reason=f"invalid BRUTEPROT configuration: {exc}",
+            )
+            return RDPBruteProtectionResult(analysis=analysis)
+
+        def fresh(login: str, password: str) -> FreshAuthAttemptResult:
+            source = (
+                CredentialSource.PROVIDED
+                if login == self.args.login and password == self.args.password
+                else CredentialSource.GENERATED
+            )
+            return self._run_fresh_auth_attempt(
+                login,
+                password,
+                mechanism=AuthMechanism.NTLM,
+                credential_source=source,
+            )
+
+        valid_baseline: FreshAuthAttemptResult | None = None
+        valid_final: FreshAuthAttemptResult | None = None
+        if self.args.login is not None and self.args.password is not None:
+            valid_baseline = fresh(self.args.login, self.args.password)
+            if valid_baseline.outcome is not AuthOutcome.AUTHENTICATED:
+                analysis = BruteProtectionResult(
+                    status="blocked",
+                    reason=(
+                        "the supplied valid-credential baseline did not authenticate; "
+                        "no failed-login pressure was sent"
+                    ),
+                )
+                return RDPBruteProtectionResult(
+                    analysis=analysis,
+                    config=config,
+                    valid_baseline=valid_baseline,
+                )
+
+        analysis = run_brute_protection(config, fresh)
+        if analysis.status == "blocked":
+            return RDPBruteProtectionResult(
+                analysis=analysis,
+                config=config,
+                valid_baseline=valid_baseline,
+            )
+        recovery = self._negotiate(
+            "Post-authentication-pressure recovery",
+            PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX,
+        )
+
+        if (
+            not lockout_enabled
+            and self.args.login is not None
+            and self.args.password is not None
+        ):
+            valid_final = fresh(self.args.login, self.args.password)
+
+        inconclusive_reasons: list[str] = []
+        if recovery.selected_protocol is None:
+            inconclusive_reasons.append(
+                "RDP negotiation did not recover after the authentication series; "
+                "blocking cannot be distinguished from service/network impact"
+            )
+        if (
+            valid_final is not None
+            and valid_final.outcome is not AuthOutcome.AUTHENTICATED
+        ):
+            inconclusive_reasons.append(
+                "the final valid-credential probe no longer authenticated; possible "
+                "source-IP, account-policy, or service impact"
+            )
+        if inconclusive_reasons and analysis.status not in {"blocked", "error"}:
+            analysis = replace(
+                analysis,
+                status="inconclusive",
+                reason="; ".join(inconclusive_reasons),
+            )
+        return RDPBruteProtectionResult(
+            analysis=analysis,
+            config=config,
+            service_recovery_probe=recovery,
+            valid_baseline=valid_baseline,
+            valid_final=valid_final,
         )
 
     @staticmethod
@@ -3638,6 +4293,32 @@ class RDP(BaseModule):
         }.get(result.status, Out.WARNING)
 
     @staticmethod
+    def _auth_method_output_category(result: AuthMethodObservation) -> Out:
+        return {
+            "authenticated": Out.OK,
+            "error": Out.ERROR,
+            "timeout": Out.ERROR,
+            "tls_error": Out.ERROR,
+            "transport_error": Out.ERROR,
+        }.get(result.status, Out.WARNING)
+
+    @staticmethod
+    def _user_enumeration_output_category(result: UserEnumerationResult) -> Out:
+        return {
+            "enumerable": Out.VULN,
+            "enumerable_partial": Out.VULN,
+            "not_observed": Out.NOTVULN,
+            "error": Out.ERROR,
+        }.get(result.status, Out.WARNING)
+
+    @staticmethod
+    def _brute_protection_output_category(result: BruteProtectionResult) -> Out:
+        return {
+            "protection_observed": Out.OK,
+            "error": Out.ERROR,
+        }.get(result.status, Out.WARNING)
+
+    @staticmethod
     def _rate_limit_output_category(result: RDPConnectionLimitResult) -> Out:
         return {
             "possible_ip_block_or_service_impact": Out.ERROR,
@@ -3819,6 +4500,56 @@ class RDP(BaseModule):
             if emit_text:
                 self._output_auth_text(self.results.auth)
             properties["authentication"] = self._auth_json(self.results.auth)
+
+        if self.results.auth_methods is not None:
+            if emit_text:
+                self._output_auth_methods_text(self.results.auth_methods)
+            properties["authenticationMethods"] = self._auth_methods_json(
+                self.results.auth_methods
+            )
+            if self.results.auth_methods.status == "error":
+                self.results.module_errors.setdefault(
+                    "AUTHMETHODS",
+                    _sanitize_auth_error(
+                        self.results.auth_methods.note or "authentication-method test failed",
+                        getattr(self.args, "password", None),
+                        getattr(self.args, "login", None),
+                    ),
+                )
+
+        if self.results.user_enumeration is not None:
+            if emit_text:
+                self._output_user_enumeration_text(self.results.user_enumeration)
+            properties["userEnumeration"] = self._user_enumeration_json(
+                self.results.user_enumeration
+            )
+            if self.results.user_enumeration.status in {"blocked", "error"}:
+                self.results.module_errors.setdefault(
+                    "USERENUM",
+                    _sanitize_auth_error(
+                        self.results.user_enumeration.reason
+                        or "user-enumeration test failed",
+                        getattr(self.args, "password", None),
+                        getattr(self.args, "login", None),
+                    ),
+                )
+
+        if self.results.brute_protection is not None:
+            if emit_text:
+                self._output_brute_protection_text(self.results.brute_protection)
+            properties["passwordGuessingProtection"] = self._brute_protection_json(
+                self.results.brute_protection
+            )
+            if self.results.brute_protection.overall_status in {"blocked", "error"}:
+                self.results.module_errors.setdefault(
+                    "BRUTEPROT",
+                    _sanitize_auth_error(
+                        self.results.brute_protection.overall_reason
+                        or "password-guessing protection test failed",
+                        getattr(self.args, "password", None),
+                        getattr(self.args, "login", None),
+                    ),
+                )
 
         if self.results.connection_limit is not None:
             if emit_text:
@@ -4262,6 +4993,203 @@ class RDP(BaseModule):
                 f"{result.certificate_sha256}"
             )
 
+    def _output_auth_methods_text(self, result: RDPAuthMethodsResult) -> None:
+        if self.use_json:
+            return
+
+        self.ptprint("RDP authentication methods", Out.INFO)
+        if result.note:
+            self._print_status(result.note, Out.WARNING)
+
+        labels = {
+            AuthMechanism.NTLM.value: "Username/password via NTLM",
+            AuthMechanism.KERBEROS.value: "Username/password via Kerberos",
+        }
+        for method in result.methods:
+            label = labels.get(method.mechanism, method.mechanism)
+            reason = method.reason or method.status.replace("_", " ")
+            self._print_status(
+                f"{label}: {method.status.replace('_', ' ')} ({reason})",
+                self._auth_method_output_category(method),
+            )
+            attempt = method.attempt
+            if attempt is None:
+                continue
+            connection_timing_ms = (
+                attempt.connection_duration_ms
+                if attempt.connection_duration_ms is not None
+                else attempt.duration_ms
+            )
+            self.ptdebug(
+                f"{label}: phase={attempt.phase.value}, "
+                f"outcome={attempt.outcome.value}, "
+                f"credentials={attempt.credential_source.value}, "
+                f"connection-attempt timing={connection_timing_ms:.1f} ms"
+            )
+            if attempt.server_error_name or attempt.server_error_hex:
+                status_label = (
+                    "CredSSP server status"
+                    if attempt.server_error_from_credssp
+                    else "unverified parsed status"
+                )
+                self.ptdebug(
+                    f"{label}: {status_label}="
+                    f"{attempt.server_error_name or attempt.server_error_hex}"
+                )
+            for evidence in attempt.evidence:
+                self.ptdebug(f"{label}: {evidence}")
+
+    def _output_user_enumeration_text(
+        self,
+        result: UserEnumerationResult,
+    ) -> None:
+        if self.use_json:
+            return
+
+        self.ptprint("RDP user enumeration", Out.INFO)
+        self.ptdebug("Scope: RDP CredSSP/NLA username-password authentication via NTLM")
+        messages = {
+            "enumerable": (
+                "Account enumeration was confirmed by distinct account-specific "
+                "server responses"
+            ),
+            "enumerable_partial": (
+                "Account enumeration was confirmed, but candidate testing stopped early"
+            ),
+            "not_observed": (
+                "No distinguishable account-enumeration response was observed "
+                "within this sample"
+            ),
+            "blocked": "User-enumeration test was not run",
+            "not_applicable": "NTLM-based RDP user enumeration is not applicable",
+            "inconclusive": "User-enumeration result is inconclusive",
+            "error": "User-enumeration test failed",
+        }
+        message = messages.get(result.status, f"User-enumeration status: {result.status}")
+        if result.reason:
+            message = f"{message} ({result.reason})"
+        self._print_status(message, self._user_enumeration_output_category(result))
+        self.ptdebug(
+            f"Baseline attempts: {result.baseline_attempts}; random-invalid "
+            f"responses consistent: {result.invalid_baselines_consistent}"
+        )
+        self.ptdebug(
+            f"Wordlist candidates: {result.candidate_count_requested} requested, "
+            f"{result.candidate_count_tested} tested, "
+            f"{result.candidate_count_skipped} skipped"
+        )
+
+        for login in result.existing_users:
+            self._print_status(f"Existing account: {login}", Out.VULN, indent=8)
+        if result.non_existing_users:
+            self.ptdebug(
+                "Non-existing candidates: " + ", ".join(result.non_existing_users)
+            )
+        for login in result.inconclusive_users:
+            self._print_status(
+                f"Candidate could not be classified: {login}",
+                Out.WARNING,
+                indent=8,
+            )
+
+    def _output_brute_protection_text(
+        self,
+        result: RDPBruteProtectionResult,
+    ) -> None:
+        if self.use_json:
+            return
+
+        self.ptprint("RDP password-guessing protections", Out.INFO)
+        self.ptdebug("Scope: RDP CredSSP/NLA username-password authentication via NTLM")
+        analysis = result.analysis
+        messages = {
+            "protection_observed": (
+                "Blocking or timeout behavior was observed during the bounded "
+                "failed-login series; its cause cannot be proven from the wire alone"
+            ),
+            "not_observed": (
+                "No source-wide blocking protection was observed within "
+                f"{analysis.attempts_performed} failed login attempts against "
+                "random nonexistent identities"
+            ),
+            "response_changed": (
+                "Server responses changed during the failed-login series, but the "
+                "change does not prove blocking"
+            ),
+            "slowdown_signal": (
+                "A connection-attempt slowdown signal was observed; server load "
+                "or network effects cannot be excluded"
+            ),
+            "insufficient_samples": (
+                "The failed-login series was too small to evaluate slowdown"
+            ),
+            "not_applicable": "NTLM-based password-guessing test is not applicable",
+            "inconclusive": "Password-guessing protection result is inconclusive",
+            "blocked": "Password-guessing protection test was not run",
+            "error": "Password-guessing protection test failed",
+        }
+        message = messages.get(analysis.status, analysis.status.replace("_", " "))
+        if analysis.reason:
+            message = f"{message} ({analysis.reason})"
+        self._print_status(message, self._brute_protection_output_category(analysis))
+
+        if (
+            analysis.status != "blocked"
+            and analysis.first_median_ms is not None
+            and analysis.last_median_ms is not None
+        ):
+            ratio = (
+                f", ratio {analysis.median_ratio:.2f}x"
+                if analysis.median_ratio is not None
+                else ""
+            )
+            self.ptdebug(
+                "Connection-attempt timing diagnostic: first median "
+                f"{analysis.first_median_ms:.1f} ms, last median "
+                f"{analysis.last_median_ms:.1f} ms{ratio}; timing alone does not "
+                "prove throttling"
+            )
+
+        lockout = analysis.account_lockout
+        if lockout.status == "lockout_observed":
+            self._print_status(
+                "Disposable account lockout was observed"
+                + (
+                    f" at wrong-password attempt {lockout.locked_at_attempt}"
+                    if lockout.locked_at_attempt is not None
+                    else ""
+                ),
+                Out.WARNING,
+            )
+        elif lockout.status == "not_observed":
+            self._print_status(
+                "Disposable account remained usable after "
+                f"{lockout.bad_attempts_performed} wrong-password attempts",
+                Out.OK,
+            )
+        elif lockout.status != "not_run":
+            self._print_status(
+                f"Account-lockout test {lockout.status.replace('_', ' ')}"
+                + (f": {lockout.reason}" if lockout.reason else ""),
+                Out.WARNING,
+            )
+
+        if result.service_recovery_probe is not None:
+            recovery = result.service_recovery_probe
+            recovered = recovery.selected_protocol is not None
+            self._print_status(
+                "RDP negotiation recovered after the authentication series"
+                if recovered
+                else "RDP negotiation did not recover after the authentication series",
+                Out.OK if recovered else Out.ERROR,
+            )
+        for label, attempt in (
+            ("Valid-credential baseline", result.valid_baseline),
+            ("Valid-credential final probe", result.valid_final),
+        ):
+            if attempt is not None:
+                self.ptdebug(f"{label}: {attempt.outcome.value}")
+
     @staticmethod
     def _rate_metrics_summary(metrics: RateProbeMetrics) -> str:
         if metrics.attempted == 0:
@@ -4478,6 +5406,179 @@ class RDP(BaseModule):
             "tlsVerification": result.tls_verification,
             "certificateSha256": result.certificate_sha256,
             "error": result.error,
+        }
+
+    @staticmethod
+    def _auth_attempt_json(result: FreshAuthAttemptResult | None) -> dict | None:
+        if result is None:
+            return None
+        return {
+            "mechanism": result.mechanism.value,
+            "credentialKind": result.credential_kind.value,
+            "credentialSource": result.credential_source.value,
+            "outcome": result.outcome.value,
+            "phase": result.phase.value,
+            "durationMs": round(result.duration_ms, 3),
+            "connectionDurationMs": (
+                round(result.connection_duration_ms, 3)
+                if result.connection_duration_ms is not None
+                else None
+            ),
+            "selectedProtocol": result.selected_protocol_name,
+            "selectedProtocolValue": result.selected_protocol,
+            "selectedMechanism": result.selected_mechanism,
+            "serverResponseObserved": result.server_response_observed,
+            "credsspAuthenticated": result.credssp_authenticated,
+            "sessionEstablished": result.session_established,
+            "rdpAuthorized": result.rdp_authorized,
+            "tlsVerification": (
+                result.tls_verification.value
+                if result.tls_verification is not None
+                else None
+            ),
+            "certificateSha256": result.certificate_sha256,
+            "serverErrorCode": result.server_error_code,
+            "serverErrorHex": result.server_error_hex,
+            "serverErrorName": result.server_error_name,
+            "serverErrorFromCredssp": result.server_error_from_credssp,
+            "error": result.error,
+            "evidence": list(result.evidence),
+        }
+
+    def _auth_methods_json(self, result: RDPAuthMethodsResult) -> dict:
+        return {
+            "status": result.status,
+            "note": result.note,
+            "credentialType": "username_password",
+            "methods": [
+                {
+                    "mechanism": method.mechanism,
+                    "credentialSource": method.credential_source,
+                    "status": method.status,
+                    "reason": method.reason,
+                    "attempt": self._auth_attempt_json(method.attempt),
+                }
+                for method in result.methods
+            ],
+        }
+
+    @staticmethod
+    def _semantic_fingerprint_json(fingerprint) -> dict | None:
+        if fingerprint is None:
+            return None
+        return {
+            "outcome": fingerprint.outcome,
+            "failureStage": fingerprint.failure_stage,
+            "ntstatus": fingerprint.ntstatus,
+            "serverErrorFromCredssp": fingerprint.server_error_from_credssp,
+            "selectedProtocol": fingerprint.selected_protocol,
+        }
+
+    def _user_enumeration_json(self, result: UserEnumerationResult) -> dict:
+        return {
+            "status": result.status,
+            "mechanism": "credssp_ntlm",
+            "scope": "RDP CredSSP/NLA username-password authentication",
+            "reason": result.reason,
+            "baselineAttempts": result.baseline_attempts,
+            "candidateCountRequested": result.candidate_count_requested,
+            "candidateCountTested": result.candidate_count_tested,
+            "candidateCountSkipped": result.candidate_count_skipped,
+            "invalidBaselinesConsistent": result.invalid_baselines_consistent,
+            "knownUserFingerprint": self._semantic_fingerprint_json(
+                result.known_user_fingerprint
+            ),
+            "invalidUserFingerprint": self._semantic_fingerprint_json(
+                result.invalid_user_fingerprint
+            ),
+            "existingUsers": list(result.existing_users),
+            "nonExistingUsers": list(result.non_existing_users),
+            "inconclusiveUsers": list(result.inconclusive_users),
+            "candidates": [
+                {
+                    "login": candidate.login,
+                    "classification": candidate.classification,
+                    "durationMs": (
+                        round(candidate.duration_ms, 3)
+                        if candidate.duration_ms is not None
+                        else None
+                    ),
+                    "fingerprint": self._semantic_fingerprint_json(
+                        candidate.fingerprint
+                    ),
+                }
+                for candidate in result.candidates
+            ],
+            "timingUsedForClassification": False,
+        }
+
+    def _brute_protection_json(self, result: RDPBruteProtectionResult) -> dict:
+        analysis = result.analysis
+        lockout = analysis.account_lockout
+        config = result.config
+        return {
+            "status": result.overall_status,
+            "seriesStatus": analysis.status,
+            "mechanism": "credssp_ntlm",
+            "scope": "RDP CredSSP/NLA username-password authentication",
+            "identityStrategy": "random_nonexistent_identities",
+            "configuredAttempts": config.attempts if config is not None else None,
+            "interAttemptDelayMs": (
+                config.inter_attempt_delay_ms if config is not None else None
+            ),
+            "reason": result.overall_reason,
+            "seriesReason": analysis.reason,
+            "attemptsPerformed": analysis.attempts_performed,
+            "firstMedianMs": analysis.first_median_ms,
+            "lastMedianMs": analysis.last_median_ms,
+            "medianChangeMs": analysis.median_change_ms,
+            "medianRatio": analysis.median_ratio,
+            "outcomeChanged": analysis.outcome_changed,
+            "timeoutObserved": analysis.timeout_observed,
+            "slowdownSignal": analysis.slowdown_signal,
+            "earlyStopped": analysis.early_stopped,
+            "timingSignalOnly": analysis.status == "slowdown_signal",
+            "timingProvesProtection": False,
+            "observations": [
+                {
+                    "index": observation.index,
+                    "durationMs": observation.duration_ms,
+                    "timedOut": observation.timed_out,
+                    "fingerprint": self._semantic_fingerprint_json(
+                        observation.fingerprint
+                    ),
+                }
+                for observation in analysis.observations
+            ],
+            "accountLockout": {
+                "status": lockout.status,
+                "enabled": (
+                    config.account_lockout.enabled if config is not None else False
+                ),
+                "configuredBadAttempts": (
+                    config.account_lockout.bad_attempts
+                    if config is not None and config.account_lockout.enabled
+                    else None
+                ),
+                "reason": lockout.reason,
+                "badAttemptsPerformed": lockout.bad_attempts_performed,
+                "lockedAtAttempt": lockout.locked_at_attempt,
+                "baselineFingerprint": self._semantic_fingerprint_json(
+                    lockout.baseline_fingerprint
+                ),
+                "finalFingerprint": self._semantic_fingerprint_json(
+                    lockout.final_fingerprint
+                ),
+            },
+            "serviceRecoveryProbe": (
+                self._negotiation_probe_json(result.service_recovery_probe)
+                if result.service_recovery_probe is not None
+                else None
+            ),
+            "validCredentialBaseline": self._auth_attempt_json(
+                result.valid_baseline
+            ),
+            "validCredentialFinal": self._auth_attempt_json(result.valid_final),
         }
 
     @staticmethod

@@ -39,3 +39,5 @@ class VULNS(Enum):
     NoIpBlocking = "PTV-SSH-NOIPBLOCKING"
     # Username enumeration via auth timing side-channel (USERENUM test):
     UserEnum = "PTV-SSH-USERENUM"
+    # Direct root login permitted (ROOTLOGIN test):
+    RootLoginPermitted = "PTV-SSH-ROOTLOGIN"

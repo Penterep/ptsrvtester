@@ -37,13 +37,14 @@ Contract:
     aborting the other selected modules.
 """
 
-__MODULELABEL__ = "Information about server:"
+__MODULELABEL__ = "Information about server"
 __MODULECODE__ = "INFO"
 __ORDER__ = 10
 
 import socket
+import nmap
 from datetime import datetime, timezone, timedelta
-from scapy.layers.ntp import NTP
+from scapy.layers.ntp import NTP, NTPControl
 
 _NTP_EPOCH = datetime(1900, 1, 1, tzinfo=timezone.utc)
 
@@ -64,18 +65,23 @@ def run(ctx):
     }
 
     ip, port = ctx.target
-    # host = ctx.host
+    host = ctx.host
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # opens an IPv4 socket for UDP
     # TODO: add IPv6 support
     sock.settimeout(4)
     data = None
+    nm = nmap.PortScanner()
+    nm.scan(ip, str(port), "", False, 5)
+    if nm[ip].state() == "down":
+        ctx.out(f"Server not responding", "ERROR", indent=4)
+
     try:
         # NTP creates a packet which states it is a query (mode=3)
         sock.sendto(bytes(NTP(version=4, mode=3)), (ip, port))
         data, _ = sock.recvfrom(1024)  # server address and port are discarded
-    except:
-        ctx.out(f"An error occured while trying to connect to server", "ERROR", indent=4)
+    except Exception as e:
+        ctx.out(f"An error occured while trying to connect to server: {str(e)}", "ERROR", indent=4)
     finally:
         sock.close()
 
@@ -87,6 +93,8 @@ def run(ctx):
     ctx.out(f"Port:                 {port}", "INFO", indent=4)
     ctx.out(f"NTP version:          {ntp.version}", "INFO", indent=4)
     ctx.out(f"Mode:                 {mode_translate[ntp.mode]} ({ntp.mode})", "INFO", indent=4)
+    ctx.out(f"Server hostname:      {nm[ip].hostname()}", "INFO", indent=4)
+    
 
     if ntp.leap == 3 and ntp.stratum == 0:
         ctx.out(f"Server sent a KoD (Kiss of Death) packet", "WARNING", indent=4)

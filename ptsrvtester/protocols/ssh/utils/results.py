@@ -41,3 +41,5 @@ class VULNS(Enum):
     UserEnum = "PTV-SSH-USERENUM"
     # Direct root login permitted (ROOTLOGIN test):
     RootLoginPermitted = "PTV-SSH-ROOTLOGIN"
+    # Shell / command execution permitted after login (SHELL test):
+    ShellAccess = "PTV-SSH-SHELLACCESS"

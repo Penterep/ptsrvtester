@@ -34,6 +34,12 @@ ptsrvtester pop3 -ts BANNER,CAPA -tg 127.0.0.1
 ptsrvtester pop3 -ts ALL --tls -tg 127.0.0.1:995
 ptsrvtester pop3 -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:110
 ptsrvtester imap -ts BANNER,CAPA -tg 127.0.0.1
+ptsrvtester ftp -ts BANNER,CMD,ANON -tg 127.0.0.1
+ptsrvtester ftp -ts ALL -tg 127.0.0.1
+ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1
+ptsrvtester ftp -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:21
+ptsrvtester msrpc -ts ALL -tg 192.168.1.10
+ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.10 --pipe svcctl -u auditor -pw secret
 ptsrvtester <module> -h     for help for module use
 ```
 
@@ -53,6 +59,7 @@ ptsrvtester <module> -h     for help for module use
                          imap   IMAP testing module
                          dhcp   DHCP testing module
                          xrdp   XRDP testing module
+                         rdp    RDP testing module
 
    -v        --version          Show script version and exit
    -h        --help             Show this help message and exit
@@ -88,12 +95,11 @@ ptsrvtester <module> -h     for help for module use
 - Write permission testing
 
 **MSRPC Module**
-- Endpoint mapper enumeration
-- MGMT interface enumeration
-- Named pipe brute-force
-- SMB/TCP/HTTP credential brute-force
-- Anonymous SMB access testing
-- Named pipe enumeration
+- Endpoint Mapper, MGMT interface and named-pipe enumeration
+- Anonymous SMB and IPC$ access testing
+- Explicit named-pipe, SMB, RPC/TCP and RPC-over-HTTP Proxy credential testing
+- Transport-aware defaults: RPC 135, SMB 445 and HTTPS RPC Proxy 443
+- Credential attempts are bounded by `--max-attempts` (default 1,000) and `--timeout-seconds`
 
 **FTP Module**
 - Banner and Service Identification
@@ -166,6 +172,17 @@ ptsrvtester <module> -h     for help for module use
 - DHCP DoS/flood attack testing
 - Network interface based testing
 
+**RDP Module**
+- TLS and certificate inspection
+- RDP version detection
+- NLA and CredSSP detection
+- Security protocol detection
+- Legacy RDP encryption testing
+- NTLM information disclosure
+- Server capability enumeration
+- Credential authentication testing
+- Connection rate limiting testing
+
 **XRDP Module**
 - XRDP server brute-force testing
 - Credential testing via GUI automation
@@ -177,6 +194,9 @@ ptsrvtester <module> -h     for help for module use
 ## Dependencies
 
 ```
+aardwolf==0.2.13
+asyauth==0.0.23
+asysocks==0.2.18
 cryptography>=42.0.8
 dnspython>=2.7.0
 impacket>=0.12.0

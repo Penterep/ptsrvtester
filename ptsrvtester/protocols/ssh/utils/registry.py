@@ -14,7 +14,7 @@ SSH_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Credentials", ["BRUTE"]),
     ("User enumeration (aggressive)", ["USERENUM"]),
     ("Denial of service (aggressive)", ["DHEAT"]),
-    ("Brute-force protection (aggressive)", ["LOCKOUT"]),
+    ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
 ]
 
 SSH_TESTS: dict[str, dict] = {
@@ -137,19 +137,21 @@ SSH_TESTS: dict[str, dict] = {
             ["", "--dheat-duration", "<seconds>", "How long to run the attack before stopping (default: 20)"],
         ],
     },
-    "LOCKOUT": {
-        "desc": "Brute-force lockout: account lockout & IP blocking (aggressive)",
-        "long": ["Make repeated failed logins and check whether password guessing is",
-                 "throttled: does the target ACCOUNT get locked, and/or does this",
-                 "attacker IP get blocked (fail2ban)? Aggressive — deliberately locks",
-                 "accounts / triggers bans; runs only when named in -ts."],
-        "requires": ["-u/--user (target account)",
-                     "-p/--password (a VALID password of a canary account) to also test account lockout"],
+    "RATELIMIT": {
+        "desc": "Connection rate-limiting test (aggressive)",
+        "long": ["Detect whether connection rate limiting is deployed, how many",
+                 "concurrent connections can be held, the connect/disconnect rate,",
+                 "and how long an idle connection survives (sshd MaxStartups /",
+                 "LoginGraceTime). Active load test — runs only when named in -ts,",
+                 "never in the default/ALL sweep."],
         "mods": [
-            ["-u", "--user", "<username>", "Target account (required)"],
-            ["-p", "--password", "<password>", "VALID password of a canary account (enables account-lockout test)"],
-            ["", "--lockout-attempts", "<n>", "Failed logins to attempt (default: 8)"],
-            ["", "--lockout-cooldown", "<seconds>", "Wait & re-probe to see if a lockout/ban clears (default: 0)"],
+            ["", "--rate-count", "<n>", "Connections per scenario (default: 30)"],
+            ["", "--rate-concurrency", "<n>", "Parallel connections (default: 10)"],
+            ["", "--rate-timeout", "<seconds>", "Per-connection timeout (default: 5)"],
+            ["", "--rate-hold-seconds", "<seconds>", "Hold time in concurrency check (default: 2)"],
+            ["", "--rate-cooldown-seconds", "<seconds>", "Recovery delay after burst (default: 3)"],
+            ["", "--rate-idle-max", "<seconds>", "Max wait for idle drop; 0 disables (default: 30)"],
+            ["", "--rate-idle-poll", "<seconds>", "Idle liveness poll interval (default: 1)"],
         ],
     },
 }

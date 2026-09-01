@@ -11,6 +11,7 @@ SSH_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Crypto & configuration (ssh-audit)", ["KEX", "KEYALG", "ENC", "MAC", "FINGERPRINT"]),
     ("Known static keys", ["BADHOSTKEY", "BADAUTHKEY"]),
     ("Credentials", ["BRUTE"]),
+    ("User enumeration (aggressive)", ["USERENUM"]),
     ("Denial of service (aggressive)", ["DHEAT"]),
     ("Brute-force protection (aggressive)", ["LOCKOUT"]),
 ]
@@ -87,6 +88,24 @@ SSH_TESTS: dict[str, dict] = {
             ["", "--privkeys", "<directory>", "Directory of <name>.key private keys (+ <name>.pass)"],
             ["", "--spray", "", "Try one secret across all users (instead of all secrets per user)"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+        ],
+    },
+    "USERENUM": {
+        "desc": "Username enumeration via auth timing side-channel (aggressive)",
+        "long": ["Check whether the server answers differently to valid and invalid",
+                 "usernames by timing the authentication phase (CVE-2016-6210 class).",
+                 "Calibrates on a KNOWN-VALID login (-u); if that login is timing-",
+                 "distinguishable from random names, enumeration is possible and any",
+                 "names given in -U are then classified as valid/invalid.",
+                 "Aggressive — makes repeated failed logins; runs only when named in -ts."],
+        "requires": ["-u/--user (a KNOWN-VALID login used to calibrate the timing oracle)",
+                     "-U/--users (optional list of usernames to enumerate once calibrated)"],
+        "mods": [
+            ["-u", "--user", "<username>", "Known-valid login for calibration (required)"],
+            ["-U", "--users", "<wordlist>", "Usernames to enumerate once enumeration is confirmed"],
+            ["", "--enum-samples", "<n>", "Timing samples per username (default: 5; range 3-50)"],
+            ["", "--enum-baseline", "<n>", "Random invalid names for the baseline (default: 5; range 2-25)"],
+            ["", "--enum-sigma", "<f>", "Separation threshold in std devs (default: 3.0)"],
         ],
     },
     "DHEAT": {

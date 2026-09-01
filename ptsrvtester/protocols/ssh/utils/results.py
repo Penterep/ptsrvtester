@@ -37,3 +37,5 @@ class VULNS(Enum):
     # Missing brute-force protection (LOCKOUT test):
     NoAccountLockout = "PTV-SSH-NOACCOUNTLOCKOUT"
     NoIpBlocking = "PTV-SSH-NOIPBLOCKING"
+    # Username enumeration via auth timing side-channel (USERENUM test):
+    UserEnum = "PTV-SSH-USERENUM"

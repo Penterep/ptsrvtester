@@ -39,6 +39,9 @@ class SSHArgs(ArgsWithBruteforce):
     dheat_duration: float | None
     lockout_attempts: int
     lockout_cooldown: float
+    enum_samples: int
+    enum_baseline: int
+    enum_sigma: float
 
     @staticmethod
     def get_help():
@@ -71,6 +74,13 @@ class SSHArgs(ArgsWithBruteforce):
             ["", "--dheat", "<N[:kex[:e_len]]>", "DHEat attack params: N concurrent sockets, optional kex + e length (default: 10)"],
             ["", "--dheat-duration", "<seconds>", "How long to run the DHEat attack before stopping (default: 20)"],
             ["", "", "", ""],
+            [get_colored_text("Username enumeration (USERENUM)", "TITLE")],
+            ["-u", "--user", "<username>", "Known-valid login used to calibrate the timing oracle (required)"],
+            ["-U", "--users", "<wordlist>", "Usernames to enumerate once enumeration is confirmed"],
+            ["", "--enum-samples", "<n>", "Timing samples per username (default: 5; range 3-50)"],
+            ["", "--enum-baseline", "<n>", "Random invalid names for the baseline (default: 5; range 2-25)"],
+            ["", "--enum-sigma", "<f>", "Separation threshold in std devs (default: 3.0)"],
+            ["", "", "", ""],
             [get_colored_text("Password-guessing lockout (LOCKOUT)", "TITLE")],
             ["-u", "--user", "<username>", "Target account (required for LOCKOUT)"],
             ["-p", "--password", "<password>", "VALID password of a canary account (enables account-lockout test)"],
@@ -93,6 +103,7 @@ class SSHArgs(ArgsWithBruteforce):
                 "ptsrvtester ssh -tg 127.0.0.1 -ts KEX,ENC,MAC",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts BADHOSTKEY -H ./hostkeys/",
                 "ptsrvtester ssh -tg 127.0.0.1:22 -ts BRUTE -u admin -P passwords.txt",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts USERENUM -u root -U users.txt",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts DHEAT --dheat 10 --dheat-duration 30",
                 "ptsrvtester ssh -ts BRUTE -h",
             ]},
@@ -112,6 +123,7 @@ class SSHArgs(ArgsWithBruteforce):
   ptsrvtester ssh -tg 127.0.0.1 -ts KEX,ENC,MAC
   ptsrvtester ssh -tg 127.0.0.1 -ts BADHOSTKEY -H ./hostkeys/
   ptsrvtester -j ssh -tg 127.0.0.1:22 -ts BRUTE -u admin -P passwords.txt --brute-threads 20
+  ptsrvtester ssh -tg 127.0.0.1 -ts USERENUM -u root -U users.txt
   ptsrvtester ssh -ts BRUTE -h"""
 
         parser = subparsers.add_parser(
@@ -202,7 +214,43 @@ class SSHArgs(ArgsWithBruteforce):
                  "clears (0 = skip recovery probe; default: 0)",
         )
 
-        add_bruteforce_args(parser)
+        userenum = parser.add_argument_group(
+            "USERENUM (aggressive)",
+            "Username enumeration via authentication timing — only runs with -ts USERENUM. "
+            "Calibrates on a KNOWN-VALID login (-u/--user) and, when enumeration is confirmed, "
+            "classifies the names in -U/--users. Makes repeated failed logins.",
+        )
+        userenum.add_argument(
+            "--enum-samples",
+            type=int,
+            default=5,
+            metavar="<n>",
+            dest="enum_samples",
+            help="timing samples per username; more is more reliable but slower "
+                 "(default: 5; range 3-50)",
+        )
+        userenum.add_argument(
+            "--enum-baseline",
+            type=int,
+            default=5,
+            metavar="<n>",
+            dest="enum_baseline",
+            help="number of random (invalid) names used to build the timing baseline "
+                 "(default: 5; range 2-25)",
+        )
+        userenum.add_argument(
+            "--enum-sigma",
+            type=float,
+            default=3.0,
+            metavar="<f>",
+            dest="enum_sigma",
+            help="how many standard deviations the valid login must be separated from the "
+                 "invalid baseline to call enumeration possible (default: 3.0)",
+        )
+
+        # -u/--user and -U/--users are NOT mutually exclusive here: USERENUM needs
+        # both at once (-u = known-valid calibration login, -U = list to enumerate).
+        add_bruteforce_args(parser, mutually_exclusive_user_and_users=False)
 
         bruteforce = next(g for g in parser._action_groups if "BRUTEFORCE" in g.title)
         bruteforce.description = "user/users + password/passwords/privkeys"

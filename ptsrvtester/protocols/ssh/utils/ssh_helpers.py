@@ -176,14 +176,19 @@ def get_host_key(ip: str, port: int) -> str:
             pass
 
 
-def get_auth_methods(ip: str, port: int) -> list[str] | None:
-    """Return the server's advertised auth methods (via a rejected ``auth_none``)."""
+def get_auth_methods_for(ip: str, port: int, username: str = "") -> list[str] | None:
+    """Return the auth methods the server advertises **for ``username``**.
+
+    Uses a rejected ``auth_none`` for that specific username, so per-user policy
+    differences (e.g. root restricted to public-key under ``PermitRootLogin
+    prohibit-password``) are visible. Returns ``None`` when it could not be read.
+    """
     trans = paramiko.Transport((ip, port))
     am: list[str] | None = None
     try:
         trans.start_client()
         try:
-            trans.auth_none("")
+            trans.auth_none(username)
         except paramiko.BadAuthenticationType as e:
             am = e.allowed_types
         except Exception:
@@ -194,6 +199,11 @@ def get_auth_methods(ip: str, port: int) -> list[str] | None:
         except Exception:
             pass
     return am
+
+
+def get_auth_methods(ip: str, port: int) -> list[str] | None:
+    """Return the server's advertised auth methods (via a rejected ``auth_none``)."""
+    return get_auth_methods_for(ip, port, "")
 
 
 def check_bad_pubkey(pubkeys_path: str, host_key: str) -> BadPubkeyResult:

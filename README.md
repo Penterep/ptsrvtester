@@ -184,7 +184,9 @@ ptsrvtester <module> -h     for help for module use
 - Legacy RDP encryption testing
 - NTLM information disclosure
 - Server capability enumeration
-- Credential authentication testing
+- NLA/CredSSP password authentication through NTLM and Kerberos
+- Username enumeration testing
+- Password-guessing protection and account lockout testing
 - Connection rate limiting testing
 
 **XRDP Module**

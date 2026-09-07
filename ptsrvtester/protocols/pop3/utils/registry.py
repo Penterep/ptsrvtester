@@ -6,6 +6,7 @@ from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
 POP3_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "NTLM", "HELPINFO"]),
     ("Authentication & credentials", ["ANON", "BRUTE"]),
+    ("Connection limits & stress", ["NOOP1", "NOOP2"]),
     ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
 ]
 
@@ -69,6 +70,36 @@ POP3_TESTS: dict[str, dict] = {
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+        ],
+    },
+    "NOOP1": {
+        "desc": "NOOP connection duration",
+        "long": [
+            "Test how long connections can be maintained with periodic NOOP.",
+            "Pre-authentication test always runs; post-authentication test runs",
+            "if -u/-p provided. RFC 1939 specifies 10-minute minimum timeout.",
+        ],
+        "mods": [
+            ["", "--duration", "<sec>", "How long the test runs (seconds)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (0 = max speed)"],
+            ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
+            ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
+        ],
+    },
+    "NOOP2": {
+        "desc": "NOOP connection count",
+        "long": [
+            "Test how many connections can be established and maintained with",
+            "periodic NOOP. Pre-authentication test always runs; post-authentication",
+            "test runs if -u/-p provided. Evaluates per-IP and per-account limits.",
+        ],
+        "mods": [
+            ["", "--count", "<n>", "Max connections to attempt (default: 150; post-auth uses 4x, cap 600)"],
+            ["", "--duration", "<sec>", "How long the test runs (seconds)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (0 = max speed)"],
+            ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
+            ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
+            ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
         ],
     },
     "RATELIMIT": rate_limit_test_spec(),

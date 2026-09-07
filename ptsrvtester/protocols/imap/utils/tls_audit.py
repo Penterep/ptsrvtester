@@ -32,7 +32,8 @@ import shutil
 import socket
 import ssl
 import subprocess
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Iterable
 
 from .results import ImapTlsCipherOffer, ImapTlsVersionScan
@@ -63,6 +64,8 @@ _VERSIONS: tuple[tuple[str, object], ...] = (
     ("TLS 1.2", ssl.TLSVersion.TLSv1_2),
     ("TLS 1.3", ssl.TLSVersion.TLSv1_3),
 )
+
+TLS_AUDIT_DEFAULT_WORKERS = 5
 
 
 def rate_tls_version(label: str) -> tuple[str, str]:
@@ -615,6 +618,7 @@ def _cipher_order(
     ciphers: list[str],
     sni: str | None,
     log: Callable[[str], None] | None = None,
+    executor: ThreadPoolExecutor | None = None,
 ) -> tuple[str | None, str | None]:
     """Overall server vs client order, then ChaCha-vs-AES if both exist.
 
@@ -638,8 +642,13 @@ def _cipher_order(
             log(f"negotiated {name or 'n/a'}")
         return name
 
-    p1 = _pick(f"{a}:{b}:@SECLEVEL=0", f"{a} then {b}")
-    p2 = _pick(f"{b}:{a}:@SECLEVEL=0", f"{b} then {a}")
+    if executor is None:
+        p1 = _pick(f"{a}:{b}:@SECLEVEL=0", f"{a} then {b}")
+        p2 = _pick(f"{b}:{a}:@SECLEVEL=0", f"{b} then {a}")
+    else:
+        f1 = executor.submit(_pick, f"{a}:{b}:@SECLEVEL=0", f"{a} then {b}")
+        f2 = executor.submit(_pick, f"{b}:{a}:@SECLEVEL=0", f"{b} then {a}")
+        p1, p2 = f1.result(), f2.result()
     if not p1 or not p2:
         return None, None
     overall_server = p1 == p2
@@ -649,8 +658,13 @@ def _cipher_order(
     pair = _chacha_aes_pair(ciphers)
     if pair is not None:
         gcm, chacha = pair
-        g_first = _pick(f"{gcm}:{chacha}:@SECLEVEL=0", f"{gcm} then {chacha}")
-        c_first = _pick(f"{chacha}:{gcm}:@SECLEVEL=0", f"{chacha} then {gcm}")
+        if executor is None:
+            g_first = _pick(f"{gcm}:{chacha}:@SECLEVEL=0", f"{gcm} then {chacha}")
+            c_first = _pick(f"{chacha}:{gcm}:@SECLEVEL=0", f"{chacha} then {gcm}")
+        else:
+            fg = executor.submit(_pick, f"{gcm}:{chacha}:@SECLEVEL=0", f"{gcm} then {chacha}")
+            fc = executor.submit(_pick, f"{chacha}:{gcm}:@SECLEVEL=0", f"{chacha} then {gcm}")
+            g_first, c_first = fg.result(), fc.result()
         chacha_follows_client = g_first == gcm and c_first == chacha
 
     if overall_server and chacha_follows_client:
@@ -672,103 +686,163 @@ def scan_tls_versions(
     implicit: bool,
     sni: str | None,
     log: Callable[[str], None] | None = None,
+    workers: int = TLS_AUDIT_DEFAULT_WORKERS,
 ) -> tuple[ImapTlsVersionScan, ...]:
-    """Probe offered TLS versions and every accepted cipher suite."""
-    out: list[ImapTlsVersionScan] = []
+    """Probe offered TLS versions and every accepted cipher suite.
+
+    ``workers`` is the max number of simultaneous TLS handshakes (default 5).
+    """
+    workers = max(1, int(workers or 1))
     sni_name = sni or host
     probe_timeout = min(timeout, 5.0)
+    log_lock = threading.Lock()
 
     def _tls_log(msg: str) -> None:
-        if log is not None:
+        if log is None:
+            return
+        with log_lock:
             log(msg)
 
-    for label, version in _VERSIONS:
-        tls13 = label == "TLS 1.3"
-        t0 = time.perf_counter()
-        offered, preferred = _version_supported(
-            host,
-            port,
-            probe_timeout,
-            implicit=implicit,
-            version=version,
-            tls13=tls13,
-            sni=sni_name,
-        )
-        elapsed_ms = int((time.perf_counter() - t0) * 1000)
-        _tls_log(f"TLS ClientHello {label} (all suites)")
-        if not offered:
-            _tls_log(f"handshake refused ({elapsed_ms} ms)")
-            continue
-        extra = f" cipher={preferred}" if preferred else ""
-        _tls_log(f"handshake accepted{extra} ({elapsed_ms} ms)")
-        ver_rating, ver_reason = rate_tls_version(label)
-        offers: list[ImapTlsCipherOffer] = []
-        order = None
-        order_note = None
-        if tls13:
+    out: list[ImapTlsVersionScan] = []
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        ver_futs = {
+            ex.submit(
+                _version_supported,
+                host,
+                port,
+                probe_timeout,
+                implicit=implicit,
+                version=version,
+                tls13=(label == "TLS 1.3"),
+                sni=sni_name,
+            ): (label, version)
+            for label, version in _VERSIONS
+        }
+        ver_hits: dict[str, tuple[object, bool, str | None]] = {}
+        for fut in as_completed(ver_futs):
+            label, version = ver_futs[fut]
+            try:
+                offered, preferred = fut.result()
+            except Exception:
+                offered, preferred = False, None
+            _tls_log(f"TLS ClientHello {label} (all suites)")
+            if not offered:
+                _tls_log("handshake refused")
+            else:
+                extra = f" cipher={preferred}" if preferred else ""
+                _tls_log(f"handshake accepted{extra}")
+            ver_hits[label] = (version, offered, preferred)
+
+        cipher_futs: dict = {}
+        tls13_names: dict[str, list[str]] = {}
+        tls12_names: dict[str, list[str]] = {}
+
+        for label, version in _VERSIONS:
+            version, offered, preferred = ver_hits[label]
+            if not offered:
+                continue
+            if label == "TLS 1.3":
+                names = list(_TLS13_SUITES)
+                if preferred and preferred not in names:
+                    names = [preferred, *names]
+                tls13_names[label] = names
+                for suite in names:
+                    if preferred and suite == preferred:
+                        continue
+                    cipher_futs[
+                        ex.submit(
+                            _openssl_tls13_cipher,
+                            host,
+                            port,
+                            probe_timeout,
+                            implicit=implicit,
+                            suite=suite,
+                            sni=sni_name,
+                        )
+                    ] = (label, suite)
+            else:
+                names = _ciphers_for_version(version)
+                tls12_names[label] = names
+                for cipher in names:
+                    cipher_futs[
+                        ex.submit(
+                            _probe_cipher,
+                            host,
+                            port,
+                            probe_timeout,
+                            implicit=implicit,
+                            version=version,
+                            cipher=cipher,
+                            sni=sni_name,
+                        )
+                    ] = (label, cipher)
+
+        accepted: set[tuple[str, str]] = set()
+        for fut in as_completed(cipher_futs):
+            label, name = cipher_futs[fut]
+            try:
+                ok = bool(fut.result())
+            except Exception:
+                ok = False
+            if ok:
+                accepted.add((label, name))
+                if label == "TLS 1.3":
+                    _tls_log(f"TLS ClientHello TLS 1.3 ciphersuites={name}")
+                else:
+                    _tls_log(f"TLS ClientHello {label} cipher={name}")
+                _tls_log(f"handshake accepted ({name})")
+
+        for label, version in _VERSIONS:
+            version, offered, preferred = ver_hits[label]
+            if not offered:
+                continue
+            ver_rating, ver_reason = rate_tls_version(label)
+            offers: list[ImapTlsCipherOffer] = []
             order = None
-            order_note = "not configured (TLS 1.3 has no server cipher order)"
-            seen: set[str] = set()
-            if preferred:
-                r, why = rate_cipher(preferred, label)
-                offers.append(ImapTlsCipherOffer(preferred, r, why))
-                seen.add(preferred)
-            for suite in _TLS13_SUITES:
-                if suite in seen:
-                    continue
-                ok = _openssl_tls13_cipher(
-                    host,
-                    port,
-                    probe_timeout,
-                    implicit=implicit,
-                    suite=suite,
-                    sni=sni_name,
+            order_note = None
+            if label == "TLS 1.3":
+                order_note = "not configured (TLS 1.3 has no server cipher order)"
+                seen: set[str] = set()
+                if preferred:
+                    r, why = rate_cipher(preferred, label)
+                    offers.append(ImapTlsCipherOffer(preferred, r, why))
+                    seen.add(preferred)
+                for suite in tls13_names.get(label, _TLS13_SUITES):
+                    if suite in seen:
+                        continue
+                    if (label, suite) in accepted:
+                        r, why = rate_cipher(suite, label)
+                        offers.append(ImapTlsCipherOffer(suite, r, why))
+                        seen.add(suite)
+            else:
+                for cipher in tls12_names.get(label, []):
+                    if (label, cipher) in accepted:
+                        r, why = rate_cipher(cipher, label)
+                        offers.append(ImapTlsCipherOffer(cipher, r, why))
+                if len(offers) >= 2:
+                    order, order_note = _cipher_order(
+                        host,
+                        port,
+                        probe_timeout,
+                        implicit=implicit,
+                        version=version,
+                        ciphers=[c.name for c in offers],
+                        sni=sni_name,
+                        log=_tls_log,
+                        executor=ex,
+                    )
+            out.append(
+                ImapTlsVersionScan(
+                    version=label,
+                    offered=True,
+                    rating=ver_rating,
+                    rating_reason=ver_reason,
+                    cipher_order=order,
+                    cipher_order_note=order_note,
+                    ciphers=tuple(offers),
                 )
-                if ok:
-                    _tls_log(f"TLS ClientHello TLS 1.3 ciphersuites={suite}")
-                    _tls_log(f"handshake accepted ({suite})")
-                    r, why = rate_cipher(suite, label)
-                    offers.append(ImapTlsCipherOffer(suite, r, why))
-                    seen.add(suite)
-        else:
-            names = _ciphers_for_version(version)
-            for cipher in names:
-                ok = _probe_cipher(
-                    host,
-                    port,
-                    probe_timeout,
-                    implicit=implicit,
-                    version=version,
-                    cipher=cipher,
-                    sni=sni_name,
-                )
-                if ok:
-                    _tls_log(f"TLS ClientHello {label} cipher={cipher}")
-                    _tls_log(f"handshake accepted ({cipher})")
-                    r, why = rate_cipher(cipher, label)
-                    offers.append(ImapTlsCipherOffer(cipher, r, why))
-            if len(offers) >= 2:
-                order, order_note = _cipher_order(
-                    host,
-                    port,
-                    probe_timeout,
-                    implicit=implicit,
-                    version=version,
-                    ciphers=[c.name for c in offers],
-                    sni=sni_name,
-                    log=_tls_log,
-                )
-        out.append(
-            ImapTlsVersionScan(
-                version=label,
-                offered=True,
-                rating=ver_rating,
-                rating_reason=ver_reason,
-                cipher_order=order,
-                cipher_order_note=order_note,
-                ciphers=tuple(offers),
             )
-        )
     return tuple(out)
 
 

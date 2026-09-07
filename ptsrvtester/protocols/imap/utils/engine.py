@@ -6,6 +6,7 @@ import imaplib
 import ipaddress
 import random
 import re
+import select
 import socket
 import ssl
 import string
@@ -66,6 +67,7 @@ from .capa import (
     valid_target_imap,
 )
 from ptlibs.ptprinthelper import ptprint
+from .ptprinthelper import get_colored_text
 
 from .decompression_payloads import (
     BILLION_LAUGHS_XML,
@@ -311,17 +313,73 @@ class ImapEngine:
             names = names[:ue_mx]
         return names
 
+    @staticmethod
+    def _imap_untagged_is_bye(line: bytes | str | None) -> bool:
+        """True for IMAP untagged BYE (RFC 9051 §7.1.5)."""
+        if not line:
+            return False
+        raw = line.encode("utf-8", errors="replace") if isinstance(line, str) else line
+        stripped = raw.rstrip(b"\r\n")
+        if not stripped:
+            return False
+        upper = stripped.upper()
+        if upper.startswith(b"* BYE"):
+            return True
+        # Untagged status is "* BYE ..."; do not treat "* OK ... BYE folder" as logout.
+        if not stripped.startswith(b"* "):
+            return False
+        tokens = upper.split()
+        return len(tokens) >= 2 and tokens[1] == b"BYE"
+
+    @staticmethod
+    def _imap_bye_body_from_text(text: str | bytes | None) -> str | None:
+        """Human text after ``* BYE``, or None if this is not an IMAP BYE."""
+        if not text:
+            return None
+        if isinstance(text, (bytes, bytearray)):
+            raw = bytes(text).decode("utf-8", errors="replace")
+        else:
+            raw = ImapEngine._unwrap_imaplib_error(str(text)).strip()
+            if len(raw) >= 3 and raw[0] == "b" and raw[1] in "'\"" and raw[-1] == raw[1]:
+                raw = raw[2:-1]
+        m = re.search(r"\* BYE\s*(.*)$", raw.strip(), re.I | re.S)
+        if not m:
+            return None
+        body = m.group(1).strip().strip("'\"")
+        return body or None
+
+    @classmethod
+    def _imap_bye_body_from_exc(cls, exc: BaseException) -> str | None:
+        for part in exc.args:
+            if isinstance(part, (bytes, bytearray, str)):
+                body = cls._imap_bye_body_from_text(part)
+                if body:
+                    return body
+        return cls._imap_bye_body_from_text(str(exc))
+
     def test_connection_limits_imap(self) -> ImapConnLimitsResult:
-        """Connection / rate / idle policy probe (PTV-SVC-IMAP-CONN*). Mirrors SMTP -rt structure."""
+        """Connection / idle policy probe (PTV-SVC-IMAP-CONN*)."""
         _show_progress = not self.use_json
-        max_attempts = getattr(self.args, "conn_limits_max", None) or CONN_LIMIT_DEFAULT_ATTEMPTS
+        max_attempts = noop2_count_from_args(self.args, CONN_LIMIT_DEFAULT_ATTEMPTS)
         return self._conn_limits_test_impl(_show_progress, max_attempts)
 
     def _conn_limits_test_impl(self, _show_progress: bool, max_attempts: int) -> ImapConnLimitsResult:
         MAX_TIMEOUT = CONN_LIMIT_TIMEOUT_CAP_SECONDS
-        MAX_BAN_WAIT = CONN_LIMIT_TIMEOUT_CAP_SECONDS
+        dur = getattr(self.args, "noop1_duration", None)
+        if dur is not None:
+            try:
+                dur_s = float(dur)
+                if dur_s > 0:
+                    MAX_TIMEOUT = dur_s
+            except (TypeError, ValueError):
+                pass
+        MAX_BAN_WAIT = MAX_TIMEOUT
         RETRY_INTERVAL = 5
         PHASE1_DELAY = 0.15
+        ramp_threads = max(1, int(getattr(self.args, "noop2_threads", None) or 1))
+        preauth_idle_ok = min(CONN_LIMIT_PREAUTH_IDLE_MAX_OK_SEC, MAX_TIMEOUT)
+        post_cap_idle_ok = min(CONN_LIMIT_POST_CAP_IDLE_MAX_OK_SEC, MAX_TIMEOUT)
+        idle_login_ok = min(CONN_LIMIT_IDLE_AFTER_LOGIN_MAX_OK_SEC, MAX_TIMEOUT)
 
         _print_lock = threading.Lock()
         _live_dirty = False
@@ -333,23 +391,27 @@ class ImapEngine:
             with _print_lock:
                 if not _live_dirty:
                     return
-                sys.stdout.write("\n")
+                sys.stdout.write("\033[2K\r")
                 sys.stdout.flush()
                 _live_dirty = False
 
         def _write_live(label: str, value: str) -> None:
             nonlocal _live_dirty
+            if not _show_progress:
+                return
             line = f"    {label} {value}"
             with _print_lock:
-                sys.stdout.write(f"\r{line:<120}")
+                sys.stdout.write(f"\033[2K\r{line:<120}")
                 sys.stdout.flush()
                 _live_dirty = True
 
         def _finalize_line(label: str, value: str) -> None:
             nonlocal _live_dirty
+            if not _show_progress:
+                return
             line = f"    {label} {value}"
             with _print_lock:
-                sys.stdout.write(f"\r{line:<120}\n")
+                sys.stdout.write(f"\033[2K\r{line:<120}\n")
                 sys.stdout.flush()
                 _live_dirty = False
 
@@ -358,18 +420,21 @@ class ImapEngine:
 
         def _dbg(msg: str, *, indent: int = 4) -> None:
             nonlocal _live_dirty
+            verbose = bool(getattr(self.args, "debug", False))
             with _print_lock:
-                if _live_dirty:
-                    sys.stdout.write("\n")
+                if _live_dirty and verbose:
+                    sys.stdout.write("\033[2K\r")
                     sys.stdout.flush()
                     _live_dirty = False
-                self._dbg(msg, indent=indent)
+            self._dbg(msg, indent=indent)
+            if verbose:
+                self._flush_terminal()
 
         def _print_verdict(is_vuln: bool, text: str) -> None:
             nonlocal _live_dirty
             with _print_lock:
                 if _live_dirty:
-                    sys.stdout.write("\n")
+                    sys.stdout.write("\033[2K\r")
                     sys.stdout.flush()
                     _live_dirty = False
                 if not _show_progress:
@@ -385,52 +450,196 @@ class ImapEngine:
             nonlocal _live_dirty
             with _print_lock:
                 if _live_dirty:
-                    sys.stdout.write("\n")
+                    sys.stdout.write("\033[2K\r")
                     sys.stdout.flush()
                     _live_dirty = False
                 if not _show_progress:
                     return
                 ptprint(text, bullet_type="TITLE", condition=True, indent=8)
 
+        extra_lock = threading.Lock()
+        terminated: list[tuple[int, str, str]] = []
+        terminated_seen: set[int] = set()
+        est_err = 0
+        est_disc = 0
+        est_timeout = 0
+
+        def _note_terminated(idx: int, reason: str, detail: str, elapsed: float) -> None:
+            with extra_lock:
+                if idx in terminated_seen:
+                    return
+                terminated_seen.add(idx)
+                terminated.append((idx, reason, f"{detail}, t={elapsed:.1f}s"))
+
+        def _bump_establish_fail(exc: BaseException) -> None:
+            nonlocal est_err, est_disc, est_timeout
+            reason, _ = self._noop2_classify_conn_failure(exc)
+            with extra_lock:
+                if reason == "timeout":
+                    est_timeout += 1
+                elif reason == "disconnect":
+                    est_disc += 1
+                else:
+                    est_err += 1
+
         def _watch_imap_disconnect(
             imap: imaplib.IMAP4 | imaplib.IMAP4_SSL,
             start_time: float,
             cap_seconds: float,
-            result_cell: list,
+            result_cell: list | None,
             stop_event: threading.Event,
+            conn_idx: int,
         ) -> None:
+            # RFC 9051 §7.1.5: logout is untagged BYE, then TCP close.
+            # Other untagged data (RFC 2177 IDLE EXISTS/EXPUNGE/OK) is not a disconnect.
+            # Do not use makefile readline() with a short timeout: on timeout it often
+            # returns b"" and looks like EOF (that produced the false 00:01 idle).
             sock = getattr(imap, "sock", None)
             if sock is None:
-                return
-            try:
-                sock.settimeout(1.0)
-            except Exception:
-                pass
-            while not stop_event.is_set():
-                elapsed = time.perf_counter() - start_time
-                if elapsed >= cap_seconds:
-                    if not result_cell:
-                        result_cell.append((cap_seconds, True))
-                    return
-                try:
-                    data = sock.recv(4096)
-                except socket.timeout:
-                    continue
-                except Exception:
-                    if not result_cell and not stop_event.is_set():
-                        result_cell.append((time.perf_counter() - start_time, False))
-                    return
-                if not data:
-                    if not result_cell and not stop_event.is_set():
-                        result_cell.append((time.perf_counter() - start_time, False))
-                    return
-                if not result_cell and not stop_event.is_set():
+                if result_cell is not None and not result_cell and not stop_event.is_set():
                     result_cell.append((time.perf_counter() - start_time, False))
                 return
+
+            def _record(elapsed: float) -> None:
+                if result_cell is not None and not result_cell and not stop_event.is_set():
+                    result_cell.append((elapsed, False))
+
+            def _note_term(reason: str, detail: str, elapsed: float) -> None:
+                _note_terminated(conn_idx, reason, detail, elapsed)
+
+            def _sock_readable(wait: float) -> bool:
+                try:
+                    if isinstance(sock, ssl.SSLSocket) and sock.pending() > 0:
+                        return True
+                except Exception:
+                    pass
+                try:
+                    ready, _, _ = select.select([sock], [], [], wait)
+                except (ValueError, OSError, TypeError):
+                    raise
+                return bool(ready)
+
+            def _handle_line(line: bytes) -> None:
+                nonlocal bye_elapsed, drain_until, bye_raw
+                if bye_elapsed is not None:
+                    return
+                if self._imap_untagged_is_bye(line):
+                    bye_elapsed = time.perf_counter() - start_time
+                    drain_until = time.perf_counter() + drain_after_bye
+                    bye_raw = line.decode("utf-8", errors="replace").strip()
+                    body = self._imap_bye_body_from_text(bye_raw) or bye_raw
+                    _note_term("disconnect", self._noop2_format_close_cause(body), bye_elapsed)
+                    return
+
+            bye_elapsed: float | None = None
+            bye_raw: str | None = None
+            drain_until: float | None = None
+            drain_after_bye = 2.0
+            buf = bytearray()
+
+            while True:
+                now = time.perf_counter()
+                elapsed = now - start_time
+                if bye_elapsed is None and elapsed >= cap_seconds:
+                    if result_cell is not None and not result_cell:
+                        result_cell.append((cap_seconds, True))
+                    return
+                if drain_until is not None and now >= drain_until:
+                    _record(bye_elapsed if bye_elapsed is not None else elapsed)
+                    return
+                stopping = stop_event.is_set()
+                wait = 0.0 if stopping else 1.0
+                if drain_until is not None and not stopping:
+                    wait = max(0.05, min(1.0, drain_until - now))
+                try:
+                    readable = _sock_readable(wait)
+                except (ValueError, OSError, TypeError):
+                    elapsed = bye_elapsed if bye_elapsed is not None else (time.perf_counter() - start_time)
+                    if bye_elapsed is None:
+                        _note_term("disconnect", "peer closed connection", elapsed)
+                    _record(elapsed)
+                    return
+                if not readable:
+                    if stopping:
+                        return
+                    continue
+                try:
+                    chunk = sock.recv(4096)
+                except (BlockingIOError, socket.timeout, TimeoutError):
+                    continue
+                except ssl.SSLWantReadError:
+                    continue
+                except ssl.SSLError as exc:
+                    msg = str(exc).lower()
+                    if "timed out" in msg or "want read" in msg or "want write" in msg:
+                        continue
+                    elapsed = bye_elapsed if bye_elapsed is not None else (time.perf_counter() - start_time)
+                    if bye_elapsed is None:
+                        _note_term("disconnect", "peer closed connection", elapsed)
+                    _record(elapsed)
+                    return
+                except Exception:
+                    elapsed = bye_elapsed if bye_elapsed is not None else (time.perf_counter() - start_time)
+                    if bye_elapsed is None:
+                        _note_term("disconnect", "peer closed connection", elapsed)
+                    _record(elapsed)
+                    return
+
+                if not chunk:
+                    if buf:
+                        _handle_line(bytes(buf))
+                    elapsed = bye_elapsed if bye_elapsed is not None else (time.perf_counter() - start_time)
+                    if bye_elapsed is None:
+                        _note_term("disconnect", "peer closed connection", elapsed)
+                    _record(elapsed)
+                    return
+
+                buf.extend(chunk)
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    line = bytes(buf[: nl + 1])
+                    del buf[: nl + 1]
+                    _handle_line(line)
+
+        def _vv_reject(idx: int, exc: BaseException, elapsed: float) -> None:
+            body = self._imap_bye_body_from_exc(exc)
+            if not body:
+                return
+            _dbg(
+                f"Connection #{idx} terminated — disconnect "
+                f"({self._noop2_format_close_cause(body)}, t={elapsed:.1f}s)"
+            )
 
         connections: list = []
         _first_error: list[str | None] = [None]
         watcher_stop = threading.Event()
+        idx_counter = 0
+        watch_threads: list[threading.Thread] = []
+        latest_watch_start = 0.0
+
+        def _new_idx() -> int:
+            nonlocal idx_counter
+            idx_counter += 1
+            return idx_counter
+
+        def _spawn_watch(
+            imap: imaplib.IMAP4 | imaplib.IMAP4_SSL,
+            start_time: float,
+            result_cell: list | None,
+            conn_idx: int,
+        ) -> None:
+            nonlocal latest_watch_start
+            t = threading.Thread(
+                target=_watch_imap_disconnect,
+                args=(imap, start_time, MAX_TIMEOUT, result_cell, watcher_stop, conn_idx),
+                daemon=True,
+            )
+            with extra_lock:
+                latest_watch_start = max(latest_watch_start, start_time)
+                watch_threads.append(t)
+            t.start()
 
         a_start_time: float | None = None
         b_start_time: float | None = None
@@ -441,26 +650,26 @@ class ImapEngine:
             _dbg("Connection limits test")
             _dbg(
                 f"Target {self.args.target.ip}:{self.args.target.port} — up to {max_attempts} parallel "
-                f"sessions (ramp {PHASE1_DELAY}s), ban duration probe max {MAX_BAN_WAIT}s, "
-                f"banner/idle timeout cap {MAX_TIMEOUT}s."
+                f"sessions ({ramp_threads} thread{'s' if ramp_threads != 1 else ''}), "
+                f"ban/idle wait {MAX_TIMEOUT:.0f}s."
             )
 
             if _show_progress:
                 _write_live("Connected:", "0")
 
             try:
+                idx_a = _new_idx()
+                t_a = time.perf_counter()
                 imap_a = self._make_imap_connection()
-                a_start_time = time.perf_counter()
+                a_start_time = t_a
                 connections.append(imap_a)
                 _dbg("Session A (banner-only): connect OK")
-                threading.Thread(
-                    target=_watch_imap_disconnect,
-                    args=(imap_a, a_start_time, MAX_TIMEOUT, a_result, watcher_stop),
-                    daemon=True,
-                ).start()
+                _spawn_watch(imap_a, a_start_time, a_result, idx_a)
                 if _show_progress:
                     _write_live("Connected:", str(len(connections)))
             except Exception as exc:
+                _bump_establish_fail(exc)
+                _vv_reject(idx_a, exc, time.perf_counter() - t_a)
                 if _first_error[0] is None:
                     _first_error[0] = str(exc)
                 _dbg(f"Session A (banner-only): connect failed — {exc}")
@@ -468,22 +677,22 @@ class ImapEngine:
             time.sleep(PHASE1_DELAY)
 
             try:
+                idx_b = _new_idx()
+                t_b = time.perf_counter()
                 imap_b = self._make_imap_connection()
-                b_start_time = time.perf_counter()
+                b_start_time = t_b
                 connections.append(imap_b)
                 try:
                     imap_b.capability()
                 except Exception:
                     pass
                 _dbg("Session B (CAPABILITY): connect OK")
-                threading.Thread(
-                    target=_watch_imap_disconnect,
-                    args=(imap_b, b_start_time, MAX_TIMEOUT, b_result, watcher_stop),
-                    daemon=True,
-                ).start()
+                _spawn_watch(imap_b, b_start_time, b_result, idx_b)
                 if _show_progress:
                     _write_live("Connected:", str(len(connections)))
             except Exception as exc:
+                _bump_establish_fail(exc)
+                _vv_reject(idx_b, exc, time.perf_counter() - t_b)
                 if _first_error[0] is None:
                     _first_error[0] = str(exc)
                 _dbg(f"Session B (CAPABILITY): connect failed — {exc}")
@@ -492,49 +701,107 @@ class ImapEngine:
                 raise OSError(_first_error[0] or "Could not establish any IMAP connection")
 
             banned = False
-            remaining = max_attempts - len(connections)
-            for _ in range(max(remaining, 0)):
-                time.sleep(PHASE1_DELAY)
+            remaining = max(max_attempts - len(connections), 0)
+            next_slot = 0
+            held_extras: list[tuple] = []
+
+            def _hold_extra(imap_extra, t0: float, idx: int) -> None:
+                with extra_lock:
+                    connections.append(imap_extra)
+                    held_extras.append((imap_extra, idx))
+                    if _show_progress:
+                        _write_live("Connected:", str(len(connections)))
+                _spawn_watch(imap_extra, t0, None, idx)
+
+            def _open_extra() -> bool:
+                """Attempt one remaining ramp slot. Failures do not stop the other slots."""
+                nonlocal next_slot
+                with extra_lock:
+                    if next_slot >= remaining:
+                        return False
+                    next_slot += 1
+                    idx = _new_idx()
+                t0 = time.perf_counter()
                 try:
                     imap_extra = self._make_imap_connection()
                 except Exception as exc:
+                    _bump_establish_fail(exc)
+                    _vv_reject(idx, exc, time.perf_counter() - t0)
+                    with extra_lock:
+                        if _first_error[0] is None:
+                            _first_error[0] = str(exc)
+                    return True
+                _hold_extra(imap_extra, t0, idx)
+                return True
+
+            if remaining > 0:
+                workers_n = min(ramp_threads, remaining)
+                if workers_n <= 1:
+                    for _ in range(remaining):
+                        time.sleep(PHASE1_DELAY)
+                        if not _open_extra():
+                            break
+                else:
+                    def _ramp_worker() -> None:
+                        while _open_extra():
+                            pass
+
+                    ramp_pool = [
+                        threading.Thread(target=_ramp_worker, daemon=True)
+                        for _ in range(workers_n)
+                    ]
+                    for w in ramp_pool:
+                        w.start()
+                    for w in ramp_pool:
+                        w.join()
+
+            # One flake during a parallel ramp must not look like a session cap.
+            shortfall_tries = 0
+            while len(connections) < max_attempts and shortfall_tries < 5:
+                idx = _new_idx()
+                t0 = time.perf_counter()
+                try:
+                    imap_extra = self._make_imap_connection()
+                except Exception as exc:
+                    _bump_establish_fail(exc)
+                    _vv_reject(idx, exc, time.perf_counter() - t0)
                     if _first_error[0] is None:
                         _first_error[0] = str(exc)
-                    banned = True
-                    break
-                connections.append(imap_extra)
-                if _show_progress:
-                    _write_live("Connected:", str(len(connections)))
+                    shortfall_tries += 1
+                    continue
+                shortfall_tries = 0
+                _hold_extra(imap_extra, t0, idx)
 
             connected = len(connections)
+            banned = connected < max_attempts
+            # Same meaning as NOOP2: TCP already closed at pool-ready, before the
+            # idle wait. Idle-watch BYEs during ramp are the CONNLIM test itself
+            # and show up later in the disconnect summary — not here.
+            with extra_lock:
+                idle_dead = set(terminated_seen)
+            reaped = 0
+            for conn, idx in held_extras:
+                if idx in idle_dead:
+                    continue
+                if self._noop2_socket_already_closed(getattr(conn, "sock", None)):
+                    reaped += 1
             _dbg(f"Ramp-up: {connected}/{max_attempts} connections established.")
             if banned:
                 _dbg(f"Ramp-up stopped: {_first_error[0]}")
             if _show_progress:
-                _finalize_line("Connected:", str(connected))
+                _end_live()
+                self._noop2_print_ramp(connected, est_err, est_disc, est_timeout, reaped)
 
-            if banned and connected >= CONN_LIMIT_CONN_IP_THRESHOLD:
-                _print_info(f"Further connections refused after {connected} sessions (possible rate / concurrency limit).")
-            elif not banned:
+            if not banned:
                 _print_verdict(
                     True,
-                    f"No refusal observed while raising concurrent sessions "
-                    f"({connected}/{max_attempts} established)",
+                    f"No connection limit ({connected}/{max_attempts} concurrent connections accepted)",
                 )
-
-            if not banned and connected >= CONN_LIMIT_CONN_GLOB_THRESHOLD:
+            else:
                 _print_verdict(
-                    True,
-                    f"Very high number of concurrent sessions from one client accepted ({connected}); "
-                    "no global-style ceiling observed within probe budget",
+                    False,
+                    f"Connection limit is enforced ({connected}/{max_attempts} concurrent connections accepted)",
                 )
-            elif not banned and connected >= CONN_LIMIT_CONN_IP_THRESHOLD:
-                _print_verdict(
-                    True,
-                    f"Many concurrent sessions from one IP accepted ({connected}) without refusal",
-                )
-            elif banned:
-                _print_verdict(False, "Concurrency or connect refusal observed during ramp-up")
 
             ban_duration_seconds: float | None = None
             ban_duration_exceeded = False
@@ -587,14 +854,14 @@ class ImapEngine:
                     )
 
                 if ban_duration_exceeded:
-                    _print_verdict(False, f"No reconnect within {int(MAX_BAN_WAIT)}s cap (strict limit or long backoff)")
+                    _print_verdict(False, f"Reconnect blocked for {int(MAX_BAN_WAIT)}s+ after refusal")
                 elif (
                     ban_duration_seconds is not None
                     and ban_duration_seconds < CONN_LIMIT_BAN_MIN_SECONDS
                 ):
-                    _print_verdict(True, "Backoff / ban window shorter than typical brute-force mitigation window")
+                    _print_verdict(True, "Ban/backoff window shorter than 30s")
                 else:
-                    _print_verdict(False, "Server eventually accepted a new connection after refusal")
+                    _print_verdict(False, "Reconnect allowed after backoff")
 
             def _await_and_report(
                 start_time: float | None,
@@ -649,9 +916,9 @@ class ImapEngine:
                 a_result,
                 "Pre-auth idle (after banner):",
                 MAX_TIMEOUT,
-                CONN_LIMIT_PREAUTH_IDLE_MAX_OK_SEC,
-                f"Pre-auth idle disconnect or limit beyond {int(CONN_LIMIT_PREAUTH_IDLE_MAX_OK_SEC)}s (hit cap or slow idle policy)",
-                f"Pre-auth idle ended within {int(CONN_LIMIT_PREAUTH_IDLE_MAX_OK_SEC)}s or server closed sooner",
+                preauth_idle_ok,
+                f"Pre-auth idle timeout > {int(preauth_idle_ok)}s",
+                f"Pre-auth idle timeout ≤ {int(preauth_idle_ok)}s",
             )
 
             post_seconds, post_exceeded = _await_and_report(
@@ -659,12 +926,67 @@ class ImapEngine:
                 b_result,
                 "Idle after CAPABILITY:",
                 MAX_TIMEOUT,
-                CONN_LIMIT_POST_CAP_IDLE_MAX_OK_SEC,
-                f"Idle after CAPABILITY beyond {int(CONN_LIMIT_POST_CAP_IDLE_MAX_OK_SEC)}s (hit cap or permissive idle)",
-                f"Idle after CAPABILITY within {int(CONN_LIMIT_POST_CAP_IDLE_MAX_OK_SEC)}s or closed sooner",
+                post_cap_idle_ok,
+                f"Idle timeout after CAPABILITY > {int(post_cap_idle_ok)}s",
+                f"Idle timeout after CAPABILITY ≤ {int(post_cap_idle_ok)}s",
             )
 
+            # A/B idle is measured; extras started later still wait for their own BYE/cap.
+            wait_origin = latest_watch_start or time.perf_counter()
+            join_until = wait_origin + MAX_TIMEOUT + 3.0
+            duration_clock = _fmt_mmss(MAX_TIMEOUT)
+
+            def _idle_remaining_text(alive: int, *, finalize: bool = False) -> str:
+                elapsed = max(0.0, time.perf_counter() - wait_origin)
+                if finalize:
+                    clock = _imap_conn_duration_display(elapsed, elapsed >= MAX_TIMEOUT)
+                else:
+                    clock = _fmt_mmss(elapsed)
+                return f"{alive}  {clock} / {duration_clock}"
+
+            while time.perf_counter() < join_until:
+                alive = sum(1 for t in watch_threads if t.is_alive())
+                if alive == 0:
+                    break
+                if _show_progress:
+                    _write_live("Idle remaining:", _idle_remaining_text(alive))
+                time.sleep(0.2)
+            if _show_progress:
+                alive = sum(1 for t in watch_threads if t.is_alive())
+                if alive:
+                    _finalize_line("Idle remaining:", _idle_remaining_text(alive, finalize=True))
+                elif _live_dirty:
+                    _end_live()
+
             watcher_stop.set()
+            for t in watch_threads:
+                t.join(timeout=2.0)
+
+            idle_disconnected = len(terminated)
+            idle_disconnected_all = bool(connected > 0 and idle_disconnected >= connected)
+            terminated_connections = tuple(sorted(terminated, key=lambda row: row[0]))
+            if _show_progress and connected > 0 and idle_disconnected > 0:
+                if idle_disconnected_all:
+                    _print_verdict(
+                        True,
+                        "Server disconnected all connections before test time limit",
+                    )
+                pct = 100.0 * idle_disconnected / connected
+                _print_info(
+                    f"Disconnected connections during test: {idle_disconnected} from {connected} ({pct:.0f}%)"
+                )
+                for idx, reason, detail in terminated_connections:
+                    with _print_lock:
+                        ptprint(
+                            get_colored_text(
+                                f"Connection #{idx} terminated — {reason} ({detail})",
+                                "ADDITIONS",
+                            ),
+                            bullet_type="TEXT",
+                            condition=True,
+                            indent=12,
+                        )
+
             for conn in connections:
                 try:
                     conn.logout()
@@ -673,42 +995,6 @@ class ImapEngine:
                         conn.shutdown()
                     except Exception:
                         pass
-
-            seq_ok = 0
-            seq_fail = 0
-            if _show_progress:
-                _write_live("Sequential connects:", f"0/{CONN_LIMIT_RATE_SEQ_ATTEMPTS}")
-
-            for _ in range(CONN_LIMIT_RATE_SEQ_ATTEMPTS):
-                try:
-                    simap = self._make_imap_connection()
-                    try:
-                        simap.logout()
-                    except Exception:
-                        try:
-                            simap.shutdown()
-                        except Exception:
-                            pass
-                    seq_ok += 1
-                except Exception:
-                    seq_fail += 1
-                if _show_progress:
-                    _write_live("Sequential connects:", f"{seq_ok + seq_fail}/{CONN_LIMIT_RATE_SEQ_ATTEMPTS}")
-                time.sleep(CONN_LIMIT_RATE_SEQ_DELAY_SEC)
-
-            if _show_progress:
-                _finalize_line("Sequential connects:", f"{seq_ok} ok, {seq_fail} refused")
-
-            if seq_fail == 0 and seq_ok >= CONN_LIMIT_RATE_VULN_MIN_OK:
-                _print_verdict(
-                    True,
-                    f"High-frequency connect/disconnect burst succeeded ({seq_ok}/{CONN_LIMIT_RATE_SEQ_ATTEMPTS}) "
-                    "without refusal — weak connect-rate limiting",
-                )
-            elif seq_fail > 0:
-                _print_verdict(False, "Connect-rate limiting or refusal observed during sequential burst")
-            else:
-                _print_verdict(False, "Sequential burst completed with limited success count")
 
             auth_parallel_accepted = 0
             auth_parallel_attempted = 0
@@ -753,18 +1039,15 @@ class ImapEngine:
                 if auth_parallel_accepted >= CONN_LIMIT_AUTH_PARALLEL_VULN_THRESHOLD and not auth_login_stopped_early:
                     _print_verdict(
                         True,
-                        f"Many simultaneous sessions with the same account accepted ({auth_parallel_accepted})",
+                        f"No per-account session limit ({auth_parallel_accepted} parallel logins accepted)",
                     )
                 elif auth_login_stopped_early and auth_parallel_accepted == 0:
                     _print_verdict(False, "LOGIN failed — check credentials or account lockout")
                     idle_probe_detail = "Skipped IDLE probe (login failed)"
                 elif auth_login_stopped_early:
-                    _print_verdict(
-                        False,
-                        "Parallel LOGIN limit or refusal observed before reaching high session count",
-                    )
+                    _print_verdict(False, "Per-account session limit is enforced")
                 else:
-                    _print_verdict(False, "Parallel authenticated sessions stayed below assessment threshold")
+                    _print_verdict(False, "Per-account session count below threshold")
 
                 for aim in auth_imaps:
                     try:
@@ -810,12 +1093,16 @@ class ImapEngine:
                                     idle_probe_detail = line.decode("utf-8", errors="replace").strip()[:200]
                                     break
                             if entered:
+                                idle_idx = _new_idx()
                                 idle_start = time.perf_counter()
                                 idle_result: list = []
                                 idle_stop_ev = threading.Event()
                                 threading.Thread(
                                     target=_watch_imap_disconnect,
-                                    args=(idle_imap, idle_start, MAX_TIMEOUT, idle_result, idle_stop_ev),
+                                    args=(
+                                        idle_imap, idle_start, MAX_TIMEOUT,
+                                        idle_result, idle_stop_ev, idle_idx,
+                                    ),
                                     daemon=True,
                                 ).start()
                                 dl = idle_start + MAX_TIMEOUT + 2.0
@@ -853,26 +1140,27 @@ class ImapEngine:
                                 if _show_progress:
                                     _finalize_line("Idle (IDLE command):", disp_i)
 
-                                if ig_exceeded or ig_elapsed > CONN_LIMIT_IDLE_AFTER_LOGIN_MAX_OK_SEC:
+                                if ig_exceeded or ig_elapsed > idle_login_ok:
                                     _print_verdict(
                                         True,
-                                        f"Authenticated IDLE session lasted {disp_i} — permissive long-lived IDLE",
+                                        f"Authenticated IDLE timeout > {int(idle_login_ok)}s",
                                     )
                                 else:
                                     _print_verdict(
                                         False,
-                                        f"IDLE session ended within {int(CONN_LIMIT_IDLE_AFTER_LOGIN_MAX_OK_SEC)}s or sooner",
+                                        f"Authenticated IDLE timeout ≤ {int(idle_login_ok)}s",
                                     )
 
                                 idle_stop_ev.set()
-                                try:
-                                    idle_imap.send(b"DONE\r\n")
-                                except Exception:
-                                    pass
-                                try:
-                                    idle_imap.readline()
-                                except Exception:
-                                    pass
+                                if ig_exceeded:
+                                    try:
+                                        idle_imap.send(b"DONE\r\n")
+                                    except Exception:
+                                        pass
+                                    try:
+                                        idle_imap.readline()
+                                    except Exception:
+                                        pass
                     except Exception as ex:
                         if idle_probe_detail is None:
                             idle_probe_detail = str(ex)
@@ -890,6 +1178,10 @@ class ImapEngine:
                 connected=connected,
                 max_attempts=max_attempts,
                 banned=banned,
+                establish_errors=est_err,
+                establish_disconnected=est_disc,
+                establish_timeout=est_timeout,
+                dropped_while_idle=reaped,
                 ban_duration_probe_ran=ban_duration_probe_ran,
                 ban_duration_seconds=ban_duration_seconds,
                 ban_duration_exceeded=ban_duration_exceeded,
@@ -897,9 +1189,6 @@ class ImapEngine:
                 preauth_idle_exceeded=pre_exceeded,
                 post_cap_idle_seconds=post_seconds,
                 post_cap_idle_exceeded=post_exceeded,
-                sequential_accepted=seq_ok,
-                sequential_attempts=CONN_LIMIT_RATE_SEQ_ATTEMPTS,
-                sequential_refused=seq_fail,
                 auth_parallel_accepted=auth_parallel_accepted,
                 auth_parallel_attempted=auth_parallel_attempted,
                 auth_login_stopped_early=auth_login_stopped_early,
@@ -907,6 +1196,9 @@ class ImapEngine:
                 idle_logged_exceeded=idle_logged_exceeded,
                 auth_phase_skip_reason=auth_phase_skip_reason,
                 idle_probe_detail=idle_probe_detail,
+                idle_disconnected=idle_disconnected,
+                idle_disconnected_all=idle_disconnected_all,
+                terminated_connections=terminated_connections,
             )
         finally:
             _end_live()
@@ -1305,6 +1597,12 @@ class ImapEngine:
             weak_cipher=weak_c,
         )
 
+    def _imap_tls_audit_workers(self) -> int:
+        raw = getattr(self.args, "noop2_threads", None)
+        if raw is None:
+            return int(tls_audit.TLS_AUDIT_DEFAULT_WORKERS)
+        return max(1, int(raw))
+
     def test_imap_tls_audit(self) -> ImapTlsAuditResult:
         """
         TLS + certificate audit for IMAP (PTV-SVC-IMAP-TLSAUDIT).
@@ -1319,6 +1617,7 @@ class ImapEngine:
         timeout = _IMAP_TLS_AUDIT_TIMEOUT_SEC
         implicit = bool(self.args.tls or port == 993)
         mode = "implicit_tls" if implicit else "starttls"
+        workers = self._imap_tls_audit_workers()
         trace: list[str] = []
         advertised: bool | None = True if implicit else None
 
@@ -1384,6 +1683,10 @@ class ImapEngine:
         versions: tuple[ImapTlsVersionScan, ...] = tuple()
         if handshake_ok:
             try:
+                self._dbg(
+                    f"TLS version/cipher scan "
+                    f"({workers} parallel connection{'s' if workers != 1 else ''})"
+                )
                 versions = tls_audit.scan_tls_versions(
                     host,
                     port,
@@ -1391,6 +1694,7 @@ class ImapEngine:
                     implicit=implicit,
                     sni=host,
                     log=self._dbg,
+                    workers=workers,
                 )
             except Exception as e:
                 self._dbg(f"TLS version/cipher scan failed: {self._snip(str(e))}")
@@ -1724,10 +2028,21 @@ class ImapEngine:
         self._flush_terminal()
         self._authlist_terminal_emitted = True
 
-    def _authlist_emit_not_available(self) -> None:
+    def _authlist_unavailable_text(self, path: str, *, connected: bool) -> str:
+        if connected:
+            return "No AUTH methods advertised"
+        label = self._authlist_path_label(path)
+        return f"{label} connection is not available"
+
+    def _authlist_emit_unavailable(self, path: str, *, connected: bool) -> None:
         if self.use_json:
             return
-        self._ptprint_raw("Not available", bullet_type="NOTVULN", condition=True, indent=8)
+        self._ptprint_raw(
+            self._authlist_unavailable_text(path, connected=connected),
+            bullet_type="INFO",
+            condition=True,
+            indent=8,
+        )
         self._flush_terminal()
         self._authlist_terminal_emitted = True
 
@@ -1758,7 +2073,7 @@ class ImapEngine:
                 self._dbg("no AUTH= in CAPABILITY", indent=8)
         except Exception as e:
             self._dbg(f"{label} connect failed: {self._snip(str(e))}", indent=8)
-            self._authlist_emit_not_available()
+            self._authlist_emit_unavailable(path, connected=False)
             return ImapAuthListPath(path=path, available=False, skip_reason=str(e)[:240], methods=tuple())
         finally:
             if imap is not None:
@@ -1770,7 +2085,7 @@ class ImapEngine:
                     except Exception:
                         pass
         if not methods:
-            self._authlist_emit_not_available()
+            self._authlist_emit_unavailable(path, connected=True)
             return ImapAuthListPath(path=path, available=True, skip_reason=None, methods=tuple())
         rows: list[ImapAuthMechRow] = []
         for m in methods:
@@ -1779,11 +2094,11 @@ class ImapEngine:
             dangerous = IMAP_AUTH_METHOD_LEVEL.get(m, "OK") == "ERROR"
             row = ImapAuthMechRow(name=m, usable=usable, outcome=outcome, dangerous=dangerous)
             rows.append(row)
-            self._authlist_emit_method_row(path, row)
             if outcome == "io_error":
                 self._dbg(f"AUTHENTICATE {m} failed: {reply}", indent=12)
             else:
                 self._dbg(f"AUTHENTICATE {m} → {outcome} {reply}", indent=12)
+            self._authlist_emit_method_row(path, row)
         return ImapAuthListPath(path=path, available=True, skip_reason=None, methods=tuple(rows))
 
     def test_imap_authlist(self) -> ImapAuthListResult:
@@ -1800,7 +2115,7 @@ class ImapEngine:
             for skip_path, skip_label in (("cleartext", "Cleartext"), ("starttls", "STARTTLS")):
                 self._authlist_emit_path_header(skip_label)
                 self._dbg("skipped (implicit TLS port 993)", indent=8)
-                self._authlist_emit_not_available()
+                self._authlist_emit_unavailable(skip_path, connected=False)
                 paths.append(
                     ImapAuthListPath(
                         path=skip_path,
@@ -4252,8 +4567,21 @@ class ImapEngine:
             for p in al.paths:
                 label = self._authlist_path_label(p.path)
                 pp(label, bullet_type="TITLE", condition=show, indent=4)
-                if not p.available or not p.methods:
-                    pp("Not available", bullet_type="NOTVULN", condition=show, indent=8)
+                if not p.available:
+                    pp(
+                        self._authlist_unavailable_text(p.path, connected=False),
+                        bullet_type="INFO",
+                        condition=show,
+                        indent=8,
+                    )
+                    continue
+                if not p.methods:
+                    pp(
+                        self._authlist_unavailable_text(p.path, connected=True),
+                        bullet_type="INFO",
+                        condition=show,
+                        indent=8,
+                    )
                     continue
                 for row in p.methods:
                     bullet, text = self._authlist_row_display(p.path, row)
@@ -4912,8 +5240,15 @@ class ImapEngine:
                         ],
                     }
                 )
-                if not p.available or not p.methods:
-                    auth_lines.append(f"{label}: Not available")
+                if not p.available:
+                    auth_lines.append(
+                        f"{label}: {self._authlist_unavailable_text(p.path, connected=False)}"
+                    )
+                    continue
+                if not p.methods:
+                    auth_lines.append(
+                        f"{label}: {self._authlist_unavailable_text(p.path, connected=True)}"
+                    )
                     continue
                 for m in p.methods:
                     _, text = self._authlist_row_display(p.path, m)
@@ -4997,7 +5332,7 @@ class ImapEngine:
                         "vuln_response": ic.detail,
                     }
                 )
-        # Connection limits / rate / idle (PTV-SVC-IMAP-CONN*)
+        # Connection limits / idle (PTV-SVC-IMAP-CONN*)
         if (cl_err := getattr(self.results, "conn_limits_error", None)) is not None:
             properties.update({"connLimitsError": cl_err})
         elif (cl := self.results.conn_limits) is not None:
@@ -5007,6 +5342,10 @@ class ImapEngine:
                         "connected": cl.connected,
                         "maxAttempts": cl.max_attempts,
                         "banned": cl.banned,
+                        "establishErrors": cl.establish_errors,
+                        "establishDisconnected": cl.establish_disconnected,
+                        "establishTimeout": cl.establish_timeout,
+                        "droppedWhileIdle": cl.dropped_while_idle,
                         "banDurationProbeRan": cl.ban_duration_probe_ran,
                         "banDurationSeconds": cl.ban_duration_seconds,
                         "banDurationExceeded": cl.ban_duration_exceeded,
@@ -5014,9 +5353,6 @@ class ImapEngine:
                         "preauthIdleExceeded": cl.preauth_idle_exceeded,
                         "idleAfterCapabilitySeconds": cl.post_cap_idle_seconds,
                         "idleAfterCapabilityExceeded": cl.post_cap_idle_exceeded,
-                        "sequentialAccepted": cl.sequential_accepted,
-                        "sequentialAttempts": cl.sequential_attempts,
-                        "sequentialRefused": cl.sequential_refused,
                         "authParallelAccepted": cl.auth_parallel_accepted,
                         "authParallelAttempted": cl.auth_parallel_attempted,
                         "authLoginStoppedEarly": cl.auth_login_stopped_early,
@@ -5024,6 +5360,12 @@ class ImapEngine:
                         "idleLoggedExceeded": cl.idle_logged_exceeded,
                         "authPhaseSkipReason": cl.auth_phase_skip_reason,
                         "idleProbeDetail": cl.idle_probe_detail,
+                        "idleDisconnected": cl.idle_disconnected,
+                        "idleDisconnectedAll": cl.idle_disconnected_all,
+                        "terminatedConnections": [
+                            {"index": idx, "reason": reason, "detail": detail}
+                            for idx, reason, detail in cl.terminated_connections
+                        ],
                     }
                 }
             )
@@ -5048,14 +5390,6 @@ class ImapEngine:
                         "vuln_code": VULNS.ConnCntIp.value,
                         "vuln_request": "Concurrent IMAP sessions from single source (ramp-up probe)",
                         "vuln_response": f"{cl.connected} simultaneous sessions accepted without refusal (budget {cl.max_attempts})",
-                    }
-                )
-            if not cl.banned and cl.connected >= CONN_LIMIT_CONN_GLOB_THRESHOLD:
-                deferred_vulns.append(
-                    {
-                        "vuln_code": VULNS.ConnCntGlob.value,
-                        "vuln_request": "High concurrency IMAP sessions (single-client ramp)",
-                        "vuln_response": f"{cl.connected} sessions accepted; no refusal within probe — verify global limits from multiple sources",
                     }
                 )
             long_bits: list[str] = []
@@ -5089,16 +5423,6 @@ class ImapEngine:
                         "vuln_code": VULNS.ConnLong.value,
                         "vuln_request": "IMAP non-authenticated / lightweight-command / IDLE idle lifetime",
                         "vuln_response": "; ".join(long_bits),
-                    }
-                )
-            if cl.sequential_refused == 0 and cl.sequential_accepted >= CONN_LIMIT_RATE_VULN_MIN_OK:
-                deferred_vulns.append(
-                    {
-                        "vuln_code": VULNS.ConnRate.value,
-                        "vuln_request": "Sequential connect / logout burst (connect-rate limiting)",
-                        "vuln_response": (
-                            f"{cl.sequential_accepted}/{cl.sequential_attempts} rapid connects succeeded without refusal"
-                        ),
                     }
                 )
 
@@ -5535,31 +5859,94 @@ class ImapEngine:
         """Send NOOP and return (success, error_msg)."""
         try:
             typ, data = imap.noop()
-            return (typ == "OK", None)
+            if typ == "OK":
+                return True, None
+            extra = ""
+            if data:
+                extra = " " + ImapEngine._unwrap_imaplib_error(str(data))
+            return False, f"{typ}{extra}".strip()
         except Exception as e:
             return (False, ImapEngine._unwrap_imaplib_error(str(e)))
 
-    def test_noop_duration_preauth(self) -> NoopDurationResult:
-        """NOOP1: Keep a pre-auth connection alive with periodic NOOP."""
-        self.debug("NOOP duration test (pre-auth): connecting...")
-        
+    @staticmethod
+    def _noop1_wait_idle(sock, delay: float, start_time: float, duration: float, *, write_live=None) -> str:
+        """Wait ``delay`` seconds; watch for peer close. Return ok / duration_cap / disconnected."""
+        if duration > 0 and (time.perf_counter() - start_time) >= duration:
+            return "duration_cap"
+        if delay <= 0:
+            return "ok"
+        deadline = time.perf_counter() + delay
+        orig_timeout = None
         try:
-            imap = self._make_imap_connection(trace=False)
-            imap.sock.settimeout(IMAP_NOOP_PREAUTH_DUR_TIMEOUT_SECONDS)
-        except Exception as e:
-            return NoopDurationResult(
-                authenticated=False,
-                test_duration_seconds=IMAP_NOOP_PREAUTH_DUR_TEST_SECONDS,
-                maintained_seconds=0.0,
-                noops_sent=0,
-                noops_ok=0,
-                noops_error=0,
-                disconnected=True,
-                disconnect_after_seconds=None,
-                hit_test_cap=False,
-                error_message=f"Connection failed: {e}",
-            )
-        
+            orig_timeout = sock.gettimeout()
+        except Exception:
+            pass
+        try:
+            while True:
+                now = time.perf_counter()
+                elapsed = now - start_time
+                if elapsed >= duration:
+                    return "duration_cap"
+                remaining_delay = deadline - now
+                if remaining_delay <= 0:
+                    return "ok"
+                if write_live:
+                    wait_s = int(remaining_delay)
+                    elapsed_min = int(elapsed / 60)
+                    elapsed_sec = int(elapsed % 60)
+                    write_live(
+                        f"Waiting {wait_s}s until next NOOP ({elapsed_min}m {elapsed_sec}s elapsed)"
+                    )
+                wait = min(1.0, remaining_delay)
+                try:
+                    ready, _, _ = select.select([sock], [], [], wait)
+                except (ValueError, OSError, TypeError):
+                    return "disconnected"
+                if not ready:
+                    continue
+                try:
+                    data = sock.recv(1, socket.MSG_PEEK)
+                except BlockingIOError:
+                    continue
+                except Exception:
+                    return "disconnected"
+                if not data:
+                    return "disconnected"
+                return "disconnected"
+        finally:
+            try:
+                if orig_timeout is not None:
+                    sock.settimeout(orig_timeout)
+            except Exception:
+                pass
+
+    def _noop1_duration_delay(self, default_duration: float, default_delay: float) -> tuple[float, float]:
+        dur = getattr(self.args, "noop1_duration", None)
+        delay = getattr(self.args, "noop1_delay", None)
+        duration = float(dur) if dur is not None else float(default_duration)
+        delay_s = float(delay) if delay is not None else float(default_delay)
+        if duration <= 0:
+            duration = float(default_duration)
+        if delay_s < 0:
+            delay_s = 0.0
+        return duration, delay_s
+
+    def _noop1_error_result(self, *, authenticated: bool, duration: float, delay: float, error: str) -> NoopDurationResult:
+        return NoopDurationResult(
+            authenticated=authenticated,
+            test_duration_seconds=duration,
+            maintained_seconds=0.0,
+            noops_sent=0,
+            noops_ok=0,
+            noops_error=0,
+            disconnected=True,
+            disconnect_after_seconds=None,
+            hit_test_cap=False,
+            error_message=error,
+            delay_seconds=delay,
+        )
+
+    def _run_noop_duration_loop(self, imap, *, authenticated: bool, duration: float, delay: float) -> NoopDurationResult:
         start_time = time.perf_counter()
         noops_sent = 0
         noops_ok = 0
@@ -5567,20 +5954,22 @@ class ImapEngine:
         disconnected = False
         disconnect_after_seconds = None
         hit_test_cap = False
+        idle_disconnect = False
         tag_counter = 0
-        
-        # Live progress setup
+        rtts: list[float] = []
+
         show_progress = not self.use_json
+        verbose = bool(getattr(self.args, "debug", False))
         live_line_dirty = False
-        
+
         def write_live(text: str):
             nonlocal live_line_dirty
-            if not show_progress:
+            if not show_progress or verbose:
                 return
             sys.stdout.write(f"\033[2K\r            {text:<100}")
             sys.stdout.flush()
             live_line_dirty = True
-        
+
         def clear_live():
             nonlocal live_line_dirty
             if not show_progress or not live_line_dirty:
@@ -5588,53 +5977,80 @@ class ImapEngine:
             sys.stdout.write("\033[2K\r")
             sys.stdout.flush()
             live_line_dirty = False
-        
-        # Initial progress message
-        if show_progress:
-            write_live(f"Test started, sending first NOOP...")
-        
+
+        def emit_vv(msg: str) -> None:
+            """Print a -vv snapshot as its own line (never onto the live \\r row)."""
+            if not verbose:
+                return
+            clear_live()
+            self.debug(msg)
+            self._flush_terminal()
+
+        if show_progress and not verbose:
+            write_live("Test started, sending first NOOP...")
+
         try:
             while True:
                 elapsed = time.perf_counter() - start_time
-                if elapsed >= IMAP_NOOP_PREAUTH_DUR_TEST_SECONDS:
+                if elapsed >= duration:
                     hit_test_cap = True
                     break
-                
-                # Send NOOP
+
                 tag_counter += 1
                 noops_sent += 1
                 tag = f"a{tag_counter:04d}"
+                t0 = time.perf_counter()
                 success, error = self._imap_noop_safe(imap, tag)
+                rt = time.perf_counter() - t0
                 if success:
                     noops_ok += 1
-                    # Live progress every NOOP
-                    if show_progress:
-                        elapsed_min = int(elapsed / 60)
-                        elapsed_sec = int(elapsed % 60)
+                    rtts.append(rt)
+                    if show_progress and not verbose and (
+                        delay > 0 or noops_sent == 1 or noops_sent % NOOP1_PROGRESS_EVERY == 0
+                    ):
+                        elapsed_min = int((time.perf_counter() - start_time) / 60)
+                        elapsed_sec = int((time.perf_counter() - start_time) % 60)
                         write_live(f"NOOPs sent: {noops_sent} ({elapsed_min}m {elapsed_sec}s elapsed)")
-                    if noops_sent % 5 == 0:
-                        self.debug(f"NOOP #{noops_sent}: OK (elapsed: {int(elapsed)}s)")
+                    if noops_sent % NOOP1_PROGRESS_EVERY == 0:
+                        emit_vv(
+                            f"NOOP #{noops_sent}: OK rt={rt:.3f}s "
+                            f"(elapsed: {int(time.perf_counter() - start_time)}s)"
+                        )
                 else:
                     noops_error += 1
                     disconnected = True
-                    disconnect_after_seconds = elapsed
-                    self.debug(f"NOOP #{noops_sent}: failed — {error}")
+                    disconnect_after_seconds = time.perf_counter() - start_time
+                    emit_vv(f"NOOP #{noops_sent}: failed — {error}")
                     break
-                
-                # Wait for the next NOOP interval
-                time.sleep(IMAP_NOOP_PREAUTH_DUR_INTERVAL_SECONDS)
+
+                wait_state = self._noop1_wait_idle(
+                    imap.sock, delay, start_time, duration,
+                    write_live=write_live if not verbose else None,
+                )
+                if wait_state == "duration_cap":
+                    hit_test_cap = True
+                    break
+                if wait_state == "disconnected":
+                    disconnected = True
+                    idle_disconnect = True
+                    disconnect_after_seconds = time.perf_counter() - start_time
+                    emit_vv(
+                        f"Idle disconnect after {disconnect_after_seconds:.1f}s "
+                        f"(no NOOP for {delay:.0f}s interval)"
+                    )
+                    break
         finally:
             clear_live()
             try:
                 imap.logout()
             except Exception:
                 pass
-        
+
         maintained_seconds = time.perf_counter() - start_time
-        
+        stats = noop1_stats_from_rtts(rtts, noops_sent, noops_error)
         return NoopDurationResult(
-            authenticated=False,
-            test_duration_seconds=IMAP_NOOP_PREAUTH_DUR_TEST_SECONDS,
+            authenticated=authenticated,
+            test_duration_seconds=duration,
             maintained_seconds=maintained_seconds,
             noops_sent=noops_sent,
             noops_ok=noops_ok,
@@ -5643,111 +6059,54 @@ class ImapEngine:
             disconnect_after_seconds=disconnect_after_seconds,
             hit_test_cap=hit_test_cap,
             error_message=None,
+            delay_seconds=delay,
+            idle_disconnect=idle_disconnect,
+            **stats,
+        )
+
+    def test_noop_duration_preauth(self) -> NoopDurationResult:
+        """NOOP1: Keep a pre-auth connection alive with periodic NOOP."""
+        duration, delay = self._noop1_duration_delay(
+            IMAP_NOOP_PREAUTH_DUR_TEST_SECONDS, IMAP_NOOP_PREAUTH_DUR_INTERVAL_SECONDS,
+        )
+        self.debug(
+            f"NOOP duration test (pre-auth): connecting... "
+            f"(duration={duration:.0f}s, delay={delay:.0f}s)"
+        )
+        self._flush_terminal()
+        try:
+            imap = self._make_imap_connection(trace=False)
+            imap.sock.settimeout(IMAP_NOOP_PREAUTH_DUR_TIMEOUT_SECONDS)
+        except Exception as e:
+            return self._noop1_error_result(
+                authenticated=False, duration=duration, delay=delay,
+                error=f"Connection failed: {e}",
+            )
+        return self._run_noop_duration_loop(
+            imap, authenticated=False, duration=duration, delay=delay,
         )
 
     def test_noop_duration_postauth(self, username: str, password: str) -> NoopDurationResult:
         """NOOP1: Keep a post-auth connection alive with periodic NOOP."""
-        self.debug(f"NOOP duration test (post-auth): connecting and logging in as {username!r}...")
-        
+        duration, delay = self._noop1_duration_delay(
+            IMAP_NOOP_POSTAUTH_DUR_TEST_SECONDS, IMAP_NOOP_POSTAUTH_DUR_INTERVAL_SECONDS,
+        )
+        self.debug(
+            f"NOOP duration test (post-auth): connecting and logging in as {username!r}... "
+            f"(duration={duration:.0f}s, delay={delay:.0f}s)"
+        )
+        self._flush_terminal()
         try:
             imap = self._make_imap_connection(trace=False)
             imap.sock.settimeout(IMAP_NOOP_POSTAUTH_DUR_TIMEOUT_SECONDS)
             imap.login(username, password)
         except Exception as e:
-            return NoopDurationResult(
-                authenticated=True,
-                test_duration_seconds=IMAP_NOOP_POSTAUTH_DUR_TEST_SECONDS,
-                maintained_seconds=0.0,
-                noops_sent=0,
-                noops_ok=0,
-                noops_error=0,
-                disconnected=True,
-                disconnect_after_seconds=None,
-                hit_test_cap=False,
-                error_message=f"Connection/login failed: {e}",
+            return self._noop1_error_result(
+                authenticated=True, duration=duration, delay=delay,
+                error=f"Connection/login failed: {e}",
             )
-        
-        start_time = time.perf_counter()
-        noops_sent = 0
-        noops_ok = 0
-        noops_error = 0
-        disconnected = False
-        disconnect_after_seconds = None
-        hit_test_cap = False
-        tag_counter = 0
-        
-        # Live progress setup
-        show_progress = not self.use_json
-        live_line_dirty = False
-        
-        def write_live(text: str):
-            nonlocal live_line_dirty
-            if not show_progress:
-                return
-            sys.stdout.write(f"\033[2K\r            {text:<100}")
-            sys.stdout.flush()
-            live_line_dirty = True
-        
-        def clear_live():
-            nonlocal live_line_dirty
-            if not show_progress or not live_line_dirty:
-                return
-            sys.stdout.write("\033[2K\r")
-            sys.stdout.flush()
-            live_line_dirty = False
-        
-        # Initial progress message
-        if show_progress:
-            write_live(f"Test started, sending first NOOP...")
-        
-        try:
-            while True:
-                elapsed = time.perf_counter() - start_time
-                if elapsed >= IMAP_NOOP_POSTAUTH_DUR_TEST_SECONDS:
-                    hit_test_cap = True
-                    break
-                
-                tag_counter += 1
-                noops_sent += 1
-                tag = f"a{tag_counter:04d}"
-                success, error = self._imap_noop_safe(imap, tag)
-                if success:
-                    noops_ok += 1
-                    # Live progress every NOOP
-                    if show_progress:
-                        elapsed_min = int(elapsed / 60)
-                        elapsed_sec = int(elapsed % 60)
-                        write_live(f"NOOPs sent: {noops_sent} ({elapsed_min}m {elapsed_sec}s elapsed)")
-                    if noops_sent % 5 == 0:
-                        self.debug(f"NOOP #{noops_sent}: OK (elapsed: {int(elapsed)}s)")
-                else:
-                    noops_error += 1
-                    disconnected = True
-                    disconnect_after_seconds = elapsed
-                    self.debug(f"NOOP #{noops_sent}: failed — {error}")
-                    break
-                
-                time.sleep(IMAP_NOOP_POSTAUTH_DUR_INTERVAL_SECONDS)
-        finally:
-            clear_live()
-            try:
-                imap.logout()
-            except Exception:
-                pass
-        
-        maintained_seconds = time.perf_counter() - start_time
-        
-        return NoopDurationResult(
-            authenticated=True,
-            test_duration_seconds=IMAP_NOOP_POSTAUTH_DUR_TEST_SECONDS,
-            maintained_seconds=maintained_seconds,
-            noops_sent=noops_sent,
-            noops_ok=noops_ok,
-            noops_error=noops_error,
-            disconnected=disconnected,
-            disconnect_after_seconds=disconnect_after_seconds,
-            hit_test_cap=hit_test_cap,
-            error_message=None,
+        return self._run_noop_duration_loop(
+            imap, authenticated=True, duration=duration, delay=delay,
         )
 
     def _noop2_ramp_threads(self) -> int:
@@ -5782,6 +6141,158 @@ class ImapEngine:
             return "disconnect", detail
         return "error", detail
 
+    @staticmethod
+    def _noop2_reason_from_text(text: str) -> str:
+        msg = (text or "").lower()
+        if "timed out" in msg or "timeout" in msg:
+            return "timeout"
+        if any(k in msg for k in ("refused", "reset", "disconnect", "closed", "broken pipe", "aborted", "eof", "bye")):
+            return "disconnect"
+        return "error"
+
+    @staticmethod
+    def _noop2_format_close_cause(error: str | None) -> str:
+        """Human-readable close cause. IMAP BYE body is tagged so it is not our idle verdict."""
+        text = (error or "").strip()
+        if not text:
+            return "peer closed connection"
+        low = text.lower()
+        if "errno" in low or "error:" in low or low.startswith(("connection", "socket", "ssl", "timeout")):
+            return text
+        if low.startswith("server bye"):
+            return text
+        return f"server BYE: {text}"
+
+    @staticmethod
+    def _noop2_drop_conn(imap) -> None:
+        """Tear down a storm socket without IMAP LOGOUT (avoids 30s hangs on dead peers)."""
+        sock = getattr(imap, "sock", None)
+        try:
+            if sock is not None:
+                try:
+                    sock.settimeout(0.2)
+                except Exception:
+                    pass
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        for attr in ("file",):
+            fh = getattr(imap, attr, None)
+            if fh is None:
+                continue
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _noop2_socket_already_closed(sock) -> bool:
+        """True if the peer has already closed the socket (FIN/RST); stray data = still alive."""
+        if sock is None:
+            return True
+        try:
+            ready, _, _ = select.select([sock], [], [], 0)
+        except (ValueError, OSError, TypeError):
+            return True
+        if not ready:
+            return False
+        try:
+            data = sock.recv(1, socket.MSG_PEEK)
+        except BlockingIOError:
+            return False
+        except Exception:
+            return True
+        return not data
+
+    def _noop2_print_ramp(self, established, est_err, est_disc, est_timeout, reaped) -> None:
+        if self.use_json:
+            return
+        self.out(f"Established {established} connections", "TITLE", indent=8)
+        self.out(f"Errors {est_err} connections", "TITLE", indent=8)
+        self.out(f"Refused at connect {est_disc} connections", "TITLE", indent=8)
+        self.out(f"Timeout {est_timeout} connections", "TITLE", indent=8)
+        self.out(f"Dropped while idle {reaped} connections", "TITLE", indent=8)
+        self._flush_terminal()
+
+    def _noop2_wait_delay(self, sock, delay: float, stop_event: threading.Event) -> str:
+        """Wait ``delay`` seconds between NOOPs. Return ok / disconnected / stopped."""
+        if delay <= 0:
+            return "ok"
+        deadline = time.perf_counter() + delay
+        while not stop_event.is_set():
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return "ok"
+            if self._noop2_socket_already_closed(sock):
+                return "disconnected"
+        try:
+            ready, _, _ = select.select([sock], [], [], min(0.25, remaining))
+        except (ValueError, OSError, TypeError):
+            return "disconnected"
+        if ready and self._noop2_socket_already_closed(sock):
+            return "disconnected"
+        if ready:
+            time.sleep(min(0.25, remaining))
+        return "stopped"
+
+    def _noop2_make_count_result(
+        self,
+        *,
+        authenticated: bool,
+        requested: int,
+        established: int,
+        maintained: int,
+        duration: float,
+        sent: int,
+        ok: int,
+        err: int,
+        disconnected: int,
+        est_err: int,
+        est_disc: int,
+        est_timeout: int,
+        reaped: int,
+        storm_pool: int,
+        min_rt,
+        max_rt,
+        avg_rt,
+        error_rate_pct: float,
+        early_exit: bool,
+        terminated,
+        delay: float,
+        error_message=None,
+    ) -> NoopConnectionCountResult:
+        return NoopConnectionCountResult(
+            authenticated=authenticated,
+            max_connections_attempted=requested,
+            connections_established=established,
+            connections_maintained=maintained,
+            test_duration_seconds=duration,
+            total_noops_sent=sent,
+            total_noops_ok=ok,
+            total_noops_error=err,
+            early_disconnect_count=disconnected,
+            error_message=error_message,
+            establish_errors=est_err,
+            establish_disconnected=est_disc,
+            establish_timeouts=est_timeout,
+            reaped_before_storm=reaped,
+            storm_pool_connections=storm_pool,
+            min_rt_seconds=min_rt,
+            max_rt_seconds=max_rt,
+            avg_rt_seconds=avg_rt,
+            error_rate_pct=error_rate_pct,
+            early_exit_no_connections=early_exit,
+            terminated_connections=tuple(terminated),
+            delay_seconds=delay,
+        )
+
     def _noop2_establish_pool(self, max_connections: int, opener, *, write_live, show_progress, clear_live=None):
         """Open connections sequentially or with ``-t`` worker threads.
 
@@ -5790,6 +6301,9 @@ class ImapEngine:
         """
         connections: list = []
         fail_count = 0
+        est_err = 0
+        est_disc = 0
+        est_timeout = 0
         ramp_threads = min(self._noop2_ramp_threads(), max_connections)
         lock = threading.Lock()
         next_index = 0
@@ -5799,9 +6313,15 @@ class ImapEngine:
             return f"Establishing connections: {len(connections)}/{max_connections}{extra}"
 
         def emit_fail(idx: int, exc: BaseException) -> None:
-            nonlocal fail_count
+            nonlocal fail_count, est_err, est_disc, est_timeout
             fail_count += 1
             reason, detail = self._noop2_classify_conn_failure(exc)
+            if reason == "timeout":
+                est_timeout += 1
+            elif reason == "disconnect":
+                est_disc += 1
+            else:
+                est_err += 1
             if clear_live:
                 clear_live()
             self.debug(f"Connection #{idx + 1} failed — {reason} ({detail})")
@@ -5826,7 +6346,7 @@ class ImapEngine:
         if ramp_threads <= 1:
             for i in range(max_connections):
                 try_one(i)
-            return connections
+            return connections, est_err, est_disc, est_timeout
 
         def worker() -> None:
             nonlocal next_index
@@ -5846,28 +6366,32 @@ class ImapEngine:
             w.start()
         for w in workers:
             w.join()
-        return connections
+        return connections, est_err, est_disc, est_timeout
 
-    def test_noop_conn_count_preauth(self) -> NoopConnectionCountResult:
-        """NOOP2: How many pre-auth connections can be maintained with NOOP."""
-        max_connections = getattr(self.args, 'noop2_connections', None) or NOOP2_DEFAULT_CONNECTIONS
-        
+    def _noop2_conn_count_test(
+        self,
+        *,
+        opener,
+        authenticated: bool,
+        max_connections: int,
+        duration: float,
+        delay: float,
+        timeout_seconds: float,
+        closer,
+        tag_prefix: str,
+        label: str,
+    ) -> NoopConnectionCountResult:
+        """Ramp up connections, then hold them with NOOP for ``duration`` seconds."""
         ramp_threads = self._noop2_ramp_threads()
         self.debug(
-            f"NOOP connection count test (pre-auth): attempting up to {max_connections} connections"
-            + (f" ({ramp_threads} threads)..." if ramp_threads > 1 else "...")
+            f"NOOP connection count test ({label}): attempting up to {max_connections} connections"
+            + (f" ({ramp_threads} threads)" if ramp_threads > 1 else "")
+            + f", duration={duration:.0f}s, delay={delay:.0f}s..."
         )
-        
-        lock = threading.Lock()
-        total_noops_sent = 0
-        total_noops_ok = 0
-        total_noops_error = 0
-        early_disconnect_count = 0
-        
-        # Live progress setup
+
         show_progress = not self.use_json
         live_line_dirty = False
-        
+
         def write_live(text: str):
             nonlocal live_line_dirty
             if not show_progress:
@@ -5875,7 +6399,7 @@ class ImapEngine:
             sys.stdout.write(f"\033[2K\r            {text:<100}")
             sys.stdout.flush()
             live_line_dirty = True
-        
+
         def clear_live():
             nonlocal live_line_dirty
             if not show_progress or not live_line_dirty:
@@ -5883,132 +6407,248 @@ class ImapEngine:
             sys.stdout.write("\033[2K\r")
             sys.stdout.flush()
             live_line_dirty = False
+
+        connections, est_err, est_disc, est_timeout = self._noop2_establish_pool(
+            max_connections, opener, write_live=write_live, show_progress=show_progress,
+            clear_live=clear_live,
+        )
+        established = len(connections)
+        clear_live()
+
+        live_connections = []
+        reaped = 0
+        for imap, idx in connections:
+            sock = getattr(imap, "sock", None)
+            if self._noop2_socket_already_closed(sock):
+                reaped += 1
+                self._noop2_drop_conn(imap)
+            else:
+                live_connections.append((imap, idx))
+        connections = live_connections
+        storm_pool = len(connections)
+
+        self._noop2_print_ramp(established, est_err, est_disc, est_timeout, reaped)
+
+        if storm_pool == 0:
+            self.debug(
+                f"NOOP2 ({label}): all {established} established sockets were closed before "
+                f"the storm (reaped={reaped}); skipping NOOP phase."
+            )
+            return self._noop2_make_count_result(
+                authenticated=authenticated,
+                requested=max_connections,
+                established=established,
+                maintained=0,
+                duration=0.0,
+                sent=0, ok=0, err=0, disconnected=0,
+                est_err=est_err, est_disc=est_disc, est_timeout=est_timeout,
+                reaped=reaped, storm_pool=0,
+                min_rt=None, max_rt=None, avg_rt=None,
+                error_rate_pct=0.0, early_exit=True, terminated=(),
+                delay=delay,
+            )
+
+        self.debug(
+            f"NOOP2 ({label}): {storm_pool}/{established} sockets alive after sweep "
+            f"(reaped={reaped}); starting NOOP storm for {duration:.0f}s (delay={delay:.0f}s)."
+        )
+
+        stop_event = threading.Event()
+        results_lock = threading.Lock()
+        agg_sent = 0
+        agg_ok = 0
+        agg_err = 0
+        agg_rtts: list[float] = []
+        terminated_info: list[tuple[int, str, str]] = []
+        active_count = storm_pool
+        FLUSH_EVERY = 32
+
+        def _flush(local_sent, local_ok, local_err, local_rtts) -> None:
+            nonlocal agg_sent, agg_ok, agg_err
+            with results_lock:
+                agg_sent += local_sent
+                agg_ok += local_ok
+                agg_err += local_err
+                if local_rtts:
+                    agg_rtts.extend(local_rtts)
+
+        def _worker(display_idx: int, imap, orig_idx: int) -> None:
+            nonlocal active_count
+            sock = getattr(imap, "sock", None)
+            local_sent = 0
+            local_ok = 0
+            local_err = 0
+            local_rtts: list[float] = []
+            total_ok = 0
+            tag_counter = 0
+            died_reason: str | None = None
+            died_cause = ""
+            try:
+                while not stop_event.is_set():
+                    if self._noop2_socket_already_closed(sock):
+                        died_reason = "disconnect"
+                        died_cause = "peer closed connection"
+                        break
+                    tag_counter += 1
+                    t0 = time.perf_counter()
+                    success, error = self._imap_noop_safe(
+                        imap, f"{tag_prefix}{orig_idx:04d}{tag_counter:04d}",
+                    )
+                    rt = time.perf_counter() - t0
+                    local_sent += 1
+                    if success:
+                        local_ok += 1
+                        total_ok += 1
+                        local_rtts.append(rt)
+                    else:
+                        local_err += 1
+                        # BYE / abort ends the socket even if TCP is still half-open.
+                        closed = self._noop2_socket_already_closed(sock)
+                        reason = self._noop2_reason_from_text(error or "")
+                        if closed or reason == "disconnect":
+                            died_reason = reason if error else "disconnect"
+                            died_cause = self._noop2_format_close_cause(error)
+                            break
+                    if local_sent % FLUSH_EVERY == 0:
+                        _flush(local_sent, local_ok, local_err, local_rtts)
+                        local_sent = local_ok = local_err = 0
+                        local_rtts = []
+                    if delay > 0:
+                        wait = self._noop2_wait_delay(sock, delay, stop_event)
+                        if wait == "disconnected":
+                            died_reason = "disconnect"
+                            died_cause = "peer closed connection"
+                            break
+                        if wait == "stopped":
+                            break
+            except Exception as exc:
+                local_sent += 1
+                local_err += 1
+                died_reason, died_cause = self._noop2_classify_conn_failure(exc)
+                died_cause = self._noop2_format_close_cause(died_cause)
+            finally:
+                _flush(local_sent, local_ok, local_err, local_rtts)
+                if died_reason is not None:
+                    t_rel = time.perf_counter() - run_start
+                    if total_ok == 0:
+                        timing = f"no successful reply, t={t_rel:.1f}s"
+                    else:
+                        timing = f"after {total_ok} OK NOOPs, t={t_rel:.1f}s"
+                    detail = f"{died_cause}; {timing}" if died_cause else timing
+                    with results_lock:
+                        active_count -= 1
+                        terminated_info.append((display_idx, died_reason, detail))
+
+        threads: list[threading.Thread] = []
+        run_start = time.perf_counter()
+        for display_idx, (imap, orig_idx) in enumerate(connections, start=1):
+            t = threading.Thread(
+                target=_worker, args=(display_idx, imap, orig_idx), daemon=True,
+            )
+            threads.append(t)
+            t.start()
+
+        deadline = run_start + duration
+        early_exit_no_conns = False
+        while time.perf_counter() < deadline:
+            with results_lock:
+                cs, co, ce = agg_sent, agg_ok, agg_err
+                active_now = active_count
+            if active_now == 0:
+                early_exit_no_conns = True
+                break
+            if show_progress:
+                remaining = int(max(0, deadline - time.perf_counter()))
+                write_live(
+                    f"NOOP storm (active {active_now}/{storm_pool}): {cs} sent "
+                    f"(ok={co}, err={ce}) — {remaining:02d}s left"
+                )
+            time.sleep(0.1)
+        stop_event.set()
+        if early_exit_no_conns:
+            # Unblock any recv() still sitting on a BYE'd socket, then leave.
+            for imap, _ in connections:
+                self._noop2_drop_conn(imap)
+            join_s = 2.0
+        else:
+            join_s = min(5.0, timeout_seconds + 2.0)
+        for t in threads:
+            t.join(timeout=join_s)
+        run_duration = time.perf_counter() - run_start
+        clear_live()
+
+        for imap, _ in connections:
+            self._noop2_drop_conn(imap)
+
+        min_rt = min(agg_rtts) if agg_rtts else None
+        max_rt = max(agg_rtts) if agg_rtts else None
+        avg_rt = (sum(agg_rtts) / len(agg_rtts)) if agg_rtts else None
+        error_rate_pct = (100.0 * agg_err / agg_sent) if agg_sent else 0.0
+        with results_lock:
+            active_end = max(active_count, 0)
+            terminated_sorted = tuple(sorted(terminated_info, key=lambda t: t[0]))
+        disconnected_during = max(storm_pool - active_end, 0)
+
+        self.debug(
+            f"NOOP2 ({label}) summary: established={established}/{max_connections} "
+            f"(err={est_err}, disc={est_disc}, timeout={est_timeout}, reaped={reaped}), "
+            f"storm_pool={storm_pool}, active_end={active_end}, "
+            f"dropped_during_test={disconnected_during}, "
+            f"early_exit={early_exit_no_conns}, duration={run_duration:.1f}s, "
+            f"sent={agg_sent}, ok={agg_ok}, error={agg_err} ({error_rate_pct:.1f}%), "
+            f"avg_rt={avg_rt}."
+        )
+
+        return self._noop2_make_count_result(
+            authenticated=authenticated,
+            requested=max_connections,
+            established=established,
+            maintained=active_end,
+            duration=run_duration,
+            sent=agg_sent, ok=agg_ok, err=agg_err,
+            disconnected=disconnected_during,
+            est_err=est_err, est_disc=est_disc, est_timeout=est_timeout,
+            reaped=reaped, storm_pool=storm_pool,
+            min_rt=min_rt, max_rt=max_rt, avg_rt=avg_rt,
+            error_rate_pct=error_rate_pct,
+            early_exit=early_exit_no_conns,
+            terminated=terminated_sorted,
+            delay=delay,
+        )
+
+    def test_noop_conn_count_preauth(self) -> NoopConnectionCountResult:
+        """NOOP2: How many pre-auth connections can be maintained with NOOP."""
+        max_connections = noop2_count_from_args(self.args, NOOP2_DEFAULT_CONNECTIONS)
+        duration, delay = self._noop1_duration_delay(
+            IMAP_NOOP_PREAUTH_CONN_TEST_SECONDS,
+            IMAP_NOOP_PREAUTH_CONN_INTERVAL_SECONDS,
+        )
 
         def opener(_idx: int):
             imap = self._make_imap_connection(trace=False)
             imap.sock.settimeout(IMAP_NOOP_PREAUTH_CONN_TIMEOUT_SECONDS)
             return imap
 
-        connections = self._noop2_establish_pool(
-            max_connections, opener, write_live=write_live, show_progress=show_progress,
-            clear_live=clear_live,
-        )
-        established = len(connections)
-        
-        clear_live()
-        self.debug(
-            f"Phase 1 complete: {established}/{max_connections} connections established. "
-            f"Holding for {IMAP_NOOP_PREAUTH_CONN_TEST_SECONDS}s with NOOP..."
-        )
-        
-        # Phase 2: Hold connections with periodic NOOP
-        start_time = time.perf_counter()
-        stop_event = threading.Event()
-        
-        def noop_worker(imap, idx):
-            nonlocal total_noops_sent, total_noops_ok, total_noops_error, early_disconnect_count
-            tag_counter = 0
-            while not stop_event.is_set():
-                time.sleep(IMAP_NOOP_PREAUTH_CONN_INTERVAL_SECONDS)
-                if stop_event.is_set():
-                    break
-                with lock:
-                    total_noops_sent += 1
-                tag_counter += 1
-                tag = f"b{idx:04d}{tag_counter:04d}"
-                success, error = self._imap_noop_safe(imap, tag)
-                with lock:
-                    if success:
-                        total_noops_ok += 1
-                    else:
-                        total_noops_error += 1
-                        early_disconnect_count += 1
-                        break
-        
-        threads = []
-        for imap, idx in connections:
-            t = threading.Thread(target=noop_worker, args=(imap, idx), daemon=True)
-            t.start()
-            threads.append(t)
-        
-        # Wait for test duration with live progress
-        end_time = time.perf_counter() + IMAP_NOOP_PREAUTH_CONN_TEST_SECONDS
-        while time.perf_counter() < end_time:
-            time.sleep(1.0)
-            if show_progress:
-                active = established - early_disconnect_count
-                remaining = int(end_time - time.perf_counter())
-                write_live(f"Maintaining connections: {active}/{established} active, {remaining}s remaining, {total_noops_ok} NOOPs sent")
-        
-        stop_event.set()
-        clear_live()
-        
-        # Wait for all threads to finish
-        for t in threads:
-            t.join(timeout=2.0)
-        
-        # Close all connections
-        for imap, _ in connections:
-            try:
-                imap.logout()
-            except Exception:
-                pass
-        
-        maintained = established - early_disconnect_count
-        test_duration = time.perf_counter() - start_time
-        
-        self.debug(f"Phase 2 complete: {maintained}/{established} connections maintained, {total_noops_ok} NOOPs OK")
-        
-        return NoopConnectionCountResult(
+        return self._noop2_conn_count_test(
+            opener=opener,
             authenticated=False,
-            max_connections_attempted=max_connections,
-            connections_established=established,
-            connections_maintained=maintained,
-            test_duration_seconds=test_duration,
-            total_noops_sent=total_noops_sent,
-            total_noops_ok=total_noops_ok,
-            total_noops_error=total_noops_error,
-            early_disconnect_count=early_disconnect_count,
-            error_message=None,
+            max_connections=max_connections,
+            duration=duration,
+            delay=delay,
+            timeout_seconds=IMAP_NOOP_PREAUTH_CONN_TIMEOUT_SECONDS,
+            closer=lambda imap: imap.logout(),
+            tag_prefix="b",
+            label="pre-auth",
         )
 
     def test_noop_conn_count_postauth(self, username: str, password: str) -> NoopConnectionCountResult:
         """NOOP2: How many post-auth connections can be maintained with NOOP."""
-        # Use 4x the pre-auth default for post-auth (600 if pre-auth is 150)
-        default_postauth = (getattr(self.args, 'noop2_connections', None) or NOOP2_DEFAULT_CONNECTIONS) * 4
-        max_connections = min(default_postauth, IMAP_NOOP_POSTAUTH_CONN_MAX_ATTEMPTS)
-        
-        ramp_threads = self._noop2_ramp_threads()
-        self.debug(
-            f"NOOP connection count test (post-auth): attempting up to {max_connections} connections"
-            + (f" ({ramp_threads} threads)..." if ramp_threads > 1 else "...")
+        raw = noop2_count_from_args(self.args, NOOP2_DEFAULT_CONNECTIONS)
+        max_connections = min(raw * 4, IMAP_NOOP_POSTAUTH_CONN_MAX_ATTEMPTS)
+        duration, delay = self._noop1_duration_delay(
+            IMAP_NOOP_POSTAUTH_CONN_TEST_SECONDS,
+            IMAP_NOOP_POSTAUTH_CONN_INTERVAL_SECONDS,
         )
-        
-        lock = threading.Lock()
-        total_noops_sent = 0
-        total_noops_ok = 0
-        total_noops_error = 0
-        early_disconnect_count = 0
-        
-        # Live progress setup
-        show_progress = not self.use_json
-        live_line_dirty = False
-        
-        def write_live(text: str):
-            nonlocal live_line_dirty
-            if not show_progress:
-                return
-            sys.stdout.write(f"\033[2K\r            {text:<100}")
-            sys.stdout.flush()
-            live_line_dirty = True
-        
-        def clear_live():
-            nonlocal live_line_dirty
-            if not show_progress or not live_line_dirty:
-                return
-            sys.stdout.write("\033[2K\r")
-            sys.stdout.flush()
-            live_line_dirty = False
 
         def opener(_idx: int):
             imap = self._make_imap_connection(trace=False)
@@ -6016,87 +6656,16 @@ class ImapEngine:
             imap.login(username, password)
             return imap
 
-        connections = self._noop2_establish_pool(
-            max_connections, opener, write_live=write_live, show_progress=show_progress,
-            clear_live=clear_live,
-        )
-        established = len(connections)
-        
-        clear_live()
-        self.debug(
-            f"Phase 1 complete: {established}/{max_connections} authenticated connections. "
-            f"Holding for {IMAP_NOOP_POSTAUTH_CONN_TEST_SECONDS}s with NOOP..."
-        )
-        
-        # Phase 2: Hold connections with periodic NOOP
-        start_time = time.perf_counter()
-        stop_event = threading.Event()
-        
-        def noop_worker(imap, idx):
-            nonlocal total_noops_sent, total_noops_ok, total_noops_error, early_disconnect_count
-            tag_counter = 0
-            while not stop_event.is_set():
-                time.sleep(IMAP_NOOP_POSTAUTH_CONN_INTERVAL_SECONDS)
-                if stop_event.is_set():
-                    break
-                with lock:
-                    total_noops_sent += 1
-                tag_counter += 1
-                tag = f"c{idx:04d}{tag_counter:04d}"
-                success, error = self._imap_noop_safe(imap, tag)
-                with lock:
-                    if success:
-                        total_noops_ok += 1
-                    else:
-                        total_noops_error += 1
-                        early_disconnect_count += 1
-                        break
-        
-        threads = []
-        for imap, idx in connections:
-            t = threading.Thread(target=noop_worker, args=(imap, idx), daemon=True)
-            t.start()
-            threads.append(t)
-        
-        # Wait for test duration with live progress
-        end_time = time.perf_counter() + IMAP_NOOP_POSTAUTH_CONN_TEST_SECONDS
-        while time.perf_counter() < end_time:
-            time.sleep(1.0)
-            if show_progress:
-                active = established - early_disconnect_count
-                remaining = int(end_time - time.perf_counter())
-                write_live(f"Maintaining connections: {active}/{established} active, {remaining}s remaining, {total_noops_ok} NOOPs sent")
-        
-        stop_event.set()
-        clear_live()
-        
-        # Wait for all threads to finish
-        for t in threads:
-            t.join(timeout=2.0)
-        
-        # Close all connections
-        for imap, _ in connections:
-            try:
-                imap.logout()
-            except Exception:
-                pass
-        
-        maintained = established - early_disconnect_count
-        test_duration = time.perf_counter() - start_time
-        
-        self.debug(f"Phase 2 complete: {maintained}/{established} connections maintained, {total_noops_ok} NOOPs OK")
-        
-        return NoopConnectionCountResult(
+        return self._noop2_conn_count_test(
+            opener=opener,
             authenticated=True,
-            max_connections_attempted=max_connections,
-            connections_established=established,
-            connections_maintained=maintained,
-            test_duration_seconds=test_duration,
-            total_noops_sent=total_noops_sent,
-            total_noops_ok=total_noops_ok,
-            total_noops_error=total_noops_error,
-            early_disconnect_count=early_disconnect_count,
-            error_message=None,
+            max_connections=max_connections,
+            duration=duration,
+            delay=delay,
+            timeout_seconds=IMAP_NOOP_POSTAUTH_CONN_TIMEOUT_SECONDS,
+            closer=lambda imap: imap.logout(),
+            tag_prefix="c",
+            label="post-auth",
         )
 
     # endregion

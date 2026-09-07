@@ -83,13 +83,9 @@ _SNIFFABLE_AUTH_PROBE_PRIORITY = (
     "ANONYMOUS",
 )
 
-# Connection limits / rate / idle (-cl): aligned with SMTP -rt methodology (parallel ramp, idle probes).
+# Connection limits / idle: parallel ramp, idle probes.
 CONN_LIMIT_DEFAULT_ATTEMPTS = 100
 CONN_LIMIT_CONN_IP_THRESHOLD = 50  # PTV-SVC-IMAP-CONNCNTIP — many simultaneous sessions from one client
-CONN_LIMIT_CONN_GLOB_THRESHOLD = 100  # PTV-SVC-IMAP-CONNCNTGLOB — extreme concurrency without refusal
-CONN_LIMIT_RATE_SEQ_ATTEMPTS = 50
-CONN_LIMIT_RATE_SEQ_DELAY_SEC = 0.08
-CONN_LIMIT_RATE_VULN_MIN_OK = 40  # rapid connect+logout successes → weak connect-rate limiting
 CONN_LIMIT_TIMEOUT_CAP_SECONDS = 300.0
 CONN_LIMIT_PREAUTH_IDLE_MAX_OK_SEC = 60.0  # banner-only idle (compare SMTP initial timeout)
 CONN_LIMIT_POST_CAP_IDLE_MAX_OK_SEC = 180.0  # after CAPABILITY (compare SMTP post-EHLO idle)
@@ -205,11 +201,15 @@ def _imap_conn_duration_display(seconds: float | None, exceeded: bool) -> str:
 
 
 class ImapConnLimitsResult(NamedTuple):
-    """IMAP connection policy probe: concurrency ramp, connect-rate, pre/post-CAPABILITY idle."""
+    """IMAP connection policy probe: concurrency ramp, idle probes, optional post-login."""
 
     connected: int
     max_attempts: int
     banned: bool
+    establish_errors: int
+    establish_disconnected: int
+    establish_timeout: int
+    dropped_while_idle: int
     ban_duration_probe_ran: bool
     ban_duration_seconds: float | None
     ban_duration_exceeded: bool
@@ -217,9 +217,6 @@ class ImapConnLimitsResult(NamedTuple):
     preauth_idle_exceeded: bool
     post_cap_idle_seconds: float | None
     post_cap_idle_exceeded: bool
-    sequential_accepted: int
-    sequential_attempts: int
-    sequential_refused: int
     # Optional post-login phase (same-account credentials on CLI only)
     auth_parallel_accepted: int
     auth_parallel_attempted: int
@@ -228,6 +225,9 @@ class ImapConnLimitsResult(NamedTuple):
     idle_logged_exceeded: bool
     auth_phase_skip_reason: str | None
     idle_probe_detail: str | None
+    idle_disconnected: int
+    idle_disconnected_all: bool
+    terminated_connections: tuple[tuple[int, str, str], ...]
 
 
 class AnonymousAccessResult(NamedTuple):
@@ -497,13 +497,36 @@ IMAP_NOOP_PREAUTH_DUR_INCREASED_MIN = 5 * 60   # >5 min → increased
 IMAP_NOOP_PREAUTH_DUR_SIGNIFICANT_MIN = 10 * 60 # >10 min → significant
 IMAP_NOOP_PREAUTH_DUR_HIGH_MIN = 30 * 60       # >30 min → high
 
+# NOOP1 timing (SMTP-compatible verdicts)
+NOOP1_SLOWDOWN_MIN_RATIO = 1.5
+NOOP1_SLOWDOWN_MIN_SECONDS = 0.5
+NOOP1_ERROR_RATE_OK_MAX_PCT = 5.0
+NOOP2_AVG_TIME_OK_MAX_SECONDS = 5.0
+NOOP2_ERROR_RATE_OK_MAX_PCT = 5.0
+
+
+def noop2_count_from_args(args, default: int, cap: int | None = None) -> int:
+    n = getattr(args, "noop2_count", None)
+    if n is None:
+        n = getattr(args, "noop2_connections", None)
+    if n is None:
+        n = default
+    n = int(n)
+    if cap is not None:
+        n = min(n, cap)
+    return max(1, n)
+
+
+NOOP1_RT_WINDOW = 10
+NOOP1_PROGRESS_EVERY = 25  # live progress + -vv snapshot interval (commands)
+
 # Pre-authentication connection count test (NOOPLIM2)
 IMAP_NOOP_PREAUTH_CONN_TEST_SECONDS = 120     # Hold connections for 2 minutes
 IMAP_NOOP_PREAUTH_CONN_INTERVAL_SECONDS = 60  # Send NOOP every minute (short interval for connection count test)
 IMAP_NOOP_PREAUTH_CONN_TIMEOUT_SECONDS = 30
 IMAP_NOOP_PREAUTH_CONN_MAX_ATTEMPTS = 150     # Try up to 150 connections (safety cap)
 
-# CLI default for --noop2-connections
+# CLI default for --count
 NOOP2_DEFAULT_CONNECTIONS = IMAP_NOOP_PREAUTH_CONN_MAX_ATTEMPTS
 
 # Pre-authentication connection count thresholds
@@ -550,6 +573,53 @@ class NoopDurationResult(NamedTuple):
     disconnect_after_seconds: float | None  # When the disconnect happened
     hit_test_cap: bool                 # True if we reached the test duration limit
     error_message: str | None          # Error detail if test failed to start
+    delay_seconds: float = 0.0
+    min_rt_seconds: float | None = None
+    max_rt_seconds: float | None = None
+    avg_rt_seconds: float | None = None
+    baseline_avg_seconds: float | None = None
+    last_window_avg_seconds: float | None = None
+    slowdown_detected: bool = False
+    error_rate_pct: float = 0.0
+    idle_disconnect: bool = False
+
+
+def noop1_rt_display(value: float | None) -> str:
+    """Format a round-trip time as ``Xs`` / ``X.Ys`` (same as SMTP)."""
+    if value is None:
+        return "N/A"
+    if value >= 10:
+        return f"{int(round(value))}s"
+    if value >= 1:
+        return f"{value:.1f}s"
+    return f"{value:.2f}s"
+
+
+def noop1_stats_from_rtts(rtts: list[float], commands_sent: int, commands_error: int) -> dict:
+    """Baseline / last-window slowdown and error rate (SMTP NOOP1 rules)."""
+    min_rt = min(rtts) if rtts else None
+    max_rt = max(rtts) if rtts else None
+    avg_rt = (sum(rtts) / len(rtts)) if rtts else None
+    window = NOOP1_RT_WINDOW
+    baseline_avg = (sum(rtts[:window]) / min(len(rtts), window)) if rtts else None
+    last_rtts = rtts[-window:] if rtts else []
+    last_window_avg = (sum(last_rtts) / len(last_rtts)) if last_rtts else None
+    slowdown = False
+    if baseline_avg is not None and last_window_avg is not None and len(rtts) >= window * 2:
+        slowdown = (
+            last_window_avg >= baseline_avg * NOOP1_SLOWDOWN_MIN_RATIO
+            or last_window_avg >= NOOP1_SLOWDOWN_MIN_SECONDS
+        )
+    error_rate = (100.0 * commands_error / commands_sent) if commands_sent else 0.0
+    return {
+        "min_rt_seconds": min_rt,
+        "max_rt_seconds": max_rt,
+        "avg_rt_seconds": avg_rt,
+        "baseline_avg_seconds": baseline_avg,
+        "last_window_avg_seconds": last_window_avg,
+        "slowdown_detected": slowdown,
+        "error_rate_pct": error_rate,
+    }
 
 
 class NoopConnectionCountResult(NamedTuple):
@@ -564,6 +634,18 @@ class NoopConnectionCountResult(NamedTuple):
     total_noops_error: int
     early_disconnect_count: int        # Connections that died during the test
     error_message: str | None
+    establish_errors: int = 0
+    establish_disconnected: int = 0
+    establish_timeouts: int = 0
+    reaped_before_storm: int = 0
+    storm_pool_connections: int = 0
+    min_rt_seconds: float | None = None
+    max_rt_seconds: float | None = None
+    avg_rt_seconds: float | None = None
+    error_rate_pct: float = 0.0
+    early_exit_no_connections: bool = False
+    terminated_connections: tuple[tuple[int, str, str], ...] = ()
+    delay_seconds: float = 0.0
 
 
 @dataclass

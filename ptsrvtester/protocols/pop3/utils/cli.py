@@ -107,11 +107,48 @@ class POP3Args(ArgsWithBruteforce):
             "--module-threads", type=int, default=1, metavar="n", dest="module_threads",
             help=argparse.SUPPRESS,
         )
+        parser.add_argument(
+            "--count",
+            nargs="?",
+            type=int,
+            const=None,
+            default=None,
+            metavar="N",
+            dest="noop2_count",
+            help=argparse.SUPPRESS,  # Shown in test-specific help via registry
+        )
+        parser.add_argument(
+            "-t", "--threads",
+            type=int,
+            default=None,
+            metavar="N",
+            dest="noop2_threads",
+            help=argparse.SUPPRESS,  # Shown in NOOP2 test help via registry
+        )
+        parser.add_argument(
+            "--duration",
+            type=float,
+            default=None,
+            metavar="SEC",
+            dest="noop1_duration",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--delay",
+            type=float,
+            default=None,
+            metavar="SEC",
+            dest="noop1_delay",
+            help=argparse.SUPPRESS,
+        )
         add_bruteforce_args(parser)
 
 
 def validate_brute_selection(args) -> None:
     """Raise if BRUTE was explicitly selected without credentials."""
+    th = getattr(args, "noop2_threads", None)
+    if th is not None and int(th) < 1:
+        raise argparse.ArgumentError(None, "-t/--threads must be >= 1")
     raw = getattr(args, "tests", None) or ""
     codes = [c.strip().upper() for c in raw.split(",") if c.strip()]
     if "BRUTE" in codes and "ALL" not in codes and not check_if_brute(args):

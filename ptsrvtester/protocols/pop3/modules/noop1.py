@@ -1,9 +1,22 @@
 """NOOP1 — NOOP connection duration (pre-auth + post-auth if -u/-p)."""
-from ._common import eng
+import sys
+
+from ..utils.connection import test_noop_duration_preauth, test_noop_duration_postauth
+from ..utils.results import (
+    NOOP1_ERROR_RATE_OK_MAX_PCT,
+    POP3_NOOP_PREAUTH_DUR_HIGH_MIN,
+    POP3_NOOP_PREAUTH_DUR_INCREASED_MIN,
+    POP3_NOOP_PREAUTH_DUR_SIGNIFICANT_MIN,
+    POP3_NOOP_POSTAUTH_DUR_HIGH_MIN,
+    POP3_NOOP_POSTAUTH_DUR_INCREASED_MIN,
+    POP3_NOOP_POSTAUTH_DUR_SIGNIFICANT_MIN,
+    VULNS,
+    noop1_rt_display,
+)
 
 __MODULELABEL__ = "NOOP connection duration"
 __MODULECODE__ = "NOOP1"
-__ORDER__ = 85
+__ORDER__ = 80
 
 
 def _fmt_held(seconds: float | None) -> str:
@@ -39,8 +52,6 @@ def _evaluate_duration(result, thresholds):
 
 
 def _emit_timing(ctx, result, indent=8):
-    from ..utils.results import NOOP1_ERROR_RATE_OK_MAX_PCT, noop1_rt_display
-
     if result.min_rt_seconds is not None:
         ctx.out(
             f"Time between two commands ({noop1_rt_display(result.min_rt_seconds)} - "
@@ -93,33 +104,36 @@ def _emit_duration(ctx, result, vulnerable):
     )
 
 
+def _flush_ctx(ctx) -> None:
+    if getattr(ctx, "json", False):
+        return
+    lock = getattr(ctx, "print_lock", None)
+    if lock is None:
+        return
+    chunk = lock.get_output_string()
+    if chunk:
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+        lock.output_string = ""
+
+
 def run(ctx):
-    e = eng(ctx)
-
-    from ..utils.results import (
-        IMAP_NOOP_PREAUTH_DUR_HIGH_MIN,
-        IMAP_NOOP_PREAUTH_DUR_INCREASED_MIN,
-        IMAP_NOOP_PREAUTH_DUR_SIGNIFICANT_MIN,
-        IMAP_NOOP_POSTAUTH_DUR_HIGH_MIN,
-        IMAP_NOOP_POSTAUTH_DUR_INCREASED_MIN,
-        IMAP_NOOP_POSTAUTH_DUR_SIGNIFICANT_MIN,
-        VULNS,
-    )
-
     ctx.out("Pre-authentication", "TITLE", indent=4)
-    e._flush_terminal()
+    _flush_ctx(ctx)
 
     try:
-        result_preauth = e.test_noop_duration_preauth()
-    except Exception as ex:
-        ctx.out(f"Test failed: {ex}", "ERROR", indent=8)
+        result_preauth = test_noop_duration_preauth(
+            ctx.args, debug=ctx.debug, flush=lambda: _flush_ctx(ctx),
+        )
+    except Exception as e:
+        ctx.out(f"Test failed: {e}", "ERROR", indent=8)
         result_preauth = None
 
     if result_preauth and not result_preauth.error_message:
         thresholds = (
-            IMAP_NOOP_PREAUTH_DUR_HIGH_MIN,
-            IMAP_NOOP_PREAUTH_DUR_SIGNIFICANT_MIN,
-            IMAP_NOOP_PREAUTH_DUR_INCREASED_MIN,
+            POP3_NOOP_PREAUTH_DUR_HIGH_MIN,
+            POP3_NOOP_PREAUTH_DUR_SIGNIFICANT_MIN,
+            POP3_NOOP_PREAUTH_DUR_INCREASED_MIN,
         )
         vulnerable, rating, _maintained_min = _evaluate_duration(result_preauth, thresholds)
         _emit_duration(ctx, result_preauth, vulnerable)
@@ -133,19 +147,22 @@ def run(ctx):
 
     if ctx.args.user and ctx.args.password:
         ctx.out("Post-authentication", "TITLE", indent=4)
-        e._flush_terminal()
+        _flush_ctx(ctx)
 
         try:
-            result_postauth = e.test_noop_duration_postauth(ctx.args.user, ctx.args.password)
-        except Exception as ex:
-            ctx.out(f"Test failed: {ex}", "ERROR", indent=8)
+            result_postauth = test_noop_duration_postauth(
+                ctx.args, ctx.args.user, ctx.args.password,
+                debug=ctx.debug, flush=lambda: _flush_ctx(ctx),
+            )
+        except Exception as e:
+            ctx.out(f"Test failed: {e}", "ERROR", indent=8)
             result_postauth = None
 
         if result_postauth and not result_postauth.error_message:
             thresholds = (
-                IMAP_NOOP_POSTAUTH_DUR_HIGH_MIN,
-                IMAP_NOOP_POSTAUTH_DUR_SIGNIFICANT_MIN,
-                IMAP_NOOP_POSTAUTH_DUR_INCREASED_MIN,
+                POP3_NOOP_POSTAUTH_DUR_HIGH_MIN,
+                POP3_NOOP_POSTAUTH_DUR_SIGNIFICANT_MIN,
+                POP3_NOOP_POSTAUTH_DUR_INCREASED_MIN,
             )
             vulnerable, rating, _maintained_min = _evaluate_duration(result_postauth, thresholds)
             _emit_duration(ctx, result_postauth, vulnerable)

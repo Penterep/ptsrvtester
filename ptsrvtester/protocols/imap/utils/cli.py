@@ -9,7 +9,6 @@ from .ptprinthelper import get_colored_text
 from .registry import IMAP_TEST_GROUPS, IMAP_TESTS, imap_test_help
 from ptsrvtester.protocols._shared.utils.cli import rate_limit_help_rows
 from .results import (
-    CONN_LIMIT_DEFAULT_ATTEMPTS,
     _IMAP_LOAD_APPEND_MAX_DEFAULT,
     _IMAP_LOAD_SEARCH_MAX_DEFAULT,
     _IMAP_USRENUM_DEFAULT_PASSWORD,
@@ -31,7 +30,6 @@ class IMAPArgs(ArgsWithBruteforce):
     zipxxe_zip_bomb_full: bool
     zipxxe_mailbox: str
     zipxxe_timeout: float
-    conn_limits_max: int | None
     imap_usrenum_password: str | None
     imap_usrenum_max: int
     imap_usrenum_threads: int
@@ -106,7 +104,7 @@ class IMAPArgs(ArgsWithBruteforce):
   ptsrvtester imap -ts ALL --tls -tg 127.0.0.1:993
   ptsrvtester imap -ts AUTHLIST -tg 127.0.0.1:143
   ptsrvtester imap -ts SNIFF -u user -p pass -tg 127.0.0.1:143
-  ptsrvtester imap -ts CONNLIM --cl-max 50 -tg mail.example.com
+  ptsrvtester imap -ts CONNLIM --count 50 -t 10 --duration 60 -tg mail.example.com
   ptsrvtester imap -ts EICAR -u user -p pass -tg 127.0.0.1:143
   ptsrvtester imap -ts ZIPXXE -u user -p pass --zipxxe-canary-url http://cb -tg 127.0.0.1:143
   ptsrvtester imap -ts RESLOAD -u user -p pass -tg 127.0.0.1:143
@@ -157,8 +155,6 @@ class IMAPArgs(ArgsWithBruteforce):
                           help="ZIPXXE: mailbox name for APPEND (default INBOX)")
         mods.add_argument("--zipxxe-timeout", type=float, default=30.0, metavar="SEC", dest="zipxxe_timeout",
                           help="ZIPXXE: timeout per message (default: 30)")
-        mods.add_argument("--cl-max", type=int, default=None, metavar="N", dest="conn_limits_max",
-                          help=f"CONNLIM: max concurrent connections in ramp-up (default {CONN_LIMIT_DEFAULT_ATTEMPTS})")
         mods.add_argument("--usrenum-password", metavar="STR", dest="imap_usrenum_password", default=None,
                           help=f"USRENUM/USRENUMPLAIN: wrong password (default {_IMAP_USRENUM_DEFAULT_PASSWORD!r})")
         mods.add_argument("--usrenum-max", type=int, default=0, metavar="N", dest="imap_usrenum_max",
@@ -181,22 +177,38 @@ class IMAPArgs(ArgsWithBruteforce):
                           dest="imap_mailbox_iso_mailbox",
                           help="MBOXISO: own baseline mailbox (default INBOX)")
         parser.add_argument(
-            "--noop2-connections",
+            "--count",
             nargs="?",
             type=int,
             const=None,
             default=None,
             metavar="N",
-            dest="noop2_connections",
+            dest="noop2_count",
             help=argparse.SUPPRESS,  # Shown in test-specific help via registry
         )
         parser.add_argument(
             "-t", "--threads",
             type=int,
-            default=1,
+            default=None,
             metavar="N",
             dest="noop2_threads",
-            help=argparse.SUPPRESS,  # Shown in NOOP2 test help via registry
+            help=argparse.SUPPRESS,  # Shown in NOOP2 / CONNLIM / TLSAUDIT test help via registry
+        )
+        parser.add_argument(
+            "--duration",
+            type=float,
+            default=None,
+            metavar="SEC",
+            dest="noop1_duration",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--delay",
+            type=float,
+            default=None,
+            metavar="SEC",
+            dest="noop1_delay",
+            help=argparse.SUPPRESS,
         )
 
         add_bruteforce_args(parser)
@@ -210,6 +222,9 @@ def _selected_codes(args) -> list[str]:
 def validate_imap_selection(args) -> None:
     """Raise if selected tests lack required modifiers / credentials."""
     codes = _selected_codes(args)
+    th = getattr(args, "noop2_threads", None)
+    if th is not None and int(th) < 1:
+        raise argparse.ArgumentError(None, "-t/--threads must be >= 1")
     if not codes or "ALL" in codes:
         return
 

@@ -160,6 +160,8 @@ IMAP_TESTS: dict[str, dict] = {
             "Note: NOOP is distinct from IDLE (which is for mailbox changes).",
         ],
         "mods": [
+            ["", "--duration", "<sec>", "How long the test runs (seconds)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (0 = max speed)"],
             ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
             ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
         ],
@@ -172,20 +174,26 @@ IMAP_TESTS: dict[str, dict] = {
             "test runs if -u/-p provided. Evaluates per-IP and per-account limits.",
         ],
         "mods": [
-            ["", "--noop2-connections", "<n>", "Max connections to attempt (default: 150)"],
+            ["", "--count", "<n>", "Max connections to attempt (default: 150; post-auth uses 4x, cap 600)"],
+            ["", "--duration", "<sec>", "How long the test runs (seconds)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (0 = max speed)"],
             ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
             ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
             ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
         ],
     },
     "CONNLIM": {
-        "desc": "Connection limits / rate / idle probes",
+        "desc": "Connection limits / idle probes",
         "long": [
-            "Connection-count, connect-rate and idle-time probes; with -u/-p",
-            "also probes parallel LOGIN sessions and IDLE lifetime.",
+            "Connection-count and idle-time probes; with -u/-p also probes",
+            "parallel LOGIN sessions and IDLE lifetime.",
         ],
         "mods": [
-            ["", "--cl-max", "<n>", "Max concurrent connections in ramp-up"],
+            ["", "--count", "<n>", "Max concurrent connections in ramp-up (default: 100)"],
+            ["", "--duration", "<sec>", "How long idle/ban probes wait (seconds)"],
+            ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
+            ["-u", "--user", "<name>", "Username for authenticated probes (optional)"],
+            ["-p", "--password", "<pass>", "Password for authenticated probes (optional)"],
         ],
     },
     "RESLOAD": {
@@ -221,6 +229,9 @@ IMAP_TESTS: dict[str, dict] = {
             "and TLSRef Intermediate (Mozilla Server Side TLS lineage).",
             "Certificate identity uses RFC 9525 wildcard matching.",
             "Implicit TLS on 993 (or --tls), otherwise STARTTLS when advertised.",
+        ],
+        "mods": [
+            ["-t", "--threads", "<n>", "Parallel TLS handshakes (default: 5)"],
         ],
     },
     "RATELIMIT": rate_limit_test_spec(),

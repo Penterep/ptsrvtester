@@ -88,8 +88,8 @@ IMAP_TESTS: dict[str, dict] = {
         "mods": [
             ["-u", "--user", "<name>", "Single candidate username"],
             ["-U", "--users", "<wordlist>", "Username wordlist (required unless -u)"],
-            ["", "--usrenum-password", "<str>", "Wrong password for every probe"],
-            ["", "--usrenum-max", "<n>", "Limit names read from wordlist (0 = no limit)"],
+            ["", "--usrenum-password", "<str>", "Wrong password for every probe (default: PtSrv_IMAP_USRENUM_!@#_2026)"],
+            ["", "--usrenum-max", "<n>", "Limit names read from wordlist (default: 0 = no limit)"],
             ["", "--usrenum-threads", "<n>", "Parallel TCP sessions (default 1)"],
         ],
     },
@@ -103,8 +103,8 @@ IMAP_TESTS: dict[str, dict] = {
         "mods": [
             ["-u", "--user", "<name>", "Single candidate username"],
             ["-U", "--users", "<wordlist>", "Username wordlist (required unless -u)"],
-            ["", "--usrenum-password", "<str>", "Wrong password for every probe"],
-            ["", "--usrenum-max", "<n>", "Limit names read from wordlist (0 = no limit)"],
+            ["", "--usrenum-password", "<str>", "Wrong password for every probe (default: PtSrv_IMAP_USRENUM_!@#_2026)"],
+            ["", "--usrenum-max", "<n>", "Limit names read from wordlist (default: 0 = no limit)"],
             ["", "--usrenum-threads", "<n>", "Parallel TCP sessions (default 1)"],
         ],
     },
@@ -120,6 +120,8 @@ IMAP_TESTS: dict[str, dict] = {
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
         ],
     },
     "EICAR": {
@@ -160,8 +162,8 @@ IMAP_TESTS: dict[str, dict] = {
             "Note: NOOP is distinct from IDLE (which is for mailbox changes).",
         ],
         "mods": [
-            ["", "--duration", "<sec>", "How long the test runs (seconds)"],
-            ["", "--delay", "<sec>", "Wait between NOOPs (0 = max speed)"],
+            ["", "--duration", "<sec>", "How long the test runs (default: 35 min pre-auth / 130 min post-auth)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (default: 4 min pre-auth / 20 min post-auth; 0 = max speed)"],
             ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
             ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
         ],
@@ -174,9 +176,9 @@ IMAP_TESTS: dict[str, dict] = {
             "test runs if -u/-p provided. Evaluates per-IP and per-account limits.",
         ],
         "mods": [
-            ["", "--count", "<n>", "Max connections to attempt (default: 150; post-auth uses 4x, cap 600)"],
-            ["", "--duration", "<sec>", "How long the test runs (seconds)"],
-            ["", "--delay", "<sec>", "Wait between NOOPs (0 = max speed)"],
+            ["", "--count", "<n>", "Max connections to attempt (default: 150)"],
+            ["", "--duration", "<sec>", "How long the test runs (default: 120s pre-auth / 180s post-auth)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (default: 60s; 0 = max speed)"],
             ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
             ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
             ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
@@ -190,7 +192,7 @@ IMAP_TESTS: dict[str, dict] = {
         ],
         "mods": [
             ["", "--count", "<n>", "Max concurrent connections in ramp-up (default: 100)"],
-            ["", "--duration", "<sec>", "How long idle/ban probes wait (seconds)"],
+            ["", "--duration", "<sec>", "How long idle/ban probes wait (default: 300)"],
             ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
             ["-u", "--user", "<name>", "Username for authenticated probes (optional)"],
             ["-p", "--password", "<pass>", "Password for authenticated probes (optional)"],
@@ -205,8 +207,8 @@ IMAP_TESTS: dict[str, dict] = {
         "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [
             ["", "--resource-load-mailbox", "<name>", "Mailbox for APPEND phase (default INBOX)"],
-            ["", "--resource-load-append-max", "<n>", "Max APPEND operations (hard cap 5000)"],
-            ["", "--resource-load-search-max", "<n>", "Max UID SEARCH ALL commands (0 skips)"],
+            ["", "--resource-load-append-max", "<n>", "Max APPEND operations (default: 400; hard cap 5000)"],
+            ["", "--resource-load-search-max", "<n>", "Max UID SEARCH ALL commands (default: 600; 0 skips)"],
         ],
     },
     "MBOXISO": {
@@ -249,18 +251,15 @@ def imap_test_help(codes: list[str]):
     blocks = []
     for code in valid:
         spec = IMAP_TESTS[code]
-        options: list[list[str]] = []
-        for line in spec.get("long", []) or []:
-            options.append(["", "", "", line])
+        desc = [f"IMAP — {code}: {spec['desc']}"]
+        desc.extend(spec.get("long", []) or [])
         if spec.get("requires"):
-            options.append(["", "", "", ""])
-            options.append(["", "", "", "Requires: " + "; ".join(spec["requires"])])
-        for row in spec.get("mods", []) or []:
-            options.append(row)
-        has_opts = bool(spec.get("mods") or spec.get("requires"))
+            desc.append("Requires: " + "; ".join(spec["requires"]))
+        mods = list(spec.get("mods", []) or [])
+        has_opts = bool(mods or spec.get("requires"))
         usage = f"ptsrvtester imap -ts {code} " + ("<options> -tg <target>" if has_opts else "-tg <target>")
-        blocks.append({"description": [f"IMAP — {code}: {spec['desc']}"]})
+        blocks.append({"description": desc})
         blocks.append({"usage": [usage]})
-        if options:
-            blocks.append({"options": options})
+        if mods:
+            blocks.append({"options": mods})
     return blocks

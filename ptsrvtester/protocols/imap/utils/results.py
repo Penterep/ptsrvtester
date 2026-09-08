@@ -85,10 +85,11 @@ _SNIFFABLE_AUTH_PROBE_PRIORITY = (
 
 # Connection limits / idle: parallel ramp, idle probes.
 CONN_LIMIT_DEFAULT_ATTEMPTS = 100
-CONN_LIMIT_CONN_IP_THRESHOLD = 50  # PTV-SVC-IMAP-CONNCNTIP — many simultaneous sessions from one client
+CONN_LIMIT_CONN_IP_THRESHOLD = 50  # finding if connected > 50; --count must be > 50 to decide
 CONN_LIMIT_TIMEOUT_CAP_SECONDS = 300.0
 CONN_LIMIT_PREAUTH_IDLE_MAX_OK_SEC = 60.0  # banner-only idle (compare SMTP initial timeout)
 CONN_LIMIT_POST_CAP_IDLE_MAX_OK_SEC = 180.0  # after CAPABILITY (compare SMTP post-EHLO idle)
+CONN_LIMIT_DURATION_RECOMMENDED_SEC = 180.0  # --duration must be > 180 to decide CAPABILITY/IDLE
 CONN_LIMIT_BAN_MIN_SECONDS = 30.0
 # Post-login probes (require `-u` / `-p` without wordlists)
 CONN_LIMIT_AUTH_PARALLEL_MAX = 30
@@ -188,6 +189,26 @@ class InvCommImapResult(NamedTuple):
     weakness: bool
     detail: str
     baseline_latency_sec: float | None
+
+
+def conn_limit_count_verdict(
+    connected: int,
+    max_attempts: int,
+    threshold: int = CONN_LIMIT_CONN_IP_THRESHOLD,
+) -> tuple[str, str]:
+    """Console category + text for the concurrent-session limit check.
+
+    Vuln only when more than ``threshold`` sessions were accepted. If ``--count``
+    is too low to prove that, return WARNING instead of a false OK/VULN.
+    """
+    if max_attempts <= threshold and connected >= max_attempts:
+        return (
+            "WARNING",
+            f"Cannot determine connection limit (count too low, Recommended > {threshold})",
+        )
+    if connected > threshold:
+        return "VULN", f"Connection limit > {threshold}"
+    return "NOTVULN", f"Connection limit ≤ {threshold}"
 
 
 def _imap_conn_duration_display(seconds: float | None, exceeded: bool) -> str:
@@ -497,9 +518,8 @@ IMAP_NOOP_PREAUTH_DUR_INCREASED_MIN = 5 * 60   # >5 min → increased
 IMAP_NOOP_PREAUTH_DUR_SIGNIFICANT_MIN = 10 * 60 # >10 min → significant
 IMAP_NOOP_PREAUTH_DUR_HIGH_MIN = 30 * 60       # >30 min → high
 
-# NOOP1 timing (SMTP-compatible verdicts)
-NOOP1_SLOWDOWN_MIN_RATIO = 1.5
-NOOP1_SLOWDOWN_MIN_SECONDS = 0.5
+# NOOP1 timing: throttling if last-window avg is ≥ 0.1s slower than baseline.
+NOOP1_SLOWDOWN_MIN_DELTA_SECONDS = 0.1
 NOOP1_ERROR_RATE_OK_MAX_PCT = 5.0
 NOOP2_AVG_TIME_OK_MAX_SECONDS = 5.0
 NOOP2_ERROR_RATE_OK_MAX_PCT = 5.0
@@ -606,10 +626,7 @@ def noop1_stats_from_rtts(rtts: list[float], commands_sent: int, commands_error:
     last_window_avg = (sum(last_rtts) / len(last_rtts)) if last_rtts else None
     slowdown = False
     if baseline_avg is not None and last_window_avg is not None and len(rtts) >= window * 2:
-        slowdown = (
-            last_window_avg >= baseline_avg * NOOP1_SLOWDOWN_MIN_RATIO
-            or last_window_avg >= NOOP1_SLOWDOWN_MIN_SECONDS
-        )
+        slowdown = (last_window_avg - baseline_avg) >= NOOP1_SLOWDOWN_MIN_DELTA_SECONDS
     error_rate = (100.0 * commands_error / commands_sent) if commands_sent else 0.0
     return {
         "min_rt_seconds": min_rt,

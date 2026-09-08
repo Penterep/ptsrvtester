@@ -70,6 +70,8 @@ POP3_TESTS: dict[str, dict] = {
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
         ],
     },
     "NOOP1": {
@@ -80,8 +82,8 @@ POP3_TESTS: dict[str, dict] = {
             "if -u/-p provided. RFC 1939 specifies 10-minute minimum timeout.",
         ],
         "mods": [
-            ["", "--duration", "<sec>", "How long the test runs (seconds)"],
-            ["", "--delay", "<sec>", "Wait between NOOPs (0 = max speed)"],
+            ["", "--duration", "<sec>", "How long the test runs (default: 35 min pre-auth / 70 min post-auth)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (default: 4 min pre-auth / 5 min post-auth; 0 = max speed)"],
             ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
             ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
         ],
@@ -94,9 +96,9 @@ POP3_TESTS: dict[str, dict] = {
             "test runs if -u/-p provided. Evaluates per-IP and per-account limits.",
         ],
         "mods": [
-            ["", "--count", "<n>", "Max connections to attempt (default: 150; post-auth uses 4x, cap 600)"],
-            ["", "--duration", "<sec>", "How long the test runs (seconds)"],
-            ["", "--delay", "<sec>", "Wait between NOOPs (0 = max speed)"],
+            ["", "--count", "<n>", "Max connections to attempt (default: 150)"],
+            ["", "--duration", "<sec>", "How long the test runs (default: 120s pre-auth / 180s post-auth)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (default: 60s; 0 = max speed)"],
             ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
             ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
             ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
@@ -118,18 +120,15 @@ def pop3_test_help(codes: list[str]):
     blocks = []
     for code in valid:
         spec = POP3_TESTS[code]
-        options: list[list[str]] = []
-        for line in spec.get("long", []) or []:
-            options.append(["", "", "", line])
+        desc = [f"POP3 — {code}: {spec['desc']}"]
+        desc.extend(spec.get("long", []) or [])
         if spec.get("requires"):
-            options.append(["", "", "", ""])
-            options.append(["", "", "", "Requires: " + "; ".join(spec["requires"])])
-        for row in spec.get("mods", []) or []:
-            options.append(row)
-        has_opts = bool(spec.get("mods") or spec.get("requires"))
+            desc.append("Requires: " + "; ".join(spec["requires"]))
+        mods = list(spec.get("mods", []) or [])
+        has_opts = bool(mods or spec.get("requires"))
         usage = f"ptsrvtester pop3 -ts {code} " + ("<options> -tg <target>" if has_opts else "-tg <target>")
-        blocks.append({"description": [f"POP3 — {code}: {spec['desc']}"]})
+        blocks.append({"description": desc})
         blocks.append({"usage": [usage]})
-        if options:
-            blocks.append({"options": options})
+        if mods:
+            blocks.append({"options": mods})
     return blocks

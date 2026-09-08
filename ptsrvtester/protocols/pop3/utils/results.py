@@ -48,9 +48,8 @@ POP3_NOOP_PREAUTH_DUR_INCREASED_MIN = 5 * 60   # >5 min → increased
 POP3_NOOP_PREAUTH_DUR_SIGNIFICANT_MIN = 15 * 60 # >15 min → significant
 POP3_NOOP_PREAUTH_DUR_HIGH_MIN = 30 * 60       # >30 min → high
 
-# NOOP1 timing (SMTP-compatible verdicts)
-NOOP1_SLOWDOWN_MIN_RATIO = 1.5
-NOOP1_SLOWDOWN_MIN_SECONDS = 0.5
+# NOOP1 timing: throttling if last-window avg is ≥ 0.1s slower than baseline.
+NOOP1_SLOWDOWN_MIN_DELTA_SECONDS = 0.1
 NOOP1_ERROR_RATE_OK_MAX_PCT = 5.0
 NOOP2_AVG_TIME_OK_MAX_SECONDS = 5.0
 NOOP2_ERROR_RATE_OK_MAX_PCT = 5.0
@@ -79,6 +78,23 @@ POP3_NOOP_PREAUTH_CONN_MAX_ATTEMPTS = 150      # Try up to 150 connections (safe
 
 # CLI default for --count
 NOOP2_DEFAULT_CONNECTIONS = POP3_NOOP_PREAUTH_CONN_MAX_ATTEMPTS
+CONN_LIMIT_CONN_IP_THRESHOLD = 50  # finding if connected > 50; --count must be > 50 to decide
+
+
+def conn_limit_count_verdict(
+    connected: int,
+    max_attempts: int,
+    threshold: int = CONN_LIMIT_CONN_IP_THRESHOLD,
+) -> tuple[str, str]:
+    """Console category + text for the concurrent-session limit check."""
+    if max_attempts <= threshold and connected >= max_attempts:
+        return (
+            "WARNING",
+            f"Cannot determine connection limit (count too low, Recommended > {threshold})",
+        )
+    if connected > threshold:
+        return "VULN", f"Connection limit > {threshold}"
+    return "NOTVULN", f"Connection limit ≤ {threshold}"
 
 # Pre-authentication connection count thresholds
 POP3_NOOP_PREAUTH_CONN_INCREASED_MIN = 20      # >20 connections → increased
@@ -157,10 +173,7 @@ def noop1_stats_from_rtts(rtts: list[float], commands_sent: int, commands_error:
     last_window_avg = (sum(last_rtts) / len(last_rtts)) if last_rtts else None
     slowdown = False
     if baseline_avg is not None and last_window_avg is not None and len(rtts) >= window * 2:
-        slowdown = (
-            last_window_avg >= baseline_avg * NOOP1_SLOWDOWN_MIN_RATIO
-            or last_window_avg >= NOOP1_SLOWDOWN_MIN_SECONDS
-        )
+        slowdown = (last_window_avg - baseline_avg) >= NOOP1_SLOWDOWN_MIN_DELTA_SECONDS
     error_rate = (100.0 * commands_error / commands_sent) if commands_sent else 0.0
     return {
         "min_rt_seconds": min_rt,

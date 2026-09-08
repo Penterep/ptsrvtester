@@ -16,6 +16,7 @@ from typing import Callable
 
 from .capa import bytes_to_text
 from .helpers import get_mode
+from .ptprinthelper import get_colored_text
 from .results import (
     EncryptionResult,
     HelpInfoResult,
@@ -27,6 +28,7 @@ from .results import (
     NOOP1_PROGRESS_EVERY,
     noop1_stats_from_rtts,
     noop2_count_from_args,
+    conn_limit_count_verdict,
     POP3_NOOP_POSTAUTH_CONN_ACCT_HIGH_MIN,
     POP3_NOOP_POSTAUTH_CONN_ACCT_INCREASED_MIN,
     POP3_NOOP_POSTAUTH_CONN_ACCT_SIGNIFICANT_MIN,
@@ -839,11 +841,11 @@ def _noop2_socket_already_closed(sock) -> bool:
 def _noop2_print_ramp(out, flush, established, est_err, est_disc, est_timeout, reaped, *, json_mode=False) -> None:
     if json_mode or out is None:
         return
-    out(f"Established {established} connections", "TITLE", indent=8)
-    out(f"Errors {est_err} connections", "TITLE", indent=8)
-    out(f"Refused at connect {est_disc} connections", "TITLE", indent=8)
-    out(f"Timeout {est_timeout} connections", "TITLE", indent=8)
-    out(f"Dropped while idle {reaped} connections", "TITLE", indent=8)
+    out(f"Established {established} connections", "TITLE", indent=4)
+    out(f"Errors {est_err} connections", "TITLE", indent=4)
+    out(f"Refused at connect {est_disc} connections", "TITLE", indent=4)
+    out(f"Timeouts during connecting {est_timeout}", "TITLE", indent=4)
+    out(f"Dropped while idle {reaped} connections", "TITLE", indent=4)
     if flush:
         flush()
 
@@ -1036,7 +1038,8 @@ def _noop2_conn_count_test(
         nonlocal live_line_dirty
         if not show_progress:
             return
-        sys.stdout.write(f"\033[2K\r            {text:<100}")
+        line = get_colored_text(text, "ADDITIONS")
+        sys.stdout.write(f"\033[2K\r{line}")
         sys.stdout.flush()
         live_line_dirty = True
 
@@ -1075,6 +1078,11 @@ def _noop2_conn_count_test(
     _noop2_print_ramp(
         out, flush, established, est_err, est_disc, est_timeout, reaped, json_mode=json_mode,
     )
+    if show_progress and out is not None:
+        kind, text = conn_limit_count_verdict(established, max_connections)
+        out(text, kind, indent=4)
+        if flush:
+            flush()
 
     if storm_pool == 0:
         if debug:

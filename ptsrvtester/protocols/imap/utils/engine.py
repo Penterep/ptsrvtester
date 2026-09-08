@@ -377,9 +377,10 @@ class ImapEngine:
         RETRY_INTERVAL = 5
         PHASE1_DELAY = 0.15
         ramp_threads = max(1, int(getattr(self.args, "noop2_threads", None) or 1))
-        preauth_idle_ok = min(CONN_LIMIT_PREAUTH_IDLE_MAX_OK_SEC, MAX_TIMEOUT)
-        post_cap_idle_ok = min(CONN_LIMIT_POST_CAP_IDLE_MAX_OK_SEC, MAX_TIMEOUT)
-        idle_login_ok = min(CONN_LIMIT_IDLE_AFTER_LOGIN_MAX_OK_SEC, MAX_TIMEOUT)
+        preauth_idle_ok = CONN_LIMIT_PREAUTH_IDLE_MAX_OK_SEC
+        post_cap_idle_ok = CONN_LIMIT_POST_CAP_IDLE_MAX_OK_SEC
+        idle_login_ok = CONN_LIMIT_IDLE_AFTER_LOGIN_MAX_OK_SEC
+        duration_recommended = int(CONN_LIMIT_DURATION_RECOMMENDED_SEC)
 
         _print_lock = threading.Lock()
         _live_dirty = False
@@ -395,25 +396,15 @@ class ImapEngine:
                 sys.stdout.flush()
                 _live_dirty = False
 
-        def _write_live(label: str, value: str) -> None:
+        def _write_live(text: str) -> None:
             nonlocal _live_dirty
             if not _show_progress:
                 return
-            line = f"    {label} {value}"
+            line = get_colored_text(text, "ADDITIONS")
             with _print_lock:
-                sys.stdout.write(f"\033[2K\r{line:<120}")
+                sys.stdout.write(f"\033[2K\r{line}")
                 sys.stdout.flush()
                 _live_dirty = True
-
-        def _finalize_line(label: str, value: str) -> None:
-            nonlocal _live_dirty
-            if not _show_progress:
-                return
-            line = f"    {label} {value}"
-            with _print_lock:
-                sys.stdout.write(f"\033[2K\r{line:<120}\n")
-                sys.stdout.flush()
-                _live_dirty = False
 
         def _fmt_mmss(seconds: float) -> str:
             return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
@@ -443,8 +434,19 @@ class ImapEngine:
                     text,
                     bullet_type="VULN" if is_vuln else "NOTVULN",
                     condition=True,
-                    indent=8,
+                    indent=4,
                 )
+
+        def _print_warning(text: str) -> None:
+            nonlocal _live_dirty
+            with _print_lock:
+                if _live_dirty:
+                    sys.stdout.write("\033[2K\r")
+                    sys.stdout.flush()
+                    _live_dirty = False
+                if not _show_progress:
+                    return
+                ptprint(text, bullet_type="WARNING", condition=True, indent=4)
 
         def _print_info(text: str) -> None:
             nonlocal _live_dirty
@@ -455,7 +457,30 @@ class ImapEngine:
                     _live_dirty = False
                 if not _show_progress:
                     return
-                ptprint(text, bullet_type="TITLE", condition=True, indent=8)
+                ptprint(text, bullet_type="TITLE", condition=True, indent=4)
+
+        def _idle_cannot_decide(exceeded: bool, threshold: float) -> bool:
+            # Still alive at --duration, but the wait was too short to prove idle > threshold.
+            return bool(exceeded and MAX_TIMEOUT <= threshold)
+
+        def _emit_idle_verdict(label: str, measured: float | None, exceeded: bool, threshold: float) -> bool:
+            """Print idle verdict with a fixed bound. Return True if duration was too low to decide."""
+            if measured is None:
+                return False
+            if _idle_cannot_decide(exceeded, threshold):
+                return True
+            bound = int(threshold)
+            secs = int(round(measured))
+            if measured > threshold:
+                _print_verdict(True, f"{label}: {secs}s (> {bound}s)")
+            else:
+                _print_verdict(False, f"{label}: {secs}s (≤ {bound}s)")
+            return False
+
+        def _warn_duration_too_low() -> None:
+            _print_warning(
+                f"Duration too low to evaluate idle timeouts (Recommended > {duration_recommended})"
+            )
 
         extra_lock = threading.Lock()
         terminated: list[tuple[int, str, str]] = []
@@ -655,7 +680,7 @@ class ImapEngine:
             )
 
             if _show_progress:
-                _write_live("Connected:", "0")
+                _write_live("Connected: 0")
 
             try:
                 idx_a = _new_idx()
@@ -666,7 +691,7 @@ class ImapEngine:
                 _dbg("Session A (banner-only): connect OK")
                 _spawn_watch(imap_a, a_start_time, a_result, idx_a)
                 if _show_progress:
-                    _write_live("Connected:", str(len(connections)))
+                    _write_live(f"Connected: {len(connections)}")
             except Exception as exc:
                 _bump_establish_fail(exc)
                 _vv_reject(idx_a, exc, time.perf_counter() - t_a)
@@ -689,7 +714,7 @@ class ImapEngine:
                 _dbg("Session B (CAPABILITY): connect OK")
                 _spawn_watch(imap_b, b_start_time, b_result, idx_b)
                 if _show_progress:
-                    _write_live("Connected:", str(len(connections)))
+                    _write_live(f"Connected: {len(connections)}")
             except Exception as exc:
                 _bump_establish_fail(exc)
                 _vv_reject(idx_b, exc, time.perf_counter() - t_b)
@@ -710,7 +735,7 @@ class ImapEngine:
                     connections.append(imap_extra)
                     held_extras.append((imap_extra, idx))
                     if _show_progress:
-                        _write_live("Connected:", str(len(connections)))
+                        _write_live(f"Connected: {len(connections)}")
                 _spawn_watch(imap_extra, t0, None, idx)
 
             def _open_extra() -> bool:
@@ -792,16 +817,11 @@ class ImapEngine:
                 _end_live()
                 self._noop2_print_ramp(connected, est_err, est_disc, est_timeout, reaped)
 
-            if not banned:
-                _print_verdict(
-                    True,
-                    f"No connection limit ({connected}/{max_attempts} concurrent connections accepted)",
-                )
+            kind, text = conn_limit_count_verdict(connected, max_attempts)
+            if kind == "WARNING":
+                _print_warning(text)
             else:
-                _print_verdict(
-                    False,
-                    f"Connection limit is enforced ({connected}/{max_attempts} concurrent connections accepted)",
-                )
+                _print_verdict(kind == "VULN", text)
 
             ban_duration_seconds: float | None = None
             ban_duration_exceeded = False
@@ -813,12 +833,12 @@ class ImapEngine:
                 _rl_stop = threading.Event()
 
                 if _show_progress:
-                    _write_live("Ban / backoff window:", "00:00")
+                    _write_live("Ban / backoff window: 00:00")
 
                     def _rl_ticker() -> None:
                         while not _rl_stop.wait(0.5):
                             elapsed = time.perf_counter() - start_rl
-                            _write_live("Ban / backoff window:", _fmt_mmss(elapsed))
+                            _write_live(f"Ban / backoff window: {_fmt_mmss(elapsed)}")
 
                     threading.Thread(target=_rl_ticker, daemon=True).start()
 
@@ -846,12 +866,7 @@ class ImapEngine:
                         time.sleep(0.2)
 
                 _rl_stop.set()
-
-                if _show_progress:
-                    _finalize_line(
-                        "Ban / backoff window:",
-                        _imap_conn_duration_display(ban_duration_seconds, ban_duration_exceeded),
-                    )
+                _end_live()
 
                 if ban_duration_exceeded:
                     _print_verdict(False, f"Reconnect blocked for {int(MAX_BAN_WAIT)}s+ after refusal")
@@ -863,31 +878,27 @@ class ImapEngine:
                 else:
                     _print_verdict(False, "Reconnect allowed after backoff")
 
-            def _await_and_report(
+            def _await_idle(
                 start_time: float | None,
                 result_cell: list,
-                label: str,
+                live_label: str,
                 cap: float,
-                threshold: float,
-                bad_msg: str,
-                ok_msg: str,
             ) -> tuple[float | None, bool]:
                 if start_time is None:
-                    if _show_progress:
-                        _finalize_line(label, "N/A")
+                    _end_live()
                     return None, False
 
                 deadline = start_time + cap + 2.0
 
                 if _show_progress and not result_cell:
-                    _write_live(label, _fmt_mmss(time.perf_counter() - start_time))
+                    _write_live(f"{live_label} {_fmt_mmss(time.perf_counter() - start_time)}")
                     live_stop = threading.Event()
 
                     def _tick() -> None:
                         while not live_stop.wait(0.5):
                             if result_cell:
                                 return
-                            _write_live(label, _fmt_mmss(time.perf_counter() - start_time))
+                            _write_live(f"{live_label} {_fmt_mmss(time.perf_counter() - start_time)}")
 
                     threading.Thread(target=_tick, daemon=True).start()
                     while not result_cell and time.perf_counter() < deadline:
@@ -901,35 +912,31 @@ class ImapEngine:
                     result_cell.append((cap, True))
 
                 elapsed, exceeded = result_cell[0]
-                disp = _imap_conn_duration_display(elapsed, exceeded)
-                if _show_progress:
-                    _finalize_line(label, disp)
-
-                if exceeded or elapsed > threshold:
-                    _print_verdict(True, bad_msg)
-                else:
-                    _print_verdict(False, ok_msg)
+                _end_live()
                 return elapsed, exceeded
 
-            pre_seconds, pre_exceeded = _await_and_report(
-                a_start_time,
-                a_result,
-                "Pre-auth idle (after banner):",
-                MAX_TIMEOUT,
+            pre_seconds, pre_exceeded = _await_idle(
+                a_start_time, a_result, "Pre-auth idle after banner:", MAX_TIMEOUT,
+            )
+            post_seconds, post_exceeded = _await_idle(
+                b_start_time, b_result, "Idle after CAPABILITY:", MAX_TIMEOUT,
+            )
+            idle_undecided = _emit_idle_verdict(
+                "Pre-auth idle timeout after banner",
+                pre_seconds,
+                pre_exceeded,
                 preauth_idle_ok,
-                f"Pre-auth idle timeout > {int(preauth_idle_ok)}s",
-                f"Pre-auth idle timeout ≤ {int(preauth_idle_ok)}s",
             )
-
-            post_seconds, post_exceeded = _await_and_report(
-                b_start_time,
-                b_result,
-                "Idle after CAPABILITY:",
-                MAX_TIMEOUT,
+            idle_undecided = _emit_idle_verdict(
+                "Idle timeout after CAPABILITY",
+                post_seconds,
+                post_exceeded,
                 post_cap_idle_ok,
-                f"Idle timeout after CAPABILITY > {int(post_cap_idle_ok)}s",
-                f"Idle timeout after CAPABILITY ≤ {int(post_cap_idle_ok)}s",
-            )
+            ) or idle_undecided
+            duration_warned = False
+            if idle_undecided or MAX_TIMEOUT <= duration_recommended:
+                _warn_duration_too_low()
+                duration_warned = True
 
             # A/B idle is measured; extras started later still wait for their own BYE/cap.
             wait_origin = latest_watch_start or time.perf_counter()
@@ -949,14 +956,9 @@ class ImapEngine:
                 if alive == 0:
                     break
                 if _show_progress:
-                    _write_live("Idle remaining:", _idle_remaining_text(alive))
+                    _write_live(f"Idle remaining: {_idle_remaining_text(alive)}")
                 time.sleep(0.2)
-            if _show_progress:
-                alive = sum(1 for t in watch_threads if t.is_alive())
-                if alive:
-                    _finalize_line("Idle remaining:", _idle_remaining_text(alive, finalize=True))
-                elif _live_dirty:
-                    _end_live()
+            _end_live()
 
             watcher_stop.set()
             for t in watch_threads:
@@ -966,26 +968,22 @@ class ImapEngine:
             idle_disconnected_all = bool(connected > 0 and idle_disconnected >= connected)
             terminated_connections = tuple(sorted(terminated, key=lambda row: row[0]))
             if _show_progress and connected > 0 and idle_disconnected > 0:
-                if idle_disconnected_all:
-                    _print_verdict(
-                        True,
-                        "Server disconnected all connections before test time limit",
-                    )
                 pct = 100.0 * idle_disconnected / connected
                 _print_info(
                     f"Disconnected connections during test: {idle_disconnected} from {connected} ({pct:.0f}%)"
                 )
-                for idx, reason, detail in terminated_connections:
-                    with _print_lock:
-                        ptprint(
-                            get_colored_text(
-                                f"Connection #{idx} terminated — {reason} ({detail})",
-                                "ADDITIONS",
-                            ),
-                            bullet_type="TEXT",
-                            condition=True,
-                            indent=12,
-                        )
+                if bool(getattr(self.args, "debug", False)):
+                    for idx, reason, detail in terminated_connections:
+                        with _print_lock:
+                            ptprint(
+                                get_colored_text(
+                                    f"Connection #{idx} terminated — {reason} ({detail})",
+                                    "ADDITIONS",
+                                ),
+                                bullet_type="TEXT",
+                                condition=True,
+                                indent=8,
+                            )
 
             for conn in connections:
                 try:
@@ -1013,7 +1011,7 @@ class ImapEngine:
                 user, pw = cred_pair
                 auth_imaps: list = []
                 if _show_progress:
-                    _write_live("Authenticated sessions:", "0")
+                    _write_live("Authenticated sessions: 0")
 
                 for _ in range(CONN_LIMIT_AUTH_PARALLEL_MAX):
                     time.sleep(CONN_LIMIT_AUTH_PARALLEL_DELAY_SEC)
@@ -1027,14 +1025,9 @@ class ImapEngine:
                         auth_login_stopped_early = True
                         break
                     if _show_progress:
-                        _write_live("Authenticated sessions:", str(len(auth_imaps)))
+                        _write_live(f"Authenticated sessions: {len(auth_imaps)}")
 
-                if _show_progress:
-                    _finalize_line(
-                        "Authenticated sessions:",
-                        f"{auth_parallel_accepted} logged in"
-                        + (" (login then refused)" if auth_login_stopped_early else ""),
-                    )
+                _end_live()
 
                 if auth_parallel_accepted >= CONN_LIMIT_AUTH_PARALLEL_VULN_THRESHOLD and not auth_login_stopped_early:
                     _print_verdict(
@@ -1107,10 +1100,7 @@ class ImapEngine:
                                 ).start()
                                 dl = idle_start + MAX_TIMEOUT + 2.0
                                 if _show_progress and not idle_result:
-                                    _write_live(
-                                        "Idle (IDLE command):",
-                                        _fmt_mmss(0.0),
-                                    )
+                                    _write_live(f"Idle (IDLE command): {_fmt_mmss(0.0)}")
                                     tick_stop = threading.Event()
 
                                     def _idle_tick() -> None:
@@ -1118,8 +1108,7 @@ class ImapEngine:
                                             if idle_result:
                                                 return
                                             _write_live(
-                                                "Idle (IDLE command):",
-                                                _fmt_mmss(time.perf_counter() - idle_start),
+                                                f"Idle (IDLE command): {_fmt_mmss(time.perf_counter() - idle_start)}"
                                             )
 
                                     threading.Thread(target=_idle_tick, daemon=True).start()
@@ -1136,20 +1125,14 @@ class ImapEngine:
                                 ig_elapsed, ig_exceeded = idle_result[0]
                                 idle_logged_seconds = ig_elapsed
                                 idle_logged_exceeded = ig_exceeded
-                                disp_i = _imap_conn_duration_display(ig_elapsed, ig_exceeded)
-                                if _show_progress:
-                                    _finalize_line("Idle (IDLE command):", disp_i)
-
-                                if ig_exceeded or ig_elapsed > idle_login_ok:
-                                    _print_verdict(
-                                        True,
-                                        f"Authenticated IDLE timeout > {int(idle_login_ok)}s",
-                                    )
-                                else:
-                                    _print_verdict(
-                                        False,
-                                        f"Authenticated IDLE timeout ≤ {int(idle_login_ok)}s",
-                                    )
+                                _end_live()
+                                if _emit_idle_verdict(
+                                    "Authenticated IDLE timeout",
+                                    ig_elapsed,
+                                    ig_exceeded,
+                                    idle_login_ok,
+                                ) and not duration_warned:
+                                    _warn_duration_too_low()
 
                                 idle_stop_ev.set()
                                 if ig_exceeded:
@@ -2041,6 +2024,7 @@ class ImapEngine:
             self._authlist_unavailable_text(path, connected=connected),
             bullet_type="INFO",
             condition=True,
+            colortext=False,
             indent=8,
         )
         self._flush_terminal()
@@ -4572,6 +4556,7 @@ class ImapEngine:
                         self._authlist_unavailable_text(p.path, connected=False),
                         bullet_type="INFO",
                         condition=show,
+                        colortext=False,
                         indent=8,
                     )
                     continue
@@ -4580,6 +4565,7 @@ class ImapEngine:
                         self._authlist_unavailable_text(p.path, connected=True),
                         bullet_type="INFO",
                         condition=show,
+                        colortext=False,
                         indent=8,
                     )
                     continue
@@ -5384,35 +5370,41 @@ class ImapEngine:
                     }
                 )
 
-            if not cl.banned and cl.connected >= CONN_LIMIT_CONN_IP_THRESHOLD:
+            if cl.max_attempts > CONN_LIMIT_CONN_IP_THRESHOLD and cl.connected > CONN_LIMIT_CONN_IP_THRESHOLD:
                 deferred_vulns.append(
                     {
                         "vuln_code": VULNS.ConnCntIp.value,
                         "vuln_request": "Concurrent IMAP sessions from single source (ramp-up probe)",
-                        "vuln_response": f"{cl.connected} simultaneous sessions accepted without refusal (budget {cl.max_attempts})",
+                        "vuln_response": f"{cl.connected} simultaneous sessions accepted (budget {cl.max_attempts})",
                     }
                 )
             long_bits: list[str] = []
-            if cl.preauth_idle_seconds is not None and (
-                cl.preauth_idle_exceeded
-                or cl.preauth_idle_seconds > CONN_LIMIT_PREAUTH_IDLE_MAX_OK_SEC
-            ):
+            dur_cap = None
+            if cl.preauth_idle_exceeded and cl.preauth_idle_seconds is not None:
+                dur_cap = cl.preauth_idle_seconds
+            elif cl.post_cap_idle_exceeded and cl.post_cap_idle_seconds is not None:
+                dur_cap = cl.post_cap_idle_seconds
+            elif cl.idle_logged_exceeded and cl.idle_logged_seconds is not None:
+                dur_cap = cl.idle_logged_seconds
+
+            def _idle_finding(seconds, exceeded, threshold: float) -> bool:
+                if seconds is None:
+                    return False
+                if exceeded and (dur_cap is not None and dur_cap <= threshold):
+                    return False
+                return seconds > threshold
+
+            if _idle_finding(cl.preauth_idle_seconds, cl.preauth_idle_exceeded, CONN_LIMIT_PREAUTH_IDLE_MAX_OK_SEC):
                 long_bits.append(
                     "pre-auth idle: "
                     + _imap_conn_duration_display(cl.preauth_idle_seconds, cl.preauth_idle_exceeded)
                 )
-            if cl.post_cap_idle_seconds is not None and (
-                cl.post_cap_idle_exceeded
-                or cl.post_cap_idle_seconds > CONN_LIMIT_POST_CAP_IDLE_MAX_OK_SEC
-            ):
+            if _idle_finding(cl.post_cap_idle_seconds, cl.post_cap_idle_exceeded, CONN_LIMIT_POST_CAP_IDLE_MAX_OK_SEC):
                 long_bits.append(
                     "idle after CAPABILITY: "
                     + _imap_conn_duration_display(cl.post_cap_idle_seconds, cl.post_cap_idle_exceeded)
                 )
-            if cl.idle_logged_seconds is not None and (
-                cl.idle_logged_exceeded
-                or cl.idle_logged_seconds > CONN_LIMIT_IDLE_AFTER_LOGIN_MAX_OK_SEC
-            ):
+            if _idle_finding(cl.idle_logged_seconds, cl.idle_logged_exceeded, CONN_LIMIT_IDLE_AFTER_LOGIN_MAX_OK_SEC):
                 long_bits.append(
                     "idle after IDLE command (authenticated): "
                     + _imap_conn_duration_display(cl.idle_logged_seconds, cl.idle_logged_exceeded)
@@ -6214,11 +6206,11 @@ class ImapEngine:
     def _noop2_print_ramp(self, established, est_err, est_disc, est_timeout, reaped) -> None:
         if self.use_json:
             return
-        self.out(f"Established {established} connections", "TITLE", indent=8)
-        self.out(f"Errors {est_err} connections", "TITLE", indent=8)
-        self.out(f"Refused at connect {est_disc} connections", "TITLE", indent=8)
-        self.out(f"Timeout {est_timeout} connections", "TITLE", indent=8)
-        self.out(f"Dropped while idle {reaped} connections", "TITLE", indent=8)
+        self.out(f"Established {established} connections", "TITLE", indent=4)
+        self.out(f"Errors {est_err} connections", "TITLE", indent=4)
+        self.out(f"Refused at connect {est_disc} connections", "TITLE", indent=4)
+        self.out(f"Timeouts during connecting {est_timeout}", "TITLE", indent=4)
+        self.out(f"Dropped while idle {reaped} connections", "TITLE", indent=4)
         self._flush_terminal()
 
     def _noop2_wait_delay(self, sock, delay: float, stop_event: threading.Event) -> str:
@@ -6396,7 +6388,8 @@ class ImapEngine:
             nonlocal live_line_dirty
             if not show_progress:
                 return
-            sys.stdout.write(f"\033[2K\r            {text:<100}")
+            line = get_colored_text(text, "ADDITIONS")
+            sys.stdout.write(f"\033[2K\r{line}")
             sys.stdout.flush()
             live_line_dirty = True
 
@@ -6428,6 +6421,10 @@ class ImapEngine:
         storm_pool = len(connections)
 
         self._noop2_print_ramp(established, est_err, est_disc, est_timeout, reaped)
+        if show_progress:
+            kind, text = conn_limit_count_verdict(established, max_connections)
+            self.out(text, kind, indent=4)
+            self._flush_terminal()
 
         if storm_pool == 0:
             self.debug(

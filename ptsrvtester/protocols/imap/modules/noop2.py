@@ -1,62 +1,11 @@
 """NOOP2 — NOOP connection count (pre-auth + post-auth if -u/-p)."""
 from ..utils.ptprinthelper import get_colored_text
+from ..utils.results import conn_limit_count_verdict
 from ._common import eng
 
 __MODULELABEL__ = "NOOP connection count"
 __MODULECODE__ = "NOOP2"
 __ORDER__ = 86
-
-
-def _evaluate_preauth_conn_count(maintained, thresholds):
-    """Evaluate pre-auth connection count and return (vulnerable, rating)."""
-    vulnerable = False
-    rating = "OK"
-
-    high_min, significant_min, increased_min = thresholds
-
-    if maintained >= high_min:
-        rating = "high"
-        vulnerable = True
-    elif maintained >= significant_min:
-        rating = "significant"
-        vulnerable = True
-    elif maintained >= increased_min:
-        rating = "increased"
-        vulnerable = True
-
-    return vulnerable, rating
-
-
-def _evaluate_postauth_conn_count(maintained, ip_thresholds, acct_thresholds):
-    """Evaluate post-auth connection count and return (vulnerable, rating_ip, rating_acct)."""
-    vulnerable = False
-    rating_ip = "OK"
-    rating_acct = "OK"
-
-    ip_high, ip_significant, ip_increased = ip_thresholds
-    acct_high, acct_significant, acct_increased = acct_thresholds
-
-    if maintained >= ip_high:
-        rating_ip = "high"
-        vulnerable = True
-    elif maintained >= ip_significant:
-        rating_ip = "significant"
-        vulnerable = True
-    elif maintained >= ip_increased:
-        rating_ip = "increased"
-        vulnerable = True
-
-    if maintained >= acct_high:
-        rating_acct = "high"
-        vulnerable = True
-    elif maintained >= acct_significant:
-        rating_acct = "significant"
-        vulnerable = True
-    elif maintained >= acct_increased:
-        rating_acct = "increased"
-        vulnerable = True
-
-    return vulnerable, rating_ip, rating_acct
 
 
 def _flush_ctx(ctx) -> None:
@@ -80,6 +29,7 @@ def _emit_noop2_result(ctx, result) -> None:
         noop1_rt_display,
     )
 
+    verbose = bool(getattr(ctx.args, "debug", False))
     if result.min_rt_seconds is not None:
         min_d = noop1_rt_display(result.min_rt_seconds)
         max_d = noop1_rt_display(result.max_rt_seconds)
@@ -89,37 +39,30 @@ def _emit_noop2_result(ctx, result) -> None:
                 f"Time between two commands ({min_d} - {max_d}, avg {avg_d}) "
                 f"— over {NOOP2_AVG_TIME_OK_MAX_SECONDS:.0f}s avg under load",
                 "VULN",
-                indent=8,
+                indent=4,
             )
         else:
             ctx.out(
                 f"Time between two commands ({min_d} - {max_d}, avg {avg_d})",
                 "NOTVULN",
-                indent=8,
+                indent=4,
             )
     else:
         ctx.out(
             f"Time between two commands: no successful replies "
             f"({result.total_noops_sent} sent)",
             "VULN",
-            indent=8,
+            indent=4,
         )
 
     err_rate = result.error_rate_pct
     if err_rate <= NOOP2_ERROR_RATE_OK_MAX_PCT:
-        ctx.out(f"Error rate: {err_rate:.0f}%", "NOTVULN", indent=8)
+        ctx.out(f"Error rate: {err_rate:.0f}%", "NOTVULN", indent=4)
     else:
         ctx.out(
             f"Error rate: {err_rate:.0f}% (over {NOOP2_ERROR_RATE_OK_MAX_PCT:.0f}%)",
             "VULN",
-            indent=8,
-        )
-
-    if result.early_exit_no_connections:
-        ctx.out(
-            "Server disconnected all connections before test time limit",
-            "VULN",
-            indent=8,
+            indent=4,
         )
 
     storm_base = result.storm_pool_connections or result.connections_established
@@ -129,57 +72,51 @@ def _emit_noop2_result(ctx, result) -> None:
         ctx.out(
             f"Disconnected connections during test: {disconnected} from {storm_base} ({pct:.0f}%)",
             "TITLE",
-            indent=8,
+            indent=4,
         )
-        for idx, reason, detail in result.terminated_connections:
-            ctx.out(
-                get_colored_text(f"Connection #{idx} terminated — {reason} ({detail})", "ADDITIONS"),
-                "TEXT",
-                indent=12,
-            )
+        if verbose:
+            for idx, reason, detail in result.terminated_connections:
+                ctx.out(
+                    get_colored_text(f"Connection #{idx} terminated — {reason} ({detail})", "ADDITIONS"),
+                    "TEXT",
+                    indent=8,
+                )
     _flush_ctx(ctx)
+
+
+def _maybe_add_conn_limit_vuln(ctx, result, vuln_code: str, phase: str) -> None:
+    kind, _ = conn_limit_count_verdict(
+        result.connections_established, result.max_connections_attempted,
+    )
+    if kind != "VULN":
+        return
+    ctx.report.add_vulnerability(
+        vuln_code=vuln_code,
+        vuln_request=(
+            f"{phase} NOOP connection count "
+            f"({result.connections_established}/{result.max_connections_attempted})"
+        ),
+    )
 
 
 def run(ctx):
     e = eng(ctx)
 
-    from ..utils.results import (
-        IMAP_NOOP_PREAUTH_CONN_HIGH_MIN,
-        IMAP_NOOP_PREAUTH_CONN_INCREASED_MIN,
-        IMAP_NOOP_PREAUTH_CONN_SIGNIFICANT_MIN,
-        IMAP_NOOP_POSTAUTH_CONN_ACCT_HIGH_MIN,
-        IMAP_NOOP_POSTAUTH_CONN_ACCT_INCREASED_MIN,
-        IMAP_NOOP_POSTAUTH_CONN_ACCT_SIGNIFICANT_MIN,
-        IMAP_NOOP_POSTAUTH_CONN_IP_HIGH_MIN,
-        IMAP_NOOP_POSTAUTH_CONN_IP_INCREASED_MIN,
-        IMAP_NOOP_POSTAUTH_CONN_IP_SIGNIFICANT_MIN,
-        VULNS,
-    )
+    from ..utils.results import VULNS
 
     ctx.out("Pre-authentication", "TITLE", indent=4)
 
     try:
         result_preauth = e.test_noop_conn_count_preauth()
     except Exception as ex:
-        ctx.out(f"Test failed: {ex}", "ERROR", indent=8)
+        ctx.out(f"Test failed: {ex}", "ERROR", indent=4)
         result_preauth = None
 
     if result_preauth and not result_preauth.error_message:
-        maintained = result_preauth.connections_maintained
-        thresholds = (
-            IMAP_NOOP_PREAUTH_CONN_HIGH_MIN,
-            IMAP_NOOP_PREAUTH_CONN_SIGNIFICANT_MIN,
-            IMAP_NOOP_PREAUTH_CONN_INCREASED_MIN,
-        )
-        vulnerable, rating = _evaluate_preauth_conn_count(maintained, thresholds)
         _emit_noop2_result(ctx, result_preauth)
-        if vulnerable:
-            ctx.report.add_vulnerability(
-                vuln_code=VULNS.NoopConnCountPreauth.value,
-                vuln_request=f"pre-auth NOOP connection count ({rating})",
-            )
+        _maybe_add_conn_limit_vuln(ctx, result_preauth, VULNS.NoopConnCountPreauth.value, "pre-auth")
     elif result_preauth:
-        ctx.out(f"Test error: {result_preauth.error_message}", "ERROR", indent=8)
+        ctx.out(f"Test error: {result_preauth.error_message}", "ERROR", indent=4)
 
     if ctx.args.user and ctx.args.password:
         ctx.out("Post-authentication", "TITLE", indent=4)
@@ -187,31 +124,13 @@ def run(ctx):
         try:
             result_postauth = e.test_noop_conn_count_postauth(ctx.args.user, ctx.args.password)
         except Exception as ex:
-            ctx.out(f"Test failed: {ex}", "ERROR", indent=8)
+            ctx.out(f"Test failed: {ex}", "ERROR", indent=4)
             result_postauth = None
 
         if result_postauth and not result_postauth.error_message:
-            maintained = result_postauth.connections_maintained
-            ip_thresholds = (
-                IMAP_NOOP_POSTAUTH_CONN_IP_HIGH_MIN,
-                IMAP_NOOP_POSTAUTH_CONN_IP_SIGNIFICANT_MIN,
-                IMAP_NOOP_POSTAUTH_CONN_IP_INCREASED_MIN,
-            )
-            acct_thresholds = (
-                IMAP_NOOP_POSTAUTH_CONN_ACCT_HIGH_MIN,
-                IMAP_NOOP_POSTAUTH_CONN_ACCT_SIGNIFICANT_MIN,
-                IMAP_NOOP_POSTAUTH_CONN_ACCT_INCREASED_MIN,
-            )
-            vulnerable, rating_ip, rating_acct = _evaluate_postauth_conn_count(
-                maintained, ip_thresholds, acct_thresholds,
-            )
             _emit_noop2_result(ctx, result_postauth)
-            if vulnerable:
-                ctx.report.add_vulnerability(
-                    vuln_code=VULNS.NoopConnCountPostauth.value,
-                    vuln_request=f"post-auth NOOP connection count (IP:{rating_ip}, account:{rating_acct})",
-                )
+            _maybe_add_conn_limit_vuln(ctx, result_postauth, VULNS.NoopConnCountPostauth.value, "post-auth")
         elif result_postauth:
-            ctx.out(f"Test error: {result_postauth.error_message}", "ERROR", indent=8)
+            ctx.out(f"Test error: {result_postauth.error_message}", "ERROR", indent=4)
     else:
         ctx.out("Post-authentication: Skipped (provide -u/--user and -p/--password)", "INFO", indent=4)

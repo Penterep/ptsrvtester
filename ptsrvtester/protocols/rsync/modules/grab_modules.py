@@ -42,7 +42,7 @@ def receive(sock: socket.socket) -> bytes:
     return data
 
 
-def _rsync_grab_modules(ctx):
+def rsync_grab_modules(ctx, print=True):
     try:
         with socket.create_connection((ctx.ip, ctx.port), timeout=ctx.timeout) as sock:
             sock.settimeout(ctx.timeout)
@@ -60,14 +60,18 @@ def _rsync_grab_modules(ctx):
 
             modules = data.decode(errors="replace")
             if modules:
-                ctx.out(f"Grabbed available modules", "VULN", indent=4)
-                _print_modules(modules, ctx)
+                ctx.out(f"Grabbed available modules", "VULN", indent=4, condition=not ctx.json and print)
+                if print:
+                    _print_modules(modules, ctx)
             else:
-                ctx.out("Could not list modules or server doesn't have any", "OK", indent=4)
+                ctx.out("Could not list modules or server doesn't have any", "OK", indent=4,
+                        condition=not ctx.json and print)
+
+            modules = _sanitize_rsync_data(modules.split('\n'))
+            return [module.split('\t')[0].strip() for module in modules]
 
     except Exception as e:
-        ctx.out(f"Error grabbing modules: {e}", "ERROR", condition=not ctx.json, indent=4)
-
+        ctx.out(f"Error grabbing modules: {e}", "ERROR", condition=not ctx.json and print, indent=4)
 
 def run(ctx):
-    _rsync_grab_modules(ctx)
+    rsync_grab_modules(ctx)

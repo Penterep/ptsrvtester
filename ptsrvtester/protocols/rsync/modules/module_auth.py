@@ -2,7 +2,7 @@ import socket
 from ptsrvtester.protocols.rsync.utils.registry import receive
 from io import BufferedReader
 from ptthreads.ptthreads import ptthreads
-
+from ptsrvtester.protocols.rsync.modules.grab_modules import rsync_grab_modules
 
 __MODULELABEL__ = "Rsync module authentication enumeration"
 __MODULECODE__ = "module_auth"
@@ -22,7 +22,7 @@ def _check_module_for_auth(sock: socket.socket, f: BufferedReader , module, ctx)
             text: str = line.decode(errors="replace").rstrip("\n")
 
             if text.startswith("@RSYNCD: OK"):
-                ctx.out(f"The '{module}' module does not require authentication"
+                ctx.out(f"The '{module}' module does not require authentication",
                         "VULN", indent=4)
                 return motd
             elif text.startswith("@ERROR"):
@@ -52,11 +52,11 @@ def _check_module(module):
 
             data = receive(sock)
             banner = data.decode(errors="replace").rstrip('\n')
-
+            banner_header = banner.split("\n")[0]
             if not banner:
                 return
 
-            sock.sendall(f"{banner}\n".encode())
+            sock.sendall(f"{banner_header}\n".encode())
 
             r = _check_module_for_auth(sock, f, module.get("module"), module.get("ctx"))
 
@@ -66,7 +66,11 @@ def _check_module(module):
 
 def _rsync_check_modules_for_auth(ctx):
     threads = ptthreads()
-    modules = [{"module": m, "ctx": ctx} for m in ctx.modules]
+    if ctx.modules:
+        modules = [{"module": m, "ctx": ctx} for m in ctx.modules]
+    else:
+        modules = [{"module": m, "ctx": ctx} for m in rsync_grab_modules(ctx, print=False)]
+
     threads.threads(modules, _check_module, 10)
 
 

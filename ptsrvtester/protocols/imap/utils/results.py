@@ -69,7 +69,7 @@ class SniffableResult(NamedTuple):
     detail: str
 
 
-CatchAllResult = str  # "configured" | "not_configured" | "indeterminate"
+CatchAllResult = str  # "configured" | "not_configured" | "indeterminate" | "unreachable"
 
 # Order of AUTHENTICATE probes when multiple mechanisms are advertised (most sensitive first).
 _SNIFFABLE_AUTH_PROBE_PRIORITY = (
@@ -108,16 +108,24 @@ _IMAP_USRENUM_MARKER_LABEL = "(fixed_wrong_password)"
 # TCP + IMAP greeting; limits hangs on filtered hosts / silent packet drops (RFC-style clients often use similar bounds).
 _IMAP_CONNECT_TIMEOUT_SEC = 8.0
 # Authenticated resource-load probe: bounded APPEND burst + SEARCH burst (PTV-SVC-IMAP-RESLOAD).
-# Inspired by rate/limit tooling (e.g. SMTP NOOP flood): measure disconnect, errors, RT slowdown — not unbounded DoS.
+# Safety caps only (not RFC numbers). RFC 9208: APPEND over quota → tagged NO [OVERQUOTA].
+# Completing the cap with OK = missing limit; connection drop = instability; slowdown = warning.
 _IMAP_LOAD_APPEND_MAX_DEFAULT = 400
 _IMAP_LOAD_SEARCH_MAX_DEFAULT = 600
 _IMAP_LOAD_PER_CMD_TIMEOUT_SEC = 30.0
 _IMAP_LOAD_PROGRESS_APPEND_INTERVAL = 25
 _IMAP_LOAD_SEARCH_INTERVAL = 50
 _IMAP_LOAD_SLOWDOWN_RATIO = 1.5
-_IMAP_LOAD_SLOWDOWN_ABS_SEC = 0.5
-_IMAP_LOAD_ERR_OK_MAX_PCT = 5.0
-_IMAP_LOAD_DISCONNECT_EARLY_MAX = 120  # ≤ this many APPENDs before disconnect → noteworthy
+_IMAP_LOAD_SLOWDOWN_MIN_DELTA_SEC = 0.1
+_IMAP_LOAD_SUBJECT_PREFIX = "ptsrv-resload-"
+_IMAP_LOAD_LIMIT_CODES = (
+    "OVERQUOTA",
+    "TOOBIG",
+    "MESSAGELIMIT",
+    "MAXCONVERTS",
+    "LIMIT",
+    "QUOTA",
+)
 # Post-login mailbox isolation / shared-folder hygiene (PTV-SVC-IMAP-AUTHZ-BYPASS).
 # Methodology aligns with RFC 3501 (SELECT), RFC 2342 (NAMESPACE), RFC 4314/2086 (GETACL), and common
 # configuration-review practice (LIST surveys, "anyone"/authenticated ACL checks — cf. Dovecot/Cyrus docs).
@@ -144,6 +152,9 @@ _IMAP_MBOX_ISO_LIST_DICTIONARY_PATTERNS: tuple[str, ...] = (
 )
 _IMAP_MBOX_ISO_ENUM_MIN_TOTAL_LISTED = 15  # heuristic: many hits across guessed LIST patterns
 _IMAP_MBOX_ISO_ENUM_MIN_NONZERO_PATTERNS = 3
+_IMAP_MBOX_ISO_GETACL_MAX = 20
+_IMAP_ACL_WORLD_IDS = frozenset({"anyone", "anonymous", "guest", "authenticated"})
+_IMAP_ACL_SKIP_IDS = frozenset({"owner", "administrators", "admin", "authuser", "-authuser"})
 # TLS + certificate audit (PTV-SVC-IMAP-TLSAUDIT): RFC 8996 / NIST SP 800-52r2 /
 # TLSRef Intermediate cipher policy; RFC 9525 identity.
 _IMAP_TLS_AUDIT_TIMEOUT_SEC = 12.0
@@ -160,7 +171,6 @@ _INVCOMM_INFO_LEAK_MARKERS = (
     b"c:\\",
     b"internal server",
     b"stack trace",
-    b" line ",
     b".py",
     b".java",
     b"0x000",
@@ -173,6 +183,7 @@ class InvCommImapCase(NamedTuple):
     """One invalid / malformed IMAP command probe (PTV-SVC-IMAP-INVCOMM)."""
     category: str
     command_display: str
+    send_text: str
     outcome: str
     reply_snippet: str | None
     response_time_sec: float | None
@@ -201,6 +212,11 @@ def conn_limit_count_verdict(
     Vuln only when more than ``threshold`` sessions were accepted. If ``--count``
     is too low to prove that, return WARNING instead of a false OK/VULN.
     """
+    if connected <= 0:
+        return (
+            "WARNING",
+            "Could not open any connection. Connection limit was not tested.",
+        )
     if max_attempts <= threshold and connected >= max_attempts:
         return (
             "WARNING",
@@ -259,6 +275,8 @@ class AnonymousAccessResult(NamedTuple):
     weak_credentials_ok: tuple[str, ...]  # e.g. "guest / guest"
     vulnerable: bool
     detail: str
+    auth_probed: bool
+    login_probed: bool
 
 
 class EicarAppendResult(NamedTuple):
@@ -325,9 +343,13 @@ class ImapResourceLoadPhase(NamedTuple):
     attempted: int
     ok: int
     failed: int
+    limited: int
     disconnected: bool
     disconnect_after: int | None
     hit_cap: bool
+    limit_enforced: bool
+    limit_code: str | None
+    limit_after: int | None
     min_rt_seconds: float | None
     max_rt_seconds: float | None
     avg_rt_seconds: float | None
@@ -338,7 +360,7 @@ class ImapResourceLoadPhase(NamedTuple):
 
 
 class ImapResourceLoadResult(NamedTuple):
-    """Bounded authenticated APPEND + SEARCH stress (PTV-SVC-IMAP-RESLOAD heuristic)."""
+    """Bounded authenticated APPEND + SEARCH resource-limit check (PTV-SVC-IMAP-RESLOAD)."""
 
     skipped: bool
     skip_reason: str | None
@@ -348,8 +370,19 @@ class ImapResourceLoadResult(NamedTuple):
     append: ImapResourceLoadPhase | None
     search: ImapResourceLoadPhase | None
     search_skipped_reason: str | None
+    quota_advertised: bool
+    quota_root_detail: str | None
+    cleanup_deleted: int | None
+    cleanup_detail: str | None
     vulnerable: bool
     detail: str
+    io_login: tuple[str, str] | None = None
+    io_select: tuple[str, str] | None = None
+    io_capability: tuple[str, str] | None = None
+    io_quota: tuple[tuple[str, str], ...] = ()
+    io_append: tuple[str, str] | None = None
+    io_search: tuple[str, str] | None = None
+    io_cleanup: tuple[str, str] | None = None
 
 
 class ImapMailboxIsoSelectRow(NamedTuple):
@@ -360,6 +393,8 @@ class ImapMailboxIsoSelectRow(NamedTuple):
     typ: str | None
     detail: str | None
     ok_selected: bool
+    send_text: str | None = None
+    recv_text: str | None = None
 
 
 class ImapMailboxIsoListSurveyRow(NamedTuple):
@@ -371,6 +406,23 @@ class ImapMailboxIsoListSurveyRow(NamedTuple):
     detail: str | None
     listed_count: int
     sample_mailboxes: tuple[str, ...]
+    send_text: str | None = None
+    recv_text: str | None = None
+
+
+class ImapMailboxIsoAclRow(NamedTuple):
+    """GETACL on one mailbox (own INBOX or a LIST-discovered folder)."""
+
+    mailbox: str
+    typ: str | None
+    anyone_rights: str | None
+    anonymous_rights: str | None
+    authenticated_rights: str | None
+    overbroad_world: bool
+    user_like_ids: tuple[str, ...]
+    raw: str | None
+    send_text: str | None = None
+    recv_text: str | None = None
 
 
 class ImapMailboxIsoResult(NamedTuple):
@@ -405,6 +457,17 @@ class ImapMailboxIsoResult(NamedTuple):
     foreign_examine_ok: bool
     vulnerable: bool
     detail: str
+    acl_folder_probes: tuple[ImapMailboxIsoAclRow, ...] = ()
+    acl_enumerated_users: tuple[str, ...] = ()
+    getacl_command_ok: bool = False
+    login_send: str | None = None
+    login_recv: str | None = None
+    select_own_send: str | None = None
+    select_own_recv: str | None = None
+    namespace_send: str | None = None
+    namespace_recv: str | None = None
+    list_root_send: str | None = None
+    list_root_recv: str | None = None
 
 
 class ImapTlsCipherOffer(NamedTuple):

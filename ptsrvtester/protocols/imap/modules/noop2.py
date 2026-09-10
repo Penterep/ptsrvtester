@@ -113,8 +113,9 @@ def run(ctx):
         result_preauth = None
 
     if result_preauth and not result_preauth.error_message:
-        _emit_noop2_result(ctx, result_preauth)
-        _maybe_add_conn_limit_vuln(ctx, result_preauth, VULNS.NoopConnCountPreauth.value, "pre-auth")
+        if result_preauth.connections_established > 0:
+            _emit_noop2_result(ctx, result_preauth)
+            _maybe_add_conn_limit_vuln(ctx, result_preauth, VULNS.NoopConnCountPreauth.value, "pre-auth")
     elif result_preauth:
         ctx.out(f"Test error: {result_preauth.error_message}", "ERROR", indent=4)
 
@@ -128,8 +129,9 @@ def run(ctx):
             result_postauth = None
 
         if result_postauth and not result_postauth.error_message:
-            _emit_noop2_result(ctx, result_postauth)
-            _maybe_add_conn_limit_vuln(ctx, result_postauth, VULNS.NoopConnCountPostauth.value, "post-auth")
+            if result_postauth.connections_established > 0:
+                _emit_noop2_result(ctx, result_postauth)
+                _maybe_add_conn_limit_vuln(ctx, result_postauth, VULNS.NoopConnCountPostauth.value, "post-auth")
         elif result_postauth:
             ctx.out(f"Test error: {result_postauth.error_message}", "ERROR", indent=4)
     else:

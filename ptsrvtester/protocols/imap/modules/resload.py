@@ -1,4 +1,4 @@
-"""RESLOAD — APPEND + SEARCH resource-load stress."""
+"""RESLOAD — APPEND + SEARCH resource-limit check."""
 from ._common import eng
 
 __MODULELABEL__ = "Resource load"

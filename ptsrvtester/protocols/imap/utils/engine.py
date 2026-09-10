@@ -82,17 +82,20 @@ from .results import (  # noqa: F401 — star import skips leading-underscore na
     _imap_conn_duration_display,
     _EICAR_STANDARD_LINE,
     _IMAP_CONNECT_TIMEOUT_SEC,
-    _IMAP_LOAD_DISCONNECT_EARLY_MAX,
-    _IMAP_LOAD_ERR_OK_MAX_PCT,
+    _IMAP_LOAD_LIMIT_CODES,
     _IMAP_LOAD_PER_CMD_TIMEOUT_SEC,
     _IMAP_LOAD_PROGRESS_APPEND_INTERVAL,
     _IMAP_LOAD_SEARCH_INTERVAL,
-    _IMAP_LOAD_SLOWDOWN_ABS_SEC,
+    _IMAP_LOAD_SLOWDOWN_MIN_DELTA_SEC,
     _IMAP_LOAD_SLOWDOWN_RATIO,
+    _IMAP_LOAD_SUBJECT_PREFIX,
     _IMAP_MBOX_ISO_CMD_TIMEOUT_SEC,
     _IMAP_MBOX_ISO_DICT_PROGRESS_EVERY,
     _IMAP_MBOX_ISO_ENUM_MIN_NONZERO_PATTERNS,
     _IMAP_MBOX_ISO_ENUM_MIN_TOTAL_LISTED,
+    _IMAP_MBOX_ISO_GETACL_MAX,
+    _IMAP_ACL_WORLD_IDS,
+    _IMAP_ACL_SKIP_IDS,
     _IMAP_MBOX_ISO_LIST_DICTIONARY_PATTERNS,
     _IMAP_MBOX_ISO_LIST_ROOT_MAX_PARSE,
     _IMAP_MBOX_ISO_LIST_SAMPLE,
@@ -110,6 +113,9 @@ from .results import (  # noqa: F401 — star import skips leading-underscore na
     _LONG_COMMAND_BODY_LEN,
     _SNIFFABLE_AUTH_PROBE_PRIORITY,
 )
+
+_INVCOMM_WARN_CATEGORIES = frozenset({"login_notag", "long_login", "long_login_nopass"})
+_INVCOMM_LABEL_WIDTH = 37
 
 
 class Out:
@@ -214,6 +220,16 @@ class ImapEngine:
             self.debug(msg, indent=indent)
         except TypeError:
             self.debug(msg)
+
+    def _imap_vv_io(self, send: str | None, recv: str | None) -> None:
+        """INVCMD-style Send/Receive immediately above the next verdict line."""
+        if self.use_json or not getattr(self.args, "debug", False):
+            return
+        if not send:
+            return
+        self._dbg(f"Send: {send}")
+        self._dbg(f"Receive: {recv if recv not in (None, '') else '(no reply)'}")
+        self._flush_terminal()
 
     def _dbg_capa_list(self, title: str, capa: list[str] | None, *, indent: int = 4) -> None:
         self._dbg(title, indent=indent)
@@ -1207,7 +1223,7 @@ class ImapEngine:
                     pass
         except Exception as e:
             self._dbg(f"Catch-all: connect failed: {e}")
-            return "not_configured"
+            return "unreachable"
 
     def _do_info(
         self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL, get_commands: bool = True
@@ -2211,7 +2227,20 @@ class ImapEngine:
         except Exception as e:
             msg = _imap_login_exception_text(e)
             self._dbg(f"{'LOGIN' if not login_ok else 'SELECT INBOX'} → {self._snip(msg)}")
-            if not login_ok and self._sniff_cleartext_auth_disallowed(msg):
+            low = msg.lower()
+            connect_fail = (
+                not login_ok
+                and (
+                    "timed out" in low
+                    or "timeout" in low
+                    or "could not connect" in low
+                    or "connection refused" in low
+                    or "network is unreachable" in low
+                )
+            )
+            if connect_fail:
+                term = f"{msg.rstrip('.')}. Cleartext sniff was not tested."
+            elif not login_ok and self._sniff_cleartext_auth_disallowed(msg):
                 term = "Not sniffable"
             elif not login_ok:
                 term = "LOGIN failed"
@@ -2343,6 +2372,7 @@ class ImapEngine:
         category: str,
         wire: bytes,
         display: str,
+        send_text: str,
         slow_threshold: float,
     ) -> InvCommImapCase:
         expect_tag = self._imap_inv_extract_tag(wire)
@@ -2376,10 +2406,12 @@ class ImapEngine:
         finally:
             elapsed = time.perf_counter() - t_start
             slow = category.startswith("long_") and elapsed > slow_threshold
-            leak = self._imap_inv_info_leak(lines)
+            leak = False if category == "login_notag" else self._imap_inv_info_leak(lines)
             snippet = self._imap_inv_reply_snippet(lines)
             pv = False
             if connect_failed:
+                pv = False
+            elif outcome == "bye" and category.startswith("long_"):
                 pv = False
             elif outcome in ("timeout", "disconnect", "bye"):
                 pv = True
@@ -2402,13 +2434,10 @@ class ImapEngine:
                         imap.shutdown()
                     except Exception:
                         pass
-        self._dbg(
-            f"INVCMD {display} → {outcome}"
-            + (f" {self._snip(snippet)}" if snippet else "")
-        )
         return InvCommImapCase(
             category=category,
             command_display=display,
+            send_text=send_text,
             outcome=outcome,
             reply_snippet=snippet,
             response_time_sec=elapsed,
@@ -2423,41 +2452,62 @@ class ImapEngine:
         Invalid / non-standard IMAP command resilience (PTV-SVC-IMAP-INVCOMM).
         RFC 3501: unknown or malformed client commands should yield tagged BAD/NO and stable sessions.
         """
-        self._dbg("Invalid command probes")
         baseline = self._imap_inv_baseline_capability_latency()
         slow_th = max(_INVCOMM_SLOW_BASE_SEC, (baseline or 0) + _INVCOMM_SLOW_EXTRA_SEC)
         long_a = b"A" * _LONG_COMMAND_BODY_LEN
         long_b = b"B" * _LONG_COMMAND_BODY_LEN
-        probes: list[tuple[str, bytes, str]] = [
-            ("invalid_cmd", b"A1 HELLO\r\n", "A1 HELLO"),
-            ("invalid_cmd", b"A2 LOGIN\r\n", "A2 LOGIN (no args)"),
-            ("invalid_cmd", b"A3 SELECTT INBOX\r\n", "A3 SELECTT INBOX"),
-            ("invalid_cmd", b"A4 FETCHX 1 BODY[]\r\n", "A4 FETCHX 1 BODY[]"),
-            ("invalid_cmd", b"A5 FOO BAR\r\n", "A5 FOO BAR"),
-            ("bad_tag", b"LOGIN user pass\r\n", "LOGIN user pass (no tag)"),
-            ("bad_tag", b"A6 A7 SELECT INBOX\r\n", "A6 A7 SELECT INBOX"),
-            ("incomplete", b"A8 SELECT\r\n", "A8 SELECT (incomplete)"),
+        probes: list[tuple[str, bytes, str, str]] = [
+            ("invalid_cmd", b"A1 HELLO\r\n", "Non-existing command", "A1 HELLO"),
+            ("invalid_cmd", b"A2 LOGIN\r\n", "LOGIN without arguments", "A2 LOGIN"),
+            ("invalid_cmd", b"A3 SELECTT INBOX\r\n", "SELECTT INBOX", "A3 SELECTT INBOX"),
+            ("invalid_cmd", b"A4 FETCHX 1 BODY[]\r\n", "FETCHX 1 BODY[]", "A4 FETCHX 1 BODY[]"),
+            ("login_notag", b"LOGIN user pass\r\n", "LOGIN without tag", "LOGIN user pass"),
+            ("invalid_cmd", b"A6 A7 SELECT INBOX\r\n", "Double tagged command", "A6 A7 SELECT INBOX"),
+            ("incomplete", b"A8 SELECT\r\n", "Incomplete SELECT", "A8 SELECT"),
             (
                 "long_login",
                 b"A9 LOGIN " + long_a + b" pass\r\n",
+                "Very long LOGIN with password",
                 f"A9 LOGIN (A×{_LONG_COMMAND_BODY_LEN}) pass",
             ),
-            ("long_select", b"A10 SELECT " + long_b + b"\r\n", f"A10 SELECT (B×{_LONG_COMMAND_BODY_LEN})"),
-            ("binary_null", b"A11 LOGIN test\x00user pass\r\n", "A11 LOGIN (NUL)"),
-            ("binary_high", b"A12 FETCH 1 BODY[\xff]\r\n", "A12 FETCH (0xFF)"),
+            (
+                "long_login_nopass",
+                b"A10 LOGIN " + long_b + b"\r\n",
+                "Very long LOGIN without password",
+                f"A10 LOGIN (B×{_LONG_COMMAND_BODY_LEN})",
+            ),
+            ("binary_null", b"A11 LOGIN test\x00user pass\r\n", "LOGIN with NUL argument", r"A11 LOGIN test\x00user pass"),
+            (
+                "binary_high",
+                b"A12 FETCH 1 BODY[\xff]\r\n",
+                "Invalid 8bit character in argument",
+                r"A12 FETCH 1 BODY[\xff]",
+            ),
         ]
-        cases = tuple(self._imap_inv_run_one_probe(c, w, d, slow_th) for c, w, d in probes)
-        if cases and all(t.outcome == "connect_error" for t in cases):
+        cases: list[InvCommImapCase] = []
+        self._inv_comm_terminal_emitted = False
+        for c, w, d, s in probes:
+            t = self._imap_inv_run_one_probe(c, w, d, s, slow_th)
+            cases.append(t)
+            if t.outcome == "connect_error":
+                break
+            if not self.use_json:
+                self._inv_comm_emit_one(t)
+                self._inv_comm_terminal_emitted = True
+                self._flush_terminal()
+        cases_t = tuple(cases)
+        if cases_t and all(t.outcome == "connect_error" for t in cases_t):
+            err = (cases_t[0].reply_snippet or "Could not connect to the server").rstrip(".")
             return InvCommImapResult(
-                tests=cases,
+                tests=cases_t,
                 vulnerable=False,
                 weakness=False,
-                detail="Could not establish IMAP session for probes (target, port, firewall).",
+                detail=f"{err}. Invalid commands were not tested.",
                 baseline_latency_sec=baseline,
             )
-        vulnerable = any(t.probe_vulnerable for t in cases)
-        weakness = any(t.slow_response or t.info_leak for t in cases)
-        bad = [t for t in cases if t.probe_vulnerable]
+        vulnerable = any(t.probe_vulnerable for t in cases_t)
+        weakness = any(t.slow_response or t.info_leak for t in cases_t)
+        bad = [t for t in cases_t if t.probe_vulnerable]
         if bad:
             detail = (
                 "Failing probes (unstable session / unexpected OK / timeout / disconnect): "
@@ -2470,7 +2520,7 @@ class ImapEngine:
         else:
             detail = "Probes completed without indicators of critical parsing or session weakness."
         return InvCommImapResult(
-            tests=cases,
+            tests=cases_t,
             vulnerable=vulnerable,
             weakness=weakness,
             detail=detail,
@@ -2553,13 +2603,14 @@ class ImapEngine:
             self._dbg(f"AUTHENTICATE ANONYMOUS failed: {self._snip(str(e))}")
             return False
 
-    def _try_login_pair(self, user: str, password: str) -> bool:
+    def _try_login_pair(self, user: str, password: str) -> bool | None:
+        """True = LOGIN OK, False = server rejected, None = could not connect."""
         disp = password if password else "<empty>"
         try:
             imap = self.connect()
         except Exception as e:
             self._dbg(f"LOGIN {user!r}: connect failed: {e}")
-            return False
+            return None
         try:
             try:
                 self._dbg(f"LOGIN {user!r} / {disp}")
@@ -2640,15 +2691,20 @@ class ImapEngine:
         authenticate_anonymous_ok = False
         login_anonymous_empty_ok = False
         weak_hits: list[str] = []
+        auth_probed = False
+        login_probed = False
+        connect_error: str | None = None
 
         imap_cap: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
         try:
             imap_cap = self.connect()
+            auth_probed = True
             banner, merged = self._merged_preauth_capabilities(imap_cap)
             auth_anonymous_advertised = self._capability_advertises_auth_anonymous(merged, banner)
             self._dbg(f"AUTH=ANONYMOUS advertised={auth_anonymous_advertised}")
             authenticate_anonymous_ok = self._try_authenticate_anonymous(imap_cap)
         except Exception as e:
+            connect_error = str(e)
             self._dbg(f"Anonymous AUTHENTICATE probe failed: {self._snip(str(e))}")
         finally:
             if imap_cap is not None:
@@ -2660,6 +2716,19 @@ class ImapEngine:
                     except Exception:
                         pass
 
+        if not auth_probed:
+            err = (connect_error or "Could not connect to the server").rstrip(".")
+            return AnonymousAccessResult(
+                auth_anonymous_advertised=False,
+                authenticate_anonymous_ok=False,
+                login_anonymous_empty_ok=False,
+                weak_credentials_ok=(),
+                vulnerable=False,
+                detail=f"{err}. Anonymous access was not tested.",
+                auth_probed=False,
+                login_probed=False,
+            )
+
         login_probes: list[tuple[str, str, str]] = [
             ("anonymous", "", "LOGIN anonymous / empty password"),
             ("anonymous", "anonymous", "LOGIN anonymous / anonymous"),
@@ -2669,11 +2738,16 @@ class ImapEngine:
             ("public", "public", "LOGIN public / public"),
         ]
         for user, password, _label in login_probes:
-            if self._try_login_pair(user, password):
-                if user == "anonymous" and password == "":
-                    login_anonymous_empty_ok = True
-                else:
-                    weak_hits.append(f"{user} / {password if password else '<empty>'}")
+            hit = self._try_login_pair(user, password)
+            if hit is None:
+                continue
+            login_probed = True
+            if not hit:
+                continue
+            if user == "anonymous" and password == "":
+                login_anonymous_empty_ok = True
+            else:
+                weak_hits.append(f"{user} / {password if password else '<empty>'}")
 
         vulnerable = bool(
             authenticate_anonymous_ok or login_anonymous_empty_ok or weak_hits
@@ -2705,6 +2779,8 @@ class ImapEngine:
             weak_credentials_ok=tuple(weak_hits),
             vulnerable=vulnerable,
             detail=detail,
+            auth_probed=auth_probed,
+            login_probed=login_probed,
         )
 
     @staticmethod
@@ -3099,7 +3175,7 @@ class ImapEngine:
         lines = [
             "From: ptsrvtester <ptsrv@invalid>",
             "To: ptsrvtester <ptsrv@invalid>",
-            f"Subject: ptsrv-resload-{seq}",
+            f"Subject: {_IMAP_LOAD_SUBJECT_PREFIX}{seq}",
             "MIME-Version: 1.0",
             "Content-Type: text/plain; charset=us-ascii",
             "",
@@ -3108,15 +3184,199 @@ class ImapEngine:
         return "\r\n".join(lines).encode("ascii", errors="replace")
 
     @staticmethod
+    def _imap_load_limit_code(typ: str | None, dat, exc: BaseException | None = None) -> str | None:
+        """RFC 9208 / 5530 / 9738 response codes that mean a resource limit was applied."""
+        parts: list[str] = []
+        if typ:
+            parts.append(str(typ))
+        if dat:
+            if isinstance(dat, (bytes, bytearray)):
+                parts.append(dat.decode(errors="replace"))
+            elif isinstance(dat, str):
+                parts.append(dat)
+            else:
+                try:
+                    for item in dat:
+                        if isinstance(item, (bytes, bytearray)):
+                            parts.append(item.decode(errors="replace"))
+                        elif item is not None:
+                            parts.append(str(item))
+                except TypeError:
+                    parts.append(str(dat))
+        if exc is not None:
+            parts.append(str(exc))
+        blob = " ".join(parts).upper()
+        for code in _IMAP_LOAD_LIMIT_CODES:
+            if f"[{code}]" in blob or f"[{code} " in blob:
+                return code
+        return None
+
+    @staticmethod
+    def _imap_load_parse_uids(dat) -> list[str]:
+        if not dat:
+            return []
+        chunks: list[str] = []
+        for item in dat:
+            if isinstance(item, (bytes, bytearray)):
+                chunks.append(item.decode(errors="replace"))
+            elif item:
+                chunks.append(str(item))
+        return [t for t in " ".join(chunks).split() if t.isdigit()]
+
+    def _imap_load_fmt_reply(self, typ, dat, *, limit: int = 240) -> str:
+        """Tagged IMAP status plus payload, one line (what imaplib returned)."""
+        parts: list[str] = []
+        if typ:
+            parts.append(str(typ))
+        if dat:
+            if isinstance(dat, (bytes, bytearray)):
+                parts.append(dat.decode(errors="replace"))
+            elif isinstance(dat, str):
+                parts.append(dat)
+            else:
+                try:
+                    for item in dat:
+                        if item is None:
+                            continue
+                        if isinstance(item, (bytes, bytearray)):
+                            parts.append(item.decode(errors="replace"))
+                        else:
+                            parts.append(str(item))
+                except TypeError:
+                    parts.append(str(dat))
+        blob = " ".join(p.replace("\r", " ").replace("\n", " ").strip() for p in parts if p).strip()
+        return self._snip(blob, limit) if blob else "(no reply)"
+
+    def _imap_resource_load_skip(
+        self,
+        *,
+        mailbox: str,
+        append_max: int,
+        search_max: int,
+        reason: str,
+        detail: str,
+    ) -> ImapResourceLoadResult:
+        return ImapResourceLoadResult(
+            skipped=True,
+            skip_reason=reason,
+            mailbox=mailbox,
+            append_max_requested=append_max,
+            search_max_requested=search_max,
+            append=None,
+            search=None,
+            search_skipped_reason=None,
+            quota_advertised=False,
+            quota_root_detail=None,
+            cleanup_deleted=None,
+            cleanup_detail=None,
+            vulnerable=False,
+            detail=detail,
+        )
+
+    def _imap_resource_load_quota_probe(
+        self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL, mailbox: str
+    ) -> tuple[bool, str | None, tuple[tuple[str, str], ...]]:
+        traces: list[tuple[str, str]] = []
+        try:
+            typ, dat = imap.capability()
+            traces.append(("CAPABILITY", self._imap_load_fmt_reply(typ, dat or getattr(imap, "capabilities", None))))
+        except Exception as e:
+            traces.append(("CAPABILITY", self._snip(str(e))))
+        banner, merged = self._merged_preauth_capabilities(imap)
+        advertised = False
+        for c in merged:
+            u = str(c).upper()
+            if u == "QUOTA" or u.startswith("QUOTA="):
+                advertised = True
+                break
+        if not advertised and banner and "QUOTA" in banner.upper():
+            advertised = True
+        if not advertised:
+            return False, None, tuple(traces)
+        bits: list[str] = []
+        try:
+            typ, dat = imap.getquotaroot(mailbox)
+            reply = self._imap_load_fmt_reply(typ, dat)
+            traces.append((f"GETQUOTAROOT {mailbox}", reply))
+            bits.append(f"GETQUOTAROOT {reply}".strip())
+        except Exception as e:
+            err = self._snip(str(e))
+            traces.append((f"GETQUOTAROOT {mailbox}", err))
+            return True, f"advertised, GETQUOTAROOT failed: {err}", tuple(traces)
+        roots: list[str] = []
+        if dat:
+            try:
+                for item in dat:
+                    text = item.decode(errors="replace") if isinstance(item, (bytes, bytearray)) else str(item)
+                    toks = [t.strip('"') for t in text.split() if t and t != mailbox]
+                    for t in toks:
+                        if t.startswith("("):
+                            break
+                        if t and t not in roots:
+                            roots.append(t)
+            except TypeError:
+                pass
+        if not roots:
+            roots = [""]
+        for root in roots[:3]:
+            shown = root if root else '""'
+            try:
+                t2, d2 = imap.getquota(root)
+                reply = self._imap_load_fmt_reply(t2, d2)
+                traces.append((f"GETQUOTA {shown}", reply))
+                bits.append(f"GETQUOTA {root!r} → {reply}")
+            except Exception as e:
+                err = self._snip(str(e))
+                traces.append((f"GETQUOTA {shown}", err))
+                bits.append(f"GETQUOTA {root!r} failed: {err}")
+                break
+        return True, "; ".join(bits), tuple(traces)
+
+    def _imap_resource_load_cleanup(
+        self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL, mailbox: str
+    ) -> tuple[int | None, str | None, tuple[str, str] | None]:
+        """Delete messages this probe APPENDed (Subject ptsrv-resload-*). Best effort."""
+        subj = _IMAP_LOAD_SUBJECT_PREFIX.rstrip("-")
+        io_cleanup: tuple[str, str] | None = None
+        try:
+            send = f"UID SEARCH HEADER Subject {subj}"
+            typ, dat = imap.uid("SEARCH", "HEADER", "Subject", subj)
+            recv = self._imap_load_fmt_reply(typ, dat)
+            io_cleanup = (send, recv)
+            if str(typ).upper() != "OK":
+                return 0, f"UID SEARCH for cleanup → {typ}", io_cleanup
+            uids = self._imap_load_parse_uids(dat)
+            if not uids:
+                return 0, None, io_cleanup
+            for i in range(0, len(uids), 80):
+                chunk = ",".join(uids[i:i + 80])
+                send = f"UID STORE {chunk} +FLAGS.SILENT (\\Deleted)"
+                typ, dat = imap.uid("STORE", chunk, "+FLAGS.SILENT", r"(\Deleted)")
+                io_cleanup = (send, self._imap_load_fmt_reply(typ, dat))
+            send = "EXPUNGE"
+            typ, dat = imap.expunge()
+            io_cleanup = (send, self._imap_load_fmt_reply(typ, dat))
+            return len(uids), None, io_cleanup
+        except Exception as e:
+            msg = self._snip(str(e))
+            if io_cleanup is None:
+                io_cleanup = ("UID SEARCH HEADER Subject ptsrv-resload", msg)
+            return 0, msg, io_cleanup
+
+    @staticmethod
     def _imap_resource_load_finish_phase(
         label: str,
         attempted: int,
         ok: int,
         failed: int,
+        limited: int,
         rtts: list[float],
         disconnected: bool,
         disconnect_after: int | None,
         hit_cap: bool,
+        limit_enforced: bool,
+        limit_code: str | None,
+        limit_after: int | None,
     ) -> ImapResourceLoadPhase:
         window = 10
         baseline = (sum(rtts[:window]) / min(len(rtts), window)) if rtts else None
@@ -3124,8 +3384,8 @@ class ImapEngine:
         last_w = (sum(last_rtts) / len(last_rtts)) if last_rtts else None
         slowdown = False
         if baseline is not None and last_w is not None and len(rtts) >= window * 2:
-            slowdown = (last_w >= baseline * _IMAP_LOAD_SLOWDOWN_RATIO) or (
-                last_w >= _IMAP_LOAD_SLOWDOWN_ABS_SEC
+            slowdown = (last_w >= baseline * _IMAP_LOAD_SLOWDOWN_RATIO) and (
+                (last_w - baseline) >= _IMAP_LOAD_SLOWDOWN_MIN_DELTA_SEC
             )
         err_pct = (100.0 * failed / attempted) if attempted else 0.0
         min_rt = min(rtts) if rtts else None
@@ -3136,9 +3396,13 @@ class ImapEngine:
             attempted=attempted,
             ok=ok,
             failed=failed,
+            limited=limited,
             disconnected=disconnected,
             disconnect_after=disconnect_after,
             hit_cap=hit_cap,
+            limit_enforced=limit_enforced,
+            limit_code=limit_code,
+            limit_after=limit_after,
             min_rt_seconds=min_rt,
             max_rt_seconds=max_rt,
             avg_rt_seconds=avg_rt,
@@ -3150,8 +3414,9 @@ class ImapEngine:
 
     def test_imap_resource_load(self) -> ImapResourceLoadResult:
         """
-        Bounded authenticated APPEND burst + UID SEARCH ALL loop (PTV-SVC-IMAP-RESLOAD).
-        Heuristic similar to SMTP NOOP flood: disconnect early, high error rate, or RT slowdown → weak limits.
+        Bounded authenticated APPEND burst + UID SEARCH ALL (PTV-SVC-IMAP-RESLOAD).
+        Completing the safety cap with OK = missing limit; RFC 9208 OVERQUOTA = quota works;
+        TCP drop = instability. Slowdown is a warning only.
         """
         mb = (getattr(self.args, "imap_resource_load_mailbox", None) or "INBOX").strip() or "INBOX"
         pair = self._imap_single_known_login()
@@ -3159,42 +3424,52 @@ class ImapEngine:
         search_max = int(getattr(self.args, "imap_resource_load_search_max", 0) or 0)
         if not pair:
             self._dbg("Resource load skipped: requires single -u and -p (no wordlists)")
-            return ImapResourceLoadResult(
-                skipped=True,
-                skip_reason="requires single -u and -p (no wordlists)",
+            return self._imap_resource_load_skip(
                 mailbox=mb,
-                append_max_requested=append_max,
-                search_max_requested=search_max,
-                append=None,
-                search=None,
-                search_skipped_reason=None,
-                vulnerable=False,
+                append_max=append_max,
+                search_max=search_max,
+                reason="requires single -u and -p (no wordlists)",
                 detail="Skipped: single known credentials required.",
             )
         user, password = pair
-        self._dbg(
-            f"Resource load test — mailbox {mb!r}, APPEND max={append_max}, SEARCH max={search_max}"
-        )
         _show = not self.use_json
         _lock = threading.Lock()
+        self._imap_resload_live = False
 
         def _live(text: str) -> None:
             if not _show:
                 return
+            line = get_colored_text(f"    {text}", "ADDITIONS")
             with _lock:
-                sys.stdout.write(f"\r    {text:<110}")
+                sys.stdout.write(f"\033[2K\r{line}")
                 sys.stdout.flush()
 
         def _live_done() -> None:
             if not _show:
                 return
             with _lock:
-                sys.stdout.write("\r" + " " * 120 + "\r")
+                sys.stdout.write("\033[2K\r")
                 sys.stdout.flush()
+
+        io_rl: dict[str, tuple[str, str]] = {}
+
+        def _io(send: str, recv: str, key: str | None = None) -> tuple[str, str]:
+            _live_done()
+            pair = (send, recv)
+            if key:
+                io_rl[key] = pair
+            return pair
 
         def _login_session() -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
             cl = self.connect()
-            cl.login(user, password)
+            pw = '"' + password.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            send = f"LOGIN {user} {pw}"
+            try:
+                typ, dat = cl.login(user, password)
+                _io(send, self._imap_load_fmt_reply(typ, dat), "login")
+            except imaplib.IMAP4.error as e:
+                _io(send, self._snip(str(e)), "login")
+                raise
             sock = getattr(cl, "sock", None)
             if sock is not None:
                 try:
@@ -3203,70 +3478,126 @@ class ImapEngine:
                     pass
             return cl
 
+        def _classify(send_fn) -> tuple[str, float, str | None, str]:
+            t0 = time.perf_counter()
+            try:
+                typ, dat = send_fn()
+                rt = time.perf_counter() - t0
+                reply = self._imap_load_fmt_reply(typ, dat)
+                code = self._imap_load_limit_code(str(typ), dat)
+                if code:
+                    return "limit", rt, code, reply
+                if str(typ).upper() == "OK":
+                    return "ok", rt, None, reply
+                return "fail", rt, None, reply
+            except imaplib.IMAP4.abort as e:
+                return "disc", time.perf_counter() - t0, None, self._snip(str(e)) or "(connection dropped)"
+            except imaplib.IMAP4.error as e:
+                rt = time.perf_counter() - t0
+                reply = self._snip(str(e))
+                code = self._imap_load_limit_code(None, None, e)
+                if code:
+                    return "limit", rt, code, reply
+                return "fail", rt, None, reply
+            except Exception as e:
+                return "disc", time.perf_counter() - t0, None, self._snip(str(e)) or "(connection dropped)"
+
         append_phase: ImapResourceLoadPhase | None = None
         search_phase: ImapResourceLoadPhase | None = None
         search_skip: str | None = None
+        quota_advertised = False
+        quota_root_detail: str | None = None
+        io_quota: tuple[tuple[str, str], ...] = ()
+        cleanup_deleted: int | None = None
+        cleanup_detail: str | None = None
         imap: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
 
         try:
             imap = _login_session()
-            self._dbg(f"LOGIN {user!r} → OK")
             try:
-                imap.select(mb)
-                self._dbg(f"SELECT {mb!r} → OK")
+                typ, dat = imap.select(mb)
+                _io(f"SELECT {mb}", self._imap_load_fmt_reply(typ, dat), "select")
             except Exception as e:
-                self._dbg(f"SELECT {mb!r} failed: {self._snip(str(e))}")
-                return ImapResourceLoadResult(
-                    skipped=True,
-                    skip_reason=str(e),
+                _io(f"SELECT {mb}", self._snip(str(e)), "select")
+                return self._imap_resource_load_skip(
                     mailbox=mb,
-                    append_max_requested=append_max,
-                    search_max_requested=search_max,
-                    append=None,
-                    search=None,
-                    search_skipped_reason=None,
-                    vulnerable=False,
+                    append_max=append_max,
+                    search_max=search_max,
+                    reason=str(e),
                     detail=f"SELECT/EXAMINE {mb!r} failed: {e}",
                 )
+            if str(typ).upper() != "OK":
+                reply = self._imap_load_fmt_reply(typ, dat)
+                return self._imap_resource_load_skip(
+                    mailbox=mb,
+                    append_max=append_max,
+                    search_max=search_max,
+                    reason=reply,
+                    detail=f"SELECT {mb!r} → {reply}",
+                )
 
-            a_ok = a_fail = 0
+            quota_advertised, quota_root_detail, io_quota = self._imap_resource_load_quota_probe(imap, mb)
+            with self._output_lock:
+                self._imap_resource_load_emit_setup(
+                    io_login=io_rl.get("login"),
+                    io_select=io_rl.get("select"),
+                    io_capability=io_rl.get("capability"),
+                    io_quota=io_quota,
+                    quota_advertised=quota_advertised,
+                    quota_root_detail=quota_root_detail,
+                )
+            self._imap_resload_live = True
+
+            a_ok = a_fail = a_lim = 0
             a_disc = False
             a_disc_after: int | None = None
+            a_limit_code: str | None = None
+            a_limit_after: int | None = None
             a_rtts: list[float] = []
             for i in range(append_max):
-                t0 = time.perf_counter()
-                try:
-                    typ, _dat = imap.append(mb, None, None, self._imap_load_small_rfc822(i))
-                    rt = time.perf_counter() - t0
-                    if typ == "OK":
-                        a_ok += 1
-                        a_rtts.append(rt)
-                    else:
-                        a_fail += 1
-                except Exception:
+                body = self._imap_load_small_rfc822(i)
+                send = f"APPEND {mb} {{{len(body)}}}"
+                kind, rt, code, reply = _classify(lambda b=body: imap.append(mb, None, None, b))
+                n = i + 1
+                if i == 0 or kind != "ok":
+                    _io(send, reply, "append")
+                if kind == "ok":
+                    a_ok += 1
+                    a_rtts.append(rt)
+                elif kind == "limit":
+                    a_lim += 1
+                    a_limit_code = code
+                    a_limit_after = n
+                    break
+                elif kind == "fail":
+                    a_fail += 1
+                    break
+                else:
                     a_fail += 1
                     a_disc = True
-                    a_disc_after = i + 1
+                    a_disc_after = n
                     break
-                if _show and (a_ok + a_fail) % _IMAP_LOAD_PROGRESS_APPEND_INTERVAL == 0:
-                    _live(f"APPEND {a_ok + a_fail}/{append_max} ok={a_ok} err={a_fail}")
-            a_attempted = a_ok + a_fail
-            a_hit_cap = a_attempted >= append_max and not a_disc
+                if _show and (a_ok + a_fail + a_lim) % _IMAP_LOAD_PROGRESS_APPEND_INTERVAL == 0:
+                    _live(f"APPEND {a_ok + a_fail + a_lim}/{append_max} ok={a_ok} err={a_fail} limit={a_lim}")
+            a_attempted = a_ok + a_fail + a_lim
+            a_hit_cap = a_attempted >= append_max and not a_disc and a_lim == 0 and a_fail == 0
             append_phase = self._imap_resource_load_finish_phase(
                 "APPEND",
                 a_attempted,
                 a_ok,
                 a_fail,
+                a_lim,
                 a_rtts,
                 a_disc,
                 a_disc_after,
                 a_hit_cap,
-            )
-            self._dbg(
-                f"APPEND phase: attempted={a_attempted} ok={a_ok} failed={a_fail} "
-                f"disconnected={a_disc}"
+                a_lim > 0,
+                a_limit_code,
+                a_limit_after,
             )
             _live_done()
+            with self._output_lock:
+                self._imap_resource_load_emit_phase(append_phase, append_max, io_rl.get("append"))
 
             if search_max > 0:
                 if a_disc:
@@ -3280,53 +3611,74 @@ class ImapEngine:
                     imap = None
                     try:
                         imap = _login_session()
-                        imap.select(mb)
+                        typ, dat = imap.select(mb)
+                        _io(f"SELECT {mb}", self._imap_load_fmt_reply(typ, dat))
+                        if str(typ).upper() != "OK":
+                            search_skip = f"SELECT {mb!r} after reconnect → {self._imap_load_fmt_reply(typ, dat)}"
                     except Exception as e:
                         search_skip = f"reconnect after APPEND disconnect failed: {e}"
-                    else:
-                        search_skip = None
-                s_ok = s_fail = 0
+                s_ok = s_fail = s_lim = 0
                 s_disc = False
                 s_disc_after: int | None = None
+                s_limit_code: str | None = None
+                s_limit_after: int | None = None
                 s_rtts: list[float] = []
                 if imap is not None and search_skip is None:
                     for j in range(search_max):
-                        t0 = time.perf_counter()
-                        try:
-                            typ, _dat = imap.uid("SEARCH", None, "ALL")
-                            rt = time.perf_counter() - t0
-                            if typ == "OK":
-                                s_ok += 1
-                                s_rtts.append(rt)
-                            else:
-                                s_fail += 1
-                        except Exception:
+                        kind, rt, code, reply = _classify(lambda: imap.uid("SEARCH", "ALL"))
+                        n = j + 1
+                        if j == 0 or kind != "ok":
+                            _io("UID SEARCH ALL", reply, "search")
+                        if kind == "ok":
+                            s_ok += 1
+                            s_rtts.append(rt)
+                        elif kind == "limit":
+                            s_lim += 1
+                            s_limit_code = code
+                            s_limit_after = n
+                            break
+                        elif kind == "fail":
+                            s_fail += 1
+                            break
+                        else:
                             s_fail += 1
                             s_disc = True
-                            s_disc_after = j + 1
+                            s_disc_after = n
                             break
-                        if _show and (s_ok + s_fail) % _IMAP_LOAD_SEARCH_INTERVAL == 0:
-                            _live(f"UID SEARCH {s_ok + s_fail}/{search_max} ok={s_ok} err={s_fail}")
-                    s_attempted = s_ok + s_fail
-                    s_hit_cap = s_attempted >= search_max and not s_disc
+                        if _show and (s_ok + s_fail + s_lim) % _IMAP_LOAD_SEARCH_INTERVAL == 0:
+                            _live(
+                                f"UID SEARCH {s_ok + s_fail + s_lim}/{search_max} "
+                                f"ok={s_ok} err={s_fail} limit={s_lim}"
+                            )
+                    s_attempted = s_ok + s_fail + s_lim
+                    s_hit_cap = s_attempted >= search_max and not s_disc and s_lim == 0 and s_fail == 0
                     search_phase = self._imap_resource_load_finish_phase(
                         "SEARCH",
                         s_attempted,
                         s_ok,
                         s_fail,
+                        s_lim,
                         s_rtts,
                         s_disc,
                         s_disc_after,
                         s_hit_cap,
-                    )
-                    self._dbg(
-                        f"SEARCH phase: attempted={s_attempted} ok={s_ok} failed={s_fail} "
-                        f"disconnected={s_disc}"
+                        s_lim > 0,
+                        s_limit_code,
+                        s_limit_after,
                     )
                 _live_done()
+                if search_phase is not None:
+                    with self._output_lock:
+                        self._imap_resource_load_emit_phase(
+                            search_phase, search_max, io_rl.get("search")
+                        )
             else:
                 search_skip = "SEARCH phase disabled (--resource-load-search-max 0)"
-                self._dbg(search_skip)
+
+            if imap is not None:
+                cleanup_deleted, cleanup_detail, io_cleanup_pair = self._imap_resource_load_cleanup(imap, mb)
+                if io_cleanup_pair:
+                    io_rl["cleanup"] = io_cleanup_pair
 
         finally:
             _live_done()
@@ -3341,29 +3693,43 @@ class ImapEngine:
 
         reasons: list[str] = []
         if append_phase:
-            if append_phase.disconnected and append_phase.disconnect_after is not None:
-                if append_phase.disconnect_after <= _IMAP_LOAD_DISCONNECT_EARLY_MAX:
-                    reasons.append(
-                        f"connection dropped during APPEND after only {append_phase.disconnect_after} attempts"
-                    )
-            if append_phase.slowdown:
-                reasons.append("APPEND round-trip slowdown vs baseline (possible tarpit or overload)")
-            if append_phase.error_rate_pct > _IMAP_LOAD_ERR_OK_MAX_PCT:
-                reasons.append(f"high APPEND error/no-OK rate ({append_phase.error_rate_pct:.1f}%)")
+            if append_phase.disconnected:
+                n = append_phase.disconnect_after if append_phase.disconnect_after is not None else append_phase.attempted
+                reasons.append(f"connection dropped during APPEND after {n} attempt(s)")
+            elif append_phase.hit_cap and not append_phase.limit_enforced:
+                reasons.append(
+                    f"no APPEND resource limit ({append_phase.ok}/{append_max} accepted; "
+                    "RFC 9208 would NO [OVERQUOTA])"
+                )
         if search_phase:
-            if search_phase.disconnected and search_phase.disconnect_after is not None:
-                if search_phase.disconnect_after <= _IMAP_LOAD_DISCONNECT_EARLY_MAX:
-                    reasons.append(
-                        f"connection dropped during SEARCH after {search_phase.disconnect_after} commands"
-                    )
-            if search_phase.slowdown:
-                reasons.append("SEARCH round-trip slowdown vs baseline")
-            if search_phase.error_rate_pct > _IMAP_LOAD_ERR_OK_MAX_PCT:
-                reasons.append(f"high SEARCH error rate ({search_phase.error_rate_pct:.1f}%)")
+            if search_phase.disconnected:
+                n = search_phase.disconnect_after if search_phase.disconnect_after is not None else search_phase.attempted
+                reasons.append(f"connection dropped during SEARCH after {n} command(s)")
+            elif search_phase.hit_cap and not search_phase.limit_enforced:
+                reasons.append(
+                    f"no SEARCH command limit ({search_phase.ok}/{search_max} UID SEARCH ALL OK)"
+                )
         vuln = len(reasons) > 0
-        detail = "; ".join(reasons) if reasons else (
-            "Bounded APPEND/SEARCH completed without strong disconnect, slowdown, or error-rate signals."
-        )
+        if reasons:
+            detail = "; ".join(reasons)
+        elif (append_phase and append_phase.limit_enforced) or (search_phase and search_phase.limit_enforced):
+            codes = []
+            if append_phase and append_phase.limit_code:
+                codes.append(f"APPEND {append_phase.limit_code}")
+            if search_phase and search_phase.limit_code:
+                codes.append(f"SEARCH {search_phase.limit_code}")
+            detail = "Resource limit observed (" + ", ".join(codes) + ")."
+        else:
+            detail = "Resource-limit check completed without a missing-limit or drop finding."
+        if getattr(self, "_imap_resload_live", False):
+            with self._output_lock:
+                self._imap_resource_load_emit_tail(
+                    search_skipped_reason=search_skip,
+                    cleanup_detail=cleanup_detail,
+                    io_cleanup=io_rl.get("cleanup"),
+                    vulnerable=vuln,
+                    detail=detail,
+                )
         return ImapResourceLoadResult(
             skipped=False,
             skip_reason=None,
@@ -3373,8 +3739,19 @@ class ImapEngine:
             append=append_phase,
             search=search_phase,
             search_skipped_reason=search_skip,
+            quota_advertised=quota_advertised,
+            quota_root_detail=quota_root_detail,
+            cleanup_deleted=cleanup_deleted,
+            cleanup_detail=cleanup_detail,
             vulnerable=vuln,
             detail=detail,
+            io_login=io_rl.get("login"),
+            io_select=io_rl.get("select"),
+            io_capability=io_rl.get("capability"),
+            io_quota=io_quota,
+            io_append=io_rl.get("append"),
+            io_search=io_rl.get("search"),
+            io_cleanup=io_rl.get("cleanup"),
         )
 
     @staticmethod
@@ -3393,27 +3770,61 @@ class ImapEngine:
         return bool(set((rights or "").lower()) & set("rwetd"))
 
     @staticmethod
-    def _imap_parse_getacl_world(
-        typ: str | None, data
-    ) -> tuple[str | None, str | None, str | None, bool, str | None]:
-        """
-        Extract rights for anyone/anonymous/authenticated from GETACL payload.
-        Returns (anyone_rights, anonymous_rights, authenticated_rights, overbroad, raw_truncated).
-        """
-        if typ != "OK" or not data:
-            return None, None, None, False, None
-        blob = b"\n".join(x for x in data if isinstance(x, bytes))
-        text = blob.decode(errors="replace")
+    def _imap_acl_tokenize(text: str) -> list[str]:
+        out: list[str] = []
+        for quoted, bare in re.findall(r'"((?:\\.|[^"\\])*)"|(\S+)', text or ""):
+            if quoted:
+                out.append(quoted.replace("\\\\", "\\").replace('\\"', '"'))
+            elif bare:
+                out.append(bare)
+        return out
+
+    @staticmethod
+    def _imap_parse_getacl_entries(typ: str | None, data, mailbox: str) -> tuple[list[tuple[str, str]], str | None]:
+        """Return (identifier, rights) pairs from a GETACL payload."""
+        if not data:
+            return [], None
+        chunks: list[str] = []
+        if isinstance(data, (bytes, bytearray)):
+            chunks.append(data.decode(errors="replace"))
+        elif isinstance(data, str):
+            chunks.append(data)
+        else:
+            try:
+                for item in data:
+                    if isinstance(item, (bytes, bytearray)):
+                        chunks.append(item.decode(errors="replace"))
+                    elif item:
+                        chunks.append(str(item))
+            except TypeError:
+                chunks.append(str(data))
+        text = " ".join(chunks).strip()
         raw_trunc = text[:6000] if len(text) > 6000 else text
-        anyone_r: str | None = None
-        anon_r: str | None = None
-        auth_r: str | None = None
+        if (typ or "").upper() != "OK":
+            return [], raw_trunc
+        tokens = ImapEngine._imap_acl_tokenize(text)
+        mb = (mailbox or "").strip().strip('"')
+        if tokens and tokens[0].strip('"') == mb:
+            tokens = tokens[1:]
+        pairs: list[tuple[str, str]] = []
+        for i in range(0, len(tokens) - 1, 2):
+            pairs.append((tokens[i], tokens[i + 1]))
+        return pairs, raw_trunc
+
+    @staticmethod
+    def _imap_classify_acl_pairs(
+        pairs: list[tuple[str, str]], login: str
+    ) -> tuple[str | None, str | None, str | None, bool, tuple[str, ...]]:
+        anyone_r = anon_r = auth_r = None
         over = False
-        for ident, rights in re.findall(
-            r"\b(anyone|anonymous|guest|authenticated)\s+(\S+)", text, re.IGNORECASE
-        ):
-            il = ident.lower()
-            r_clean = rights.strip()
+        user_like: list[str] = []
+        seen: set[str] = set()
+        login_l = (login or "").strip().lower()
+        for ident, rights in pairs:
+            il = (ident or "").strip().strip('"').lower()
+            r_clean = (rights or "").strip().strip('"')
+            if not il:
+                continue
             sens = ImapEngine._imap_acl_rights_world_sensitive(r_clean)
             if il in ("anyone", "guest"):
                 anyone_r = r_clean if anyone_r is None else f"{anyone_r},{r_clean}"
@@ -3427,7 +3838,14 @@ class ImapEngine:
                 auth_r = r_clean if auth_r is None else f"{auth_r},{r_clean}"
                 if sens:
                     over = True
-        return anyone_r, anon_r, auth_r, over, raw_trunc
+            elif il == login_l or il in _IMAP_ACL_SKIP_IDS or il in _IMAP_ACL_WORLD_IDS:
+                continue
+            elif re.fullmatch(r"[lrswipkxtecdan]+", il) and not r_clean:
+                continue
+            elif il not in seen:
+                seen.add(il)
+                user_like.append(ident.strip().strip('"'))
+        return anyone_r, anon_r, auth_r, over, tuple(user_like)
 
     @staticmethod
     def _imap_foreign_like_mailbox_visible(name: str, fu: str, login: str, own_mb: str) -> bool:
@@ -3451,6 +3869,13 @@ class ImapEngine:
         if nl.startswith(fl + ".inbox"):
             return True
         return False
+
+    @staticmethod
+    def _imap_mbox_iso_client_send_error(typ: str | None, detail: str | None) -> bool:
+        if (typ or "").upper() != "EXC" or not detail:
+            return False
+        d = detail.lower()
+        return "codec" in d or "encode" in d or "decode" in d
 
     def test_imap_mailbox_iso(self) -> ImapMailboxIsoResult:
         """
@@ -3499,16 +3924,26 @@ class ImapEngine:
         def _live(msg: str) -> None:
             if not _show:
                 return
+            line = get_colored_text(f"    {msg}", "ADDITIONS")
             with _lock:
-                sys.stdout.write(f"\r    {msg:<110}")
+                sys.stdout.write(f"\033[2K\r{line}")
                 sys.stdout.flush()
 
         def _live_done() -> None:
             if not _show:
                 return
             with _lock:
-                sys.stdout.write("\r" + " " * 120 + "\r")
+                sys.stdout.write("\033[2K\r")
                 sys.stdout.flush()
+
+        io_cap: dict[str, tuple[str, str]] = {}
+
+        def _io(send: str, recv: str, key: str | None = None) -> tuple[str, str]:
+            _live_done()
+            pair = (send, recv)
+            if key:
+                io_cap[key] = pair
+            return pair
 
         def _recover_own(imap: imaplib.IMAP4 | imaplib.IMAP4_SSL) -> None:
             try:
@@ -3534,12 +3969,20 @@ class ImapEngine:
         foreign_visible_root = False
         dict_rows: list[ImapMailboxIsoListSurveyRow] = []
         select_rows: list[ImapMailboxIsoSelectRow] = []
+        acl_rows: list[ImapMailboxIsoAclRow] = []
+        getacl_command_ok = False
         acl_in_capa = False
 
         try:
             imap = self.connect()
-            imap.login(login_user, password)
-            self._dbg(f"LOGIN {login_user!r} → OK")
+            pw = '"' + password.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            send_login = f"LOGIN {login_user} {pw}"
+            try:
+                typ_login, dat_login = imap.login(login_user, password)
+                _io(send_login, self._imap_load_fmt_reply(typ_login, dat_login), "login")
+            except imaplib.IMAP4.error as e:
+                _io(send_login, self._snip(str(e)), "login")
+                raise
             sock = getattr(imap, "sock", None)
             if sock is not None:
                 try:
@@ -3554,9 +3997,10 @@ class ImapEngine:
                 pass
 
             try:
-                typ0, _ = imap.select(own_mb)
+                typ0, dat0 = imap.select(own_mb)
+                _io(f"SELECT {own_mb}", self._imap_load_fmt_reply(typ0, dat0), "select")
             except Exception as e:
-                self._dbg(f"SELECT {own_mb!r} failed: {self._snip(str(e))}")
+                _io(f"SELECT {own_mb}", self._snip(str(e)), "select")
                 return ImapMailboxIsoResult(
                     skipped=True,
                     skip_reason=str(e),
@@ -3617,43 +4061,30 @@ class ImapEngine:
                     detail=f"Baseline SELECT {own_mb!r} returned {typ0!r}",
                 )
 
-            self._dbg(f"SELECT {own_mb!r} → {typ0}")
             try:
                 namespace_typ, ns_dat = imap.namespace()
+                _io("NAMESPACE", self._imap_load_fmt_reply(namespace_typ, ns_dat), "namespace")
                 if ns_dat and isinstance(ns_dat[0], bytes):
                     nst = ns_dat[0].decode(errors="replace")
                     namespace_raw = nst[:4000] if len(nst) > 4000 else nst
                 else:
                     namespace_raw = None
-                self._dbg(f"NAMESPACE → {namespace_typ} {self._snip(namespace_raw)}")
             except Exception as e:
                 namespace_typ = "EXC"
                 namespace_raw = str(e)[:500]
-                self._dbg(f"NAMESPACE failed: {self._snip(str(e))}")
+                _io("NAMESPACE", self._snip(str(e)), "namespace")
 
-            if acl_in_capa:
-                try:
-                    get_acl_typ, get_acl_dat = imap.getacl(own_mb)
-                    anyone_r, anon_r, auth_r, acl_over, get_acl_raw = self._imap_parse_getacl_world(
-                        get_acl_typ, get_acl_dat if get_acl_dat is not None else []
-                    )
-                    self._dbg(f"GETACL {own_mb!r} → {get_acl_typ} {self._snip(get_acl_raw)}")
-                except Exception as e:
-                    get_acl_typ = "EXC"
-                    get_acl_raw = str(e)[:800]
-                    self._dbg(f"GETACL {own_mb!r} failed: {self._snip(str(e))}")
-            else:
-                get_acl_typ = "SKIP"
-                get_acl_raw = "ACL not in CAPABILITY — GETACL not attempted"
-                self._dbg(get_acl_raw)
+            get_acl_typ = None
+            get_acl_raw = None
 
             try:
                 list_root_typ, list_dat = imap.list('""', "*")
+                _io('LIST "" *', self._imap_load_fmt_reply(list_root_typ, list_dat), "list")
             except Exception as e:
                 list_root_typ = "EXC"
                 list_dat = []
                 list_root_sample = [f"(list error: {e})"][:3]
-                self._dbg(f"LIST \"\" * failed: {self._snip(str(e))}")
+                _io('LIST "" *', self._snip(str(e)), "list")
 
             names_acc: list[str] = []
             if list_root_typ == "OK" and list_dat:
@@ -3667,7 +4098,6 @@ class ImapEngine:
                             list_root_truncated = True
                             break
             list_root_count = len(names_acc)
-            self._dbg(f"LIST \"\" * → {list_root_typ} count={list_root_count}")
             for nm in names_acc[:_IMAP_MBOX_ISO_LIST_SAMPLE]:
                 list_root_sample.append(nm)
             for nm in names_acc:
@@ -3678,11 +4108,15 @@ class ImapEngine:
             n_pat = len(_IMAP_MBOX_ISO_LIST_DICTIONARY_PATTERNS)
             for i, pat in enumerate(_IMAP_MBOX_ISO_LIST_DICTIONARY_PATTERNS, start=1):
                 if _show and (i % _IMAP_MBOX_ISO_DICT_PROGRESS_EVERY == 0 or i == n_pat):
-                    _live(f"mailbox-iso LIST \"\" {pat!r}  ({i}/{n_pat})")
+                    _live(f"LIST {pat} ({i}/{n_pat})")
                 lt = ld = None
                 lnames: list[str] = []
+                send_list = f'LIST "" {pat}'
+                send_t = recv_t = None
                 try:
                     lt, ldat = imap.list('""', pat)
+                    recv_t = self._imap_load_fmt_reply(lt, ldat)
+                    send_t, recv_t = _io(send_list, recv_t)
                     ld = None
                     if lt == "OK" and ldat:
                         for atom in ldat:
@@ -3694,6 +4128,7 @@ class ImapEngine:
                 except Exception as e:
                     lt = "EXC"
                     ld = str(e)[:400]
+                    send_t, recv_t = _io(send_list, self._snip(str(e)))
                 sample_t = tuple(lnames[:5])
                 dict_rows.append(
                     ImapMailboxIsoListSurveyRow(
@@ -3703,15 +4138,111 @@ class ImapEngine:
                         detail=ld,
                         listed_count=len(lnames),
                         sample_mailboxes=sample_t,
+                        send_text=send_t,
+                        recv_text=recv_t,
                     )
                 )
             _live_done()
-            dict_total_dbg = sum(r.listed_count for r in dict_rows)
-            dict_nz = sum(1 for r in dict_rows if r.listed_count)
-            self._dbg(
-                f"LIST dictionary: {len(dict_rows)} patterns, "
-                f"{dict_nz} nonzero, total listed={dict_total_dbg}"
-            )
+
+            acl_rows: list[ImapMailboxIsoAclRow] = []
+            getacl_command_ok = False
+            targets: list[str] = []
+            seen_mb: set[str] = set()
+
+            def _add_acl_target(name: str) -> None:
+                n = (name or "").strip()
+                if not n:
+                    return
+                key = n.lower()
+                if key in seen_mb:
+                    return
+                seen_mb.add(key)
+                targets.append(n)
+
+            _add_acl_target(own_mb)
+            for nm in names_acc:
+                _add_acl_target(nm)
+            for row in dict_rows:
+                for nm in row.sample_mailboxes:
+                    _add_acl_target(nm)
+            targets = targets[:_IMAP_MBOX_ISO_GETACL_MAX]
+
+            getacl_stop = False
+            for i, mbx in enumerate(targets, start=1):
+                if getacl_stop:
+                    break
+                if _show:
+                    _live(f"GETACL {mbx} ({i}/{len(targets)})")
+                typ: str | None = None
+                dat = None
+                send_acl = f"GETACL {mbx}"
+                try:
+                    typ, dat = imap.getacl(mbx)
+                    send_acl, recv_acl = _io(send_acl, self._imap_load_fmt_reply(typ, dat))
+                except imaplib.IMAP4.error as e:
+                    typ = "EXC"
+                    dat = str(e)
+                    send_acl, recv_acl = _io(send_acl, self._snip(str(e)))
+                except Exception as e:
+                    typ = "EXC"
+                    dat = str(e)
+                    send_acl, recv_acl = _io(send_acl, self._snip(str(e)))
+                tu = (typ or "").upper()
+                blob = self._imap_load_fmt_reply(typ, dat).lower()
+                if i == 1 and (
+                    tu == "BAD"
+                    or "unknown command" in blob
+                    or "illegal" in blob
+                    or "not implemented" in blob
+                ):
+                    getacl_stop = True
+                    get_acl_typ = typ
+                    get_acl_raw = self._imap_load_fmt_reply(typ, dat)
+                    acl_rows.append(
+                        ImapMailboxIsoAclRow(
+                            mailbox=mbx,
+                            typ=typ,
+                            anyone_rights=None,
+                            anonymous_rights=None,
+                            authenticated_rights=None,
+                            overbroad_world=False,
+                            user_like_ids=tuple(),
+                            raw=get_acl_raw,
+                            send_text=send_acl,
+                            recv_text=recv_acl,
+                        )
+                    )
+                    break
+                pairs, raw = self._imap_parse_getacl_entries(typ, dat, mbx)
+                a_r, an_r, au_r, over, users = self._imap_classify_acl_pairs(pairs, login_user)
+                if tu == "OK":
+                    getacl_command_ok = True
+                    if mbx.strip().lower() == own_mb.strip().lower() or get_acl_typ is None:
+                        get_acl_typ = typ
+                        get_acl_raw = raw
+                        anyone_r, anon_r, auth_r = a_r, an_r, au_r
+                        if over:
+                            acl_over = True
+                if over:
+                    acl_over = True
+                acl_rows.append(
+                    ImapMailboxIsoAclRow(
+                        mailbox=mbx,
+                        typ=typ,
+                        anyone_rights=a_r,
+                        anonymous_rights=an_r,
+                        authenticated_rights=au_r,
+                        overbroad_world=over,
+                        user_like_ids=users,
+                        raw=raw,
+                        send_text=send_acl,
+                        recv_text=recv_acl,
+                    )
+                )
+            _live_done()
+            if get_acl_typ is None:
+                get_acl_typ = "SKIP"
+                get_acl_raw = "GETACL not attempted"
 
             probe_specs: list[tuple[str, str]] = [
                 ("foreign_slash_inbox", f"{fu}/INBOX"),
@@ -3725,10 +4256,13 @@ class ImapEngine:
                 detail: str | None = None
                 typ: str | None = None
                 ok_sel = False
+                send_ex = f"EXAMINE {mbx}"
+                recv_ex: str | None = None
                 try:
                     if hasattr(imap, "examine"):
                         typ, dat = imap.examine(mbx)
                     else:
+                        send_ex = f"SELECT {mbx}"
                         typ, dat = imap.select(mbx)
                     ok_sel = typ == "OK"
                     if dat:
@@ -3739,14 +4273,15 @@ class ImapEngine:
                             )[:400]
                         except Exception:
                             detail = str(dat)[:400]
+                    send_ex, recv_ex = _io(send_ex, self._imap_load_fmt_reply(typ, dat))
                 except Exception as e:
                     typ = "EXC"
                     detail = str(e)[:400]
+                    send_ex, recv_ex = _io(send_ex, self._snip(str(e)))
                 if ok_sel and mbx != own_mb:
                     _recover_own(imap)
                 elif typ == "EXC":
                     _recover_own(imap)
-                self._dbg(f"EXAMINE {mbx!r} → {typ} {self._snip(detail)}")
                 select_rows.append(
                     ImapMailboxIsoSelectRow(
                         probe_id=pid,
@@ -3754,6 +4289,8 @@ class ImapEngine:
                         typ=typ,
                         detail=detail,
                         ok_selected=ok_sel,
+                        send_text=send_ex,
+                        recv_text=recv_ex,
                     )
                 )
 
@@ -3786,10 +4323,20 @@ class ImapEngine:
             parts.append(
                 "GETACL: anyone/anonymous/authenticated has sensitive rights (r/w/e/t/d class heuristic)"
             )
-        elif anyone_r or anon_r:
+        elif anyone_r is not None or anon_r is not None:
             parts.append(
                 "GETACL: world-style identifiers present (review rights even if not flagged sensitive)"
             )
+        enum_users: list[str] = []
+        seen_u: set[str] = set()
+        for row in acl_rows:
+            for u in row.user_like_ids:
+                k = u.lower()
+                if k not in seen_u:
+                    seen_u.add(k)
+                    enum_users.append(u)
+        if enum_users:
+            parts.append("GETACL listed accounts: " + ", ".join(enum_users))
         if foreign_visible_root:
             parts.append(f'LIST "" "*" shows names matching foreign token {fu!r} (information leak risk)')
         if enum_sig:
@@ -3800,7 +4347,7 @@ class ImapEngine:
             parts.append(
                 "No cross-user EXAMINE OK, no broad world ACL rights heuristic, limited LIST exposure by this probe."
             )
-        vuln = bool(foreign_ok or acl_over or foreign_visible_root or enum_sig)
+        vuln = bool(foreign_ok or acl_over or foreign_visible_root or enum_sig or enum_users)
         detail = "; ".join(parts)
         return ImapMailboxIsoResult(
             skipped=False,
@@ -3830,6 +4377,17 @@ class ImapEngine:
             foreign_examine_ok=foreign_ok,
             vulnerable=vuln,
             detail=detail,
+            acl_folder_probes=tuple(acl_rows),
+            acl_enumerated_users=tuple(enum_users),
+            getacl_command_ok=getacl_command_ok,
+            login_send=(io_cap["login"][0] if "login" in io_cap else None),
+            login_recv=(io_cap["login"][1] if "login" in io_cap else None),
+            select_own_send=(io_cap["select"][0] if "select" in io_cap else None),
+            select_own_recv=(io_cap["select"][1] if "select" in io_cap else None),
+            namespace_send=(io_cap["namespace"][0] if "namespace" in io_cap else None),
+            namespace_recv=(io_cap["namespace"][1] if "namespace" in io_cap else None),
+            list_root_send=(io_cap["list"][0] if "list" in io_cap else None),
+            list_root_recv=(io_cap["list"][1] if "list" in io_cap else None),
         )
 
     def _usrenum_eta_remaining_seconds(self, done: int, total: int, elapsed: float) -> float | None:
@@ -4516,8 +5074,8 @@ class ImapEngine:
                     pp("TLS", bullet_type="NOTVULN", condition=show, indent=4)
             else:
                 pp(
-                    "No connection mode available (cleartext, STARTTLS, TLS failed)",
-                    bullet_type="VULN",
+                    "Could not connect. Encryption was not tested.",
+                    bullet_type="WARNING",
                     condition=show,
                     indent=4,
                 )
@@ -4593,42 +5151,65 @@ class ImapEngine:
             if sn.detail == "LOGIN failed":
                 pp("LOGIN failed", bullet_type="WARNING", condition=show, indent=4)
                 return
+            if sn.detail.endswith("was not tested."):
+                pp(sn.detail, bullet_type="WARNING", condition=show, indent=4)
+                return
             pp("Not sniffable", bullet_type="NOTVULN", condition=show, indent=4)
+
+    @staticmethod
+    def _inv_comm_server_response_text(snippet: str) -> str:
+        text = snippet.strip()
+        if text.startswith("* "):
+            text = text[2:]
+        return text
+
+    def _inv_comm_emit_one(self, t: InvCommImapCase) -> None:
+        """One probe: -vv Send/Receive, then the result line."""
+        pp = self._ptprint_raw
+        show = not self.use_json
+        self._dbg(f"Send: {t.send_text}")
+        self._dbg(f"Receive: {t.reply_snippet or '(no reply)'}")
+        self._flush_terminal()
+        time_str = f" ({t.response_time_sec:.2f}s)" if t.response_time_sec is not None else ""
+        msg = f"{t.command_display:<{_INVCOMM_LABEL_WIDTH}}{t.outcome}{time_str}"
+        if t.probe_vulnerable:
+            bullet = "VULN"
+        elif t.category in _INVCOMM_WARN_CATEGORIES:
+            bullet = "WARNING"
+        else:
+            bullet = "TITLE"
+        pp(msg, bullet_type=bullet, condition=show, indent=4)
+        if t.reply_snippet and (t.category in _INVCOMM_WARN_CATEGORIES or t.probe_vulnerable):
+            pp(
+                f"Server response: {self._inv_comm_server_response_text(t.reply_snippet)}",
+                bullet_type="TEXT",
+                condition=show,
+                indent=8,
+            )
+        if t.slow_response:
+            pp("Slow response (possible parser / DoS)", bullet_type="WARNING", condition=show, indent=8)
+        if (
+            t.session_ok_after is False
+            and t.outcome in ("OK", "NO", "BAD")
+            and not t.probe_vulnerable
+        ):
+            pp("CAPABILITY follow-up failed (session unstable)", bullet_type="WARNING", condition=show, indent=8)
+        self._flush_terminal()
 
     def _inv_comm_emit_terminal(self, ic: InvCommImapResult) -> None:
         """Shared text layout for invalid-command audit (stream + output replay)."""
         pp = self._ptprint_raw
         show = not self.use_json
-        tagged_outcomes = frozenset({"OK", "NO", "BAD"})
+        if ic.tests and all(t.outcome == "connect_error" for t in ic.tests):
+            pp(ic.detail, bullet_type="WARNING", condition=show, indent=4)
+            return
         for t in ic.tests:
-            time_str = f" ({t.response_time_sec:.2f}s)" if t.response_time_sec is not None else ""
-            if t.probe_vulnerable:
-                msg = f"VULNERABLE / UNSTABLE: {t.command_display} → {t.outcome}{time_str}"
-            else:
-                msg = f"{t.command_display}: {t.outcome}{time_str}"
-            pp(msg, bullet_type="TITLE", condition=show, indent=4)
-            if t.reply_snippet and (t.info_leak or t.probe_vulnerable):
-                pp(t.reply_snippet, bullet_type="TEXT", condition=show, indent=8)
-            if t.info_leak:
-                pp("Verbose error (possible info leak)", bullet_type="TITLE", condition=show, indent=8)
-            if t.slow_response:
-                pp("Slow response (possible parser / DoS)", bullet_type="TITLE", condition=show, indent=8)
-            if (
-                t.session_ok_after is False
-                and t.outcome in tagged_outcomes
-                and not t.probe_vulnerable
-            ):
-                pp("CAPABILITY follow-up failed (session unstable)", bullet_type="TITLE", condition=show, indent=8)
-
+            self._inv_comm_emit_one(t)
         if ic.vulnerable:
             pp(ic.detail, bullet_type="VULN", condition=show, indent=4)
-        elif ic.weakness:
-            pp(f"WEAKNESS: {ic.detail}", bullet_type="WARNING", condition=show, indent=4)
-        else:
-            pp(ic.detail, bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_inv_comm_result(self) -> None:
-        """Terminal output for invalid IMAP command audit (align with SMTP -iv: [i] per line)."""
+        """Terminal output for invalid IMAP command audit."""
         with self._output_lock:
             if (err := getattr(self.results, "inv_comm_error", None)) is not None:
                 self._ptprint_raw(
@@ -4640,6 +5221,10 @@ class ImapEngine:
                 return
             ic = self.results.inv_comm
             if ic is None:
+                return
+            if getattr(self, "_inv_comm_terminal_emitted", False):
+                if ic.vulnerable and not self.use_json:
+                    self._ptprint_raw(ic.detail, bullet_type="VULN", condition=True, indent=4)
                 return
             self._inv_comm_emit_terminal(ic)
 
@@ -4654,31 +5239,51 @@ class ImapEngine:
                     "Server accepted invalid credentials (indeterminate). Results may be false positives.",
                     bullet="WARNING",
                 )
+            elif catch_all == "unreachable":
+                self._tprint(
+                    "Could not connect to the server. Catch-all was not tested.",
+                    bullet="WARNING",
+                )
             else:
                 self._tprint("Not configured (server rejects invalid creds)", bullet="NOTVULN")
 
     def _anonymous_emit_terminal(self, ar: AnonymousAccessResult) -> None:
         pp = self._ptprint_raw
         show = not self.use_json
-        if ar.auth_anonymous_advertised:
-            pp(
-                "AUTH=ANONYMOUS offered in pre-login CAPABILITY (or banner)",
-                bullet_type="WARNING",
-                condition=show,
-                indent=4,
-            )
-        else:
-            pp("AUTH=ANONYMOUS not advertised", bullet_type="NOTVULN", condition=show, indent=4)
+        if not ar.auth_probed and not ar.login_probed:
+            pp(ar.detail, bullet_type="WARNING", condition=show, indent=4)
+            return
+        if ar.auth_probed:
+            if ar.auth_anonymous_advertised:
+                pp(
+                    "AUTH method ANONYMOUS advertised",
+                    bullet_type="WARNING",
+                    condition=show,
+                    indent=4,
+                )
+            else:
+                pp("AUTH method ANONYMOUS not advertised", bullet_type="NOTVULN", condition=show, indent=4)
 
-        if ar.authenticate_anonymous_ok:
-            pp("AUTHENTICATE ANONYMOUS: accepted (OK)", bullet_type="VULN", condition=show, indent=4)
-        else:
-            pp("AUTHENTICATE ANONYMOUS: not accepted", bullet_type="NOTVULN", condition=show, indent=4)
+            if ar.authenticate_anonymous_ok:
+                pp("Use AUTHENTICATE ANONYMOUS: accepted", bullet_type="VULN", condition=show, indent=4)
+            else:
+                pp("Use AUTHENTICATE ANONYMOUS: not accepted", bullet_type="NOTVULN", condition=show, indent=4)
 
-        if ar.login_anonymous_empty_ok:
-            pp("LOGIN anonymous with empty password: accepted", bullet_type="VULN", condition=show, indent=4)
-        else:
-            pp("LOGIN anonymous with empty password: rejected", bullet_type="NOTVULN", condition=show, indent=4)
+        if ar.login_probed:
+            if ar.login_anonymous_empty_ok:
+                pp(
+                    "Use LOGIN (anonymous/guest/public) with empty password: accepted",
+                    bullet_type="VULN",
+                    condition=show,
+                    indent=4,
+                )
+            else:
+                pp(
+                    "Use LOGIN (anonymous/guest/public) with empty password: rejected",
+                    bullet_type="NOTVULN",
+                    condition=show,
+                    indent=4,
+                )
 
         for w in ar.weak_credentials_ok:
             pp(f"LOGIN accepted: {w}", bullet_type="VULN", condition=show, indent=4)
@@ -4690,8 +5295,6 @@ class ImapEngine:
                 condition=show,
                 indent=4,
             )
-        else:
-            pp(f"Verdict: {ar.detail}", bullet_type="NOTVULN", condition=show, indent=4)
 
     def _stream_anonymous_result(self) -> None:
         """Stream anonymous auth result immediately (thread-safe)."""
@@ -4765,43 +5368,148 @@ class ImapEngine:
             pp(line, bullet_type="TEXT", condition=True, indent=8)
         pp(f"Elapsed: {zr.elapsed_sec:.1f} s", bullet_type="TEXT", condition=True, indent=8)
 
-    def _imap_resource_load_emit_terminal(self, lr: ImapResourceLoadResult) -> None:
-        pp = self._ptprint_raw
-        show = not self.use_json
-        if lr.skipped:
-            pp(f"Skipped: {lr.skip_reason or lr.detail}", bullet_type="WARNING", condition=show, indent=4)
+    def _imap_resource_load_emit_setup(
+        self,
+        *,
+        io_login: tuple[str, str] | None,
+        io_select: tuple[str, str] | None,
+        io_capability: tuple[str, str] | None,
+        io_quota: tuple[tuple[str, str], ...],
+        quota_advertised: bool,
+        quota_root_detail: str | None,
+    ) -> None:
+        if self.use_json:
             return
-        if lr.append is not None:
-            ap = lr.append
+        if io_login:
+            self._imap_vv_io(*io_login)
+        if io_select:
+            self._imap_vv_io(*io_select)
+        if io_capability:
+            self._imap_vv_io(*io_capability)
+        for send, recv in io_quota:
+            self._imap_vv_io(send, recv)
+        if quota_advertised:
+            extra = f" ({quota_root_detail})" if quota_root_detail else ""
+            self._ptprint_raw(f"QUOTA advertised{extra}", bullet_type="TITLE", condition=True, indent=4)
+        else:
+            self._ptprint_raw("QUOTA not advertised in CAPABILITY", bullet_type="TITLE", condition=True, indent=4)
+        self._flush_terminal()
+
+    def _imap_resource_load_emit_phase(
+        self,
+        ph: ImapResourceLoadPhase,
+        cap: int,
+        io_pair: tuple[str, str] | None,
+    ) -> None:
+        if self.use_json:
+            return
+        if io_pair:
+            self._imap_vv_io(*io_pair)
+        show = True
+        pp = self._ptprint_raw
+        if ph.limit_enforced:
+            after = f" after {ph.limit_after}" if ph.limit_after is not None else ""
             pp(
-                f"APPEND: attempted={ap.attempted} ok={ap.ok} failed={ap.failed} "
-                f"disconnect={ap.disconnected} err_rate={ap.error_rate_pct:.1f}% "
-                f"slowdown={ap.slowdown}",
-                bullet_type="TITLE",
+                f"{ph.label} limited ({ph.limit_code or 'limit'}{after})",
+                bullet_type="NOTVULN",
                 condition=show,
                 indent=4,
             )
-        if lr.search is not None:
-            sp = lr.search
+        elif ph.disconnected:
+            n = ph.disconnect_after if ph.disconnect_after is not None else ph.attempted
             pp(
-                f"UID SEARCH ALL: attempted={sp.attempted} ok={sp.ok} failed={sp.failed} "
-                f"disconnect={sp.disconnected} err_rate={sp.error_rate_pct:.1f}% "
-                f"slowdown={sp.slowdown}",
-                bullet_type="TITLE",
-                condition=show,
-                indent=4,
-            )
-        if lr.search_skipped_reason:
-            pp(f"SEARCH note: {lr.search_skipped_reason}", bullet_type="TITLE", condition=show, indent=4)
-        if lr.vulnerable:
-            pp(
-                f"Bounded load showed weak limits or instability: {lr.detail}",
+                f"{ph.label} connection dropped after {n}",
                 bullet_type="VULN",
                 condition=show,
                 indent=4,
             )
-        else:
-            pp(lr.detail, bullet_type="NOTVULN", condition=show, indent=4)
+        elif ph.hit_cap:
+            pp(
+                f"No {ph.label} resource limit ({ph.ok}/{cap} accepted)",
+                bullet_type="VULN",
+                condition=show,
+                indent=4,
+            )
+        elif ph.failed:
+            pp(
+                f"{ph.label} unexpected NO/BAD (not a quota/limit code)",
+                bullet_type="WARNING",
+                condition=show,
+                indent=4,
+            )
+        if ph.slowdown:
+            b = ph.baseline_avg_seconds
+            w = ph.last_window_avg_seconds
+            extra = ""
+            if b is not None and w is not None:
+                extra = f" (baseline {b:.2f}s → last {w:.2f}s)"
+            pp(
+                f"{ph.label} slower under load{extra}",
+                bullet_type="WARNING",
+                condition=show,
+                indent=4,
+            )
+        self._flush_terminal()
+
+    def _imap_resource_load_emit_tail(
+        self,
+        *,
+        search_skipped_reason: str | None,
+        cleanup_detail: str | None,
+        io_cleanup: tuple[str, str] | None,
+        vulnerable: bool,
+        detail: str,
+    ) -> None:
+        if self.use_json:
+            return
+        pp = self._ptprint_raw
+        if search_skipped_reason:
+            pp(f"SEARCH note: {search_skipped_reason}", bullet_type="TITLE", condition=True, indent=4)
+            self._flush_terminal()
+        if cleanup_detail:
+            if io_cleanup:
+                self._imap_vv_io(*io_cleanup)
+            pp(
+                f"EXPUNGE cleanup failed (test messages may remain): {cleanup_detail}",
+                bullet_type="WARNING",
+                condition=True,
+                indent=4,
+            )
+            self._flush_terminal()
+        if not vulnerable:
+            pp(detail, bullet_type="NOTVULN", condition=True, indent=4)
+            self._flush_terminal()
+
+    def _imap_resource_load_emit_terminal(self, lr: ImapResourceLoadResult) -> None:
+        if lr.skipped:
+            self._ptprint_raw(
+                f"Skipped: {lr.skip_reason or lr.detail}",
+                bullet_type="WARNING",
+                condition=not self.use_json,
+                indent=4,
+            )
+            return
+        if getattr(self, "_imap_resload_live", False):
+            return
+        self._imap_resource_load_emit_setup(
+            io_login=lr.io_login,
+            io_select=lr.io_select,
+            io_capability=lr.io_capability,
+            io_quota=lr.io_quota,
+            quota_advertised=lr.quota_advertised,
+            quota_root_detail=lr.quota_root_detail,
+        )
+        if lr.append is not None:
+            self._imap_resource_load_emit_phase(lr.append, lr.append_max_requested, lr.io_append)
+        if lr.search is not None:
+            self._imap_resource_load_emit_phase(lr.search, lr.search_max_requested, lr.io_search)
+        self._imap_resource_load_emit_tail(
+            search_skipped_reason=lr.search_skipped_reason,
+            cleanup_detail=lr.cleanup_detail,
+            io_cleanup=lr.io_cleanup,
+            vulnerable=lr.vulnerable,
+            detail=lr.detail,
+        )
 
     def _stream_imap_resource_load_result(self) -> None:
         """Stream IMAP resource load probe result (thread-safe)."""
@@ -4949,58 +5657,99 @@ class ImapEngine:
         if mr.skipped:
             pp(f"Skipped: {mr.skip_reason or mr.detail}", bullet_type="WARNING", condition=show, indent=4)
             return
-        pp(
-            f"Baseline mailbox: {mr.own_mailbox!r}; foreign token: {mr.foreign_user_token!r}; "
-            f"login: {mr.login_username!r}",
-            bullet_type="TITLE",
-            condition=show,
-            indent=4,
+
+        def _out(send: str | None, recv: str | None, text: str, bullet: str) -> None:
+            self._imap_vv_io(send, recv)
+            pp(text, bullet_type=bullet, condition=show, indent=4)
+            self._flush_terminal()
+
+        self._imap_vv_io(mr.login_send, mr.login_recv)
+        _out(
+            mr.select_own_send,
+            mr.select_own_recv,
+            f"Logged in as {mr.login_username!r}, mailbox {mr.own_mailbox} "
+            f"(other-user token: {mr.foreign_user_token})",
+            "TITLE",
         )
-        pp(
-            f"NAMESPACE: {mr.namespace_typ or 'n/a'}; GETACL: {mr.get_acl_typ or 'n/a'} "
-            f"(ACL in CAPABILITY: {mr.acl_in_capability})",
-            bullet_type="TITLE",
-            condition=show,
-            indent=4,
-        )
-        pp(
-            f"LIST \"\" \"*\": {mr.list_root_typ or 'n/a'} count≈{mr.list_root_count}"
-            f"{'+' if mr.list_root_truncated else ''}",
-            bullet_type="TITLE",
-            condition=show,
-            indent=4,
-        )
-        if mr.list_root_sample:
-            for s in mr.list_root_sample[:6]:
-                pp(f"sample: {s}", bullet_type="TEXT", condition=show, indent=8)
-        for r in mr.select_probes:
-            bullet = "VULN" if r.ok_selected else "NOTVULN"
-            snip = (r.detail or "").replace("\r\n", " ")[:120]
-            pp(
-                f"EXAMINE [{r.probe_id}] {r.mailbox!r} → {r.typ or 'n/a'} {snip}",
-                bullet_type=bullet,
-                condition=show,
-                indent=8,
-            )
-        pp(
-            f"LIST dictionary: {mr.list_dictionary_nonzero_patterns} patterns with hits, "
-            f"{mr.list_dictionary_total_listed} total LIST rows",
-            bullet_type="TITLE",
-            condition=show,
-            indent=4,
-        )
-        if mr.acl_anyone_rights or mr.acl_anonymous_rights or mr.acl_authenticated_rights:
-            pp(
-                f"ACL identifiers — anyone: {mr.acl_anyone_rights!r} anonymous: {mr.acl_anonymous_rights!r} "
-                f"authenticated: {mr.acl_authenticated_rights!r}",
-                bullet_type="TITLE",
-                condition=show,
-                indent=4,
-            )
-        if mr.vulnerable:
-            pp(mr.detail, bullet_type="VULN", condition=show, indent=4)
+        ns = mr.namespace_typ or "n/a"
+        if (ns or "").upper() == "EXC":
+            _out(mr.namespace_send, mr.namespace_recv, f"NAMESPACE failed: {self._snip(mr.namespace_raw)}", "WARNING")
         else:
-            pp(mr.detail, bullet_type="NOTVULN", condition=show, indent=4)
+            _out(mr.namespace_send, mr.namespace_recv, f"NAMESPACE: {ns}", "TITLE")
+        if (mr.list_root_typ or "").upper() == "OK":
+            names = ", ".join(mr.list_root_sample) if mr.list_root_sample else ""
+            more = "+" if mr.list_root_truncated else ""
+            n = mr.list_root_count
+            box = "mailbox" if n == 1 else "mailboxes"
+            extra = f" ({names})" if names else ""
+            _out(mr.list_root_send, mr.list_root_recv, f"LIST: {n}{more} {box}{extra}", "TITLE")
+        else:
+            _out(mr.list_root_send, mr.list_root_recv, f"LIST failed: {mr.list_root_typ or 'n/a'}", "WARNING")
+        for r in mr.select_probes:
+            if r.ok_selected:
+                _out(r.send_text, r.recv_text, f"Opened another user's mailbox: {r.mailbox}", "VULN")
+            elif self._imap_mbox_iso_client_send_error(r.typ, r.detail):
+                _out(r.send_text, r.recv_text, f"Could not send Unicode mailbox name {r.mailbox!r}", "WARNING")
+            elif (r.typ or "").upper() == "EXC":
+                _out(r.send_text, r.recv_text, f"EXAMINE {r.mailbox} failed: {self._snip(r.detail)}", "WARNING")
+            else:
+                _out(r.send_text, r.recv_text, f"EXAMINE rejected: {r.mailbox}", "NOTVULN")
+        if mr.enumeration_signal:
+            npat = len(mr.list_dictionary)
+            first = next((d for d in mr.list_dictionary if d.send_text), None)
+            _out(
+                first.send_text if first else None,
+                first.recv_text if first else None,
+                f"LIST folder guesses returned hits "
+                f"({mr.list_dictionary_nonzero_patterns}/{npat})",
+                "VULN",
+            )
+        n_acl = len(mr.acl_folder_probes)
+        if n_acl == 0:
+            _out(None, None, "GETACL not attempted", "TITLE")
+        elif not mr.getacl_command_ok:
+            hint = "" if mr.acl_in_capability else " (ACL not advertised)"
+            first = mr.acl_folder_probes[0]
+            extra = f" → {first.typ}" if first.typ else ""
+            _out(first.send_text, first.recv_text, f"GETACL not available{hint}{extra}", "TITLE")
+        else:
+            box = "mailbox" if n_acl == 1 else "mailboxes"
+            capa = "" if mr.acl_in_capability else " (not advertised in CAPABILITY)"
+            first = mr.acl_folder_probes[0]
+            _out(first.send_text, first.recv_text, f"GETACL: checked {n_acl} {box}{capa}", "TITLE")
+            for r in mr.acl_folder_probes:
+                if (r.typ or "").upper() != "OK":
+                    continue
+                same = r.mailbox == first.mailbox
+                snd = None if same else r.send_text
+                rcv = None if same else r.recv_text
+                if r.overbroad_world:
+                    rights = r.anyone_rights or r.anonymous_rights or r.authenticated_rights or ""
+                    who = "anyone" if r.anyone_rights is not None else (
+                        "anonymous" if r.anonymous_rights is not None else "authenticated"
+                    )
+                    _out(snd, rcv, f"GETACL {r.mailbox}: {who} has rights {rights!r}", "VULN")
+                elif r.anyone_rights is not None or r.anonymous_rights is not None:
+                    wr = r.anyone_rights if r.anyone_rights is not None else r.anonymous_rights
+                    label = "anyone" if r.anyone_rights is not None else "anonymous"
+                    extra = "no rights" if not wr else f"rights {wr!r}"
+                    _out(snd, rcv, f"GETACL {r.mailbox}: {label} on ACL ({extra})", "WARNING")
+            if mr.acl_enumerated_users:
+                _out(
+                    None,
+                    None,
+                    "GETACL listed accounts: " + ", ".join(mr.acl_enumerated_users),
+                    "VULN",
+                )
+        if mr.foreign_like_mailbox_visible_in_root_list:
+            _out(
+                mr.list_root_send,
+                mr.list_root_recv,
+                f"LIST shows names matching other-user token {mr.foreign_user_token!r}",
+                "VULN",
+            )
+        if not mr.vulnerable:
+            _out(None, None, mr.detail, "NOTVULN")
 
     def _stream_imap_mailbox_iso_result(self) -> None:
         """Stream mailbox isolation probe result (thread-safe)."""
@@ -5297,6 +6046,7 @@ class ImapEngine:
                             {
                                 "category": t.category,
                                 "command": t.command_display,
+                                "sent": t.send_text,
                                 "outcome": t.outcome,
                                 "replySnippet": t.reply_snippet,
                                 "responseTimeSec": t.response_time_sec,
@@ -5433,6 +6183,8 @@ class ImapEngine:
                         "weakCredentialsOk": list(ar.weak_credentials_ok),
                         "vulnerable": ar.vulnerable,
                         "detail": ar.detail,
+                        "authProbed": ar.auth_probed,
+                        "loginProbed": ar.login_probed,
                     }
                 }
             )
@@ -5501,9 +6253,13 @@ class ImapEngine:
                 "attempted": ph.attempted,
                 "ok": ph.ok,
                 "failed": ph.failed,
+                "limited": ph.limited,
                 "disconnected": ph.disconnected,
                 "disconnectAfter": ph.disconnect_after,
                 "hitCap": ph.hit_cap,
+                "limitEnforced": ph.limit_enforced,
+                "limitCode": ph.limit_code,
+                "limitAfter": ph.limit_after,
                 "minRtSeconds": ph.min_rt_seconds,
                 "maxRtSeconds": ph.max_rt_seconds,
                 "avgRtSeconds": ph.avg_rt_seconds,
@@ -5523,6 +6279,10 @@ class ImapEngine:
                 "appendMaxRequested": rl.append_max_requested,
                 "searchMaxRequested": rl.search_max_requested,
                 "searchSkippedReason": rl.search_skipped_reason,
+                "quotaAdvertised": rl.quota_advertised,
+                "quotaRootDetail": rl.quota_root_detail,
+                "cleanupDeleted": rl.cleanup_deleted,
+                "cleanupDetail": rl.cleanup_detail,
                 "vulnerable": rl.vulnerable,
                 "detail": rl.detail,
             }
@@ -5571,6 +6331,21 @@ class ImapEngine:
                 "listDictionaryNonzeroPatterns": miso.list_dictionary_nonzero_patterns,
                 "enumerationSignal": miso.enumeration_signal,
                 "foreignExamineOk": miso.foreign_examine_ok,
+                "getAclCommandOk": miso.getacl_command_ok,
+                "aclEnumeratedUsers": list(miso.acl_enumerated_users),
+                "aclFolderProbes": [
+                    {
+                        "mailbox": r.mailbox,
+                        "typ": r.typ,
+                        "anyoneRights": r.anyone_rights,
+                        "anonymousRights": r.anonymous_rights,
+                        "authenticatedRights": r.authenticated_rights,
+                        "overbroadWorld": r.overbroad_world,
+                        "userLikeIds": list(r.user_like_ids),
+                        "raw": (r.raw or "")[:2000] if r.raw else None,
+                    }
+                    for r in miso.acl_folder_probes
+                ],
                 "vulnerable": miso.vulnerable,
                 "detail": miso.detail,
                 "selectProbes": [

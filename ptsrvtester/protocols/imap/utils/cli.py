@@ -166,7 +166,7 @@ class IMAPArgs(ArgsWithBruteforce):
                           help="RESLOAD: mailbox for APPEND phase (default INBOX)")
         mods.add_argument("--resource-load-append-max", type=int, default=_IMAP_LOAD_APPEND_MAX_DEFAULT,
                           metavar="N", dest="imap_resource_load_append_max",
-                          help=f"RESLOAD: max APPEND operations (default {_IMAP_LOAD_APPEND_MAX_DEFAULT}; hard cap 5000)")
+                          help=f"RESLOAD: max APPEND operations (default {_IMAP_LOAD_APPEND_MAX_DEFAULT})")
         mods.add_argument("--resource-load-search-max", type=int, default=_IMAP_LOAD_SEARCH_MAX_DEFAULT,
                           metavar="N", dest="imap_resource_load_search_max",
                           help=f"RESLOAD: max UID SEARCH ALL (default {_IMAP_LOAD_SEARCH_MAX_DEFAULT}; 0 skips)")

@@ -199,16 +199,15 @@ IMAP_TESTS: dict[str, dict] = {
         ],
     },
     "RESLOAD": {
-        "desc": "APPEND + SEARCH resource-load stress",
+        "desc": "APPEND + SEARCH resource-limit check",
         "long": [
-            "Bounded authenticated APPEND burst followed by a UID SEARCH ALL",
-            "loop; watches for disconnects, errors and slowdown.",
+            "Logs in, APPENDs many small messages, then runs UID SEARCH ALL.",
         ],
         "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [
             ["", "--resource-load-mailbox", "<name>", "Mailbox for APPEND phase (default INBOX)"],
-            ["", "--resource-load-append-max", "<n>", "Max APPEND operations (default: 400; hard cap 5000)"],
-            ["", "--resource-load-search-max", "<n>", "Max UID SEARCH ALL commands (default: 600; 0 skips)"],
+            ["", "--resource-load-append-max", "<n>", "Max APPEND operations (default 400)"],
+            ["", "--resource-load-search-max", "<n>", "Max UID SEARCH ALL commands (default 600; 0 skips)"],
         ],
     },
     "MBOXISO": {

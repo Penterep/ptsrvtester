@@ -14,7 +14,9 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 from base64 import b64decode, b64encode
+from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -2581,8 +2583,24 @@ class ImapEngine:
                 except Exception:
                     pass
 
-    def _try_authenticate_anonymous(self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL) -> bool:
-        """RFC 4505 SASL ANONYMOUS over IMAP AUTHENTICATE (imaplib supplies base64 trace)."""
+    def _anon_detail(self, value: object) -> str:
+        """One-line IMAP error without bytes-repr (b'…')."""
+        if value is None:
+            return ""
+        if isinstance(value, (bytes, bytearray)):
+            text = value.decode(errors="replace")
+        else:
+            text = str(value)
+            if (text.startswith("b'") and text.endswith("'")) or (
+                text.startswith('b"') and text.endswith('"')
+            ):
+                text = text[2:-1]
+        return self._snip(text)
+
+    def _try_authenticate_anonymous(
+        self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL
+    ) -> tuple[bool, str]:
+        """RFC 4505 SASL ANONYMOUS. Returns (ok, detail)."""
 
         def authobject(b: bytes):
             return b"".join(
@@ -2594,32 +2612,28 @@ class ImapEngine:
             extra = ""
             if dat:
                 try:
-                    extra = " " + self._snip(dat[0] if isinstance(dat, list) else dat)
+                    extra = self._anon_detail(dat[0] if isinstance(dat, list) else dat)
                 except Exception:
                     extra = ""
-            self._dbg(f"AUTHENTICATE ANONYMOUS → {typ}{extra}")
-            return typ == "OK"
+            ok = typ == "OK"
+            if ok:
+                return True, extra
+            return False, extra or str(typ)
         except Exception as e:
-            self._dbg(f"AUTHENTICATE ANONYMOUS failed: {self._snip(str(e))}")
-            return False
+            return False, self._anon_detail(e)
 
-    def _try_login_pair(self, user: str, password: str) -> bool | None:
-        """True = LOGIN OK, False = server rejected, None = could not connect."""
-        disp = password if password else "<empty>"
+    def _try_login_pair(self, user: str, password: str) -> tuple[bool, str]:
+        """True = LOGIN OK; False = rejected, timeout, or connect failure."""
         try:
             imap = self.connect()
         except Exception as e:
-            self._dbg(f"LOGIN {user!r}: connect failed: {e}")
-            return None
+            return False, self._anon_detail(e) or "connect failed"
         try:
             try:
-                self._dbg(f"LOGIN {user!r} / {disp}")
                 imap.login(user, password)
-                self._dbg(f"LOGIN {user!r} → OK")
-                return True
+                return True, "OK"
             except Exception as e:
-                self._dbg(f"LOGIN {user!r} → failed: {self._snip(str(e))}")
-                return False
+                return False, self._anon_detail(e) or "rejected"
         finally:
             try:
                 imap.logout()
@@ -2687,10 +2701,13 @@ class ImapEngine:
         Probe anonymous and weak default IMAP logins (PTL-SVC-IMAP-ANONYMOUS).
         RFC 4505 (SASL ANONYMOUS); pre-auth CAPABILITY may list AUTH=ANONYMOUS (RFC 3501).
         """
+        self._anonymous_live = False
         auth_anonymous_advertised = False
         authenticate_anonymous_ok = False
+        authenticate_detail: str | None = None
         login_anonymous_empty_ok = False
         weak_hits: list[str] = []
+        attempts: list[AnonymousLoginProbe] = []
         auth_probed = False
         login_probed = False
         connect_error: str | None = None
@@ -2701,11 +2718,19 @@ class ImapEngine:
             auth_probed = True
             banner, merged = self._merged_preauth_capabilities(imap_cap)
             auth_anonymous_advertised = self._capability_advertises_auth_anonymous(merged, banner)
-            self._dbg(f"AUTH=ANONYMOUS advertised={auth_anonymous_advertised}")
-            authenticate_anonymous_ok = self._try_authenticate_anonymous(imap_cap)
+            with self._output_lock:
+                self._anonymous_emit_auth_capa(auth_anonymous_advertised)
+            self._anonymous_live = True
+            authenticate_anonymous_ok, authenticate_detail = self._try_authenticate_anonymous(imap_cap)
+            with self._output_lock:
+                self._anonymous_emit_authenticate(authenticate_anonymous_ok, authenticate_detail)
         except Exception as e:
             connect_error = str(e)
-            self._dbg(f"Anonymous AUTHENTICATE probe failed: {self._snip(str(e))}")
+            if auth_probed:
+                authenticate_detail = self._anon_detail(e)
+                with self._output_lock:
+                    self._anonymous_emit_authenticate(False, authenticate_detail)
+                self._anonymous_live = True
         finally:
             if imap_cap is not None:
                 try:
@@ -2729,19 +2754,22 @@ class ImapEngine:
                 login_probed=False,
             )
 
-        login_probes: list[tuple[str, str, str]] = [
-            ("anonymous", "", "LOGIN anonymous / empty password"),
-            ("anonymous", "anonymous", "LOGIN anonymous / anonymous"),
-            ("guest", "", "LOGIN guest / empty password"),
-            ("guest", "guest", "LOGIN guest / guest"),
-            ("public", "", "LOGIN public / empty password"),
-            ("public", "public", "LOGIN public / public"),
+        login_probes: list[tuple[str, str]] = [
+            ("anonymous", ""),
+            ("anonymous", "anonymous"),
+            ("guest", ""),
+            ("guest", "guest"),
+            ("public", ""),
+            ("public", "public"),
         ]
-        for user, password, _label in login_probes:
-            hit = self._try_login_pair(user, password)
-            if hit is None:
-                continue
+        for user, password in login_probes:
+            hit, detail = self._try_login_pair(user, password)
             login_probed = True
+            attempts.append(
+                AnonymousLoginProbe(username=user, password=password, accepted=hit, detail=detail)
+            )
+            with self._output_lock:
+                self._anonymous_emit_login(user, password, hit, detail)
             if not hit:
                 continue
             if user == "anonymous" and password == "":
@@ -2781,6 +2809,8 @@ class ImapEngine:
             detail=detail,
             auth_probed=auth_probed,
             login_probed=login_probed,
+            authenticate_detail=authenticate_detail,
+            login_attempts=tuple(attempts),
         )
 
     @staticmethod
@@ -2797,11 +2827,46 @@ class ImapEngine:
         ]
         return "\r\n".join(lines).encode("ascii")
 
+    @staticmethod
+    def _eicar_zip_bytes(inner_name: str, payload: bytes) -> bytes:
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(inner_name, payload)
+        return buf.getvalue()
+
+    @staticmethod
+    def _eicar_attachment_rfc822(filename: str, payload: bytes, content_type: str) -> bytes:
+        msg = MIMEMultipart("mixed")
+        msg["Subject"] = f"EICAR antivirus test ({filename})"
+        msg["From"] = "ptsrvtester <ptsrvtester@invalid>"
+        msg["To"] = "ptsrvtester <ptsrvtester@invalid>"
+        msg.attach(MIMEText("ptsrvtester EICAR attachment probe\r\n", "plain", "us-ascii"))
+        main, _, sub = content_type.partition("/")
+        part = MIMEBase(main or "application", sub or "octet-stream")
+        part.set_payload(payload)
+        encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=filename)
+        msg.attach(part)
+        return msg.as_bytes(policy=email_policy.SMTP)
+
+    def _eicar_payloads(self) -> list[tuple[str, bytes]]:
+        raw = _EICAR_STANDARD_LINE.encode("ascii")
+        z1 = self._eicar_zip_bytes("eicar.com", raw)
+        z2 = self._eicar_zip_bytes("eicar.zip", z1)
+        return [
+            ("body (plain EICAR)", self._eicar_rfc822_bytes()),
+            ("eicar.com", self._eicar_attachment_rfc822("eicar.com", raw, "application/octet-stream")),
+            ("eicar.com.txt", self._eicar_attachment_rfc822("eicar.com.txt", raw, "text/plain")),
+            ("eicar.zip", self._eicar_attachment_rfc822("eicar.zip", z1, "application/zip")),
+            ("eicar_double.zip", self._eicar_attachment_rfc822("eicar_double.zip", z2, "application/zip")),
+        ]
+
     def test_eicar_append(self) -> EicarAppendResult:
         """
-        APPEND a minimal RFC 822 message containing the EICAR test line.
-        OK implies the server accepted the payload without rejecting it as malware (PTV-SVC-IMAP-EICAR).
+        APPEND EICAR as plain body, .com/.txt attachments, and ZIP / nested ZIP.
+        Any APPEND OK means that variant was stored (PTV-SVC-IMAP-EICAR).
         """
+        self._eicar_live = False
         mb = (getattr(self.args, "eicar_mailbox", None) or "INBOX").strip() or "INBOX"
         pair = self._imap_single_known_login()
         if not pair:
@@ -2815,14 +2880,16 @@ class ImapEngine:
                 vulnerable=False,
             )
         user, password = pair
-        msg = self._eicar_rfc822_bytes()
+        variants: list[EicarVariantResult] = []
         imap: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
-        try:
-            imap = self.connect()
-            imap.login(user, password)
-            self._dbg(f"LOGIN {user!r} → OK")
-            typ, data = imap.append(mb, None, None, msg)
-            detail: str | None = None
+
+        def _login() -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
+            cl = self.connect()
+            cl.login(user, password)
+            return cl
+
+        def _fmt_append(typ, data) -> str:
+            detail = ""
             if data:
                 try:
                     raw = data[0]
@@ -2830,25 +2897,66 @@ class ImapEngine:
                     detail = detail[:500]
                 except Exception:
                     detail = str(data)[:500]
-            self._dbg(f"APPEND {mb!r} (EICAR) → {typ} {self._snip(detail)}")
-            return EicarAppendResult(
-                skipped=False,
-                skip_reason=None,
-                mailbox=mb,
-                append_typ=typ,
-                append_detail=detail,
-                vulnerable=(typ == "OK"),
-            )
+            return detail
+
+        try:
+            imap = _login()
+            with self._output_lock:
+                self._dbg(f"LOGIN {user!r} → OK")
+                self._flush_terminal()
+            self._eicar_live = True
+            for label, payload in self._eicar_payloads():
+                if imap is None:
+                    try:
+                        imap = _login()
+                    except Exception as e:
+                        row = EicarVariantResult(
+                            label=label,
+                            append_typ="EXC",
+                            append_detail=self._snip(str(e)),
+                            accepted=False,
+                        )
+                        variants.append(row)
+                        with self._output_lock:
+                            self._eicar_emit_variant(mb, row)
+                        continue
+                try:
+                    typ, data = imap.append(mb, None, None, payload)
+                    detail = _fmt_append(typ, data)
+                    row = EicarVariantResult(
+                        label=label,
+                        append_typ=str(typ) if typ is not None else None,
+                        append_detail=detail or None,
+                        accepted=(str(typ).upper() == "OK"),
+                    )
+                except Exception as e:
+                    row = EicarVariantResult(
+                        label=label,
+                        append_typ="EXC",
+                        append_detail=self._snip(str(e)),
+                        accepted=False,
+                    )
+                    try:
+                        imap.logout()
+                    except Exception:
+                        try:
+                            imap.shutdown()
+                        except Exception:
+                            pass
+                    imap = None
+                variants.append(row)
+                with self._output_lock:
+                    self._eicar_emit_variant(mb, row)
         except Exception as e:
-            self._dbg(f"EICAR APPEND failed: {self._snip(str(e))}")
-            return EicarAppendResult(
-                skipped=True,
-                skip_reason=str(e),
-                mailbox=mb,
-                append_typ=None,
-                append_detail=None,
-                vulnerable=False,
-            )
+            if not variants:
+                return EicarAppendResult(
+                    skipped=True,
+                    skip_reason=str(e),
+                    mailbox=mb,
+                    append_typ=None,
+                    append_detail=None,
+                    vulnerable=False,
+                )
         finally:
             if imap is not None:
                 try:
@@ -2858,6 +2966,18 @@ class ImapEngine:
                         imap.shutdown()
                     except Exception:
                         pass
+
+        vulnerable = any(v.accepted for v in variants)
+        first = next((v for v in variants if v.accepted), variants[0] if variants else None)
+        return EicarAppendResult(
+            skipped=False,
+            skip_reason=None,
+            mailbox=mb,
+            append_typ=first.append_typ if first else None,
+            append_detail=first.append_detail if first else None,
+            vulnerable=vulnerable,
+            variants=tuple(variants),
+        )
 
     def _imap_zipxxe_variant_title(self, variant: str) -> str:
         return ZIPXXE_VARIANT_TITLES.get(
@@ -2913,8 +3033,6 @@ class ImapEngine:
                     continue
                 self._dbg(line, indent=8)
         pp(self._imap_zipxxe_variant_outcome_line(v), bullet_type="TEXT", condition=True, indent=8)
-        if v.detail:
-            pp(f"Summary: {v.detail}", bullet_type="TEXT", condition=True, indent=8)
 
     @staticmethod
     def _imap_zipxxe_close(imap: imaplib.IMAP4 | imaplib.IMAP4_SSL | None) -> None:
@@ -3877,6 +3995,48 @@ class ImapEngine:
         d = detail.lower()
         return "codec" in d or "encode" in d or "decode" in d
 
+    @staticmethod
+    def _imap_mbox_iso_unicode_mailbox(token: str) -> str:
+        """Accent one letter of the other-user token (user2 → usér2, admin → ádmin)."""
+        t = (token or "").strip() or "user2"
+        if any(ord(c) > 127 for c in t):
+            return t
+        for src, dst in (
+            ("e", "é"), ("E", "É"),
+            ("a", "á"), ("A", "Á"),
+            ("i", "í"), ("I", "Í"),
+            ("o", "ó"), ("O", "Ó"),
+            ("u", "ú"), ("U", "Ú"),
+            ("y", "ý"), ("Y", "Ý"),
+        ):
+            if src in t:
+                return t.replace(src, dst, 1)
+        return t[0] + "\u0301" + t[1:] if t else "usér2"
+
+    @staticmethod
+    def _imap_mailbox_modified_utf7(name: str) -> str:
+        """RFC 3501 mailbox encoding so imaplib can send non-ASCII names."""
+        out: list[str] = []
+        buf: list[str] = []
+
+        def flush() -> None:
+            if not buf:
+                return
+            raw = "".join(buf).encode("utf-16-be")
+            b64 = b64encode(raw).decode("ascii").rstrip("=").replace("/", ",")
+            out.append("&" + b64 + "-")
+            buf.clear()
+
+        for ch in name:
+            o = ord(ch)
+            if 0x20 <= o <= 0x7e:
+                flush()
+                out.append("&-" if ch == "&" else ch)
+            else:
+                buf.append(ch)
+        flush()
+        return "".join(out)
+
     def test_imap_mailbox_iso(self) -> ImapMailboxIsoResult:
         """
         Post-login mailbox isolation & shared-folder hygiene (PTV-SVC-IMAP-AUTHZ-BYPASS).
@@ -4250,20 +4410,21 @@ class ImapEngine:
                 ("foreign_hashmail", f"#mail/{fu}"),
                 ("path_dotdot", f"../{fu}/INBOX"),
                 ("foreign_dotinbox", f"{fu}.INBOX"),
-                ("unicode_mailbox_us_eacute", "usér2"),
+                ("unicode_mailbox", self._imap_mbox_iso_unicode_mailbox(fu)),
             ]
             for pid, mbx in probe_specs:
                 detail: str | None = None
                 typ: str | None = None
                 ok_sel = False
-                send_ex = f"EXAMINE {mbx}"
+                wire = self._imap_mailbox_modified_utf7(mbx)
+                send_ex = f"EXAMINE {wire}"
                 recv_ex: str | None = None
                 try:
                     if hasattr(imap, "examine"):
-                        typ, dat = imap.examine(mbx)
+                        typ, dat = imap.examine(wire)
                     else:
-                        send_ex = f"SELECT {mbx}"
-                        typ, dat = imap.select(mbx)
+                        send_ex = f"SELECT {wire}"
+                        typ, dat = imap.select(wire)
                     ok_sel = typ == "OK"
                     if dat:
                         try:
@@ -5247,6 +5408,49 @@ class ImapEngine:
             else:
                 self._tprint("Not configured (server rejects invalid creds)", bullet="NOTVULN")
 
+    def _anonymous_vv(self, text: str) -> None:
+        if self.use_json:
+            return
+        self._dbg(text)
+        self._flush_terminal()
+
+    def _anonymous_verdict(self, text: str, bullet: str) -> None:
+        if self.use_json:
+            return
+        self._ptprint_raw(text, bullet_type=bullet, condition=True, indent=4)
+        self._flush_terminal()
+
+    def _anonymous_emit_auth_capa(self, advertised: bool) -> None:
+        self._anonymous_vv(f"AUTH=ANONYMOUS advertised={advertised}")
+        if advertised:
+            self._anonymous_verdict("AUTH method ANONYMOUS advertised", "WARNING")
+        else:
+            self._anonymous_verdict("AUTH method ANONYMOUS not advertised", "NOTVULN")
+
+    def _anonymous_emit_authenticate(self, ok: bool, detail: str | None) -> None:
+        extra = f": {detail}" if detail else ""
+        if ok:
+            self._anonymous_vv(f"AUTHENTICATE ANONYMOUS OK{extra}")
+            self._anonymous_verdict("Use AUTHENTICATE ANONYMOUS: accepted", "VULN")
+        else:
+            self._anonymous_vv(f"AUTHENTICATE ANONYMOUS failed{extra}")
+            self._anonymous_verdict("Use AUTHENTICATE ANONYMOUS: not accepted", "NOTVULN")
+
+    def _anonymous_emit_login(self, user: str, password: str, accepted: bool, detail: str | None) -> None:
+        pw_disp = '""' if not password else password
+        self._anonymous_vv(f"LOGIN {user} {pw_disp}")
+        if accepted:
+            self._anonymous_vv("OK")
+            tail, bullet = "accepted", "VULN"
+        else:
+            self._anonymous_vv(f"failed: {detail or 'rejected'}")
+            tail, bullet = "rejected", "NOTVULN"
+        if password:
+            text = f'Use LOGIN "{user}" and password "{password}": {tail}'
+        else:
+            text = f'Use LOGIN "{user}" and empty password: {tail}'
+        self._anonymous_verdict(text, bullet)
+
     def _anonymous_emit_terminal(self, ar: AnonymousAccessResult) -> None:
         pp = self._ptprint_raw
         show = not self.use_json
@@ -5254,54 +5458,51 @@ class ImapEngine:
             pp(ar.detail, bullet_type="WARNING", condition=show, indent=4)
             return
         if ar.auth_probed:
-            if ar.auth_anonymous_advertised:
-                pp(
-                    "AUTH method ANONYMOUS advertised",
-                    bullet_type="WARNING",
-                    condition=show,
-                    indent=4,
-                )
-            else:
-                pp("AUTH method ANONYMOUS not advertised", bullet_type="NOTVULN", condition=show, indent=4)
-
-            if ar.authenticate_anonymous_ok:
-                pp("Use AUTHENTICATE ANONYMOUS: accepted", bullet_type="VULN", condition=show, indent=4)
-            else:
-                pp("Use AUTHENTICATE ANONYMOUS: not accepted", bullet_type="NOTVULN", condition=show, indent=4)
-
-        if ar.login_probed:
-            if ar.login_anonymous_empty_ok:
-                pp(
-                    "Use LOGIN (anonymous/guest/public) with empty password: accepted",
-                    bullet_type="VULN",
-                    condition=show,
-                    indent=4,
-                )
-            else:
-                pp(
-                    "Use LOGIN (anonymous/guest/public) with empty password: rejected",
-                    bullet_type="NOTVULN",
-                    condition=show,
-                    indent=4,
-                )
-
-        for w in ar.weak_credentials_ok:
-            pp(f"LOGIN accepted: {w}", bullet_type="VULN", condition=show, indent=4)
-
-        if ar.vulnerable:
-            pp(
-                "Verdict: anonymous or weak default access",
-                bullet_type="VULN",
-                condition=show,
-                indent=4,
-            )
+            self._anonymous_emit_auth_capa(ar.auth_anonymous_advertised)
+            self._anonymous_emit_authenticate(ar.authenticate_anonymous_ok, ar.authenticate_detail)
+        if ar.login_attempts:
+            for p in ar.login_attempts:
+                self._anonymous_emit_login(p.username, p.password, p.accepted, p.detail)
+        elif ar.login_probed:
+            self._anonymous_emit_login("anonymous", "", ar.login_anonymous_empty_ok, None)
+            for w in ar.weak_credentials_ok:
+                user, _, pw = w.partition(" / ")
+                password = "" if pw in ("<empty>", "") else pw
+                self._anonymous_emit_login(user, password, True, "OK")
 
     def _stream_anonymous_result(self) -> None:
         """Stream anonymous auth result immediately (thread-safe)."""
         if (ar := self.results.anonymous) is None:
             return
         with self._output_lock:
+            if getattr(self, "_anonymous_live", False):
+                return
             self._anonymous_emit_terminal(ar)
+
+    def _eicar_emit_variant(self, mailbox: str, v: EicarVariantResult) -> None:
+        if self.use_json:
+            return
+        recv = v.append_detail or v.append_typ or ""
+        if v.accepted:
+            self._dbg(f"APPEND {mailbox!r} {v.label} → {v.append_typ or 'OK'} {self._snip(recv)}")
+        else:
+            self._dbg(f"APPEND {mailbox!r} {v.label} → failed: {self._snip(recv) or v.append_typ or 'rejected'}")
+        self._flush_terminal()
+        if v.accepted:
+            self._ptprint_raw(
+                f"APPEND accepted {v.label}",
+                bullet_type="VULN",
+                condition=True,
+                indent=4,
+            )
+        else:
+            self._ptprint_raw(
+                f"APPEND rejected {v.label}",
+                bullet_type="NOTVULN",
+                condition=True,
+                indent=4,
+            )
+        self._flush_terminal()
 
     def _eicar_emit_terminal(self, er: EicarAppendResult) -> None:
         pp = self._ptprint_raw
@@ -5309,14 +5510,12 @@ class ImapEngine:
         if er.skipped:
             pp(f"Skipped: {er.skip_reason or 'n/a'}", bullet_type="WARNING", condition=show, indent=4)
             return
+        if er.variants:
+            for v in er.variants:
+                self._eicar_emit_variant(er.mailbox, v)
+            return
         if er.vulnerable:
-            pp(
-                "APPEND accepted EICAR test message — inbound AV may be missing or ineffective "
-                f"(server: {er.append_typ})",
-                bullet_type="VULN",
-                condition=show,
-                indent=4,
-            )
+            pp("APPEND accepted EICAR test message", bullet_type="VULN", condition=show, indent=4)
         else:
             snippet = (er.append_detail or "n/a").replace("\r\n", " ")[:200]
             pp(
@@ -5331,6 +5530,8 @@ class ImapEngine:
         if (er := self.results.eicar) is None:
             return
         with self._output_lock:
+            if getattr(self, "_eicar_live", False):
+                return
             self._eicar_emit_terminal(er)
 
     def _stream_imap_zipxxe_result(self) -> None:
@@ -6207,14 +6408,27 @@ class ImapEngine:
                         "appendResult": er.append_typ,
                         "appendDetail": er.append_detail,
                         "vulnerable": er.vulnerable,
+                        "variants": [
+                            {
+                                "label": v.label,
+                                "appendResult": v.append_typ,
+                                "appendDetail": v.append_detail,
+                                "accepted": v.accepted,
+                            }
+                            for v in er.variants
+                        ],
                     }
                 }
             )
             if er.vulnerable and not er.skipped:
+                hits = [v.label for v in er.variants if v.accepted]
                 deferred_vulns.append(
                     {
                         "vuln_code": VULNS.Eicar.value,
-                        "vuln_request": f"APPEND EICAR test line to mailbox {er.mailbox!r} (RFC 822 message body)",
+                        "vuln_request": (
+                            f"APPEND EICAR variants to mailbox {er.mailbox!r}: "
+                            + (", ".join(hits) if hits else "RFC 822 EICAR")
+                        ),
                         "vuln_response": er.append_detail or er.append_typ or "OK",
                     }
                 )

@@ -267,6 +267,15 @@ class ImapConnLimitsResult(NamedTuple):
     terminated_connections: tuple[tuple[int, str, str], ...]
 
 
+class AnonymousLoginProbe(NamedTuple):
+    """One LOGIN probe (anonymous / guest / public, empty or matching password)."""
+
+    username: str
+    password: str
+    accepted: bool
+    detail: str | None = None
+
+
 class AnonymousAccessResult(NamedTuple):
     """Anonymous / pseudo-anonymous IMAP access (SASL ANONYMOUS, LOGIN patterns)."""
     auth_anonymous_advertised: bool
@@ -277,16 +286,28 @@ class AnonymousAccessResult(NamedTuple):
     detail: str
     auth_probed: bool
     login_probed: bool
+    authenticate_detail: str | None = None
+    login_attempts: tuple[AnonymousLoginProbe, ...] = ()
+
+
+class EicarVariantResult(NamedTuple):
+    """One EICAR APPEND payload (plain body, .com/.txt attachment, or ZIP)."""
+
+    label: str
+    append_typ: str | None
+    append_detail: str | None
+    accepted: bool
 
 
 class EicarAppendResult(NamedTuple):
-    """APPEND minimal RFC 822 message containing EICAR test line (PTV-SVC-IMAP-EICAR when accepted)."""
+    """APPEND EICAR variants (PTV-SVC-IMAP-EICAR when any payload is accepted)."""
     skipped: bool
     skip_reason: str | None
     mailbox: str
     append_typ: str | None
     append_detail: str | None
     vulnerable: bool
+    variants: tuple[EicarVariantResult, ...] = ()
 
 
 # Same titles / payload filenames as SMTP ZIPXXE (terminal + JSON stay aligned).

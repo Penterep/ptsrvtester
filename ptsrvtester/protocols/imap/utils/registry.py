@@ -127,8 +127,8 @@ IMAP_TESTS: dict[str, dict] = {
     "EICAR": {
         "desc": "APPEND EICAR antivirus probe",
         "long": [
-            "APPEND an RFC 822 message containing the EICAR test line to a",
-            "mailbox to check server-side antivirus / content filtering.",
+            "APPEND EICAR as plain body, eicar.com / eicar.com.txt attachments,",
+            "and ZIP / nested ZIP (eicar.org / SMTP AV variants).",
         ],
         "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [

@@ -9,6 +9,7 @@ import re
 import select
 import socket
 import ssl
+import statistics
 import string
 import sys
 import threading
@@ -17,7 +18,6 @@ import uuid
 import zipfile
 from base64 import b64decode, b64encode
 from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email import policy as email_policy
@@ -35,6 +35,7 @@ from .helpers import (
     Target,
     check_if_brute,
     get_mode,
+    one_cli_user,
     simple_bruteforce,
     text_or_file,
     valid_target,
@@ -65,15 +66,18 @@ from .capa import (
     _extract_capabilities_from_banner,
     _normalize_imap_login_error_for_enum,
     _imap_login_exception_text,
+    _imap_dat_to_text,
     _parse_capability_commands,
     valid_target_imap,
 )
-from ptlibs.ptprinthelper import ptprint
+from ptlibs.ptprinthelper import out_if, ptprint
 from .ptprinthelper import get_colored_text
+from .progress import ThreadedProgress
 
 from .decompression_payloads import (
     BILLION_LAUGHS_XML,
     build_full_zip_bomb,
+    build_huge_zip_bomb,
     build_minimal_docx_with_xxe,
     build_minimal_zip_bomb,
     build_zip_with_xxe,
@@ -144,9 +148,6 @@ class ImapEngine:
         self.use_json = bool(getattr(args, "json", False))
         self.do_brute = check_if_brute(args)
         self._output_lock = threading.Lock()
-        self._usrenum_progress_lock = threading.Lock()
-        self._usrenum_mt_progress_line_active = False
-        self._usrenum_progress_start = None
         self._ntlm_transient_init_emitted = False
         from .results import IMAPResults
         self.results = IMAPResults()
@@ -216,6 +217,10 @@ class ImapEngine:
             return text[: limit - 3] + "..."
         return text
 
+    def _imap_folder(self) -> str:
+        """Folder for APPEND/SELECT (--mailbox, default INBOX)."""
+        return (getattr(self.args, "mailbox", None) or "INBOX").strip() or "INBOX"
+
     def _dbg(self, msg: str, *, indent: int = 4) -> None:
         """Verbose-only (-vv) line via ctx.debug / ADDITIONS."""
         try:
@@ -242,18 +247,32 @@ class ImapEngine:
         for c in capa:
             self._dbg(str(c), indent=item_indent)
 
-    def _dbg_usrenum_row(self, method: str, row: "ImapUserEnumProbeRow") -> None:
+    def _dbg_usrenum_row(
+        self,
+        method: str,
+        row: "ImapUserEnumProbeRow",
+        *,
+        output=None,
+    ) -> None:
+        if not getattr(self.args, "debug", False) or self.use_json:
+            return
         kind = row.probe_kind
         user = row.username
         if row.error:
-            self._dbg(f"USR-ENUM {method} {kind} {user!r}: connect/error {self._snip(row.error)}")
+            msg = f"USR-ENUM {method} {kind} {user!r}: connect/error {self._snip(row.error)}"
         elif row.unexpected_ok:
-            self._dbg(f"USR-ENUM {method} {kind} {user!r}: unexpected OK")
+            msg = f"USR-ENUM {method} {kind} {user!r}: unexpected OK"
         else:
-            self._dbg(
+            msg = (
                 f"USR-ENUM {method} {kind} {user!r}: {self._snip(row.reply_raw)} "
-                f"(norm={row.reply_normalized!r})"
+                f"(norm={row.reply_normalized!r} t={row.elapsed_ms}ms)"
             )
+        if output is not None:
+            line = out_if(msg, "ADDITIONS", True, colortext=True, indent=0)
+            if line:
+                output.add_string_to_output(line.rstrip("\n"))
+            return
+        self._dbg(msg)
 
     def _emit_section_heading(self, title: str) -> None:
         """Print section title before work starts (align with SMTP/FTP progressive terminal UX)."""
@@ -314,22 +333,165 @@ class ImapEngine:
 
     def _imap_single_known_login(self) -> tuple[str, str] | None:
         """One explicit user+password, no wordlists (same idea as FTP bruteforce single-known)."""
-        u = getattr(self.args, "user", None)
+        u = one_cli_user(getattr(self.args, "user", None))
         p = getattr(self.args, "password", None)
         uf = getattr(self.args, "users", None)
         pf = getattr(self.args, "passwords", None)
         if u and p and not uf and not pf:
-            return (str(u), str(p))
+            return (u, str(p))
         return None
 
     def _imap_usrenum_names_from_cli(self) -> list[str]:
         """Candidate usernames for USRENUM / USRENUMPLAIN from -u / -U (same as BRUTE)."""
         raw = text_or_file(getattr(self.args, "user", None), getattr(self.args, "users", None))
-        names = [ln.strip() for ln in raw if ln.strip() and not ln.strip().startswith("#")]
+        names: list[str] = []
+        seen: set[str] = set()
+        for ln in raw:
+            s = (ln or "").replace("\ufeff", "").strip()
+            if not s or s.startswith("#") or s in seen:
+                continue
+            seen.add(s)
+            names.append(s)
         ue_mx = int(getattr(self.args, "imap_usrenum_max", 0) or 0)
         if ue_mx > 0:
             names = names[:ue_mx]
         return names
+
+    def _imap_usrenum_threads(self) -> int:
+        """USRENUM / USRENUMPLAIN workers from -t/--threads (default 1)."""
+        return max(1, int(getattr(self.args, "noop2_threads", None) or 1))
+
+    @staticmethod
+    def _imap_usrenum_synthetic_invalid(n: int = 2) -> list[str]:
+        return [f"enumtest_invalid_{random.getrandbits(32):08x}" for _ in range(n)]
+
+    def _imap_usrenum_timing_usable(self, invalid_times: list[float]) -> bool:
+        """
+        Timing is only an oracle when unknown users fail fast and times are stable
+        (OWASP WSTG-IDENT-04). Parallel -t and Dovecot-style auth_failure_delay
+        (~2s on every failure) are not username leaks (RFC 5530 AUTHENTICATIONFAILED
+        covers unknown user and bad password alike).
+        """
+        if self._imap_usrenum_threads() > 1:
+            return False
+        if len(invalid_times) < 2:
+            return False
+        med = statistics.median(invalid_times)
+        if med >= 400.0:
+            return False
+        lo, hi = min(invalid_times), max(invalid_times)
+        if lo <= 0.0 or (hi / lo) > 1.35:
+            return False
+        return True
+
+    def _imap_usrenum_timing_outlier(self, elapsed_ms: float | None, invalid_times: list[float]) -> bool:
+        """True if auth-command RTT is slower than a tight invalid-user baseline."""
+        if elapsed_ms is None or not self._imap_usrenum_timing_usable(invalid_times):
+            return False
+        med = statistics.median(invalid_times)
+        return elapsed_ms >= max(invalid_times) + 80.0 and elapsed_ms >= med * 2.0
+
+    @staticmethod
+    def _imap_usrenum_delay_note(invalid_times: list[float], wordlist_times: list[float]) -> str | None:
+        """Explain 2s/4s auth_failure_delay when fake users land in both buckets."""
+        inv = [t for t in invalid_times if t is not None]
+        wl = [t for t in wordlist_times if t is not None]
+        all_t = inv + wl
+        if len(all_t) < 4 or len(inv) < 2:
+            return None
+        lo, hi = min(all_t), max(all_t)
+        if hi < 800 or hi < lo * 1.5:
+            return None
+        inv_lo, inv_hi = min(inv), max(inv)
+        if inv_hi < inv_lo * 1.4:
+            return None
+        return (
+            f"Some replies took ~{int(round(lo / 1000))}s and others ~{int(round(hi / 1000))}s. "
+            "That extra wait is a retry delay, not a sign that the account exists."
+        )
+
+    def _imap_usrenum_close(self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL | None) -> None:
+        if imap is None:
+            return
+        try:
+            imap.logout()
+        except Exception:
+            try:
+                imap.shutdown()
+            except Exception:
+                pass
+
+    def _imap_usrenum_read_tagged(
+        self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL, tag: bytes, t0: float
+    ) -> tuple[str, str, float]:
+        """Read until the tagged reply; keep untagged lines in the signature (RFC 3501)."""
+        chunks: list[str] = []
+        while True:
+            line = imap.readline()
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            if not line:
+                return "ABORT", " | ".join(chunks) or "empty reply", elapsed_ms
+            decoded = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            chunks.append(decoded)
+            full = " | ".join(chunks)
+            if line.startswith(tag) or line.upper().startswith(tag.upper()):
+                rest = line[len(tag):].strip()
+                parts = rest.split(None, 1)
+                typ = parts[0].decode("utf-8", errors="replace").upper() if parts else "NO"
+                return typ, full, elapsed_ms
+            if decoded.upper().startswith("* BYE"):
+                return "ABORT", full, elapsed_ms
+
+    def _imap_usrenum_measure_login(
+        self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL, username: str, password: str
+    ) -> tuple[str, str, float]:
+        """LOGIN (RFC 3501 astring); time only the command. Keep tagged NO vs BAD."""
+        uq = imap._quote(username)
+        pq = imap._quote(password)
+        if isinstance(uq, str):
+            uq = uq.encode("utf-8")
+        if isinstance(pq, str):
+            pq = pq.encode("utf-8")
+        tag = imap._new_tag()
+        if isinstance(tag, str):
+            tag = tag.encode("ascii")
+        t0 = time.perf_counter()
+        try:
+            imap.send(tag + b" LOGIN " + uq + b" " + pq + b"\r\n")
+            typ, raw, elapsed_ms = self._imap_usrenum_read_tagged(imap, tag, t0)
+            return typ, raw, elapsed_ms
+        except imaplib.IMAP4.abort as e:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return "ABORT", _imap_login_exception_text(e), elapsed_ms
+        except (OSError, socket.timeout, TimeoutError) as e:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return "ABORT", str(e), elapsed_ms
+
+    def _imap_usrenum_measure_plain(
+        self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL, username: str, password: str
+    ) -> tuple[str, str, float]:
+        """AUTHENTICATE PLAIN (RFC 4616); time only the command. Keep tagged NO vs BAD."""
+        blob = (
+            b"\x00"
+            + username.encode("utf-8", errors="replace")
+            + b"\x00"
+            + password.encode("utf-8", errors="replace")
+        )
+
+        def _auth_cb(_chal: bytes) -> bytes:
+            return blob
+
+        imap.literal = imaplib._Authenticator(_auth_cb).process
+        t0 = time.perf_counter()
+        try:
+            typ, dat = imap._simple_command("AUTHENTICATE", "PLAIN")
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return (typ or "").upper(), _imap_dat_to_text(dat), elapsed_ms
+        except imaplib.IMAP4.abort as e:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return "ABORT", _imap_login_exception_text(e), elapsed_ms
+        finally:
+            imap.literal = None
 
     @staticmethod
     def _imap_untagged_is_bye(line: bytes | str | None) -> bool:
@@ -1217,6 +1379,8 @@ class ImapEngine:
                 return "indeterminate"
             except Exception as e:
                 self._dbg(f"Catch-all rejected (not configured): {self._snip(str(e))}")
+                if self._imap_text_is_timeout(str(e)):
+                    return "unreachable"
                 return "not_configured"
             finally:
                 try:
@@ -2696,6 +2860,24 @@ class ImapEngine:
             return True
         return False
 
+    def _imap_session_is_encrypted(self) -> bool:
+        if getattr(self.args, "tls", False) or getattr(self.args, "starttls", False):
+            return True
+        port = getattr(getattr(self.args, "target", None), "port", None)
+        return port == 993
+
+    def _usrenum_logindisabled_on_session(
+        self,
+        imap: imaplib.IMAP4 | imaplib.IMAP4_SSL,
+        banner: str | None,
+        merged: list[str],
+    ) -> bool:
+        """LOGINDISABLED for the live session. After STARTTLS/TLS ignore the plaintext banner."""
+        live = [str(c) for c in (imap.capabilities or [])]
+        if self._imap_session_is_encrypted():
+            return self._capability_logindisabled(live or None, None)
+        return self._capability_logindisabled(merged, banner)
+
     def test_anonymous_access(self) -> AnonymousAccessResult:
         """
         Probe anonymous and weak default IMAP logins (PTL-SVC-IMAP-ANONYMOUS).
@@ -2790,6 +2972,11 @@ class ImapEngine:
         if weak_hits:
             parts.append("Weak default accounts: " + "; ".join(weak_hits))
         if not vulnerable:
+            n_to = sum(1 for a in attempts if self._imap_text_is_timeout(a.detail))
+            if self._imap_text_is_timeout(authenticate_detail):
+                n_to += 1
+            if n_to:
+                parts.append(f"{n_to} probe(s) timed out and were not confirmed as rejected")
             if auth_anonymous_advertised:
                 parts.append("SASL ANONYMOUS advertised; authenticated login failed or was denied")
             detail = (
@@ -2867,7 +3054,7 @@ class ImapEngine:
         Any APPEND OK means that variant was stored (PTV-SVC-IMAP-EICAR).
         """
         self._eicar_live = False
-        mb = (getattr(self.args, "eicar_mailbox", None) or "INBOX").strip() or "INBOX"
+        mb = self._imap_folder()
         pair = self._imap_single_known_login()
         if not pair:
             self._dbg("EICAR skipped: requires single -u and -p (no wordlists)")
@@ -3013,6 +3200,8 @@ class ImapEngine:
                     return f"{label}: {code} (rejected)"
             return f"{label}: NO (rejected)"
         if v.error > 0:
+            if any(self._imap_text_is_timeout(line) for line in v.imap_trace):
+                return f"{label}: timed out (not confirmed)"
             return f"{label}: (error)"
         return f"{label}: (skipped)"
 
@@ -3046,46 +3235,24 @@ class ImapEngine:
             except Exception:
                 pass
 
-    def test_imap_zipxxe(self) -> ZipxxeResult:
+    def test_imap_xxe_suite(
+        self,
+        *,
+        suite: str,
+        variants: list[str],
+        canary_url: str = "",
+        verification: str,
+        x_test: str,
+        subject: str,
+    ) -> ZipxxeResult:
         """
-        APPEND Zip bomb, Billion Laughs and XXE payloads (PTL-SVC-IMAP-ZIPXXE).
-
-        Method (verified sources):
-        - RFC 3501 §6.3.11 / RFC 9051 §6.3.12: APPEND is an authenticated-state
-          command; the argument is an RFC 822 message; SELECT is not required.
-        - OWASP XXE Prevention Cheat Sheet / WSTG XML Injection: SYSTEM entity
-          to a canary (OOB), including OOXML (ZIP+XML) containers.
-        - Billion Laughs: nested internal entity expansion DoS (DTD still on).
-        - Zip bombs: high-ratio DEFLATE; opt-in only (same as SMTP ZIPXXE).
-        APPEND OK means the store accepted the message; XML/ZIP impact is
-        processing-side and requires manual CPU / canary verification.
+        APPEND XML/ZIP payloads (XXESSRF / XXEEXP / ZIPBOMB).
+        APPEND OK means the store accepted the message; impact is manual.
         """
-        mb = (getattr(self.args, "zipxxe_mailbox", None) or "INBOX").strip() or "INBOX"
-        canary_url = str(getattr(self.args, "zipxxe_canary_url", "") or "").strip()
-        timeout = max(5.0, float(getattr(self.args, "zipxxe_timeout", 30.0) or 30.0))
-        variants_arg = getattr(self.args, "zipxxe_variants", None)
-        incl_zip_bomb = bool(getattr(self.args, "zipxxe_zip_bomb", False))
-        incl_zip_bomb_full = bool(getattr(self.args, "zipxxe_zip_bomb_full", False))
-        default_variants = [
-            "billion_laughs_attach",
-            "billion_laughs_body",
-            "xxe_zip",
-            "xxe_docx",
-            "xxe_body",
-        ]
-        if variants_arg:
-            variants = [v.strip().lower() for v in str(variants_arg).split(",") if v.strip()]
-        else:
-            variants = list(default_variants)
-        if incl_zip_bomb and "zip_bomb" not in variants:
-            variants.append("zip_bomb")
-        if incl_zip_bomb_full and "zip_bomb_full" not in variants:
-            variants.append("zip_bomb_full")
-
-        VERIFICATION_INSTRUCTIONS = (
-            "Monitor server CPU, memory, disk, IMAP responsiveness. For XXE variants, check canary for HTTP requests. "
-            "FAIL if significant slowdown, freeze, restart, or disk exhaustion occurs."
-        )
+        mb = self._imap_folder()
+        timeout = max(5.0, float(getattr(self.args, "xxe_timeout", None) or getattr(self.args, "zipxxe_timeout", None) or 30.0))
+        live_attr = f"_imap_{suite}_live"
+        canary_attr = f"_imap_{suite}_canary_streamed"
         empty = ZipxxeResult(
             manual_verification_required=True,
             canary_url=canary_url,
@@ -3094,7 +3261,7 @@ class ImapEngine:
             elapsed_sec=0.0,
             auth_used=False,
             detail="No variants sent; check connection.",
-            verification_instructions=VERIFICATION_INSTRUCTIONS,
+            verification_instructions=verification,
             all_rejected_at_append=False,
         )
         pair = self._imap_single_known_login()
@@ -3102,12 +3269,12 @@ class ImapEngine:
             return empty._replace(detail="Skipped: requires single -u and -p (no wordlists)")
         user, password = pair
 
-        self._imap_zipxxe_streamed_live = False
-        self._imap_zipxxe_canary_streamed = False
+        setattr(self, live_attr, False)
+        setattr(self, canary_attr, False)
         if not self.use_json and getattr(self.args, "debug", False) and canary_url:
             ptprint("Canary URL", bullet_type="TITLE", condition=True, indent=4)
             ptprint(canary_url, bullet_type="TEXT", condition=True, indent=8)
-            self._imap_zipxxe_canary_streamed = True
+            setattr(self, canary_attr, True)
 
         def _reply_snip(data) -> str:
             if not data:
@@ -3132,7 +3299,7 @@ class ImapEngine:
             msg["From"] = "ptsrvtester <ptsrvtester@invalid>"
             msg["To"] = "ptsrvtester <ptsrvtester@invalid>"
             msg["Date"] = time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())
-            msg["X-Test"] = "IMAP-ZIPXXE"
+            msg["X-Test"] = x_test
             msg["X-Test-ID"] = test_id
             msg.attach(MIMEText(body, "plain", "utf-8"))
             part = MIMEBase(*content_type.split("/", 1))
@@ -3150,7 +3317,7 @@ class ImapEngine:
                 "MIME-Version: 1.0",
                 "Content-Type: application/xml; charset=utf-8",
                 f"Date: {time.strftime('%a, %d %b %Y %H:%M:%S +0000', time.gmtime())}",
-                "X-Test: IMAP-ZIPXXE",
+                f"X-Test: {x_test}",
                 f"X-Test-ID: {test_id}",
                 "",
                 xml_body,
@@ -3160,8 +3327,7 @@ class ImapEngine:
         start_time = time.perf_counter()
         auth_used = False
         var_results: list[ZipxxeVariantResult] = []
-        subject = "IMAP ZIPXXE probe"
-        body = "ptsrvtester ZIPXXE content probe"
+        body = "ptsrvtester content probe"
 
         for var_name in variants:
             if var_name in ("xxe_zip", "xxe_docx", "xxe_body") and not canary_url:
@@ -3191,15 +3357,20 @@ class ImapEngine:
                     )
                 elif var_name == "xxe_body":
                     raw_msg = _build_xml_body(subject, xxe_xml_template(canary_url), zip_test_id)
-                elif var_name == "zip_bomb":
+                elif var_name in ("zip_bomb", "zip_bomb_small"):
                     raw_msg = _build_mime_with_attachment(
                         subject, body, build_minimal_zip_bomb(),
-                        "zipbomb.zip", zip_test_id, "application/zip",
+                        "zipbomb-small.zip", zip_test_id, "application/zip",
                     )
-                elif var_name == "zip_bomb_full":
+                elif var_name in ("zip_bomb_full", "zip_bomb_medium"):
                     raw_msg = _build_mime_with_attachment(
                         subject, body, build_full_zip_bomb(),
-                        "zipbomb_full.zip", zip_test_id, "application/zip",
+                        "zipbomb-medium.zip", zip_test_id, "application/zip",
+                    )
+                elif var_name == "zip_bomb_huge":
+                    raw_msg = _build_mime_with_attachment(
+                        subject, body, build_huge_zip_bomb(),
+                        "zipbomb-huge.zip", zip_test_id, "application/zip",
                     )
                 else:
                     continue
@@ -3260,7 +3431,7 @@ class ImapEngine:
             )
             var_results.append(variant_result)
             if not self.use_json and getattr(self.args, "debug", False):
-                self._imap_zipxxe_streamed_live = True
+                setattr(self, live_attr, True)
                 self._imap_zipxxe_stream_variant_section(variant_result, stream_trace=True)
 
         elapsed = time.perf_counter() - start_time
@@ -3282,8 +3453,62 @@ class ImapEngine:
             elapsed_sec=elapsed,
             auth_used=auth_used,
             detail=detail,
-            verification_instructions=VERIFICATION_INSTRUCTIONS,
+            verification_instructions=verification,
             all_rejected_at_append=all_rejected_at_append,
+        )
+
+    def test_imap_xxessrf(self) -> ZipxxeResult:
+        canary = str(getattr(self.args, "canary_url", None) or getattr(self.args, "zipxxe_canary_url", None) or "").strip()
+        return self.test_imap_xxe_suite(
+            suite="xxessrf",
+            variants=["xxe_zip", "xxe_docx", "xxe_body"],
+            canary_url=canary,
+            verification=(
+                "For XXE variants, check canary for HTTP requests. "
+                "APPEND OK means the message was stored, not that SSRF succeeded."
+            ),
+            x_test="IMAP-XXESSRF",
+            subject="IMAP XXE SSRF probe",
+        )
+
+    def test_imap_xxeexp(self) -> ZipxxeResult:
+        return self.test_imap_xxe_suite(
+            suite="xxeexp",
+            variants=["billion_laughs_attach", "billion_laughs_body"],
+            canary_url="",
+            verification=(
+                "Monitor server CPU, memory and IMAP responsiveness. "
+                "FAIL if significant slowdown, freeze or restart occurs."
+            ),
+            x_test="IMAP-XXEEXP",
+            subject="IMAP XML entity expansion probe",
+        )
+
+    def _imap_zipbomb_variants(self) -> list[str]:
+        """ZIPBOMB payload ids. No --variant-* → small+medium (not huge)."""
+        selected: list[str] = []
+        if getattr(self.args, "zipbomb_variant_small", False):
+            selected.append("zip_bomb_small")
+        if getattr(self.args, "zipbomb_variant_medium", False):
+            selected.append("zip_bomb_medium")
+        if getattr(self.args, "zipbomb_variant_huge", False):
+            selected.append("zip_bomb_huge")
+        if not selected:
+            return ["zip_bomb_small", "zip_bomb_medium"]
+        return selected
+
+    def test_imap_zipbomb(self) -> ZipxxeResult:
+        variants = self._imap_zipbomb_variants()
+        return self.test_imap_xxe_suite(
+            suite="zipbomb",
+            variants=variants,
+            canary_url="",
+            verification=(
+                "Monitor server disk, memory and IMAP responsiveness. "
+                "FAIL if freeze, restart or disk exhaustion occurs."
+            ),
+            x_test="IMAP-ZIPBOMB",
+            subject="IMAP zip bomb probe",
         )
 
     @staticmethod
@@ -3536,7 +3761,7 @@ class ImapEngine:
         Completing the safety cap with OK = missing limit; RFC 9208 OVERQUOTA = quota works;
         TCP drop = instability. Slowdown is a warning only.
         """
-        mb = (getattr(self.args, "imap_resource_load_mailbox", None) or "INBOX").strip() or "INBOX"
+        mb = self._imap_folder()
         pair = self._imap_single_known_login()
         append_max = int(getattr(self.args, "imap_resource_load_append_max", 0) or 0)
         search_max = int(getattr(self.args, "imap_resource_load_search_max", 0) or 0)
@@ -4043,7 +4268,7 @@ class ImapEngine:
         Baseline SELECT on own mailbox; cross-mailbox attempts use EXAMINE when supported (read-only).
         LIST "" "*", bounded LIST dictionary, NAMESPACE, GETACL on own mailbox.
         """
-        own_mb = (getattr(self.args, "imap_mailbox_iso_mailbox", None) or "INBOX").strip() or "INBOX"
+        own_mb = self._imap_folder()
         fu = (getattr(self.args, "imap_mailbox_iso_foreign_user", None) or "user2").strip() or "user2"
         pair = self._imap_single_known_login()
         if not pair:
@@ -4551,201 +4776,270 @@ class ImapEngine:
             list_root_recv=(io_cap["list"][1] if "list" in io_cap else None),
         )
 
-    def _usrenum_eta_remaining_seconds(self, done: int, total: int, elapsed: float) -> float | None:
-        if done <= 0 or total <= 0 or done >= total:
-            return None
-        return elapsed * (total - done) / done
-
-    def _format_usrenum_clock(self, seconds: float | None) -> str:
-        if seconds is None:
-            return "--:--:--"
-        sec = max(0.0, float(seconds))
-        h, rem = divmod(int(sec + 0.5), 3600)
-        m, s = divmod(rem, 60)
-        return f"{h:d}:{m:02d}:{s:02d}"
-
     def _usrenum_progress_reset(self) -> None:
-        self._usrenum_mt_progress_line_active = False
-        self._usrenum_progress_start = time.time()
+        self._usrenum_live_hits = False
+        self._usrenum_live_hit_names: set[str] = set()
 
-    def _usrenum_progress_update(self, done: int, total: int, *, label: str = "LOGIN enum") -> None:
-        if self.use_json or total <= 0:
-            return
-        start = self._usrenum_progress_start or time.time()
-        elapsed = max(0.0, time.time() - start)
-        pct = min(100, max(0, int(100 * done / total)))
-        eta_sec = self._usrenum_eta_remaining_seconds(done, total, elapsed)
-        time_part = self._format_usrenum_clock(eta_sec)
-        line_core = f"{label} {done}/{total}  {time_part}  {pct}%"
-        th = max(1, int(getattr(self.args, "imap_usrenum_threads", 1) or 1))
-        with self._usrenum_progress_lock:
-            if th > 1:
-                self._usrenum_mt_progress_line_active = True
-                if sys.stdout.isatty():
-                    sys.stdout.write(f"\033[2K\r    {line_core}")
-                    sys.stdout.flush()
-            else:
-                sys.stdout.write(f"\r    {line_core}")
-                sys.stdout.flush()
+    @staticmethod
+    def _usrenum_progress_label(user: str) -> str:
+        u = (user or "").strip()
+        if len(u) > 48:
+            return u[:45] + "..."
+        return u
 
-    def _usrenum_progress_finalize(self) -> None:
-        if self.use_json:
-            return
-        th = max(1, int(getattr(self.args, "imap_usrenum_threads", 1) or 1))
-        with self._usrenum_progress_lock:
-            if th > 1 and self._usrenum_mt_progress_line_active:
-                if sys.stdout.isatty():
-                    sys.stdout.write("\033[2K\r")
-                else:
-                    sys.stdout.write("\n")
-                sys.stdout.flush()
-                self._usrenum_mt_progress_line_active = False
+    def _usrenum_note_row(self, row: "ImapUserEnumProbeRow", live_state: dict | None) -> str | None:
+        """Update live baseline; return username if this is a new oracle hit."""
+        if live_state is None:
+            return None
+        if (
+            row.probe_kind == "control_invalid"
+            and row.error is None
+            and not self._imap_usrenum_row_timed_out(row)
+        ):
+            if row.elapsed_ms is not None:
+                live_state["invalid_times"].append(row.elapsed_ms)
+            if row.reply_normalized and not row.unexpected_ok:
+                live_state["inv_set"].add(row.reply_normalized)
+        if not self._imap_usrenum_is_enumerated(
+            row, live_state["inv_set"], live_state["invalid_times"]
+        ):
+            return None
+        if row.username in live_state["hits"]:
+            return None
+        live_state["hits"].append(row.username)
+        names = getattr(self, "_usrenum_live_hit_names", None)
+        if names is None:
+            self._usrenum_live_hit_names = {row.username}
+        else:
+            names.add(row.username)
+        self._usrenum_live_hits = True
+        return row.username
+
+    def _usrenum_fill_item_output(
+        self,
+        output,
+        row_method: str,
+        row: "ImapUserEnumProbeRow",
+        live_state: dict | None,
+    ) -> None:
+        self._dbg_usrenum_row(row_method, row, output=output)
+        hit = self._usrenum_note_row(row, live_state)
+        if hit and not self.use_json:
+            output.add_string_to_output("    " + hit)
+
+    def _usrenum_progress_item(
+        self,
+        progress: ThreadedProgress,
+        row_method: str,
+        row: "ImapUserEnumProbeRow",
+        live_state: dict | None = None,
+    ) -> None:
+        output = progress.new_output()
+        self._usrenum_fill_item_output(output, row_method, row, live_state)
+        progress.flush(output, repaint=False)
+        progress.advance(label=self._usrenum_progress_label(row.username))
+
+    def _imap_usrenum_probe(
+        self,
+        username: str,
+        wrong_password: str,
+        probe_kind: str,
+        probe_index: int,
+        *,
+        mechanism: str,
+    ) -> ImapUserEnumProbeRow:
+        imap: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
+        try:
+            imap = self.connect()
+        except Exception as e:
+            return ImapUserEnumProbeRow(
+                username=username,
+                probe_kind=probe_kind,
+                reply_raw=None,
+                reply_normalized=None,
+                elapsed_ms=None,
+                unexpected_ok=False,
+                error=str(e),
+                probe_index=probe_index,
+            )
+        try:
+            if mechanism == "LOGIN":
+                typ, raw, elapsed_ms = self._imap_usrenum_measure_login(imap, username, wrong_password)
             else:
-                sys.stdout.write("\033[2K\r")
-                sys.stdout.flush()
+                typ, raw, elapsed_ms = self._imap_usrenum_measure_plain(imap, username, wrong_password)
+            unexpected_ok = typ == "OK"
+            if unexpected_ok:
+                norm = "login_unexpected_ok" if mechanism == "LOGIN" else "plain_unexpected_ok"
+            else:
+                norm = _normalize_imap_login_error_for_enum(raw, status=typ) or None
+            return ImapUserEnumProbeRow(
+                username=username,
+                probe_kind=probe_kind,
+                reply_raw=raw or None,
+                reply_normalized=norm,
+                elapsed_ms=round(elapsed_ms, 2),
+                unexpected_ok=unexpected_ok,
+                error=None,
+                probe_index=probe_index,
+            )
+        except Exception as e:
+            return ImapUserEnumProbeRow(
+                username=username,
+                probe_kind=probe_kind,
+                reply_raw=None,
+                reply_normalized=None,
+                elapsed_ms=None,
+                unexpected_ok=False,
+                error=str(e),
+                probe_index=probe_index,
+            )
+        finally:
+            self._imap_usrenum_close(imap)
 
     def _imap_usrenum_probe_login_wrong_password(
         self, username: str, wrong_password: str, probe_kind: str, probe_index: int
     ) -> ImapUserEnumProbeRow:
-        imap: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
-        t0 = time.perf_counter()
-        try:
-            imap = self.connect()
-        except Exception as e:
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            row = ImapUserEnumProbeRow(
-                username=username,
-                probe_kind=probe_kind,
-                reply_raw=None,
-                reply_normalized=None,
-                elapsed_ms=round(elapsed_ms, 2),
-                unexpected_ok=False,
-                error=str(e),
-                probe_index=probe_index,
-            )
-            self._dbg_usrenum_row("LOGIN", row)
-            return row
-        try:
-            try:
-                imap.capability()
-            except Exception:
-                pass
-            imap.login(username, wrong_password)
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            row = ImapUserEnumProbeRow(
-                username=username,
-                probe_kind=probe_kind,
-                reply_raw="OK",
-                reply_normalized="login_unexpected_ok",
-                elapsed_ms=round(elapsed_ms, 2),
-                unexpected_ok=True,
-                error=None,
-                probe_index=probe_index,
-            )
-            self._dbg_usrenum_row("LOGIN", row)
-            return row
-        except Exception as e:
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            raw = _imap_login_exception_text(e)
-            norm = _normalize_imap_login_error_for_enum(raw)
-            row = ImapUserEnumProbeRow(
-                username=username,
-                probe_kind=probe_kind,
-                reply_raw=raw,
-                reply_normalized=norm or None,
-                elapsed_ms=round(elapsed_ms, 2),
-                unexpected_ok=False,
-                error=None,
-                probe_index=probe_index,
-            )
-            self._dbg_usrenum_row("LOGIN", row)
-            return row
-        finally:
-            if imap is not None:
-                try:
-                    imap.logout()
-                except Exception:
-                    try:
-                        imap.shutdown()
-                    except Exception:
-                        pass
+        return self._imap_usrenum_probe(
+            username, wrong_password, probe_kind, probe_index, mechanism="LOGIN",
+        )
 
     def _imap_usrenum_probe_plain_wrong_password(
         self, username: str, wrong_password: str, probe_kind: str, probe_index: int
     ) -> ImapUserEnumProbeRow:
-        """RFC 4616 PLAIN: authorization identity \\0 authentication identity \\0 password (UTF-8)."""
-        imap: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
-        t0 = time.perf_counter()
-        plain_blob = (
-            b"\x00"
-            + username.encode("utf-8", errors="replace")
-            + b"\x00"
-            + wrong_password.encode("utf-8", errors="replace")
+        """RFC 4616 PLAIN: empty authorization identity, authentication identity, password."""
+        return self._imap_usrenum_probe(
+            username, wrong_password, probe_kind, probe_index, mechanism="PLAIN",
         )
 
-        def _auth_cb(_chal: bytes) -> bytes:
-            return plain_blob
+    def _imap_usrenum_run_mixed(
+        self,
+        *,
+        probe,
+        names: list[str],
+        extra_invalid: list[str],
+        start_idx: int,
+        threads: int,
+        progress: ThreadedProgress,
+        row_method: str,
+        live_state: dict | None = None,
+    ) -> list[ImapUserEnumProbeRow]:
+        work: list[tuple[str, str, int]] = []
+        idx = start_idx
+        for u in names:
+            work.append((u, "wordlist", idx))
+            idx += 1
+        for u in extra_invalid:
+            work.append((u, "control_invalid", idx))
+            idx += 1
+        if not work:
+            return []
 
+        if threads <= 1 or len(work) == 1:
+            rows: list[ImapUserEnumProbeRow] = []
+            for u, kind, i in work:
+                row = probe(u, kind, i)
+                rows.append(row)
+                self._usrenum_progress_item(progress, row_method, row, live_state)
+            return rows
+
+        rows_par: list[ImapUserEnumProbeRow] = []
+        rows_lock = threading.Lock()
+
+        def work_item(item, output) -> str:
+            u, kind, i = item
+            row = probe(u, kind, i)
+            with rows_lock:
+                rows_par.append(row)
+                self._usrenum_fill_item_output(output, row_method, row, live_state)
+            return self._usrenum_progress_label(u)
+
+        progress.run(work, work_item, threads, finalize=False)
+        return sorted(rows_par, key=lambda r: r.probe_index)
+
+    def _imap_usrenum_collect_rows(
+        self,
+        *,
+        probe,
+        names: list[str],
+        threads: int,
+        row_method: str,
+        baseline_dbg: str,
+    ) -> list[ImapUserEnumProbeRow]:
+        invalid_users = self._imap_usrenum_synthetic_invalid(2)
+        extra_invalid = self._imap_usrenum_synthetic_invalid(2)
+        self._dbg(f"{baseline_dbg}{invalid_users!r}")
+        all_rows: list[ImapUserEnumProbeRow] = []
+        probe_idx = 0
+        total_phases = len(invalid_users) + len(extra_invalid) + len(names)
+        progress = ThreadedProgress(
+            total_phases,
+            enabled=not self.use_json,
+            indent=4,
+            bar_indent=4,
+        )
+        self._usrenum_progress_reset()
         try:
-            imap = self.connect()
-        except Exception as e:
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            row = ImapUserEnumProbeRow(
-                username=username,
-                probe_kind=probe_kind,
-                reply_raw=None,
-                reply_normalized=None,
-                elapsed_ms=round(elapsed_ms, 2),
-                unexpected_ok=False,
-                error=str(e),
-                probe_index=probe_index,
-            )
-            self._dbg_usrenum_row("PLAIN", row)
-            return row
-        try:
-            try:
-                imap.capability()
-            except Exception:
-                pass
-            imap.authenticate("PLAIN", _auth_cb)
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            row = ImapUserEnumProbeRow(
-                username=username,
-                probe_kind=probe_kind,
-                reply_raw="OK",
-                reply_normalized="plain_unexpected_ok",
-                elapsed_ms=round(elapsed_ms, 2),
-                unexpected_ok=True,
-                error=None,
-                probe_index=probe_index,
-            )
-            self._dbg_usrenum_row("PLAIN", row)
-            return row
-        except Exception as e:
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            raw = _imap_login_exception_text(e)
-            norm = _normalize_imap_login_error_for_enum(raw)
-            row = ImapUserEnumProbeRow(
-                username=username,
-                probe_kind=probe_kind,
-                reply_raw=raw,
-                reply_normalized=norm or None,
-                elapsed_ms=round(elapsed_ms, 2),
-                unexpected_ok=False,
-                error=None,
-                probe_index=probe_index,
-            )
-            self._dbg_usrenum_row("PLAIN", row)
-            return row
+            for inv in invalid_users:
+                row = probe(inv, "control_invalid", probe_idx)
+                probe_idx += 1
+                all_rows.append(row)
+                self._usrenum_progress_item(progress, row_method, row)
+            if names:
+                all_rows.extend(
+                    self._imap_usrenum_run_mixed(
+                        probe=probe,
+                        names=names,
+                        extra_invalid=extra_invalid,
+                        start_idx=probe_idx,
+                        threads=threads,
+                        progress=progress,
+                        row_method=row_method,
+                        live_state=self._imap_usrenum_live_state_from_rows(all_rows),
+                    )
+                )
         finally:
-            if imap is not None:
-                try:
-                    imap.logout()
-                except Exception:
-                    try:
-                        imap.shutdown()
-                    except Exception:
-                        pass
+            progress.finalize()
+        return all_rows
+
+    @staticmethod
+    def _imap_text_is_timeout(text: str | None) -> bool:
+        t = (text or "").lower()
+        return "timed out" in t or "timeout" in t or "could not connect" in t
+
+    def _imap_usrenum_row_timed_out(self, r: ImapUserEnumProbeRow) -> bool:
+        if self._imap_text_is_timeout(r.error) or self._imap_text_is_timeout(r.reply_raw):
+            return True
+        return self._imap_text_is_timeout(r.reply_normalized)
+
+    def _imap_usrenum_is_enumerated(
+        self,
+        r: ImapUserEnumProbeRow,
+        inv_set: set[str],
+        invalid_times: list[float],
+    ) -> bool:
+        if r.probe_kind != "wordlist" or r.error:
+            return False
+        if self._imap_usrenum_row_timed_out(r):
+            return False
+        if r.unexpected_ok:
+            return True
+        text_diff = bool(inv_set and r.reply_normalized and r.reply_normalized not in inv_set)
+        time_diff = self._imap_usrenum_timing_outlier(r.elapsed_ms, invalid_times)
+        return text_diff or time_diff
+
+    def _imap_usrenum_live_state_from_rows(self, rows: list[ImapUserEnumProbeRow]) -> dict:
+        inv_set: set[str] = set()
+        invalid_times: list[float] = []
+        for r in rows:
+            if r.probe_kind != "control_invalid" or r.error:
+                continue
+            if self._imap_usrenum_row_timed_out(r):
+                continue
+            if r.elapsed_ms is not None:
+                invalid_times.append(r.elapsed_ms)
+            if r.reply_normalized and not r.unexpected_ok:
+                inv_set.add(r.reply_normalized)
+        return {"inv_set": inv_set, "invalid_times": invalid_times, "hits": []}
 
     def _analyze_imap_usrenum(
         self,
@@ -4770,66 +5064,82 @@ class ImapEngine:
             )
         invalid_norms: list[str] = []
         invalid_conn_err = 0
+        invalid_times: list[float] = []
+        timed_out_n = 0
         for r in rows:
+            if self._imap_usrenum_row_timed_out(r) or (r.error and self._imap_text_is_timeout(r.error)):
+                timed_out_n += 1
             if r.probe_kind != "control_invalid":
                 continue
-            if r.error:
+            if r.error or self._imap_usrenum_row_timed_out(r):
                 invalid_conn_err += 1
-            elif r.unexpected_ok:
+                continue
+            if r.unexpected_ok:
                 pass
             elif r.reply_normalized:
                 invalid_norms.append(r.reply_normalized)
+            if r.elapsed_ms is not None:
+                invalid_times.append(r.elapsed_ms)
         inv_set = set(invalid_norms)
         enumerated: list[str] = []
         for r in rows:
-            if r.probe_kind != "wordlist":
-                continue
-            if r.error:
-                continue
-            if r.unexpected_ok:
-                enumerated.append(r.username)
-                continue
-            if inv_set and r.reply_normalized and r.reply_normalized not in inv_set:
+            if self._imap_usrenum_is_enumerated(r, inv_set, invalid_times):
                 enumerated.append(r.username)
         any_wl_unexpected = any(
             r.unexpected_ok for r in rows if r.probe_kind == "wordlist"
         )
+        wordlist = [r for r in rows if r.probe_kind == "wordlist"]
+        wordlist_timeouts = sum(1 for r in wordlist if self._imap_usrenum_row_timed_out(r))
         vulnerable = bool(enumerated) or any_wl_unexpected
         indeterminate = False
         if not inv_set and invalid_conn_err >= 2:
             indeterminate = True
         elif not inv_set and len(rows) <= 2:
             indeterminate = True
+        elif timed_out_n and timed_out_n * 2 >= len(rows):
+            indeterminate = True
+        elif wordlist and wordlist_timeouts * 2 >= len(wordlist):
+            indeterminate = True
+        elif len(inv_set) < 1 and timed_out_n:
+            indeterminate = True
         auth_label = "LOGIN" if enumeration_method == "LOGIN" else "AUTHENTICATE PLAIN"
         detail_parts: list[str] = []
         if vulnerable:
             if enumerated:
                 detail_parts.append(
-                    f"Distinct {auth_label} failure (or unexpected OK) vs non-existent baseline suggests username oracle."
+                    f"Distinct {auth_label} status/text or slower auth vs non-existent baseline suggests username oracle."
                 )
             if any_wl_unexpected:
                 detail_parts.append(
                     f"{auth_label} succeeded with fixed wrong password for at least one probe."
                 )
         elif indeterminate:
-            detail_parts.append(
-                "Could not establish stable baseline from synthetic invalid usernames (connection or identical errors)."
-            )
+            if timed_out_n:
+                detail_parts.append(
+                    f"{timed_out_n} of {len(rows)} probes timed out. "
+                    "Could not tell whether usernames exist."
+                )
+            else:
+                detail_parts.append(
+                    "Could not get a usable reply for made-up names. "
+                    "Could not tell whether usernames exist."
+                )
         else:
             detail_parts.append(
-                "No reliable differentiation vs invalid-user baseline in this sample (heuristic)."
+                "All names failed the same way. The server does not reveal whether a username exists."
             )
-        if enumeration_method == "LOGIN" and login_disabled_advertised:
-            detail_parts.insert(
-                0,
-                "CAPABILITY lists LOGINDISABLED (RFC 3501): plaintext LOGIN is disabled; "
-                "this test still issues LOGIN — interpret results with caution (SASL may be required).",
+            delay_note = self._imap_usrenum_delay_note(invalid_times, [
+                r.elapsed_ms for r in rows
+                if r.probe_kind == "wordlist" and r.elapsed_ms is not None
+            ])
+            if delay_note:
+                detail_parts.append(delay_note)
+        if not self._imap_usrenum_timing_usable(invalid_times):
+            self._dbg(
+                "USR-ENUM: timing oracle disabled "
+                f"(threads={self._imap_usrenum_threads()} invalid_ms={invalid_times!r})"
             )
-        if enumeration_method == "AUTHENTICATE PLAIN" and not auth_plain_advertised:
-            detail_parts.insert(
-                0,
-                "CAPABILITY did not list AUTH=PLAIN; AUTHENTICATE PLAIN may be unavailable or rejected for all probes.",
-            )
+        # LOGINDISABLED / AUTH=PLAIN notes are printed once as a warning, not repeated in detail.
         self._dbg(
             f"USR-ENUM {enumeration_method}: enumerated={enumerated!r} "
             f"vulnerable={vulnerable} indeterminate={indeterminate}"
@@ -4857,7 +5167,7 @@ class ImapEngine:
                 auth_plain_advertised=False,
             )
         pwd = getattr(self.args, "imap_usrenum_password", None) or _IMAP_USRENUM_DEFAULT_PASSWORD
-        threads = max(1, int(getattr(self.args, "imap_usrenum_threads", 1) or 1))
+        threads = self._imap_usrenum_threads()
 
         login_disabled_advertised = False
         imap_chk: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
@@ -4868,11 +5178,16 @@ class ImapEngine:
             except Exception:
                 pass
             banner_chk, merged_chk = self._merged_preauth_capabilities(imap_chk)
-            login_disabled_advertised = self._capability_logindisabled(merged_chk, banner_chk)
-            self._dbg(f"USR-ENUM: LOGINDISABLED advertised={login_disabled_advertised}")
+            login_disabled_advertised = self._usrenum_logindisabled_on_session(
+                imap_chk, banner_chk, merged_chk
+            )
+            self._dbg(
+                f"USR-ENUM: LOGINDISABLED advertised={login_disabled_advertised} "
+                f"starttls={bool(getattr(self.args, 'starttls', False))} "
+                f"tls={bool(getattr(self.args, 'tls', False))}"
+            )
         except Exception as e:
             self._dbg(f"USR-ENUM: capability check failed: {self._snip(str(e))}")
-            pass
         finally:
             if imap_chk is not None:
                 try:
@@ -4883,67 +5198,15 @@ class ImapEngine:
                     except Exception:
                         pass
 
-        invalid_users = [
-            f"enumtest_invalid_{random.getrandbits(32):08x}",
-            f"enumtest_invalid_{random.getrandbits(32):08x}",
-        ]
-        self._dbg(f"USR-ENUM: LOGIN — synthetic baseline: {invalid_users!r}")
-        all_rows: list[ImapUserEnumProbeRow] = []
-        probe_idx = 0
-        total_phases = len(invalid_users) + len(names)
-        self._usrenum_progress_reset()
-
-        for inv in invalid_users:
-            all_rows.append(
-                self._imap_usrenum_probe_login_wrong_password(inv, pwd, "control_invalid", probe_idx)
-            )
-            probe_idx += 1
-            if not self.use_json and total_phases > 0:
-                self._usrenum_progress_update(len(all_rows), total_phases, label="LOGIN enum")
-
-        if not names:
-            self._usrenum_progress_finalize()
-            return self._analyze_imap_usrenum(
-                all_rows,
-                enumeration_method="LOGIN",
-                login_disabled_advertised=login_disabled_advertised,
-                auth_plain_advertised=False,
-            )
-
-        base_idx = probe_idx
-
-        def run_word(u: str, idx: int) -> ImapUserEnumProbeRow:
-            return self._imap_usrenum_probe_login_wrong_password(u, pwd, "wordlist", idx)
-
-        if threads <= 1 or len(names) == 1:
-            for u in names:
-                all_rows.append(run_word(u, base_idx))
-                base_idx += 1
-                if not self.use_json and total_phases > 0:
-                    self._usrenum_progress_update(len(all_rows), total_phases, label="LOGIN enum")
-        else:
-            work = [(names[i], base_idx + i) for i in range(len(names))]
-            done_lock = threading.Lock()
-            completed = [len(invalid_users)]
-
-            def worker(item: tuple[str, int]) -> ImapUserEnumProbeRow:
-                u, idx = item
-                row = run_word(u, idx)
-                if not self.use_json and total_phases > 0:
-                    with done_lock:
-                        completed[0] += 1
-                        self._usrenum_progress_update(completed[0], total_phases, label="LOGIN enum")
-                return row
-
-            results_par: list[ImapUserEnumProbeRow] = []
-            max_workers = min(threads, len(names))
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = [ex.submit(worker, w) for w in work]
-                for fut in as_completed(futs):
-                    results_par.append(fut.result())
-            all_rows.extend(sorted(results_par, key=lambda r: r.probe_index))
-
-        self._usrenum_progress_finalize()
+        all_rows = self._imap_usrenum_collect_rows(
+            probe=lambda u, kind, idx: self._imap_usrenum_probe_login_wrong_password(
+                u, pwd, kind, idx
+            ),
+            names=names,
+            threads=threads,
+            row_method="LOGIN",
+            baseline_dbg="USR-ENUM: LOGIN — synthetic baseline: ",
+        )
         return self._analyze_imap_usrenum(
             all_rows,
             enumeration_method="LOGIN",
@@ -4961,7 +5224,7 @@ class ImapEngine:
                 auth_plain_advertised=False,
             )
         pwd = getattr(self.args, "imap_usrenum_password", None) or _IMAP_USRENUM_DEFAULT_PASSWORD
-        threads = max(1, int(getattr(self.args, "imap_usrenum_threads", 1) or 1))
+        threads = self._imap_usrenum_threads()
 
         auth_plain_advertised = False
         imap_chk: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
@@ -4976,7 +5239,6 @@ class ImapEngine:
             self._dbg(f"USR-ENUM: AUTH=PLAIN advertised={auth_plain_advertised}")
         except Exception as e:
             self._dbg(f"USR-ENUM PLAIN: capability check failed: {self._snip(str(e))}")
-            pass
         finally:
             if imap_chk is not None:
                 try:
@@ -4987,67 +5249,15 @@ class ImapEngine:
                     except Exception:
                         pass
 
-        invalid_users = [
-            f"enumtest_invalid_{random.getrandbits(32):08x}",
-            f"enumtest_invalid_{random.getrandbits(32):08x}",
-        ]
-        self._dbg(f"USR-ENUM: PLAIN (RFC 4616) — synthetic baseline: {invalid_users!r}")
-        all_rows: list[ImapUserEnumProbeRow] = []
-        probe_idx = 0
-        total_phases = len(invalid_users) + len(names)
-        self._usrenum_progress_reset()
-
-        for inv in invalid_users:
-            all_rows.append(
-                self._imap_usrenum_probe_plain_wrong_password(inv, pwd, "control_invalid", probe_idx)
-            )
-            probe_idx += 1
-            if not self.use_json and total_phases > 0:
-                self._usrenum_progress_update(len(all_rows), total_phases, label="PLAIN enum")
-
-        if not names:
-            self._usrenum_progress_finalize()
-            return self._analyze_imap_usrenum(
-                all_rows,
-                enumeration_method="AUTHENTICATE PLAIN",
-                login_disabled_advertised=False,
-                auth_plain_advertised=auth_plain_advertised,
-            )
-
-        base_idx = probe_idx
-
-        def run_word(u: str, idx: int) -> ImapUserEnumProbeRow:
-            return self._imap_usrenum_probe_plain_wrong_password(u, pwd, "wordlist", idx)
-
-        if threads <= 1 or len(names) == 1:
-            for u in names:
-                all_rows.append(run_word(u, base_idx))
-                base_idx += 1
-                if not self.use_json and total_phases > 0:
-                    self._usrenum_progress_update(len(all_rows), total_phases, label="PLAIN enum")
-        else:
-            work = [(names[i], base_idx + i) for i in range(len(names))]
-            done_lock = threading.Lock()
-            completed = [len(invalid_users)]
-
-            def worker(item: tuple[str, int]) -> ImapUserEnumProbeRow:
-                u, idx = item
-                row = run_word(u, idx)
-                if not self.use_json and total_phases > 0:
-                    with done_lock:
-                        completed[0] += 1
-                        self._usrenum_progress_update(completed[0], total_phases, label="PLAIN enum")
-                return row
-
-            results_par: list[ImapUserEnumProbeRow] = []
-            max_workers = min(threads, len(names))
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = [ex.submit(worker, w) for w in work]
-                for fut in as_completed(futs):
-                    results_par.append(fut.result())
-            all_rows.extend(sorted(results_par, key=lambda r: r.probe_index))
-
-        self._usrenum_progress_finalize()
+        all_rows = self._imap_usrenum_collect_rows(
+            probe=lambda u, kind, idx: self._imap_usrenum_probe_plain_wrong_password(
+                u, pwd, kind, idx
+            ),
+            names=names,
+            threads=threads,
+            row_method="PLAIN",
+            baseline_dbg="USR-ENUM: PLAIN (RFC 4616) — synthetic baseline: ",
+        )
         return self._analyze_imap_usrenum(
             all_rows,
             enumeration_method="AUTHENTICATE PLAIN",
@@ -5095,6 +5305,8 @@ class ImapEngine:
             return NTLMResult(False, None, auth_ntlm_advertised)
         except Exception as e:
             self._dbg(f"AUTHENTICATE NTLM failed: {self._snip(str(e))}")
+            if self._imap_text_is_timeout(str(e)):
+                return NTLMResult(False, None, auth_ntlm_advertised, incomplete=True)
             return NTLMResult(False, None, auth_ntlm_advertised)
         finally:
             try:
@@ -5335,6 +5547,8 @@ class ImapEngine:
         msg = f"{t.command_display:<{_INVCOMM_LABEL_WIDTH}}{t.outcome}{time_str}"
         if t.probe_vulnerable:
             bullet = "VULN"
+        elif t.outcome in ("timeout", "connect_error", "disconnect", "bye"):
+            bullet = "WARNING"
         elif t.category in _INVCOMM_WARN_CATEGORIES:
             bullet = "WARNING"
         else:
@@ -5402,7 +5616,7 @@ class ImapEngine:
                 )
             elif catch_all == "unreachable":
                 self._tprint(
-                    "Could not connect to the server. Catch-all was not tested.",
+                    "Catch-all timed out or could not connect. Not confirmed.",
                     bullet="WARNING",
                 )
             else:
@@ -5432,6 +5646,9 @@ class ImapEngine:
         if ok:
             self._anonymous_vv(f"AUTHENTICATE ANONYMOUS OK{extra}")
             self._anonymous_verdict("Use AUTHENTICATE ANONYMOUS: accepted", "VULN")
+        elif self._imap_text_is_timeout(detail):
+            self._anonymous_vv(f"AUTHENTICATE ANONYMOUS failed{extra}")
+            self._anonymous_verdict("Use AUTHENTICATE ANONYMOUS: timed out (not confirmed)", "WARNING")
         else:
             self._anonymous_vv(f"AUTHENTICATE ANONYMOUS failed{extra}")
             self._anonymous_verdict("Use AUTHENTICATE ANONYMOUS: not accepted", "NOTVULN")
@@ -5442,6 +5659,9 @@ class ImapEngine:
         if accepted:
             self._anonymous_vv("OK")
             tail, bullet = "accepted", "VULN"
+        elif self._imap_text_is_timeout(detail):
+            self._anonymous_vv(f"failed: {detail or 'timed out'}")
+            tail, bullet = "timed out (not confirmed)", "WARNING"
         else:
             self._anonymous_vv(f"failed: {detail or 'rejected'}")
             tail, bullet = "rejected", "NOTVULN"
@@ -5495,6 +5715,13 @@ class ImapEngine:
                 condition=True,
                 indent=4,
             )
+        elif self._imap_text_is_timeout(v.append_detail) or self._imap_text_is_timeout(v.append_typ):
+            self._ptprint_raw(
+                f"APPEND timed out (not confirmed) {v.label}",
+                bullet_type="WARNING",
+                condition=True,
+                indent=4,
+            )
         else:
             self._ptprint_raw(
                 f"APPEND rejected {v.label}",
@@ -5516,6 +5743,13 @@ class ImapEngine:
             return
         if er.vulnerable:
             pp("APPEND accepted EICAR test message", bullet_type="VULN", condition=show, indent=4)
+        elif self._imap_text_is_timeout(er.append_detail) or self._imap_text_is_timeout(er.append_typ):
+            pp(
+                "APPEND timed out (not confirmed)",
+                bullet_type="WARNING",
+                condition=show,
+                indent=4,
+            )
         else:
             snippet = (er.append_detail or "n/a").replace("\r\n", " ")[:200]
             pp(
@@ -5534,21 +5768,28 @@ class ImapEngine:
                 return
             self._eicar_emit_terminal(er)
 
-    def _stream_imap_zipxxe_result(self) -> None:
-        """Stream ZIPXXE result (SMTP ZIPXXE layout: variants then Summary)."""
+    def _stream_imap_xxe_suite(
+        self,
+        *,
+        suite: str,
+        result_attr: str,
+        error_attr: str,
+        fail_label: str,
+    ) -> None:
+        """Stream XXESSRF / XXEEXP / ZIPBOMB (ZIPXXE layout: variants then Summary)."""
         if self.use_json:
             return
         pp = ptprint
-        if (err := self.results.zipxxe_error) is not None:
-            pp(f"ZIPXXE test failed: {err}", bullet_type="VULN", condition=True, indent=4)
+        if (err := getattr(self.results, error_attr, None)) is not None:
+            pp(f"{fail_label} failed: {err}", bullet_type="VULN", condition=True, indent=4)
             return
-        zr = self.results.zipxxe
+        zr = getattr(self.results, result_attr, None)
         if zr is None:
             return
-        if zr.canary_url and not getattr(self, "_imap_zipxxe_canary_streamed", False):
+        if zr.canary_url and not getattr(self, f"_imap_{suite}_canary_streamed", False):
             pp("Canary URL", bullet_type="TITLE", condition=True, indent=4)
             pp(zr.canary_url, bullet_type="TEXT", condition=True, indent=8)
-        if not (getattr(self.args, "debug", False) and getattr(self, "_imap_zipxxe_streamed_live", False)):
+        if not (getattr(self.args, "debug", False) and getattr(self, f"_imap_{suite}_live", False)):
             for v in zr.variants:
                 self._imap_zipxxe_stream_variant_section(v, stream_trace=False)
         extra: list[str] = []
@@ -5568,6 +5809,21 @@ class ImapEngine:
         for line in extra:
             pp(line, bullet_type="TEXT", condition=True, indent=8)
         pp(f"Elapsed: {zr.elapsed_sec:.1f} s", bullet_type="TEXT", condition=True, indent=8)
+
+    def _stream_imap_xxessrf_result(self) -> None:
+        self._stream_imap_xxe_suite(
+            suite="xxessrf", result_attr="xxessrf", error_attr="xxessrf_error", fail_label="XXESSRF",
+        )
+
+    def _stream_imap_xxeexp_result(self) -> None:
+        self._stream_imap_xxe_suite(
+            suite="xxeexp", result_attr="xxeexp", error_attr="xxeexp_error", fail_label="XXEEXP",
+        )
+
+    def _stream_imap_zipbomb_result(self) -> None:
+        self._stream_imap_xxe_suite(
+            suite="zipbomb", result_attr="zipbomb", error_attr="zipbomb_error", fail_label="ZIPBOMB",
+        )
 
     def _imap_resource_load_emit_setup(
         self,
@@ -5891,8 +6147,15 @@ class ImapEngine:
                 _out(r.send_text, r.recv_text, f"Opened another user's mailbox: {r.mailbox}", "VULN")
             elif self._imap_mbox_iso_client_send_error(r.typ, r.detail):
                 _out(r.send_text, r.recv_text, f"Could not send Unicode mailbox name {r.mailbox!r}", "WARNING")
-            elif (r.typ or "").upper() == "EXC":
-                _out(r.send_text, r.recv_text, f"EXAMINE {r.mailbox} failed: {self._snip(r.detail)}", "WARNING")
+            elif (r.typ or "").upper() == "EXC" or self._imap_text_is_timeout(r.detail):
+                _out(
+                    r.send_text,
+                    r.recv_text,
+                    f"EXAMINE {r.mailbox} timed out (not confirmed)"
+                    if self._imap_text_is_timeout(r.detail)
+                    else f"EXAMINE {r.mailbox} failed: {self._snip(r.detail)}",
+                    "WARNING",
+                )
             else:
                 _out(r.send_text, r.recv_text, f"EXAMINE rejected: {r.mailbox}", "NOTVULN")
         if mr.enumeration_signal:
@@ -5950,7 +6213,18 @@ class ImapEngine:
                 "VULN",
             )
         if not mr.vulnerable:
-            _out(None, None, mr.detail, "NOTVULN")
+            if any(
+                self._imap_text_is_timeout(r.detail) or (r.typ or "").upper() == "EXC"
+                for r in mr.select_probes
+            ):
+                _out(
+                    None,
+                    None,
+                    "Some mailbox probes timed out or failed. Isolation was not fully confirmed.",
+                    "WARNING",
+                )
+            else:
+                _out(None, None, mr.detail, "NOTVULN")
 
     def _stream_imap_mailbox_iso_result(self) -> None:
         """Stream mailbox isolation probe result (thread-safe)."""
@@ -5973,22 +6247,20 @@ class ImapEngine:
         show = not self.use_json
         if ur.enumeration_method == "LOGIN" and ur.login_disabled_advertised:
             pp(
-                "CAPABILITY: LOGINDISABLED — plaintext LOGIN is disabled (RFC 3501). "
-                "This probe still uses LOGIN; interpret results with caution (real clients should use SASL).",
+                "Plaintext LOGIN is turned off. A real client would use STARTTLS or SASL first.",
                 bullet_type="WARNING",
                 condition=show,
                 indent=4,
             )
         elif ur.enumeration_method == "AUTHENTICATE PLAIN" and not ur.auth_plain_advertised:
             pp(
-                "CAPABILITY did not list AUTH=PLAIN — AUTHENTICATE PLAIN may fail or be unsupported; "
-                "interpret results with caution.",
+                "AUTH=PLAIN is not offered. AUTHENTICATE PLAIN may be rejected for every name.",
                 bullet_type="WARNING",
                 condition=show,
                 indent=4,
             )
         if ur.indeterminate:
-            pp(f"Indeterminate: {ur.detail}", bullet_type="WARNING", condition=show, indent=4)
+            pp(ur.detail, bullet_type="WARNING", condition=show, indent=4)
             return
         tag = "LOGIN" if ur.enumeration_method == "LOGIN" else "AUTHENTICATE PLAIN"
         if ur.vulnerable:
@@ -5998,8 +6270,10 @@ class ImapEngine:
                 condition=show,
                 indent=4,
             )
+            shown = getattr(self, "_usrenum_live_hit_names", set())
             for u in ur.enumerated_usernames:
-                pp(f"differentiated: {u}", bullet_type="TEXT", condition=show, indent=8)
+                if u not in shown:
+                    pp(u, bullet_type="TEXT", condition=show, indent=8)
         else:
             pp(ur.detail, bullet_type="NOTVULN", condition=show, indent=4)
 
@@ -6018,6 +6292,7 @@ class ImapEngine:
             return
         with self._output_lock:
             self._imap_usrenum_emit_terminal(ur)
+        self._flush_terminal()
 
     def _stream_imap_usrenum_plain_result(self) -> None:
         """Stream AUTHENTICATE PLAIN user enumeration result (thread-safe)."""
@@ -6034,6 +6309,7 @@ class ImapEngine:
             return
         with self._output_lock:
             self._imap_usrenum_emit_terminal(ur)
+        self._flush_terminal()
 
     def _stream_ntlm_result(self) -> None:
         """Stream NTLM info result immediately (thread-safe)."""
@@ -6042,6 +6318,9 @@ class ImapEngine:
         pp = self._ptprint_raw
         show = not self.use_json
         with self._output_lock:
+            if getattr(ntlm, "incomplete", False):
+                pp("NTLM timed out (not confirmed)", bullet_type="WARNING", condition=show, indent=4)
+                return
             if not (ntlm.success and ntlm.ntlm is not None):
                 pp("Not available", bullet_type="NOTVULN", condition=show, indent=4)
                 return
@@ -6432,35 +6711,41 @@ class ImapEngine:
                         "vuln_response": er.append_detail or er.append_typ or "OK",
                     }
                 )
-        # ZIPXXE APPEND (PTL-SVC-IMAP-ZIPXXE) — manual verification, no auto vuln
-        if (zipxxe_err := getattr(self.results, "zipxxe_error", None)) is not None:
-            properties.update({"zipxxeError": zipxxe_err})
-        elif (zr := getattr(self.results, "zipxxe", None)) is not None:
-            properties.update({
-                "zipxxe": {
-                    "manualVerificationRequired": zr.manual_verification_required,
-                    "canaryUrl": zr.canary_url or None,
-                    "mailbox": zr.mailbox,
-                    "elapsedSec": round(zr.elapsed_sec, 2),
-                    "authUsed": zr.auth_used,
-                    "detail": zr.detail,
-                    "allRejectedAtAppend": zr.all_rejected_at_append,
-                    "verificationInstructions": zr.verification_instructions,
-                    "variants": [
-                        {
-                            "variant": v.variant,
-                            "sent": v.sent,
-                            "accepted": v.accepted,
-                            "rejected": v.rejected,
-                            "error": v.error,
-                            "imapTrace": list(v.imap_trace),
-                            "detail": v.detail,
-                            "testId": v.test_id or None,
-                        }
-                        for v in zr.variants
-                    ],
-                }
-            })
+        # XXESSRF / XXEEXP / ZIPBOMB — manual verification, no auto vuln
+        def _xxe_result_json(zr: ZipxxeResult) -> dict:
+            return {
+                "manualVerificationRequired": zr.manual_verification_required,
+                "canaryUrl": zr.canary_url or None,
+                "mailbox": zr.mailbox,
+                "elapsedSec": round(zr.elapsed_sec, 2),
+                "authUsed": zr.auth_used,
+                "detail": zr.detail,
+                "allRejectedAtAppend": zr.all_rejected_at_append,
+                "verificationInstructions": zr.verification_instructions,
+                "variants": [
+                    {
+                        "variant": v.variant,
+                        "sent": v.sent,
+                        "accepted": v.accepted,
+                        "rejected": v.rejected,
+                        "error": v.error,
+                        "imapTrace": list(v.imap_trace),
+                        "detail": v.detail,
+                        "testId": v.test_id or None,
+                    }
+                    for v in zr.variants
+                ],
+            }
+
+        for json_key, res_attr, err_attr in (
+            ("xxessrf", "xxessrf", "xxessrf_error"),
+            ("xxeexp", "xxeexp", "xxeexp_error"),
+            ("zipbomb", "zipbomb", "zipbomb_error"),
+        ):
+            if (xxe_err := getattr(self.results, err_attr, None)) is not None:
+                properties.update({f"{json_key}Error": xxe_err})
+            elif (zr := getattr(self.results, res_attr, None)) is not None:
+                properties.update({json_key: _xxe_result_json(zr)})
         def _rl_phase_dict(ph: ImapResourceLoadPhase) -> dict:
             return {
                 "label": ph.label,
@@ -6800,8 +7085,9 @@ class ImapEngine:
         # Login bruteforce (skip terminal output if streamed; always add to deferred for JSON)
         if (creds := self.results.creds) is not None and len(creds) > 0:
             json_lines = [f"user: {cred.user}, password: {cred.passw}" for cred in creds]
-            if self.args.user is not None:
-                user_str = f"username: {self.args.user}"
+            names = text_or_file(self.args.user, None)
+            if names:
+                user_str = "username: " + ", ".join(names)
             else:
                 user_str = f"usernames: {self.args.users}"
             if self.args.password is not None:

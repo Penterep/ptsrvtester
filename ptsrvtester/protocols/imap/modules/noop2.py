@@ -1,4 +1,5 @@
 """NOOP2 — NOOP connection count (pre-auth + post-auth if -u/-p)."""
+from ..utils.helpers import one_cli_user
 from ..utils.ptprinthelper import get_colored_text
 from ..utils.results import conn_limit_count_verdict
 from ._common import eng
@@ -119,11 +120,12 @@ def run(ctx):
     elif result_preauth:
         ctx.out(f"Test error: {result_preauth.error_message}", "ERROR", indent=4)
 
-    if ctx.args.user and ctx.args.password:
+    user = one_cli_user(ctx.args.user)
+    if user and ctx.args.password:
         ctx.out("Post-authentication", "TITLE", indent=4)
 
         try:
-            result_postauth = e.test_noop_conn_count_postauth(ctx.args.user, ctx.args.password)
+            result_postauth = e.test_noop_conn_count_postauth(user, ctx.args.password)
         except Exception as ex:
             ctx.out(f"Test failed: {ex}", "ERROR", indent=4)
             result_postauth = None

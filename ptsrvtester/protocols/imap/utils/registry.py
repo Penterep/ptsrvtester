@@ -7,7 +7,7 @@ IMAP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "AUTHLIST", "NTLM"]),
     ("Protocol & validation", ["SNIFF", "INVCMD"]),
     ("Authentication & enumeration", ["ANON", "USRENUM", "USRENUMPLAIN", "BRUTE"]),
-    ("Content security", ["EICAR", "ZIPXXE"]),
+    ("Content security", ["EICAR", "XXESSRF", "XXEEXP", "ZIPBOMB"]),
     ("Connection limits & stress", ["NOOP1", "NOOP2", "CONNLIM", "RESLOAD"]),
     ("Access control & TLS", ["MBOXISO", "TLSAUDIT"]),
     ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
@@ -82,30 +82,32 @@ IMAP_TESTS: dict[str, dict] = {
         "desc": "LOGIN user enumeration",
         "long": [
             "LOGIN each name from -u/-U with a fixed wrong password and",
-            "compare errors against non-existent baselines.",
+            "compare status, error text and auth time against non-existent",
+            "baselines.",
         ],
         "requires": ["-u/--user or -U/--users"],
         "mods": [
-            ["-u", "--user", "<name>", "Single candidate username"],
+            ["-u", "--user", "<name> …", "Candidate username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist (required unless -u)"],
             ["", "--usrenum-password", "<str>", "Wrong password for every probe (default: PtSrv_IMAP_USRENUM_!@#_2026)"],
             ["", "--usrenum-max", "<n>", "Limit names read from wordlist (default: 0 = no limit)"],
-            ["", "--usrenum-threads", "<n>", "Parallel TCP sessions (default 1)"],
+            ["-t", "--threads", "<n>", "Parallel TCP sessions (default 1)"],
         ],
     },
     "USRENUMPLAIN": {
         "desc": "AUTHENTICATE PLAIN user enumeration",
         "long": [
             "AUTHENTICATE PLAIN (SASL) each name from -u/-U with a wrong",
-            "password; use when CAPABILITY lists LOGINDISABLED.",
+            "password; compare status, error text and auth time against",
+            "baselines. Use when CAPABILITY lists LOGINDISABLED.",
         ],
         "requires": ["-u/--user or -U/--users"],
         "mods": [
-            ["-u", "--user", "<name>", "Single candidate username"],
+            ["-u", "--user", "<name> …", "Candidate username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist (required unless -u)"],
             ["", "--usrenum-password", "<str>", "Wrong password for every probe (default: PtSrv_IMAP_USRENUM_!@#_2026)"],
             ["", "--usrenum-max", "<n>", "Limit names read from wordlist (default: 0 = no limit)"],
-            ["", "--usrenum-threads", "<n>", "Parallel TCP sessions (default 1)"],
+            ["-t", "--threads", "<n>", "Parallel TCP sessions (default 1)"],
         ],
     },
     "BRUTE": {
@@ -116,7 +118,7 @@ IMAP_TESTS: dict[str, dict] = {
         ],
         "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
         "mods": [
-            ["-u", "--user", "<name>", "Single username"],
+            ["-u", "--user", "<name> …", "Username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
@@ -127,30 +129,49 @@ IMAP_TESTS: dict[str, dict] = {
     "EICAR": {
         "desc": "APPEND EICAR antivirus probe",
         "long": [
-            "APPEND EICAR as plain body, eicar.com / eicar.com.txt attachments,",
-            "and ZIP / nested ZIP (eicar.org / SMTP AV variants).",
+            "APPEND EICAR as a plain body, eicar.com / eicar.com.txt",
+            "attachments, and ZIP / nested ZIP.",
+        ],
+        "requires": ["-u/--user and -p/--password (no wordlists)"],
+    },
+    "XXESSRF": {
+        "desc": "SSRF through XXE vulnerability",
+        "long": [
+            "APPEND RFC 822 messages with an external XML entity pointing at",
+            "the canary URL (ZIP, DOCX, and XML body). Check the canary for",
+            "HTTP requests. APPEND OK only means the store accepted the message.",
+        ],
+        "requires": ["-u/--user and -p/--password (no wordlists)", "--canary-url"],
+        "mods": [
+            ["", "--canary-url", "<URL>", "Canary/callback URL (required)"],
+            ["", "--timeout", "<sec>", "Per-message timeout (default: 30)"],
+        ],
+    },
+    "XXEEXP": {
+        "desc": "XML Entity Expansion (Billion of Lolz) via XXE vulnerability (DoS)",
+        "long": [
+            "APPEND Billion Laughs as an XML attachment and as an XML body.",
+            "Impact is processing-side: watch CPU, memory and IMAP responsiveness.",
         ],
         "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [
-            ["", "--eicar-mailbox", "<name>", "Mailbox name for APPEND (default INBOX)"],
+            ["", "--timeout", "<sec>", "Per-message timeout (default: 30)"],
         ],
     },
-    "ZIPXXE": {
-        "desc": "Zip bomb, Billion Laughs, XXE",
+    "ZIPBOMB": {
+        "desc": "Zip bomb (DoS)",
         "long": [
-            "After LOGIN, APPEND RFC 822 messages with Zip bomb, Billion Laughs",
-            "and XXE payloads (same variants as SMTP ZIPXXE). APPEND is valid in",
-            "authenticated state (RFC 3501 §6.3.11); SELECT is not required.",
-            "XXE variants require a canary URL. Impact is manual (CPU / canary).",
+            "APPEND zip bombs as mail attachments. Without --variant-* flags,",
+            "sends the small and medium payloads. --variant-huge unpacks to",
+            "about 1 TiB in a single extract.",
+            "Watch disk, memory and IMAP responsiveness.",
         ],
-        "requires": ["-u/--user and -p/--password (no wordlists)", "--zipxxe-canary-url for xxe_* variants"],
+        "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [
-            ["", "--zipxxe-canary-url", "<URL>", "Canary URL for xxe_zip / xxe_docx / xxe_body"],
-            ["", "--zipxxe-variants", "<v1,v2,...>", "billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx,xxe_body (default: all)"],
-            ["", "--zipxxe-zip-bomb", "", "Include zip_bomb (minimal ~200KB; DoS risk!)"],
-            ["", "--zipxxe-zip-bomb-full", "", "Include zip_bomb_full (~100KB→~100MB; extreme DoS risk!)"],
-            ["", "--zipxxe-mailbox", "<name>", "Mailbox name for APPEND (default INBOX)"],
-            ["", "--zipxxe-timeout", "<sec>", "Per-message timeout (default: 30)"],
+            ["", "--variant-small", "", "Small zip bomb (sent by default)"],
+            ["", "--variant-medium", "", "Medium zip bomb, ~100 MB unpacked (sent by default)"],
+            ["", "--variant-huge", "", "Huge zip bomb, ~1 TiB unpacked (not default; extreme DoS)"],
+            ["", "--timeout", "<sec>", "Per-message timeout (default: 30)"],
         ],
     },
     "NOOP1": {
@@ -205,7 +226,6 @@ IMAP_TESTS: dict[str, dict] = {
         ],
         "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [
-            ["", "--resource-load-mailbox", "<name>", "Mailbox for APPEND phase (default INBOX)"],
             ["", "--resource-load-append-max", "<n>", "Max APPEND operations (default 400)"],
             ["", "--resource-load-search-max", "<n>", "Max UID SEARCH ALL commands (default 600; 0 skips)"],
         ],
@@ -219,7 +239,6 @@ IMAP_TESTS: dict[str, dict] = {
         "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [
             ["", "--mailbox-iso-foreign-user", "<name>", "Token for cross-user heuristics (default user2)"],
-            ["", "--mailbox-iso-mailbox", "<name>", "Own baseline mailbox (default INBOX)"],
         ],
     },
     "TLSAUDIT": {
@@ -238,6 +257,12 @@ IMAP_TESTS: dict[str, dict] = {
     "RATELIMIT": rate_limit_test_spec(),
 }
 
+# Tests that SELECT/APPEND via --mailbox (shown in imap -ts <TEST> -h).
+_IMAP_FOLDER_OPT = ["", "--mailbox", "<name>", "IMAP Folder"]
+_IMAP_FOLDER_TESTS = frozenset({
+    "EICAR", "XXESSRF", "XXEEXP", "ZIPBOMB", "RESLOAD", "MBOXISO",
+})
+
 
 def imap_test_help(codes: list[str]):
     if not codes:
@@ -255,6 +280,10 @@ def imap_test_help(codes: list[str]):
         if spec.get("requires"):
             desc.append("Requires: " + "; ".join(spec["requires"]))
         mods = list(spec.get("mods", []) or [])
+        if code in _IMAP_FOLDER_TESTS and not any(
+            len(row) > 1 and row[1] == "--mailbox" for row in mods
+        ):
+            mods.insert(0, list(_IMAP_FOLDER_OPT))
         has_opts = bool(mods or spec.get("requires"))
         usage = f"ptsrvtester imap -ts {code} " + ("<options> -tg <target>" if has_opts else "-tg <target>")
         blocks.append({"description": desc})

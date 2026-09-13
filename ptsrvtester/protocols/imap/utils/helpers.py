@@ -392,6 +392,12 @@ def text_or_file(text: str | list[str] | None, filepath: str | None) -> list[str
     return result
 
 
+def one_cli_user(user: str | list[str] | None) -> str | None:
+    """Single ``-u`` name, or ``None`` when ``-u`` has zero or several names."""
+    names = [x.strip() for x in text_or_file(user, None) if str(x).strip()]
+    return names[0] if len(names) == 1 else None
+
+
 def filepaths(directory: str, ext: str) -> list[str]:
     """
     Finds files of given extension in a given directory

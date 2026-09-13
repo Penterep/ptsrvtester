@@ -13,6 +13,7 @@ class NTLMResult(NamedTuple):
     success: bool
     ntlm: NTLMInfo | None
     auth_ntlm_advertised: bool  # AUTH=NTLM in pre-login CAPABILITY (or banner)
+    incomplete: bool = False  # connect/AUTH timed out — not a confirmed reject
 
 
 class InfoResult(NamedTuple):
@@ -317,8 +318,11 @@ ZIPXXE_VARIANT_TITLES: dict[str, str] = {
     "xxe_zip": "XXE in ZIP test",
     "xxe_docx": "XXE in DOCX test",
     "xxe_body": "XXE in body test",
-    "zip_bomb": "Zip bomb test",
-    "zip_bomb_full": "Zip bomb full test",
+    "zip_bomb": "Zip bomb small",
+    "zip_bomb_small": "Zip bomb small",
+    "zip_bomb_full": "Zip bomb medium",
+    "zip_bomb_medium": "Zip bomb medium",
+    "zip_bomb_huge": "Zip bomb huge (≥1 TiB)",
 }
 
 ZIPXXE_VARIANT_PAYLOAD_LABELS: dict[str, str] = {
@@ -327,8 +331,11 @@ ZIPXXE_VARIANT_PAYLOAD_LABELS: dict[str, str] = {
     "xxe_zip": "report.zip",
     "xxe_docx": "document.docx",
     "xxe_body": "body (XML)",
-    "zip_bomb": "zipbomb.zip",
-    "zip_bomb_full": "zipbomb_full.zip",
+    "zip_bomb": "zipbomb-small.zip",
+    "zip_bomb_small": "zipbomb-small.zip",
+    "zip_bomb_full": "zipbomb-medium.zip",
+    "zip_bomb_medium": "zipbomb-medium.zip",
+    "zip_bomb_huge": "zipbomb-huge.zip",
 }
 
 
@@ -770,8 +777,12 @@ class IMAPResults:
     conn_limits: "ImapConnLimitsResult | None" = None
     conn_limits_error: str | None = None
     eicar: EicarAppendResult | None = None
-    zipxxe: ZipxxeResult | None = None
-    zipxxe_error: str | None = None
+    xxessrf: ZipxxeResult | None = None
+    xxessrf_error: str | None = None
+    xxeexp: ZipxxeResult | None = None
+    xxeexp_error: str | None = None
+    zipbomb: ZipxxeResult | None = None
+    zipbomb_error: str | None = None
     imap_usrenum: ImapUserEnumResult | None = None
     imap_usrenum_error: str | None = None
     imap_usrenum_plain: ImapUserEnumResult | None = None
@@ -804,7 +815,9 @@ class VULNS(Enum):
     ConnLong = "PTV-SVC-IMAP-CONNLONG"
     ConnRate = "PTV-SVC-IMAP-CONNRATE"
     Eicar = "PTV-SVC-IMAP-EICAR"
-    Zipxxe = "PTL-SVC-IMAP-ZIPXXE"
+    Xxessrf = "PTL-SVC-IMAP-XXESSRF"
+    Xxeexp = "PTL-SVC-IMAP-XXEEXP"
+    Zipbomb = "PTL-SVC-IMAP-ZIPBOMB"
     UserEnumLogin = "PTV-SVC-IMAP-USRENUM"
     ResourceLoad = "PTV-SVC-IMAP-RESLOAD"
     AuthzBypass = "PTV-SVC-IMAP-AUTHZ-BYPASS"

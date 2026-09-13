@@ -1,4 +1,5 @@
 """NOOP1 — NOOP connection duration (pre-auth + post-auth if -u/-p)."""
+from ..utils.helpers import one_cli_user
 from ._common import eng
 
 __MODULELABEL__ = "NOOP connection duration"
@@ -131,12 +132,13 @@ def run(ctx):
     elif result_preauth:
         ctx.out(f"Test error: {result_preauth.error_message}", "ERROR", indent=8)
 
-    if ctx.args.user and ctx.args.password:
+    user = one_cli_user(ctx.args.user)
+    if user and ctx.args.password:
         ctx.out("Post-authentication", "TITLE", indent=4)
         e._flush_terminal()
 
         try:
-            result_postauth = e.test_noop_duration_postauth(ctx.args.user, ctx.args.password)
+            result_postauth = e.test_noop_duration_postauth(user, ctx.args.password)
         except Exception as ex:
             ctx.out(f"Test failed: {ex}", "ERROR", indent=8)
             result_postauth = None

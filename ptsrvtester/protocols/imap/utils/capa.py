@@ -10,17 +10,75 @@ def valid_target_imap(target: str) -> Target:
     return valid_target(target, domain_allowed=True)
 
 
-def _normalize_imap_login_error_for_enum(msg: str) -> str:
+def _imap_dat_to_text(dat) -> str:
+    """IMAP data payload as text (all items; tagged NO/BAD from imaplib)."""
+    if dat is None:
+        return ""
+    items = dat if isinstance(dat, (list, tuple)) else (dat,)
+    chunks: list[str] = []
+    for last in items:
+        if last is None:
+            continue
+        if isinstance(last, bytes):
+            chunks.append(last.decode(errors="replace"))
+        else:
+            chunks.append(str(last))
+    return " ".join(chunks).strip()
+
+
+def _strip_imap_command_tags_for_enum(msg: str) -> str:
+    """Drop per-connection IMAP command tags (imaplib tagpre+seq, e.g. IEHG1).
+
+    Untagged ``* STATUS ...`` lines are kept — those can be a real oracle.
     """
-    Normalize IMAP LOGIN failure text for comparison (OWASP-style username oracle).
-    Collapses whitespace; strips trailing session/host suffixes similar to SMTP auth enum.
+    chunks: list[str] = []
+    for chunk in re.split(r"\s*\|\s*", msg):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = re.match(
+            r"^(\*|[\w.-]{1,32})\s+(OK|NO|BAD|BYE|PREAUTH)\b(.*)$",
+            chunk,
+            re.IGNORECASE,
+        )
+        if not m:
+            chunks.append(chunk)
+            continue
+        token, status, rest = m.group(1), m.group(2), m.group(3)
+        if token == "*":
+            chunks.append(f"* {status}{rest}".strip())
+        else:
+            chunks.append(f"{status}{rest}".strip())
+    return " | ".join(chunks)
+
+
+def _normalize_imap_login_error_for_enum(msg: str, *, status: str | None = None) -> str:
+    """
+    Signature for username-oracle comparison (OWASP WSTG-IDENT-04).
+
+    Includes tagged status (RFC 3501/9051 NO vs BAD) and IMAP response codes
+    (RFC 5530, e.g. AUTHENTICATIONFAILED vs UNAVAILABLE), not only human text.
+    Command tags must not be part of the signature — every IMAP session uses a
+    new tag, which would otherwise look like a distinct error for every probe.
     """
     if not msg:
-        return ""
-    s = msg if isinstance(msg, str) else str(msg)
-    s = " ".join(s.split())
-    s = re.sub(r"\s+[a-zA-Z0-9.-]{15,}\s+-\s+[a-zA-Z0-9.]+\s*$", "", s)
-    return s.strip().lower()
+        s = ""
+    else:
+        s = msg if isinstance(msg, str) else str(msg)
+        s = _strip_imap_command_tags_for_enum(s)
+        s = " ".join(s.split())
+        s = re.sub(r"\s+[a-zA-Z0-9.-]{15,}\s+-\s+[a-zA-Z0-9.]+\s*$", "", s)
+        s = s.strip().lower()
+    st = (status or "").strip().lower()
+    if st:
+        if s == st:
+            s = ""
+        elif s.startswith(st + " "):
+            s = s[len(st):].strip()
+    code_m = re.search(r"\[([a-z0-9_-]+)\]", s, re.IGNORECASE)
+    code = code_m.group(1).lower() if code_m else ""
+    parts = [p for p in (st, code, s) if p]
+    return "|".join(parts)
 
 
 def _imap_login_exception_text(exc: BaseException) -> str:

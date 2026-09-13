@@ -33,7 +33,7 @@ def run(ctx):
         )
     elif catch_all == "unreachable":
         ctx.out(
-            "Could not connect to the server. Catch-all was not tested.",
+            "Catch-all timed out or could not connect. Not confirmed.",
             "WARNING",
             indent=4,
         )

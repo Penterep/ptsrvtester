@@ -14,7 +14,9 @@ from typing import NamedTuple
 from impacket import uuid
 from impacket.dcerpc.v5 import epm, mgmt, samr, transport
 from impacket.dcerpc.v5.epm import MSRPC_UUID_PORTMAP
-from impacket.dcerpc.v5.rpcrt import DCERPCException, RPC_C_AUTHN_WINNT
+from impacket.dcerpc.v5.rpcrt import (
+    DCERPCException, RPC_C_AUTHN_WINNT, RPC_C_AUTHN_LEVEL_PKT_INTEGRITY,
+)
 from impacket.dcerpc.v5.rpch import RPCProxyClientException
 from impacket.http import AUTH_NTLM
 from impacket.nt_errors import (
@@ -42,6 +44,10 @@ from impacket.smbconnection import SMBConnection, SessionError
 from .helpers import text_or_file
 from .samr_policy import format_interval, parse_lockout_policy, parse_password_policy
 from .samr_users import parse_samr_user, unavailable_samr_user
+from .rpc_auth import (
+    VerifiedDCERPC, SUPPORTED_RPC_PROBES, UnsupportedRpcProbe, confirm_rpc_access,
+)
+from .rpc_proxy import ObservedRPCProxyTransport, is_http_auth_rejection
 
 
 class Out(Enum):
@@ -77,20 +83,26 @@ class _AttemptResult:
     accepted: bool = False
     rejected: bool = False
     error: Exception | None = None
+    evidence: dict | None = None
 
 
 @dataclass
 class MSRPCResult:
     EpmapEndpoints: dict | None = None
     MgmtEndpoints: list[str] | None = None
+    MgmtInterfaces: list[dict] | None = None
     Pipes: list[str] | None = None
     PipesCreds: list[Credential] | None = None
     Anonymous: list[str] | None = None
+    AnonymousAccess: dict | None = None
     SamrPolicy: dict | None = None
     SamrUsers: dict | None = None
+    SamrGroups: dict | None = None
+    SamrUserInfo: dict | None = None
     SMB_Brute: list[Credential] | None = None
     TCP_Brute: list[Credential] | None = None
     HTTP_Brute: list[Credential] | None = None
+    credential_checks: dict[str, list[dict]] = field(default_factory=dict)
     module_errors: dict[str, str] = field(default_factory=dict)
 
 
@@ -389,7 +401,9 @@ class MsrpcEngine(_PrintMixin):
             self._disconnect(dce)
 
     def enumerate_mgmt(self) -> list[str]:
-        dangerous: list[str] = []
+        found: list[str] = []
+        details_list: list[dict] = []
+        self.results.MgmtInterfaces = details_list
         dce = None
         try:
             binding = f"ncacn_ip_tcp:{self.args.ip}[{self.rpc_port}]"
@@ -404,10 +418,10 @@ class MsrpcEngine(_PrintMixin):
                 uuid.bin_to_uuidtup(vector["if_id"][index]["Data"].getData())
                 for index in range(vector["count"])
             }
-            interfaces.add(("AFA8BD80-7D8A-11C9-BEF4-08002B102989", "1.0"))
-
             for interface_uuid, version in sorted(interfaces):
                 canonical = interface_uuid.lower()
+                if canonical not in found:
+                    found.append(canonical)
                 binary_key = uuid.uuidtup_to_bin((interface_uuid, version))[:18]
                 provider = self._provider_name(epm.KNOWN_UUIDS.get(binary_key))
                 protocol = self._provider_name(epm.KNOWN_PROTOCOLS.get(canonical))
@@ -415,19 +429,23 @@ class MsrpcEngine(_PrintMixin):
                 self.ptprint(f"Provider: {provider}")
                 self.ptprint(f"UUID: {interface_uuid} v{version}")
                 details = KNOWN_INTERFACE_UUIDS.get(canonical)
+                details_list.append({
+                    "uuid": canonical, "version": version,
+                    "provider": provider, "protocol": protocol,
+                    "knownPipe": details["pipe"] if details else None,
+                })
                 if details is not None:
-                    dangerous.append(canonical)
                     self.ptprint(f"Named Pipe: {details['pipe']}")
                     self.ptprint(f"Description: {details['description']}")
 
             self.ptprint(f"Interfaces found: {len(interfaces)}", out=Out.INFO)
             if getattr(self.args, "output", None):
-                self.write_to_file(dangerous)
-            return dangerous
+                self.write_to_file([f"{item['uuid']}:{item['version']}" for item in details_list])
+            return found
         except Exception as exc:
             self.record_module_error("ENUMMGMT", exc)
             self.ptprint(f"RPC management enumeration failed: {exc}", out=Out.ERROR)
-            return []
+            return found
         finally:
             self._disconnect(dce)
 
@@ -592,8 +610,15 @@ class MsrpcEngine(_PrintMixin):
         return names
 
     def _print_samr_policy(self, result: dict) -> list[str]:
-        lines: list[str] = []
+        lines = [
+            f"SAMR policy source: {result['sourceHost']}",
+            "Policy scope: queried SAM domain (local account policy or AD domain default)",
+            "Effective per-user password and lockout policies: not queried; "
+            "AD users may have different policies",
+        ]
         self.ptprint(f"SAMR policy query status: {result['status']}", out=Out.INFO)
+        for line in lines:
+            self.ptprint(line, out=Out.INFO)
         for domain in result["domains"]:
             name = domain.get("name", "unknown")
             sid = domain.get("sid", "unknown")
@@ -663,6 +688,9 @@ class MsrpcEngine(_PrintMixin):
         result: dict[str, object] = {
             "status": "error",
             "reason": None,
+            "sourceHost": self.args.ip,
+            "policyScope": "sam_domain",
+            "effectiveUserPolicyChecked": False,
             "domains": [],
         }
         smb = None
@@ -1290,6 +1318,7 @@ class MsrpcEngine(_PrintMixin):
         pending_limit = max(1, workers * 2)
         credentials = enumerate(self._iter_credentials(usernames, passwords))
         accepted: list[tuple[int, Credential]] = []
+        checks: list[tuple[int, dict]] = []
         error_count = 0
         first_error: tuple[int, Exception] | None = None
 
@@ -1306,6 +1335,12 @@ class MsrpcEngine(_PrintMixin):
                 )
             if outcome.accepted:
                 accepted.append((index, outcome.credential))
+            if outcome.evidence is not None:
+                checks.append((index, {
+                    "attempt": index + 1,
+                    "status": "accepted" if outcome.accepted else ("rejected" if outcome.rejected else "inconclusive"),
+                    **outcome.evidence,
+                }))
             if outcome.error is not None:
                 error_count += 1
                 if first_error is None or index < first_error[0]:
@@ -1333,6 +1368,14 @@ class MsrpcEngine(_PrintMixin):
                     pass
 
         found = [credential for _, credential in sorted(accepted)]
+        if checks:
+            evidence = [value for _, value in sorted(checks)]
+            self.results.credential_checks[code] = evidence
+            if code == "BRUTEHTTP":
+                tunnels = sum(item.get("rpcTunnel") == "established" for item in evidence)
+                self.ptprint(f"RPC Proxy tunnels established: {tunnels}/{len(evidence)}", out=Out.INFO)
+            confirmed = sum(item.get("rpcCall") == "confirmed" for item in evidence)
+            self.ptprint(f"Read-only RPC calls confirmed: {confirmed}/{len(evidence)}", out=Out.INFO)
         if first_error is not None:
             self.record_module_error(code, first_error[1])
             self.ptprint(
@@ -1363,8 +1406,17 @@ class MsrpcEngine(_PrintMixin):
         )
 
     def Anonymous_smb(self) -> list[str]:
+        """Retain legacy null-session flags and publish separate access evidence."""
         smb = None
         logged_in = False
+        legacy: list[str] = []
+        stage = "login"
+        evidence = {
+            "status": "error", "reason": None, "sessionType": "unknown",
+            "login": "not_tested", "ipcAccess": "not_tested",
+            "shareEnumeration": "not_tested", "shares": [],
+        }
+        self.results.AnonymousAccess = evidence
         try:
             smb = SMBConnection(
                 self.args.ip,
@@ -1375,36 +1427,70 @@ class MsrpcEngine(_PrintMixin):
             try:
                 smb.login("", "")
                 logged_in = True
-            except SessionError:
-                self.ptprint("Anonymous SMB login is denied", out=Out.NOTVULN)
-                return []
+            except SessionError as exc:
+                if exc.getErrorCode() in _AUTH_REJECTION_STATUSES | {STATUS_ACCESS_DENIED}:
+                    evidence.update(status="denied", reason="authentication_denied", login="denied")
+                    self.ptprint("Anonymous SMB login is denied", out=Out.NOTVULN)
+                    return []
+                raise
 
-            # Verify the exact IPC$ access represented by the second legacy flag.
+            guest = bool(smb.isGuestSession())
+            evidence.update(login="accepted", sessionType="guest" if guest else "null")
+            if not guest:
+                legacy = ["True", "Unknown"]
+            self.ptprint(
+                "Empty SMB credentials mapped to Guest" if guest else "SMB null session accepted",
+                out=Out.INFO if guest else Out.VULN,
+            )
+            stage = "ipcAccess"
             try:
                 smb.connectTree("IPC$")
-            except SessionError:
-                self.ptprint(
-                    "Anonymous SMB login is allowed, but IPC$ access is denied",
-                    out=Out.VULN,
-                )
-                return ["True", "False"]
+            except SessionError as exc:
+                if exc.getErrorCode() != STATUS_ACCESS_DENIED:
+                    raise
+                evidence.update(status="partial", reason="ipc_access_denied", ipcAccess="denied")
+                if legacy:
+                    legacy[1] = "False"
+                self.ptprint("IPC$ access is denied", out=Out.WARNING)
+                return legacy
 
-            self.ptprint("Anonymous SMB login and IPC$ access are allowed", out=Out.VULN)
+            evidence["ipcAccess"] = "allowed"
+            if legacy:
+                legacy[1] = "True"
+            self.ptprint("IPC$ access is allowed", out=Out.INFO)
+            stage = "shareEnumeration"
             try:
                 shares = smb.listShares()
-            except SessionError as exc:
-                shares = []
-                self.ptprint(
-                    f"Anonymous share enumeration is denied: {exc}",
-                    out=Out.WARNING,
-                )
+            except Exception as exc:
+                # listShares uses SRVS RPC, whose authorization failures are
+                # DCERPCSessionError rather than SMB SessionError.
+                if not self._samr_access_denied(exc):
+                    raise
+                evidence.update(status="partial", reason="share_enumeration_denied", shareEnumeration="denied")
+                self.ptprint("Share enumeration is denied", out=Out.WARNING)
+                return legacy
             for share in shares:
-                try:
-                    name = share["shi1_netname"]
-                except (KeyError, TypeError):
-                    continue
-                self.ptprint(f"Share: {str(name).rstrip(chr(0))}")
-            return ["True", "True"]
+                name = str(share["shi1_netname"]).rstrip("\x00")
+                if not name:
+                    raise ValueError("SMB share response contains an empty name")
+                item = {"name": name}
+                for wire_name, key in (("shi1_type", "type"), ("shi1_remark", "remark")):
+                    try:
+                        value = share[wire_name]
+                        item[key] = int(value) if key == "type" else str(value).rstrip("\x00")
+                    except KeyError:
+                        item[key] = None
+                evidence["shares"].append(item)
+                self.ptprint(f"Share: {name}")
+            evidence.update(status="complete", shareEnumeration="complete")
+            return legacy
+        except Exception as exc:
+            evidence.update(status="error", reason="operational_error")
+            evidence[stage] = "error"
+            safe_error = self._sanitized_samr_error(exc)
+            self.record_module_error("ANONSMB", safe_error)
+            self.ptprint(f"SMB anonymous access check failed: {safe_error}", out=Out.ERROR)
+            return legacy
         finally:
             if smb is not None and logged_in:
                 self._close_smb(smb)
@@ -1456,6 +1542,14 @@ class MsrpcEngine(_PrintMixin):
     def smb_brute(self) -> list[Credential]:
         return self._run_credential_attempts("BRUTESMB", self._smb_attempt)
 
+    def enumerate_samr_groups(self) -> dict:
+        from .samr_groups import enumerate_samr_groups
+        return enumerate_samr_groups(self)
+
+    def query_samr_user_info(self) -> dict:
+        from .samr_userinfo import query_samr_user_info
+        return query_samr_user_info(self)
+
     @staticmethod
     def _interface_uuid_binary(interface: str) -> bytes:
         raw = str(interface).strip()
@@ -1481,27 +1575,36 @@ class MsrpcEngine(_PrintMixin):
     ) -> _AttemptResult:
         interface_binary = self._interface_uuid_binary(interface)
         dce = None
+        evidence = {"interface": interface, "rpcBind": "not_tested", "rpcCall": "not_tested"}
+        stage = "rpcBind"
         try:
+            if interface_binary not in SUPPORTED_RPC_PROBES:
+                raise UnsupportedRpcProbe(f"No read-only credential confirmation probe for {interface}")
             rpc_transport = transport.DCERPCTransportFactory(f"ncacn_ip_tcp:{host}[{port}]")
             rpc_transport.set_connect_timeout(self.connect_timeout)
             rpc_transport.set_credentials(
                 credential.username or "", credential.password or "", domain or ""
             )
-            dce = rpc_transport.get_dce_rpc()
+            dce = VerifiedDCERPC(rpc_transport)
             dce.set_credentials(
                 credential.username or "", credential.password or "", domain or ""
             )
             dce.set_auth_type(RPC_C_AUTHN_WINNT)
+            dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_INTEGRITY)
             dce.connect()
             dce.bind(interface_binary)
-            return _AttemptResult(credential, accepted=True)
-        except SessionError:
-            return _AttemptResult(credential, rejected=True)
+            evidence["rpcBind"] = "accepted"
+            stage = "rpcCall"
+            confirm_rpc_access(dce, interface_binary)
+            evidence["rpcCall"] = "confirmed"
+            return _AttemptResult(credential, accepted=True, evidence=evidence)
         except Exception as exc:
-            error_code = getattr(exc, "error_code", None)
-            if error_code == 5:
-                return _AttemptResult(credential, rejected=True)
-            return _AttemptResult(credential, error=exc)
+            # Access denied can mean method authorization rather than a wrong
+            # password. Only explicit logon rejection statuses classify as such.
+            rejected = self._samr_error_code(exc) in _AUTH_REJECTION_STATUSES
+            evidence[stage] = "denied" if rejected else "unconfirmed"
+            evidence["reason"] = "authentication_denied" if rejected else ("unsupported_interface" if isinstance(exc, UnsupportedRpcProbe) else "rpc_access_unconfirmed")
+            return _AttemptResult(credential, rejected=rejected, error=None if rejected else exc, evidence=evidence)
         finally:
             self._disconnect(dce)
 
@@ -1528,9 +1631,13 @@ class MsrpcEngine(_PrintMixin):
 
     def _http_attempt(self, credential: Credential) -> _AttemptResult:
         dce = None
+        rpc_transport = None
+        evidence = {"proxyChannels": {"in": "not_tested", "out": "not_tested"},
+                    "rpcTunnel": "not_tested", "rpcBind": "not_tested", "rpcCall": "not_tested"}
+        stage = "rpcTunnel"
         try:
             proxy_host = getattr(self.args, "host", None) or self.args.ip
-            rpc_transport = transport.DCERPCTransportFactory(
+            rpc_transport = ObservedRPCProxyTransport(
                 f"ncacn_http:[593,RpcProxy={proxy_host}:{self.http_port}]"
             )
             rpc_transport.set_connect_timeout(self.connect_timeout)
@@ -1540,13 +1647,14 @@ class MsrpcEngine(_PrintMixin):
                 getattr(self.args, "domain", "") or "",
             )
             rpc_transport.set_auth_type(AUTH_NTLM)
-            dce = rpc_transport.get_dce_rpc()
+            dce = VerifiedDCERPC(rpc_transport)
             dce.set_credentials(
                 credential.username or "",
                 credential.password or "",
                 getattr(self.args, "domain", "") or "",
             )
             dce.set_auth_type(RPC_C_AUTHN_WINNT)
+            dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_INTEGRITY)
             with _HTTP_PROXY_CONNECT_LOCK:
                 previous_timeout = socket.getdefaulttimeout()
                 socket.setdefaulttimeout(self.connect_timeout)
@@ -1554,20 +1662,23 @@ class MsrpcEngine(_PrintMixin):
                     dce.connect()
                 finally:
                     socket.setdefaulttimeout(previous_timeout)
+            evidence["rpcTunnel"] = "established"
+            stage = "rpcBind"
             dce.bind(MSRPC_UUID_PORTMAP)
-            return _AttemptResult(credential, accepted=True)
-        except SessionError:
-            return _AttemptResult(credential, rejected=True)
-        except RPCProxyClientException as exc:
-            if "401 Unauthorized" in str(exc):
-                return _AttemptResult(credential, rejected=True)
-            return _AttemptResult(credential, error=exc)
+            evidence["rpcBind"] = "accepted"
+            stage = "rpcCall"
+            confirm_rpc_access(dce, MSRPC_UUID_PORTMAP)
+            evidence["rpcCall"] = "confirmed"
+            return _AttemptResult(credential, accepted=True, evidence=evidence)
         except Exception as exc:
-            error_code = getattr(exc, "error_code", None)
-            if error_code == 5:
-                return _AttemptResult(credential, rejected=True)
-            return _AttemptResult(credential, error=exc)
+            proxy_rejected = isinstance(exc, RPCProxyClientException) and is_http_auth_rejection(exc)
+            rejected = proxy_rejected or self._samr_error_code(exc) in _AUTH_REJECTION_STATUSES
+            evidence[stage] = "denied" if rejected else "unconfirmed"
+            evidence["reason"] = "proxy_authentication_denied" if proxy_rejected else ("authentication_denied" if rejected else "proxy_or_backend_access_unconfirmed")
+            return _AttemptResult(credential, rejected=rejected, error=None if rejected else exc, evidence=evidence)
         finally:
+            if rpc_transport is not None:
+                evidence["proxyChannels"] = dict(rpc_transport.channel_status)
             self._disconnect(dce)
 
     def http_brute(self) -> list[Credential]:
@@ -1591,17 +1702,23 @@ class MsrpcEngine(_PrintMixin):
             "description": None,
             "epmapEndpoints": self.results.EpmapEndpoints,
             "mgmtEndpoints": self.results.MgmtEndpoints,
+            "mgmtInterfaces": self.results.MgmtInterfaces,
             "pipes": self.results.Pipes,
             "anonymous": (
                 ",".join(self.results.Anonymous) if self.results.Anonymous else None
             ),
             "samrPolicy": self.results.SamrPolicy,
             "samrUsers": self.results.SamrUsers,
+            "samrGroups": self.results.SamrGroups,
+            "samrUserInfo": self.results.SamrUserInfo,
+            "anonymousAccess": self.results.AnonymousAccess,
             "pipesCreds": self._credentials_to_string(self.results.PipesCreds),
             "smbBrute": self._credentials_to_string(self.results.SMB_Brute),
             "tcpBrute": self._credentials_to_string(self.results.TCP_Brute),
             "httpBrute": self._credentials_to_string(self.results.HTTP_Brute),
         }
+        if self.results.credential_checks:
+            properties["credentialChecks"] = self.results.credential_checks
         if self.results.module_errors:
             properties["moduleErrors"] = [
                 {"test": code, "error": error}

@@ -25,6 +25,8 @@ EXPECTED_TEST_ORDER = (
     "ANONSMB",
     "SAMRPOLICY",
     "SAMRUSERS",
+    "SAMRGROUPS",
+    "SAMRUSERINFO",
     "BRUTEPIPE",
     "BRUTESMB",
     "BRUTETCP",
@@ -40,6 +42,8 @@ EXPECTED_EXPLICIT_ONLY_TESTS = frozenset(
     {
         "SAMRPOLICY",
         "SAMRUSERS",
+        "SAMRGROUPS",
+        "SAMRUSERINFO",
         "BRUTEPIPE",
         "BRUTESMB",
         "BRUTETCP",
@@ -85,7 +89,7 @@ def structure_main(**overrides) -> MSRPC:
 
 
 class MSRPCStructureTests(unittest.TestCase):
-    def test_public_entrypoint_and_registry_expose_exactly_ten_tests(self):
+    def test_public_entrypoint_and_registry_expose_twelve_tests(self):
         self.assertIs(MSRPC, MSRPCMain)
         self.assertEqual(
             MODULES["msrpc"][0],
@@ -104,10 +108,12 @@ class MSRPCStructureTests(unittest.TestCase):
             sorted(discovered, key=lambda code: (discovered[code].order, code))
         )
 
-        self.assertEqual(discovered_in_order, EXPECTED_TEST_ORDER)
-        self.assertEqual(set(discovered), set(EXPECTED_TEST_ORDER))
-        self.assertEqual(len(discovered), 10)
-        self.assertEqual(len({entry.order for entry in discovered.values()}), 10)
+        # BaseMain also discovers the shared RATELIMIT adapter; MSRPC's
+        # explicit registry controls which protocol tests are selectable.
+        self.assertEqual(discovered_in_order, (*EXPECTED_TEST_ORDER, "RATELIMIT"))
+        self.assertEqual(set(discovered), set(EXPECTED_TEST_ORDER) | {"RATELIMIT"})
+        self.assertEqual(len(discovered), 13)
+        self.assertEqual(len({entry.order for entry in discovered.values()}), 13)
 
         samrusers = MSRPC_TESTS["SAMRUSERS"]
         self.assertEqual(samrusers["family"], "smb")

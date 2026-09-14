@@ -26,7 +26,6 @@ from ptsrvtester.protocols.msrpc.main import MSRPC
 from ptsrvtester.protocols.msrpc.utils.cli import MSRPCArgs
 from ptsrvtester.protocols.msrpc.utils.engine import (
     Credential,
-    MsrpcEngine,
     _AttemptResult,
 )
 from ptsrvtester.protocols.msrpc.utils.samr_policy import (
@@ -41,7 +40,7 @@ from ptsrvtester.protocols.msrpc.utils.samr_policy import (
 
 TEST_IP = "192.0.2.25"
 TEST_INTERFACE_UUID = "12345778-1234-abcd-ef00-0123456789ab"
-TEST_INTERFACE = f"{TEST_INTERFACE_UUID}:1.0"
+TEST_INTERFACE = f"{TEST_INTERFACE_UUID}:0.0"
 
 
 def msrpc_args(**overrides) -> MSRPCArgs:
@@ -83,6 +82,7 @@ def msrpc_main(**overrides) -> tuple[MSRPC, Mock]:
 
 def rpc_transport() -> tuple[Mock, Mock]:
     rpc_transport_mock = Mock()
+    rpc_transport_mock.channel_status = {"in": "opened", "out": "opened"}
     dce = Mock()
     rpc_transport_mock.get_dce_rpc.return_value = dce
     return rpc_transport_mock, dce
@@ -179,7 +179,26 @@ def samr_more_users(
     )
 
 
-class MSRPCPortRoutingTests(unittest.TestCase):
+class MockedRPCTransportTests(unittest.TestCase):
+    """Keep legacy routing tests at the transport boundary.
+
+    Real packet verification is tested independently in test_msrpc_rpc_auth.
+    Engine confirmation outcomes are tested in test_msrpc_access.
+    """
+    def setUp(self):
+        super().setUp()
+        verified = patch(
+            "ptsrvtester.protocols.msrpc.utils.engine.VerifiedDCERPC",
+            side_effect=lambda rpc: rpc.get_dce_rpc(),
+        )
+        confirmation = patch("ptsrvtester.protocols.msrpc.utils.engine.confirm_rpc_access")
+        verified.start()
+        confirmation.start()
+        self.addCleanup(verified.stop)
+        self.addCleanup(confirmation.stop)
+
+
+class MSRPCPortRoutingTests(MockedRPCTransportTests):
     def test_mixed_default_families_use_rpc_135_smb_445_and_http_443(self):
         module, _ = msrpc_main(tests="ENUMEPM,ANONSMB,BRUTEHTTP")
         engine = module.engine
@@ -201,6 +220,7 @@ class MSRPCPortRoutingTests(unittest.TestCase):
         epm_dce.disconnect.assert_called_once_with()
 
         smb = Mock()
+        smb.isGuestSession.return_value = False
         smb.listShares.return_value = []
         with patch(
             "ptsrvtester.protocols.msrpc.utils.engine.SMBConnection",
@@ -212,7 +232,7 @@ class MSRPCPortRoutingTests(unittest.TestCase):
 
         http_transport, http_dce = rpc_transport()
         with patch(
-            "ptsrvtester.protocols.msrpc.utils.engine.transport.DCERPCTransportFactory",
+            "ptsrvtester.protocols.msrpc.utils.engine.ObservedRPCProxyTransport",
             return_value=http_transport,
         ) as factory:
             self.assertEqual(
@@ -271,7 +291,7 @@ class MSRPCPortRoutingTests(unittest.TestCase):
         )
         http_transport, _ = rpc_transport()
         with patch(
-            "ptsrvtester.protocols.msrpc.utils.engine.transport.DCERPCTransportFactory",
+            "ptsrvtester.protocols.msrpc.utils.engine.ObservedRPCProxyTransport",
             return_value=http_transport,
         ) as http_factory:
             http_module.engine.http_brute()
@@ -383,6 +403,7 @@ class MSRPCStructuredProbeTests(unittest.TestCase):
 
         smb = Mock()
         smb.listShares.return_value = [{"shi1_netname": "IPC$\x00"}]
+        smb.isGuestSession.return_value = False
         with patch(
             "ptsrvtester.protocols.msrpc.utils.engine.SMBConnection",
             return_value=smb,
@@ -435,7 +456,7 @@ class MSRPCAnonymousClassificationTests(unittest.TestCase):
         )
 
 
-class MSRPCBindingAndCleanupTests(unittest.TestCase):
+class MSRPCBindingAndCleanupTests(MockedRPCTransportTests):
     def test_named_pipe_uses_custom_smb_port_and_disconnects(self):
         module, _ = msrpc_main(
             tests="BRUTEPIPE",
@@ -477,7 +498,7 @@ class MSRPCBindingAndCleanupTests(unittest.TestCase):
         )
         rpc_mock, dce = rpc_transport()
         expected = impacket_uuid.uuidtup_to_bin(
-            (TEST_INTERFACE_UUID, "1.0")
+            (TEST_INTERFACE_UUID, "0.0")
         )
 
         with patch(
@@ -515,7 +536,7 @@ class MSRPCBindingAndCleanupTests(unittest.TestCase):
         factory.assert_not_called()
 
 
-class MSRPCCredentialSafetyTests(unittest.TestCase):
+class MSRPCCredentialSafetyTests(MockedRPCTransportTests):
     def test_smb_guest_mapping_is_rejected_but_non_guest_is_accepted(self):
         guest_module, _ = msrpc_main(tests="BRUTESMB")
         guest = Mock()
@@ -622,7 +643,7 @@ class MSRPCCredentialSafetyTests(unittest.TestCase):
             proxy_error="HTTP/1.1 401 Unauthorized",
         )
         with patch(
-            "ptsrvtester.protocols.msrpc.utils.engine.transport.DCERPCTransportFactory",
+            "ptsrvtester.protocols.msrpc.utils.engine.ObservedRPCProxyTransport",
             return_value=rpc_mock,
         ):
             self.assertEqual(module.engine.http_brute(), [])
@@ -640,7 +661,7 @@ class MSRPCCredentialSafetyTests(unittest.TestCase):
         socket.setdefaulttimeout(17.0)
         try:
             with patch(
-                "ptsrvtester.protocols.msrpc.utils.engine.transport.DCERPCTransportFactory",
+                "ptsrvtester.protocols.msrpc.utils.engine.ObservedRPCProxyTransport",
                 return_value=rpc_mock,
             ):
                 self.assertEqual(
@@ -815,6 +836,7 @@ class MSRPCSamrPolicyConversionTests(unittest.TestCase):
         result = {
             "status": "complete",
             "reason": None,
+            "sourceHost": TEST_IP,
             "domains": [
                 {
                     "status": "complete",
@@ -845,10 +867,13 @@ class MSRPCSamrPolicyConversionTests(unittest.TestCase):
 
 class MSRPCSamrPolicyEngineTests(unittest.TestCase):
     def test_complete_query_uses_one_smb_login_and_minimal_samr_access(self):
-        module, _ = msrpc_main(
+        module, report = msrpc_main(
             tests="SAMRPOLICY",
             target=SimpleNamespace(ip=TEST_IP, port=1445),
+            output="policy.txt",
         )
+        module.engine.ptprint = Mock()
+        module.engine.write_to_file = Mock()
         smb = Mock()
         smb.isGuestSession.return_value = False
         rpc_mock, dce = rpc_transport()
@@ -911,6 +936,9 @@ class MSRPCSamrPolicyEngineTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "complete")
         self.assertIsNone(result["reason"])
+        self.assertEqual(result["sourceHost"], TEST_IP)
+        self.assertEqual(result["policyScope"], "sam_domain")
+        self.assertFalse(result["effectiveUserPolicyChecked"])
         self.assertEqual(len(result["domains"]), 1)
         self.assertEqual(result["domains"][0]["name"], "EXAMPLE")
         self.assertEqual(result["domains"][0]["sid"], "S-1-5-21-1-2-3")
@@ -920,6 +948,21 @@ class MSRPCSamrPolicyEngineTests(unittest.TestCase):
         self.assertEqual(
             result["domains"][0]["lockoutPolicy"]["lockoutThreshold"], 5
         )
+
+        console = "\n".join(item.args[0] for item in module.engine.ptprint.call_args_list)
+        module.engine.write_to_file.assert_called_once()
+        text_output = "\n".join(module.engine.write_to_file.call_args.args[0])
+        for rendered in (console, text_output):
+            self.assertIn(f"SAMR policy source: {TEST_IP}", rendered)
+            self.assertIn("queried SAM domain", rendered)
+            self.assertIn("local account policy or AD domain default", rendered)
+            self.assertIn("Effective per-user password and lockout policies: not queried", rendered)
+
+        module.engine.results.SamrPolicy = result
+        module.engine.output()
+        properties = report.create_node_object.call_args.args[3]
+        self.assertEqual(properties["samrPolicy"], result)
+        report.add_vulnerability.assert_not_called()
 
         connection.assert_called_once_with(
             TEST_IP,
@@ -1045,6 +1088,9 @@ class MSRPCSamrPolicyEngineTests(unittest.TestCase):
             {
                 "status": "denied",
                 "reason": "authentication_denied",
+                "sourceHost": TEST_IP,
+                "policyScope": "sam_domain",
+                "effectiveUserPolicyChecked": False,
                 "domains": [],
             },
         )
@@ -1149,6 +1195,9 @@ class MSRPCSamrPolicyEngineTests(unittest.TestCase):
             {
                 "status": "denied",
                 "reason": "samr_access_denied",
+                "sourceHost": TEST_IP,
+                "policyScope": "sam_domain",
+                "effectiveUserPolicyChecked": False,
                 "domains": [],
             },
         )
@@ -1994,7 +2043,7 @@ class MSRPCSamrUsersEngineTests(unittest.TestCase):
         smb.close.assert_called_once_with()
 
 
-class MSRPCResourceCleanupTests(unittest.TestCase):
+class MSRPCResourceCleanupTests(MockedRPCTransportTests):
     def test_dce_connections_are_disconnected_when_probe_fails(self):
         module, _ = msrpc_main(tests="ENUMEPM")
         rpc_mock, dce = rpc_transport()
@@ -2032,6 +2081,7 @@ class MSRPCResourceCleanupTests(unittest.TestCase):
     def test_smb_and_http_sessions_are_cleaned_up_on_inner_failure(self):
         smb_module, _ = msrpc_main(tests="ANONSMB")
         smb = Mock()
+        smb.isGuestSession.return_value = False
         smb.connectTree.side_effect = SessionError(STATUS_ACCESS_DENIED)
         with patch(
             "ptsrvtester.protocols.msrpc.utils.engine.SMBConnection",
@@ -2041,6 +2091,7 @@ class MSRPCResourceCleanupTests(unittest.TestCase):
         smb.logoff.assert_called_once_with()
 
         no_share_list = Mock()
+        no_share_list.isGuestSession.return_value = False
         no_share_list.listShares.side_effect = SessionError(STATUS_ACCESS_DENIED)
         with patch(
             "ptsrvtester.protocols.msrpc.utils.engine.SMBConnection",
@@ -2052,20 +2103,22 @@ class MSRPCResourceCleanupTests(unittest.TestCase):
         no_share_list.logoff.assert_called_once_with()
 
         broken_smb = Mock()
+        broken_smb.isGuestSession.return_value = False
         broken_smb.listShares.side_effect = OSError("connection reset")
         with patch(
             "ptsrvtester.protocols.msrpc.utils.engine.SMBConnection",
             return_value=broken_smb,
         ):
-            with self.assertRaises(OSError):
-                smb_module.engine.Anonymous_smb()
+            self.assertEqual(smb_module.engine.Anonymous_smb(), ["True", "True"])
+        self.assertEqual(smb_module.engine.results.AnonymousAccess["status"], "error")
+        self.assertIn("ANONSMB", smb_module.engine.results.module_errors)
         broken_smb.logoff.assert_called_once_with()
 
         http_module, _ = msrpc_main(tests="BRUTEHTTP")
         rpc_mock, dce = rpc_transport()
         dce.bind.side_effect = OSError("bind failed")
         with patch(
-            "ptsrvtester.protocols.msrpc.utils.engine.transport.DCERPCTransportFactory",
+            "ptsrvtester.protocols.msrpc.utils.engine.ObservedRPCProxyTransport",
             return_value=rpc_mock,
         ):
             self.assertEqual(http_module.engine.http_brute(), [])

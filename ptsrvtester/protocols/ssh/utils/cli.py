@@ -80,6 +80,12 @@ class SSHArgs(ArgsWithBruteforce):
             ["-P", "--passwords", "<wordlist>", "Passwords to log in (first that works is used)"],
             ["", "--privkeys", "<dir>", "Private keys to log in"],
             ["", "", "", ""],
+            [get_colored_text("Post-auth privileges (PRIVS)", "TITLE")],
+            ["-u", "--user", "<username>", "Account to test (required)"],
+            ["-p", "--password", "<password>", "Password to log in"],
+            ["-P", "--passwords", "<wordlist>", "Passwords to log in (first that works is used)"],
+            ["", "--privkeys", "<dir>", "Private keys to log in"],
+            ["", "", "", ""],
             [get_colored_text("Root login policy (ROOTLOGIN)", "TITLE")],
             ["-u", "--user", "<username>", "Account to test (default: root)"],
             ["-p", "--password", "<password>", "Password to confirm root login (optional)"],
@@ -117,6 +123,7 @@ class SSHArgs(ArgsWithBruteforce):
                 "ptsrvtester ssh -tg 127.0.0.1:22 -ts BRUTE -u admin -P passwords.txt",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts ROOTLOGIN",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts SHELL -u svc -p secret",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts PRIVS -u svc -p secret",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts USERENUM -u root -U users.txt",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts DHEAT --dheat 10 --dheat-duration 30",
                 "ptsrvtester ssh -ts BRUTE -h",
@@ -139,6 +146,7 @@ class SSHArgs(ArgsWithBruteforce):
   ptsrvtester -j ssh -tg 127.0.0.1:22 -ts BRUTE -u admin -P passwords.txt --brute-threads 20
   ptsrvtester ssh -tg 127.0.0.1 -ts ROOTLOGIN
   ptsrvtester ssh -tg 127.0.0.1 -ts SHELL -u svc -p secret
+  ptsrvtester ssh -tg 127.0.0.1 -ts PRIVS -u svc -p secret
   ptsrvtester ssh -tg 127.0.0.1 -ts USERENUM -u root -U users.txt
   ptsrvtester ssh -ts BRUTE -h"""
 

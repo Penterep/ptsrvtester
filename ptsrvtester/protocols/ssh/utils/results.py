@@ -43,3 +43,7 @@ class VULNS(Enum):
     RootLoginPermitted = "PTV-SSH-ROOTLOGIN"
     # Shell / command execution permitted after login (SHELL test):
     ShellAccess = "PTV-SSH-SHELLACCESS"
+    # Post-auth privileges & access (PRIVS test):
+    PrivilegedGroup = "PTV-SSH-PRIVGROUP"
+    SensitiveFileAccess = "PTV-SSH-SENSITIVEFILE"
+    SudoAccess = "PTV-SSH-SUDOACCESS"

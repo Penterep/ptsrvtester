@@ -47,3 +47,7 @@ class VULNS(Enum):
     PrivilegedGroup = "PTV-SSH-PRIVGROUP"
     SensitiveFileAccess = "PTV-SSH-SENSITIVEFILE"
     SudoAccess = "PTV-SSH-SUDOACCESS"
+    # Port forwarding & tunneling (FORWARD test):
+    PortForwarding = "PTV-SSH-PORTFORWARDING"
+    AgentForwarding = "PTV-SSH-AGENTFORWARDING"
+    X11Forwarding = "PTV-SSH-X11FORWARDING"

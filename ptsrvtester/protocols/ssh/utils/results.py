@@ -51,3 +51,16 @@ class VULNS(Enum):
     PortForwarding = "PTV-SSH-PORTFORWARDING"
     AgentForwarding = "PTV-SSH-AGENTFORWARDING"
     X11Forwarding = "PTV-SSH-X11FORWARDING"
+    # SFTP access control & confinement (SFTP test):
+    SftpNoChroot = "PTV-SSH-SFTPNOCHROOT"
+    SftpTraversal = "PTV-SSH-SFTPTRAVERSAL"
+    SftpSymlinkEscape = "PTV-SSH-SFTPSYMLINK"
+    SftpUnrestricted = "PTV-SSH-SFTPUNRESTRICTED"
+    SftpADS = "PTV-SSH-SFTPADS"
+    # SFTP content scanning & resource limits (SFTPDATA test):
+    SftpNoAntivirus = "PTV-SSH-SFTPNOAV"
+    SftpContentProcessingDoS = "PTV-SSH-SFTPPROCESSINGDOS"
+    SftpNoQuota = "PTV-SSH-SFTPNOQUOTA"
+    # Protocol & config hygiene (TERRAPIN / SSHV1 tests):
+    Terrapin = "PTV-SSH-TERRAPIN"
+    SSHv1 = "PTV-SSH-SSHV1"

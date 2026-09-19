@@ -97,10 +97,16 @@ def run_lockout_check(
             valid_baseline_ok = False
             notes.append("valid-password baseline was blocked at the network level; "
                          "account-lockout cannot be isolated")
-        else:
+        elif o is Outcome.ERROR:
             valid_baseline_ok = False
-            notes.append("the supplied password did not authenticate before the burst; "
-                         "account-lockout result would be unreliable, so it is skipped")
+            notes.append("could not complete a connection to verify the valid password "
+                         "(transport/negotiation error, not an auth rejection) — check that the "
+                         "host is reachable and the client can negotiate with it; "
+                         "account-lockout skipped")
+        else:  # REJECTED
+            valid_baseline_ok = False
+            notes.append("the supplied password did not authenticate before the burst — verify "
+                         "-p is the correct password for -u; account-lockout skipped")
 
     # (B) Connectivity baseline: one wrong password should be a normal REJECTED.
     progress("baseline connectivity")

@@ -39,6 +39,9 @@ class SSHArgs(ArgsWithBruteforce):
     dheat_duration: float | None
     lockout_attempts: int
     lockout_cooldown: float
+    sftp_max_mb: int
+    sftp_max_files: int
+    sftp_bomb_mb: int
     enum_samples: int
     enum_baseline: int
     enum_sigma: float
@@ -86,6 +89,19 @@ class SSHArgs(ArgsWithBruteforce):
             ["-P", "--passwords", "<wordlist>", "Passwords to log in (first that works is used)"],
             ["", "--privkeys", "<dir>", "Private keys to log in"],
             ["", "", "", ""],
+            [get_colored_text("SFTP access control (SFTP)", "TITLE")],
+            ["-u", "--user", "<username>", "Account to test (required)"],
+            ["-p", "--password", "<password>", "Password to log in"],
+            ["-P", "--passwords", "<wordlist>", "Passwords to log in (first that works is used)"],
+            ["", "--privkeys", "<dir>", "Private keys to log in"],
+            ["", "", "", ""],
+            [get_colored_text("SFTP content & limits (SFTPDATA, aggressive)", "TITLE")],
+            ["-u", "--user", "<username>", "Account to test (required)"],
+            ["-p", "--password", "<password>", "Password to log in"],
+            ["", "--sftp-max-mb", "<n>", "Max MB written in the quota probe (default: 10; cap 200)"],
+            ["", "--sftp-max-files", "<n>", "Max files created in the count probe (default: 100; cap 2000)"],
+            ["", "--sftp-bomb-mb", "<n>", "Decompressed size of the ZIP-bomb probe (default: 10; cap 200)"],
+            ["", "", "", ""],
             [get_colored_text("Port forwarding & tunneling (FORWARD)", "TITLE")],
             ["-u", "--user", "<username>", "Account to test (required)"],
             ["-p", "--password", "<password>", "Password to log in"],
@@ -125,12 +141,15 @@ class SSHArgs(ArgsWithBruteforce):
                 "ptsrvtester ssh -tg 127.0.0.1",
                 "ptsrvtester ssh -tg 127.0.0.1:22 -ts BANNER,HOSTKEY,AUTHM",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts KEX,ENC,MAC",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts TERRAPIN,SSHV1",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts BADHOSTKEY -H ./hostkeys/",
                 "ptsrvtester ssh -tg 127.0.0.1:22 -ts BRUTE -u admin -P passwords.txt",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts ROOTLOGIN",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts SHELL -u svc -p secret",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts PRIVS -u svc -p secret",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts FORWARD -u svc -p secret",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts SFTP -u sftpuser -p secret",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts SFTPDATA -u sftpuser -p secret --sftp-max-mb 20",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts USERENUM -u root -U users.txt",
                 "ptsrvtester ssh -tg 127.0.0.1 -ts DHEAT --dheat 10 --dheat-duration 30",
                 "ptsrvtester ssh -ts BRUTE -h",
@@ -155,6 +174,8 @@ class SSHArgs(ArgsWithBruteforce):
   ptsrvtester ssh -tg 127.0.0.1 -ts SHELL -u svc -p secret
   ptsrvtester ssh -tg 127.0.0.1 -ts PRIVS -u svc -p secret
   ptsrvtester ssh -tg 127.0.0.1 -ts FORWARD -u svc -p secret
+  ptsrvtester ssh -tg 127.0.0.1 -ts SFTP -u sftpuser -p secret
+  ptsrvtester ssh -tg 127.0.0.1 -ts SFTPDATA -u sftpuser -p secret
   ptsrvtester ssh -tg 127.0.0.1 -ts USERENUM -u root -U users.txt
   ptsrvtester ssh -ts BRUTE -h"""
 
@@ -278,6 +299,25 @@ class SSHArgs(ArgsWithBruteforce):
             dest="enum_sigma",
             help="how many standard deviations the valid login must be separated from the "
                  "invalid baseline to call enumeration possible (default: 3.0)",
+        )
+
+        sftpdata = parser.add_argument_group(
+            "SFTPDATA (aggressive)",
+            "SFTP content scanning & resource-limit test — only runs with -ts SFTPDATA. "
+            "Uploads BOUNDED, cleaned-up test files (EICAR, a small ZIP-bomb/XXE probe, "
+            "and quota probes). Every default is small and clamped to a safe cap.",
+        )
+        sftpdata.add_argument(
+            "--sftp-max-mb", type=int, default=None, metavar="<n>", dest="sftp_max_mb",
+            help="max MB written in the disk/quota probe (default: 10; capped at 200)",
+        )
+        sftpdata.add_argument(
+            "--sftp-max-files", type=int, default=None, metavar="<n>", dest="sftp_max_files",
+            help="max files created in the count-quota probe (default: 100; capped at 2000)",
+        )
+        sftpdata.add_argument(
+            "--sftp-bomb-mb", type=int, default=None, metavar="<n>", dest="sftp_bomb_mb",
+            help="decompressed size of the ZIP-bomb processing probe (default: 10; capped at 200)",
         )
 
         # -u/--user and -U/--users are NOT mutually exclusive here: USERENUM needs

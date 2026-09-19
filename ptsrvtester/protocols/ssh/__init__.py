@@ -2,9 +2,9 @@
 
 Provides the ``SSH`` test runner and its ``SSHArgs`` CLI definition. Tests are
 organized one-per-file under ``modules/`` and selected via ``-ts`` (BANNER,
-HOSTKEY, AUTHM, KEX, KEYALG, ENC, MAC, FINGERPRINT, BADHOSTKEY, BADAUTHKEY,
-BRUTE, ROOTLOGIN, SHELL, PRIVS, FORWARD, USERENUM, LOCKOUT, DHEAT). The crypto
-section tests (KEX/KEYALG/ENC/MAC/FINGERPRINT) share a
+HOSTKEY, AUTHM, KEX, KEYALG, ENC, MAC, FINGERPRINT, SSHV1, TERRAPIN, BADHOSTKEY, BADAUTHKEY,
+BRUTE, ROOTLOGIN, SHELL, PRIVS, FORWARD, SFTP, SFTPDATA, USERENUM, LOCKOUT, DHEAT). The
+crypto section tests (KEX/KEYALG/ENC/MAC/FINGERPRINT) share a
 single ssh-audit scan; DHEAT is an aggressive, opt-in DoS test with its own run.
 """
 from .main import SSH

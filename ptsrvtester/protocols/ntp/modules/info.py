@@ -1,4 +1,4 @@
-__MODULELABEL__ = "Information about server (mode 3)"
+__MODULELABEL__ = "Information about server"
 __MODULECODE__ = "INFO"
 __ORDER__ = 10
 
@@ -35,27 +35,51 @@ def run(ctx):
     
     # TODO: add nmap scan to determine if port+ip combo resolve to NTP
     nm = nmap.PortScanner()
-    nm.scan(ip, str(port), "-sU", False, 5)
+    nm.scan(ip, str(port), "-sU", False, 3)
     if nm[ip].state() == "down":
         ctx.out(f"Server not responding", "ERROR", indent=4)
 
     try:
-        # NTP creates a packet which states it is a query (mode=3)
+        # NTP creates a packet which states it is a query (mode 3)
         sock.sendto(bytes(NTP(version=4, mode=3)), (ip, port))
         data, _ = sock.recvfrom(1024)  # server address and port are discarded
     except Exception as e:
         ctx.out(f"An error occured while trying to connect to server: {str(e)}", "ERROR", indent=4)
     finally:
         sock.close()
-
+    
     if not data:
         return
 
     ntp = NTP(data)
     ctx.out(f"IP:                   {ip}", "INFO", indent=4)
     ctx.out(f"Port:                 {port}", "INFO", indent=4)
-    ctx.out(f"Server hostname:      {nm[ip].hostname()}", "INFO", indent=4)
-    ctx.out(f"NTP version:          {ntp.version}", "INFO", indent=4)
+    ctx.out(f"Server hostname:      {nm[ip].hostname() if nm[ip].hostname() != "" else "Unknown"}", "INFO", indent=4)
+
+    extra_scan_failed = True
+    fullver, processor, system_OS, OS_ver = "", "", "", "" 
+    try:
+        # Trying to get better version and system information (mode 6)
+        nm.scan(ip, str(port), "-sU --script ntp-info", False, 3)
+        nm_out = str(nm[ip]['udp'][port]['script']['ntp-info']).split("\n  ")[2:]
+        # version: ntpd 4.2.8p10@1.3728-o Tue Sep  7 09:05:22 UTC 2021 (11)
+        # processor: armv7l
+        # system: Linux/3.10.0_hi3536
+        fullver = nm_out[0][14:].split("@")[0]
+        processor = nm_out[1][11:]
+        system_OS, OS_ver = nm_out[2][8:].split("/")
+        extra_scan_failed = False
+    except:
+        pass
+
+    if extra_scan_failed:
+        ctx.out(f"NTP version:          {ntp.version}", "INFO", indent=4)
+    else:
+        ctx.out(f"NTP version:          {fullver}", "INFO", indent=4)
+        ctx.out(f"Processor:            {processor}", "INFO", indent=4)
+        ctx.out(f"System OS:            {system_OS}", "INFO", indent=4)
+        ctx.out(f"OS version:           {OS_ver}", "INFO", indent=4)
+        
     ctx.out(f"Mode:                 {ntp.mode} ({mode_translate[ntp.mode]})", "INFO", indent=4)
     
 

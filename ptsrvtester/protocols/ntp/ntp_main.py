@@ -28,14 +28,9 @@ class NTP(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
     @staticmethod
     def module_args() -> BaseArgs:
         return NTPArgs()
-        raise NotImplementedError
 
     def _prepare_target(self) -> None:
         """Resolve self.target = (ip, port) before any module runs.
-
-        Fill in protocol defaults (e.g. default port) and host resolution.
-        If you don't override this, BaseMain's default takes (ip, port) straight
-        from args.target.
         """
         target = self.args.target
         if getattr(target, "port", 0) == 0:
@@ -63,5 +58,4 @@ class NTP(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
             "host": self.target_host,
             "ip": self.target[0],
             "port": self.target[1],
-            "error": False
         }

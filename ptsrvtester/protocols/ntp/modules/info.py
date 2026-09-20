@@ -65,14 +65,16 @@ def run(ctx):
     }
 
     ip, port = ctx.target
-    host = ctx.host
+    # host = ctx.host
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # opens an IPv4 socket for UDP
     # TODO: add IPv6 support
-    sock.settimeout(4)
+    sock.settimeout(5)
     data = None
+    
+    # TODO: add nmap scan to determine if port+ip combo resolve to NTP
     nm = nmap.PortScanner()
-    nm.scan(ip, str(port), "", False, 5)
+    nm.scan(ip, str(port), "-sU", False, 5)
     if nm[ip].state() == "down":
         ctx.out(f"Server not responding", "ERROR", indent=4)
 
@@ -91,9 +93,9 @@ def run(ctx):
     ntp = NTP(data)
     ctx.out(f"IP:                   {ip}", "INFO", indent=4)
     ctx.out(f"Port:                 {port}", "INFO", indent=4)
-    ctx.out(f"NTP version:          {ntp.version}", "INFO", indent=4)
-    ctx.out(f"Mode:                 {mode_translate[ntp.mode]} ({ntp.mode})", "INFO", indent=4)
     ctx.out(f"Server hostname:      {nm[ip].hostname()}", "INFO", indent=4)
+    ctx.out(f"NTP version:          {ntp.version}", "INFO", indent=4)
+    ctx.out(f"Mode:                 {ntp.mode} ({mode_translate[ntp.mode]})", "INFO", indent=4)
     
 
     if ntp.leap == 3 and ntp.stratum == 0:
@@ -109,7 +111,9 @@ def run(ctx):
         stratum_status = "Primary"
     elif ntp.stratum >= 2 and ntp.stratum < 16:
         stratum_status = "Secondary"
-    ctx.out(f"Stratum:              {stratum_status} ({ntp.stratum})", "INFO", indent=4)
+    ctx.out(f"Stratum:              {ntp.stratum} ({stratum_status})", "INFO", indent=4)
+
+    ctx.out(f"Reference ID:         {ntp.id}", "INFO", indent=4)
 
     # leap could be potentially misconfigured or malfunctioning
     # TODO: check if leap seconds coincide with global events (very low priority)
@@ -120,10 +124,9 @@ def run(ctx):
         leap_status = "Last minute had 61s"
     elif ntp.leap == 2:
         leap_status = "Last minute had 59s"
-    ctx.out(f"Leap indicator:       {leap_status} ({ntp.leap})", "INFO", indent=4)
+    ctx.out(f"Leap indicator:       {ntp.leap} ({leap_status})", "INFO", indent=4)
 
     precision_sec = 2 ** int(ntp.precision)
     ctx.out(f"Precision:            2^{ntp.precision} = {precision_sec * 1e6:.3f} µs", "INFO", indent=4)
-    ctx.out(f"Reference ID:         {ntp.id}", "INFO", indent=4)
     ctx.out(f"Reference timestamp:  {_ntp_to_utc(ntp.ref)}", "INFO", indent=4)
     ctx.out(f"Transmit timestamp:   {_ntp_to_utc(ntp.sent)}", "INFO", indent=4)

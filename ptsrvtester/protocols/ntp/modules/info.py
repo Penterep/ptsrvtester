@@ -28,15 +28,14 @@ def run(ctx):
     ip, port = ctx.target
     # host = ctx.host
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # opens an IPv4 socket for UDP
     # TODO: add IPv6 support
-    sock.settimeout(5)
+    # TODO: add nmap scan to determine if port+ip combo resolve to NTP
     data = None
     
-    # TODO: add nmap scan to determine if port+ip combo resolve to NTP
-
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # opens an IPv4 socket for UDP
     try:
         # NTP creates a packet which states it is a query (mode 3)
+        sock.settimeout(5)
         sock.sendto(bytes(NTP(version=4, mode=3)), (ip, port))
         data, _ = sock.recvfrom(1024)  # server address and port are discarded
     except Exception as e:
@@ -48,46 +47,48 @@ def run(ctx):
         return
 
     mode_6_scan_success = False
-    fullver, processor, system_OS, OS_ver = "", "", "", "" 
+    fullver, processor, system_OS = "", "", ""
     nm = nmap.PortScanner()
-    try:
-        # Trying to get better version and system information (mode 6)
-        nm.scan(ip, str(port), "-sU --script ntp-info", False, 6)
-        nm_out = str(nm[ip]['udp'][port]['script']['ntp-info']).split("\n  ")[2:]
-        # string before -o in ver is the upstream revision identity,
-        # it's not necessary for vuln evaluation
-        fullver = nm_out[0][14:].split(" ")[0]
-        if fullver[-2:] == "-o":
-            fullver = fullver.split("@")[0]
-        else:
-            fullver = fullver[:-2]
-        processor = nm_out[1][11:]
-        system_OS = nm_out[2][8:]
-        mode_6_scan_success = True
-    except:
-        pass
+    for i in range(2):
+        try:
+            # TODO: needs testing (couldn't find server with lower version than 4.2.0)
+            # Trying to get better version and system information (mode 6)
+            nm.scan(ip, str(port), "-sU --script ntp-info", False, 6)
+            nm_out = str(nm[ip]['udp'][port]['script']['ntp-info']).split("\n  ")[2:]
+            # string before -o in ver is the upstream revision identity,
+            # it's not necessary for vuln evaluation
+            fullver = nm_out[0][14:].split(" ")[0]
+            if fullver[-2:] == "-o":
+                fullver = fullver.split("@")[0]
+            else:
+                fullver = fullver[:-2]
+            processor = nm_out[1][11:]
+            system_OS = nm_out[2][8:]
+            mode_6_scan_success = True
+            break
+        except:
+            pass
 
     ntp = NTP(data)
+    version = ntp.version if fullver == "" else fullver
+
     ctx.out(f"IP:                   {ip}", "INFO", indent=4)
     ctx.out(f"Port:                 {port}", "INFO", indent=4)
     ctx.out(f"Accepts mode 6:       {mode_6_scan_success}", "INFO", indent=4)
+    ctx.out(f"NTP version:          {version}", "INFO", indent=4)
 
     if mode_6_scan_success:
         ctx.out(f"Server hostname:      {nm[ip].hostname() if nm[ip].hostname() != "" else "Unknown"}", "INFO", indent=4)
-        ctx.out(f"NTP version:          {fullver}", "INFO", indent=4)
         ctx.out(f"Processor:            {processor}", "INFO", indent=4)
         ctx.out(f"System OS:            {system_OS}", "INFO", indent=4)
-    else:
-        ctx.out(f"NTP version:          {ntp.version}", ("INFO" if ntp.version >= 4 else "VULN"), indent=4)
 
     ctx.out(f"Mode:                 {ntp.mode} ({mode_translate[ntp.mode]})", "INFO", indent=4)
-    
 
     if ntp.leap == 3 and ntp.stratum == 0:
         ctx.out(f"Server sent a KoD (Kiss of Death) packet", "WARNING", indent=4)
-        return
+        # return
 
-    # fake or misconfigured servers can return a weird combination of stratum and refID
+    # TODO: fake or misconfigured servers can apparently return a weird combination of stratum and refID, try detecting that
     # TODO: check if server is correctly configured or maliciously set up
     stratum_status = "Unsynchronized"
     if ntp.stratum == 0:
@@ -115,3 +116,30 @@ def run(ctx):
     ctx.out(f"Precision:            2^{ntp.precision} = {precision_sec * 1e6:.3f} µs", "INFO", indent=4)
     ctx.out(f"Reference timestamp:  {_ntp_to_utc(ntp.ref)}", "INFO", indent=4)
     ctx.out(f"Transmit timestamp:   {_ntp_to_utc(ntp.sent)}", "INFO", indent=4)
+
+
+    # ------- Vulnerabilites (will put into another module once problems are figured out) -------
+    
+    ctx.out(f"Possible vulnerabilities (temporarily in info)", "INFO", indent=0)
+    
+    # only 4.2.8p15 - CVE-2023-26551 to CVE-2023-26555 (DoS through errors in code)
+    # from 0.3.0 to 0.3.2 - CVE-2023-33192 (DoS through crafted cookies)
+    # up to (excluding) 4.2.7p26 - CVE-2013-5211 (traffic amplification through monolist)
+    
+    if not mode_6_scan_success:
+        if ntp.version < 4:
+            ctx.out(f"CVE-2013-5211", "VULN", indent=4)
+        return
+    
+    parsed_ver = tuple(int(x) for x in fullver.replace("p", ".").split("."))
+    error_DoS_ver = (4, 2, 8, 15)
+    cookies_DoS_ver_min = (0, 3, 0)
+    cookies_DoS_ver_max = (0, 3, 2)
+    monolist_ver = (4, 2, 7, 26)
+    
+    if parsed_ver == error_DoS_ver:
+        ctx.out(f"from CVE-2023-26551 to CVE-2023-26555", "VULN", indent=4)
+    if cookies_DoS_ver_min <= parsed_ver <= cookies_DoS_ver_max:
+        ctx.out(f"CVE-2023-33192", "VULN", indent=4)
+    if parsed_ver < monolist_ver:
+        ctx.out(f"CVE-2013-5211", "VULN", indent=4)

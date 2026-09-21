@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from Cryptodome.Cipher import ARC4
 from impacket import ntlm, uuid
-from impacket.dcerpc.v5 import epm, lsad, mgmt, samr
+from impacket.dcerpc.v5 import epm, lsad, mgmt, samr, transport
 from impacket.dcerpc.v5.rpcrt import (
     DCERPCException, DCERPC_v5, MSRPC_FAULT, MSRPC_RESPONSE,
     PFC_FIRST_FRAG, PFC_LAST_FRAG, RPC_C_AUTHN_LEVEL_CONNECT,
@@ -94,6 +94,178 @@ def ready_connection(data=b"", *, chunk_size=None):
     dce._expected_context_id = 0
     dce._expected_auth_context_id = 79231
     return dce
+
+
+def bind_ack_packet():
+    """Valid NTLM challenge/BIND_ACK for the real upstream bind handshake."""
+    flags = FLAGS | ntlm.NTLMSSP_NEGOTIATE_UNICODE | ntlm.NTLMSSP_NEGOTIATE_NTLM
+    flags |= ntlm.NTLMSSP_NEGOTIATE_TARGET_INFO | ntlm.NTLMSSP_REQUEST_TARGET
+    target_info = ntlm.AV_PAIRS()
+    for field, value in (
+        (ntlm.NTLMSSP_AV_HOSTNAME, "LAB"),
+        (ntlm.NTLMSSP_AV_DNS_HOSTNAME, "lab.test"),
+        (ntlm.NTLMSSP_AV_DOMAINNAME, "LAB"),
+    ):
+        target_info[field] = value.encode("utf-16le")
+    challenge = ntlm.NTLMAuthChallenge()
+    challenge["flags"] = flags
+    challenge["challenge"] = b"12345678"
+    challenge["domain_name"] = b""
+    challenge["domain_offset"] = 48
+    challenge["TargetInfoFields"] = target_info
+    challenge["TargetInfoFields_offset"] = 48
+    challenge["Version"] = b""
+    auth_data = challenge.getData()
+    body = struct.pack("<HHIH", 4280, 4280, 0, 4) + b"135\x00\x00\x00"
+    body += struct.pack("<BBHHH", 1, 0, 0, 0, 0)
+    body += uuid.uuidtup_to_bin(("8a885d04-1ceb-11c9-9fe8-08002b104860", "2.0"))
+    body += struct.pack("<BBBBI", RPC_C_AUTHN_WINNT, RPC_C_AUTHN_LEVEL_PKT_INTEGRITY, 0, 0, 79231)
+    body += auth_data
+    return struct.pack("<BBBB4sHHI", 5, 0, 12, 3, b"\x10\x00\x00\x00",
+                       16 + len(body), len(auth_data), 1) + body
+
+
+class BindPacketTransport(MemoryTransport):
+    """Message transport may return more than the requested common header."""
+
+    def __init__(self, chunks):
+        super().__init__()
+        self.chunks = list(chunks)
+        self.reads = 0
+
+    def recv(self, force_recv=0, count=0):
+        self.reads += 1
+        return self.chunks.pop(0) if self.chunks else b""
+
+
+class RpcBindFramingTests(unittest.TestCase):
+    def connection(self, rpc_transport):
+        dce = VerifiedDCERPC(rpc_transport)
+        dce.set_credentials("audit", "offline-password", "LAB")
+        dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_INTEGRITY)
+        return dce
+
+    def test_real_ntlm_bind_accepts_full_and_split_ack(self):
+        ack = bind_ack_packet()
+        for split in (None, 8, 16, 64, len(ack) - 1):
+            with self.subTest(split=split):
+                chunks = [ack] if split is None else [ack[:split], ack[split:]]
+                rpc_transport = BindPacketTransport(chunks)
+                dce = self.connection(rpc_transport)
+                dce.bind(mgmt.MSRPC_UUID_MGMT)
+                self.assertTrue(dce._verification_ready)
+                self.assertEqual(dce.verified_responses, 0)
+                self.assertEqual(len(dce.get_session_key()), 16)
+                self.assertIs(dce.get_rpc_transport(), rpc_transport)
+                self.assertIs(dce._transport, rpc_transport)
+                self.assertEqual(rpc_transport.reads, len(chunks))
+                self.assertEqual([packet[2] for packet in rpc_transport.sent], [11, 16])
+
+    def test_real_tcp_transport_handles_short_socket_reads_and_signed_call(self):
+        sock = Mock()
+        wire = bytearray(bind_ack_packet())
+
+        def socket_recv(count):
+            chunk = bytes(wire[:min(count, 3)])
+            del wire[:len(chunk)]
+            return chunk
+
+        sock.recv.side_effect = socket_recv
+        rpc_transport = transport.TCPTransport("192.0.2.1")
+        rpc_transport._TCPTransport__socket = sock
+        dce = self.connection(rpc_transport)
+        dce.bind(mgmt.MSRPC_UUID_MGMT)
+        self.assertFalse(wire)
+        self.assertTrue(dce._verification_ready)
+        dce.call(0, b"\x00\x00\x00\x00")
+        wire.extend(response_packet(b"confirmed", signer=server_signer(dce.get_session_key())))
+        self.assertEqual(dce.recv(), b"confirmed")
+        self.assertEqual(dce.verified_responses, 1)
+        self.assertIs(dce.get_rpc_transport(), rpc_transport)
+        dce.disconnect()
+        sock.close.assert_called_once()
+
+    def test_eof_in_header_or_body_fails_and_restores_transport(self):
+        ack = bind_ack_packet()
+        for retained in (0, 8, 16, len(ack) - 1):
+            with self.subTest(retained=retained):
+                rpc_transport = BindPacketTransport([ack[:retained]])
+                dce = self.connection(rpc_transport)
+                with self.assertRaisesRegex(RpcAuthenticationUnconfirmed, "connection ended"):
+                    dce.bind(mgmt.MSRPC_UUID_MGMT)
+                self.assertLessEqual(rpc_transport.reads, 2)
+                self.assertIs(dce._transport, rpc_transport)
+                self.assertFalse(dce._verification_ready)
+                self.assertEqual(dce.verified_responses, 0)
+                self.assertEqual(len(rpc_transport.sent), 1)
+
+    def test_invalid_lengths_fail_before_reading_body(self):
+        ack = bind_ack_packet()
+        for fragment_size, auth_size, expected in (
+            (0, 0, "fragment length"),
+            (15, 0, "fragment length"),
+            (16, 1, "authentication length"),
+            (64, 64, "authentication length"),
+        ):
+            with self.subTest(fragment_size=fragment_size, auth_size=auth_size):
+                header = bytearray(ack[:16])
+                struct.pack_into("<HH", header, 8, fragment_size, auth_size)
+                rpc_transport = BindPacketTransport([bytes(header)])
+                dce = self.connection(rpc_transport)
+                with self.assertRaisesRegex(RpcAuthenticationUnconfirmed, expected):
+                    dce.bind(mgmt.MSRPC_UUID_MGMT)
+                self.assertEqual(rpc_transport.reads, 1)
+                self.assertIs(dce._transport, rpc_transport)
+
+    def test_bind_size_limit_is_checked_before_body_read(self):
+        rpc_transport = BindPacketTransport([bind_ack_packet()[:16]])
+        dce = self.connection(rpc_transport)
+        dce.MAX_BIND_RESPONSE_BYTES = 64
+        with self.assertRaisesRegex(RpcAuthenticationUnconfirmed, "size limit"):
+            dce.bind(mgmt.MSRPC_UUID_MGMT)
+        self.assertEqual(rpc_transport.reads, 1)
+        self.assertFalse(dce._verification_ready)
+
+    def test_overlarge_transport_chunk_cannot_bypass_receive_bound(self):
+        rpc_transport = BindPacketTransport([bind_ack_packet() + b"x" * 1024])
+        dce = self.connection(rpc_transport)
+        dce.MAX_RESPONSE_BYTES = 512
+        with self.assertRaisesRegex(RpcAuthenticationUnconfirmed, "size limit"):
+            dce.bind(mgmt.MSRPC_UUID_MGMT)
+        self.assertEqual(rpc_transport.reads, 1)
+        self.assertIs(dce._transport, rpc_transport)
+
+    def test_unsupported_encoding_and_fragmented_bind_fail_closed(self):
+        for position, value, expected in ((0, 4, "encoding"), (4, 0, "encoding"), (3, 1, "Fragmented")):
+            with self.subTest(position=position):
+                header = bytearray(bind_ack_packet()[:16])
+                header[position] = value
+                rpc_transport = BindPacketTransport([bytes(header)])
+                dce = self.connection(rpc_transport)
+                with self.assertRaisesRegex(RpcAuthenticationUnconfirmed, expected):
+                    dce.bind(mgmt.MSRPC_UUID_MGMT)
+                self.assertEqual(rpc_transport.reads, 1)
+
+    def test_original_transport_is_exposed_during_bind_and_restored_on_failure(self):
+        rpc_transport = MemoryTransport()
+        dce = self.connection(rpc_transport)
+
+        def failed_bind(connection, *args, **kwargs):
+            self.assertIs(connection.get_rpc_transport(), rpc_transport)
+            raise TimeoutError("offline bind timeout")
+
+        with patch.object(DCERPC_v5, "bind", autospec=True, side_effect=failed_bind):
+            with self.assertRaises(TimeoutError):
+                dce.bind(mgmt.MSRPC_UUID_MGMT)
+        self.assertIs(dce._transport, rpc_transport)
+        self.assertFalse(dce._verification_ready)
+
+    def test_bytes_after_bind_pdu_remain_buffered(self):
+        rpc_transport = BindPacketTransport([bind_ack_packet() + b"next-pdu"])
+        dce = self.connection(rpc_transport)
+        dce.bind(mgmt.MSRPC_UUID_MGMT)
+        self.assertEqual(dce._receive_buffer, b"next-pdu")
+        self.assertEqual(rpc_transport.reads, 1)
 
 
 class RpcVerifierTests(unittest.TestCase):

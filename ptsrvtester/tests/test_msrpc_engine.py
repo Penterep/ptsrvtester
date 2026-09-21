@@ -17,8 +17,12 @@ from impacket.nt_errors import (
     STATUS_INVALID_INFO_CLASS,
     STATUS_LOGON_FAILURE,
     STATUS_MORE_ENTRIES,
+    STATUS_NO_MORE_ENTRIES,
+    STATUS_NO_SUCH_USER,
     STATUS_NOT_SUPPORTED,
     STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_IO_TIMEOUT,
+    STATUS_ACCOUNT_LOCKED_OUT,
 )
 from impacket.smbconnection import SessionError
 
@@ -36,6 +40,7 @@ from ptsrvtester.protocols.msrpc.utils.samr_policy import (
     parse_password_policy,
     relative_interval,
 )
+from ptsrvtester.tests.test_msrpc_session import enumeration_fixture
 
 
 TEST_IP = "192.0.2.25"
@@ -86,6 +91,13 @@ def rpc_transport() -> tuple[Mock, Mock]:
     dce = Mock()
     rpc_transport_mock.get_dce_rpc.return_value = dce
     return rpc_transport_mock, dce
+
+
+def share_inventory_fixture(shares=(), *, status="complete", reason=None, error=None, truncated=False):
+    return {
+        "status": status, "reason": reason, "shares": list(shares),
+        "returned": len(shares), "limit": 10000, "truncated": truncated, "pages": 1, "error": error,
+    }
 
 
 def old_relative_interval(raw_100ns: int) -> dict[str, int]:
@@ -196,6 +208,12 @@ class MockedRPCTransportTests(unittest.TestCase):
         confirmation.start()
         self.addCleanup(verified.stop)
         self.addCleanup(confirmation.stop)
+        shares = patch(
+            "ptsrvtester.protocols.msrpc.utils.engine.enumerate_shares",
+            return_value=share_inventory_fixture(),
+        )
+        self.shares = shares.start()
+        self.addCleanup(shares.stop)
 
 
 class MSRPCPortRoutingTests(MockedRPCTransportTests):
@@ -210,7 +228,7 @@ class MSRPCPortRoutingTests(MockedRPCTransportTests):
                 return_value=epm_transport,
             ) as factory,
             patch(
-                "ptsrvtester.protocols.msrpc.utils.engine.epm.hept_lookup",
+                "ptsrvtester.protocols.msrpc.utils.engine.iter_epm_entries",
                 return_value=[],
             ),
         ):
@@ -265,7 +283,7 @@ class MSRPCPortRoutingTests(MockedRPCTransportTests):
                 return_value=rpc_mock,
             ) as rpc_factory,
             patch(
-                "ptsrvtester.protocols.msrpc.utils.engine.epm.hept_lookup",
+                "ptsrvtester.protocols.msrpc.utils.engine.iter_epm_entries",
                 return_value=[],
             ),
         ):
@@ -325,7 +343,7 @@ class MSRPCStructuredProbeTests(unittest.TestCase):
                 return_value=rpc_mock,
             ),
             patch(
-                "ptsrvtester.protocols.msrpc.utils.engine.epm.hept_lookup",
+                "ptsrvtester.protocols.msrpc.utils.engine.iter_epm_entries",
                 return_value=[entry],
             ),
             patch(
@@ -398,15 +416,20 @@ class MSRPCStructuredProbeTests(unittest.TestCase):
         dce.disconnect.assert_called_once_with()
 
         engine.args.pipes = ["samr", "svcctl"]
-        engine.try_authenticated_pipe_bind = Mock(side_effect=[True, False])
-        self.assertEqual(engine.enumerate_pipes(), ["samr"])
-
-        smb = Mock()
-        smb.listShares.return_value = [{"shi1_netname": "IPC$\x00"}]
-        smb.isGuestSession.return_value = False
+        pipe_smb = Mock()
+        pipe_smb.openFile.side_effect = [7, SessionError(STATUS_OBJECT_NAME_NOT_FOUND)]
         with patch(
             "ptsrvtester.protocols.msrpc.utils.engine.SMBConnection",
-            return_value=smb,
+            return_value=pipe_smb,
+        ):
+            self.assertEqual(engine.enumerate_pipes(), ["samr"])
+
+        smb = Mock()
+        smb.isGuestSession.return_value = False
+        with (
+            patch("ptsrvtester.protocols.msrpc.utils.engine.SMBConnection", return_value=smb),
+            patch("ptsrvtester.protocols.msrpc.utils.engine.enumerate_shares",
+                  return_value=share_inventory_fixture([{"name": "IPC$", "type": 0, "remark": None}])),
         ):
             self.assertEqual(engine.Anonymous_smb(), ["True", "True"])
 
@@ -484,7 +507,7 @@ class MSRPCBindingAndCleanupTests(MockedRPCTransportTests):
 
         factory.assert_called_once_with(f"ncacn_np:{TEST_IP}[\\pipe\\samr]")
         self.assertEqual(smb_connection.call_args.kwargs["timeout"], 5.0)
-        smb.login.assert_called_once_with("alice", "secret", "EXAMPLE")
+        smb.login.assert_called_once_with("alice", "secret", "EXAMPLE", ntlmFallback=False)
         rpc_mock.set_dport.assert_called_once_with(1445)
         rpc_mock.set_smb_connection.assert_called_once_with(smb)
         dce.disconnect.assert_called_once_with()
@@ -537,6 +560,15 @@ class MSRPCBindingAndCleanupTests(MockedRPCTransportTests):
 
 
 class MSRPCCredentialSafetyTests(MockedRPCTransportTests):
+    def test_smb_login_preserves_password_whitespace(self):
+        password = " \tsecret  "
+        module, _ = msrpc_main(tests="BRUTESMB", password=password)
+        smb = Mock()
+        smb.isGuestSession.return_value = False
+        with patch("ptsrvtester.protocols.msrpc.utils.engine.SMBConnection", return_value=smb):
+            module.engine.smb_brute()
+        smb.login.assert_called_once_with("alice", password, "EXAMPLE", ntlmFallback=False)
+
     def test_smb_guest_mapping_is_rejected_but_non_guest_is_accepted(self):
         guest_module, _ = msrpc_main(tests="BRUTESMB")
         guest = Mock()
@@ -882,16 +914,9 @@ class MSRPCSamrPolicyEngineTests(unittest.TestCase):
         builtin_sid = canonical_sid("S-1-5-32")
         account_sid = canonical_sid("S-1-5-21-1-2-3")
 
-        enumeration = {
-            "Buffer": {
-                "Buffer": [
-                    {"Name": "localized-builtin\x00"},
-                    {"Name": "EXAMPLE\x00"},
-                ]
-            },
-            "EnumerationContext": 0,
-            "ErrorCode": 0,
-        }
+        enumeration = samr_enum_page([
+            {"Name": "localized-builtin\x00"}, {"Name": "EXAMPLE\x00"},
+        ])
 
         with (
             patch(
@@ -990,7 +1015,7 @@ class MSRPCSamrPolicyEngineTests(unittest.TestCase):
             ),
         )
         enumerate_domains.assert_called_once_with(
-            dce, server_handle, enumerationContext=0
+            dce, server_handle, enumerationContext=0, preferedMaximumLength=16384
         )
         self.assertEqual(
             lookup_domain.call_args_list,
@@ -1028,25 +1053,14 @@ class MSRPCSamrPolicyEngineTests(unittest.TestCase):
         smb.logoff.assert_called_once_with()
         smb.close.assert_called_once_with()
 
-    def test_domain_enumeration_follows_more_entries_without_duplicates(self):
+    def test_domain_enumeration_follows_more_entries_with_bounded_pages(self):
         module, _ = msrpc_main(tests="SAMRPOLICY")
         dce = Mock()
         server_handle = "server-handle"
-        first_page = {
-            "Buffer": {"Buffer": [{"Name": "EXAMPLE\x00"}]},
-            "EnumerationContext": 7,
-            "ErrorCode": STATUS_MORE_ENTRIES,
-        }
-        second_page = {
-            "Buffer": {
-                "Buffer": [
-                    {"Name": "example"},
-                    {"Name": "TRUSTED\x00"},
-                ]
-            },
-            "EnumerationContext": 7,
-            "ErrorCode": 0,
-        }
+        first_page = samr_enum_page(
+            [{"Name": "EXAMPLE\x00"}], context=7, status=STATUS_MORE_ENTRIES,
+        )
+        second_page = samr_enum_page([{"Name": "TRUSTED\x00"}])
         more_entries = samr.DCERPCSessionError(
             error_code=STATUS_MORE_ENTRIES,
             packet=first_page,
@@ -1056,14 +1070,14 @@ class MSRPCSamrPolicyEngineTests(unittest.TestCase):
             "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrEnumerateDomainsInSamServer",
             side_effect=[more_entries, second_page],
         ) as enumerate_domains:
-            names = module.engine._enumerate_samr_domain_names(dce, server_handle)
+            names = list(module.engine._enumerate_samr_domain_names(dce, server_handle))
 
         self.assertEqual(names, ["EXAMPLE", "TRUSTED"])
         self.assertEqual(
             enumerate_domains.call_args_list,
             [
-                call(dce, server_handle, enumerationContext=0),
-                call(dce, server_handle, enumerationContext=7),
+                call(dce, server_handle, enumerationContext=0, preferedMaximumLength=16384),
+                call(dce, server_handle, enumerationContext=7, preferedMaximumLength=16384),
             ],
         )
 
@@ -1235,11 +1249,7 @@ class MSRPCSamrPolicyEngineTests(unittest.TestCase):
             ),
             patch(
                 "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrEnumerateDomainsInSamServer",
-                return_value={
-                    "Buffer": {"Buffer": [{"Name": "EXAMPLE"}]},
-                    "EnumerationContext": 0,
-                    "ErrorCode": 0,
-                },
+                return_value=samr_enum_page([{"Name": "EXAMPLE"}]),
             ),
             patch(
                 "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrLookupDomainInSamServer",
@@ -1308,11 +1318,7 @@ class MSRPCSamrPolicyEngineTests(unittest.TestCase):
             ),
             patch(
                 "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrEnumerateDomainsInSamServer",
-                return_value={
-                    "Buffer": {"Buffer": [{"Name": "EXAMPLE"}]},
-                    "EnumerationContext": 0,
-                    "ErrorCode": 0,
-                },
+                return_value=samr_enum_page([{"Name": "EXAMPLE"}]),
             ),
             patch(
                 "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrLookupDomainInSamServer",
@@ -1415,6 +1421,8 @@ class MSRPCSamrUsersEngineTests(unittest.TestCase):
         domain_sids=("S-1-5-21-1-2-3",),
         max_users=1000,
         target_port=0,
+        domain_pages=None,
+        open_domain_responses=None,
     ):
         module, _ = msrpc_main(
             tests="SAMRUSERS",
@@ -1428,13 +1436,9 @@ class MSRPCSamrUsersEngineTests(unittest.TestCase):
         server_handle = "server-handle"
         sid_objects = [canonical_sid(value) for value in domain_sids]
         domain_handles = [f"domain-handle-{index}" for index in range(len(domain_names))]
-        domain_enumeration = {
-            "Buffer": {
-                "Buffer": [{"Name": f"{name}\x00"} for name in domain_names]
-            },
-            "EnumerationContext": 0,
-            "ErrorCode": 0,
-        }
+        domain_enumeration = samr_enum_page(
+            [{"Name": f"{name}\x00"} for name in domain_names],
+        )
         user_controls = user_controls or {}
         open_user_errors = open_user_errors or {}
 
@@ -1476,6 +1480,7 @@ class MSRPCSamrUsersEngineTests(unittest.TestCase):
                 patch(
                     "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrEnumerateDomainsInSamServer",
                     return_value=domain_enumeration,
+                    side_effect=domain_pages,
                 )
             )
             lookup_domain = stack.enter_context(
@@ -1487,7 +1492,7 @@ class MSRPCSamrUsersEngineTests(unittest.TestCase):
             open_domain = stack.enter_context(
                 patch(
                     "ptsrvtester.protocols.msrpc.utils.engine.samr.hSamrOpenDomain",
-                    side_effect=[
+                    side_effect=open_domain_responses if open_domain_responses is not None else [
                         {"DomainHandle": handle} for handle in domain_handles
                     ],
                 )
@@ -1920,7 +1925,7 @@ class MSRPCSamrUsersEngineTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(run.result["status"], "error")
+        self.assertEqual(run.result["status"], "partial")
         self.assertEqual(run.result["reason"], "operational_error")
         self.assertIn("SAMRUSERS", run.module.engine.results.module_errors)
         self.assertEqual(
@@ -1946,7 +1951,7 @@ class MSRPCSamrUsersEngineTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(run.result["status"], "error")
+        self.assertEqual(run.result["status"], "partial")
         self.assertEqual(run.result["reason"], "operational_error")
         self.assertEqual(run.result["returned"], 1)
         self.assertIn("SAMRUSERS", run.module.engine.results.module_errors)
@@ -1958,6 +1963,22 @@ class MSRPCSamrUsersEngineTests(unittest.TestCase):
             ],
             [0, 7],
         )
+
+    def test_users_survive_failure_or_denial_on_next_domain_page(self):
+        for failure in (TimeoutError("next domain page"), samr.DCERPCSessionError(error_code=STATUS_ACCESS_DENIED)):
+            with self.subTest(failure=type(failure).__name__):
+                run = self._run_enumeration(
+                    [samr_enum_page([samr_enum_user("alice", 1000)])],
+                    domain_pages=[
+                        samr_enum_page([{"Name": "EXAMPLE"}], context=7, status=STATUS_MORE_ENTRIES),
+                        failure,
+                    ],
+                )
+                self.assertEqual(run.result["status"], "partial")
+                self.assertEqual(run.result["returned"], 1)
+                self.assertEqual(run.result["domains"][0]["users"][0]["name"], "alice")
+                self.assertEqual(bool(run.module.engine.results.module_errors), isinstance(failure, TimeoutError))
+                self.assertEqual(run.enumerate_domains.call_count, 2)
 
     def test_malformed_enumeration_response_is_error_not_empty_success(self):
         malformed = {
@@ -1980,9 +2001,13 @@ class MSRPCSamrUsersEngineTests(unittest.TestCase):
             user_controls={1000: {"Buffer": {}, "ErrorCode": 0}},
         )
 
-        self.assertEqual(run.result["status"], "error")
+        self.assertEqual(run.result["status"], "partial")
         self.assertEqual(run.result["reason"], "operational_error")
-        self.assertEqual(run.result["returned"], 0)
+        self.assertEqual(run.result["returned"], 1)
+        user = run.result["domains"][0]["users"][0]
+        self.assertEqual((user["name"], user["stateStatus"]), ("alice", "error"))
+        self.assertIsNone(user["disabled"])
+        self.assertIsNone(user["lockedOut"])
         self.assertIn("SAMRUSERS", run.module.engine.results.module_errors)
         self.assertEqual(
             run.close_handle.call_args_list,
@@ -1992,6 +2017,93 @@ class MSRPCSamrUsersEngineTests(unittest.TestCase):
                 call(run.dce, run.server_handle),
             ],
         )
+
+    def test_empty_real_ndr_user_inventory_is_complete(self):
+        for status in (0, STATUS_NO_MORE_ENTRIES):
+            with self.subTest(status=status):
+                response = enumeration_fixture(
+                    status=status, response_class=samr.SamrEnumerateUsersInDomainResponse,
+                )
+                self.assertEqual(response["Buffer"], b"")
+                run = self._run_enumeration([response])
+                self.assertEqual(run.result["status"], "complete")
+                self.assertEqual(run.result["domains"][0]["status"], "complete")
+                self.assertEqual(run.result["returned"], 0)
+                self.assertEqual(run.module.engine.results.module_errors, {})
+                run.open_user.assert_not_called()
+
+    def test_null_buffer_with_nonzero_count_is_an_error(self):
+        response = enumeration_fixture(response_class=samr.SamrEnumerateUsersInDomainResponse)
+        response["CountReturned"] = 1
+        run = self._run_enumeration([response])
+        self.assertEqual(run.result["status"], "error")
+        self.assertIn("SAMRUSERS", run.module.engine.results.module_errors)
+
+    def test_open_domain_timeout_does_not_report_complete_domain(self):
+        run = self._run_enumeration([], open_domain_responses=[TimeoutError("open domain")])
+        self.assertEqual(run.result["status"], "error")
+        self.assertEqual(run.result["domains"][0]["status"], "error")
+        self.assertEqual(run.result["domains"][0]["reason"], "operational_error")
+        self.assertIn("SAMRUSERS", run.module.engine.results.module_errors)
+        run.enumerate_users.assert_not_called()
+        run.close_handle.assert_called_once_with(run.dce, run.server_handle)
+        run.dce.disconnect.assert_called_once()
+        run.smb.close.assert_called_once()
+
+    def test_removed_user_keeps_identity_and_does_not_stop_later_users(self):
+        for failure_stage in ("open", "query"):
+            with self.subTest(failure_stage=failure_stage):
+                failure = samr.DCERPCSessionError(error_code=STATUS_NO_SUCH_USER)
+                run = self._run_enumeration(
+                    [
+                        samr_more_users([samr_enum_user("alice", 1000), samr_enum_user("bob", 1001)], 7),
+                        samr_enum_page([samr_enum_user("charlie", 1002)]),
+                    ],
+                    open_user_errors={1001: failure} if failure_stage == "open" else None,
+                    user_controls={1001: failure} if failure_stage == "query" else None,
+                )
+                users = run.result["domains"][0]["users"]
+                self.assertEqual([user["name"] for user in users], ["alice", "bob", "charlie"])
+                self.assertEqual([user["stateStatus"] for user in users], ["complete", "unavailable", "complete"])
+                self.assertEqual(users[1]["stateReason"], "no_such_user")
+                self.assertEqual(run.result["status"], "partial")
+                self.assertEqual(run.result["returned"], 3)
+                self.assertEqual(run.module.engine.results.module_errors, {})
+                self.assertEqual([call.kwargs["userId"] for call in run.open_user.call_args_list], [1000, 1001, 1002])
+                printed = "\n".join(call.args[0] for call in run.module.engine.ptprint.call_args_list)
+                self.assertIn("account state: no such user", printed)
+                self.assertNotIn("account state: access denied", printed)
+
+    def test_detail_timeout_keeps_all_identities_from_received_page(self):
+        run = self._run_enumeration(
+            [samr_enum_page([samr_enum_user(name, rid) for name, rid in (
+                ("alice", 1000), ("bob", 1001), ("charlie", 1002),
+            )])],
+            user_controls={1001: TimeoutError("user detail")},
+        )
+        users = run.result["domains"][0]["users"]
+        self.assertEqual([user["name"] for user in users], ["alice", "bob", "charlie"])
+        self.assertEqual([user["stateStatus"] for user in users], ["complete", "error", "unavailable"])
+        self.assertEqual(users[2]["stateReason"], "not_queried")
+        self.assertEqual(run.result["status"], "partial")
+        self.assertEqual(run.result["returned"], 3)
+        self.assertEqual([call.kwargs["userId"] for call in run.open_user.call_args_list], [1000, 1001])
+        self.assertIn("SAMRUSERS", run.module.engine.results.module_errors)
+
+    def test_detail_failure_preserves_known_user_limit(self):
+        for label, page in (
+            ("page_overflow", samr_enum_page([samr_enum_user("alice", 1000), samr_enum_user("bob", 1001)])),
+            ("continuation", samr_more_users([samr_enum_user("alice", 1000)], 7)),
+        ):
+            with self.subTest(label=label):
+                run = self._run_enumeration(
+                    [page], max_users=1, user_controls={1000: TimeoutError("user detail")},
+                )
+                self.assertEqual(run.result["status"], "partial")
+                self.assertTrue(run.result["truncated"])
+                self.assertTrue(run.result["domains"][0]["truncated"])
+                self.assertEqual(run.result["returned"], 1)
+                run.open_user.assert_called_once()
 
     def test_operational_error_redacts_secrets_from_result_log_and_module_error(self):
         username = "samr-user-leak-marker"
@@ -2053,7 +2165,7 @@ class MSRPCResourceCleanupTests(MockedRPCTransportTests):
                 return_value=rpc_mock,
             ),
             patch(
-                "ptsrvtester.protocols.msrpc.utils.engine.epm.hept_lookup",
+                "ptsrvtester.protocols.msrpc.utils.engine.iter_epm_entries",
                 side_effect=OSError("lookup failed"),
             ),
         ):
@@ -2092,7 +2204,7 @@ class MSRPCResourceCleanupTests(MockedRPCTransportTests):
 
         no_share_list = Mock()
         no_share_list.isGuestSession.return_value = False
-        no_share_list.listShares.side_effect = SessionError(STATUS_ACCESS_DENIED)
+        self.shares.return_value = share_inventory_fixture(status="denied", reason="share_enumeration_denied")
         with patch(
             "ptsrvtester.protocols.msrpc.utils.engine.SMBConnection",
             return_value=no_share_list,
@@ -2104,7 +2216,9 @@ class MSRPCResourceCleanupTests(MockedRPCTransportTests):
 
         broken_smb = Mock()
         broken_smb.isGuestSession.return_value = False
-        broken_smb.listShares.side_effect = OSError("connection reset")
+        self.shares.return_value = share_inventory_fixture(
+            status="error", reason="operational_error", error=OSError("connection reset"),
+        )
         with patch(
             "ptsrvtester.protocols.msrpc.utils.engine.SMBConnection",
             return_value=broken_smb,
@@ -2123,6 +2237,237 @@ class MSRPCResourceCleanupTests(MockedRPCTransportTests):
         ):
             self.assertEqual(http_module.engine.http_brute(), [])
         dce.disconnect.assert_called_once_with()
+
+
+class MSRPCPipeEnumerationRegressionTests(unittest.TestCase):
+    def _run(self, smb, **args):
+        module, report = msrpc_main(tests="ENUMPIPES", **args)
+        module.engine.ptprint = Mock()
+        with patch(
+            "ptsrvtester.protocols.msrpc.utils.engine.SMBConnection", return_value=smb,
+        ) as connection:
+            found = module.engine.enumerate_pipes()
+        module.engine.results.Pipes = found
+        module.engine.output()
+        return module.engine, report, connection, found
+
+    def test_bad_credentials_stop_after_one_login_for_entire_default_pipe_list(self):
+        for status in (STATUS_LOGON_FAILURE, STATUS_ACCOUNT_LOCKED_OUT, STATUS_ACCESS_DENIED):
+            with self.subTest(status=status):
+                smb = Mock()
+                smb.login.side_effect = SessionError(status)
+                engine, _, connection, found = self._run(smb, max_attempts=1)
+                connection.assert_called_once()
+                smb.login.assert_called_once_with("alice", "secret", "EXAMPLE", ntlmFallback=False)
+                smb.connectTree.assert_not_called()
+                smb.openFile.assert_not_called()
+                smb.logoff.assert_not_called()
+                smb.close.assert_called_once()
+                self.assertEqual(found, [])
+                self.assertEqual(engine.results.module_errors, {})
+
+    def test_one_session_opens_all_pipes_and_closes_handles_including_zero(self):
+        smb = Mock()
+        smb.connectTree.return_value = 0
+        smb.openFile.side_effect = [0, SessionError(STATUS_OBJECT_NAME_NOT_FOUND),
+                                   SessionError(STATUS_ACCESS_DENIED), 7]
+        engine, report, connection, found = self._run(
+            smb, pipes=["samr", "absent", "denied", "svcctl"],
+            target=SimpleNamespace(ip=TEST_IP, port=1445),
+        )
+        self.assertEqual(found, ["samr", "svcctl"])
+        self.assertEqual(engine.results.module_errors, {})
+        connection.assert_called_once_with(TEST_IP, TEST_IP, sess_port=1445, timeout=5.0)
+        smb.login.assert_called_once()
+        smb.connectTree.assert_called_once_with("IPC$")
+        self.assertEqual(smb.openFile.call_args_list, [
+            call(0, "\\samr"), call(0, "\\absent"), call(0, "\\denied"), call(0, "\\svcctl"),
+        ])
+        self.assertEqual(smb.closeFile.call_args_list, [call(0, 0), call(0, 7)])
+        smb.disconnectTree.assert_called_once_with(0)
+        smb.logoff.assert_called_once()
+        smb.close.assert_called_once()
+        report.add_vulnerability.assert_not_called()
+
+    def test_anonymous_or_guest_reachability_remains_available(self):
+        for guest in (False, True):
+            with self.subTest(guest=guest):
+                smb = Mock()
+                smb.isGuestSession.return_value = guest
+                engine, report, _, found = self._run(
+                    smb, pipes=["samr"], username="", password="", domain="",
+                )
+                self.assertEqual(found, ["samr"])
+                smb.login.assert_called_once_with("", "", "", ntlmFallback=False)
+                self.assertEqual(engine.results.module_errors, {})
+                report.add_vulnerability.assert_not_called()
+
+    def test_smb_timeout_is_reported_at_login_ipc_and_pipe_stages(self):
+        for stage in ("login", "connectTree", "openFile"):
+            with self.subTest(stage=stage):
+                smb = Mock()
+                getattr(smb, stage).side_effect = SessionError(STATUS_IO_TIMEOUT)
+                engine, report, _, found = self._run(smb, pipes=["samr", "svcctl"])
+                self.assertEqual(found, [])
+                self.assertIn("ENUMPIPES", engine.results.module_errors)
+                properties = report.create_node_object.call_args.args[3]
+                self.assertEqual(properties["moduleErrors"][0]["test"], "ENUMPIPES")
+                smb.login.assert_called_once()
+                if stage == "openFile":
+                    smb.openFile.assert_called_once()
+                smb.close.assert_called_once()
+
+    def test_partial_result_retains_error_in_json_and_stops_on_broken_connection(self):
+        smb = Mock()
+        smb.openFile.side_effect = [11, TimeoutError("offline timeout"), 12]
+        engine, report, _, found = self._run(smb, pipes=["samr", "svcctl", "lsarpc"])
+        self.assertEqual(found, ["samr"])
+        self.assertEqual(smb.openFile.call_count, 2)
+        smb.closeFile.assert_called_once_with(smb.connectTree.return_value, 11)
+        self.assertIn("ENUMPIPES", engine.results.module_errors)
+        properties = report.create_node_object.call_args.args[3]
+        self.assertEqual(properties["pipes"], ["samr"])
+        self.assertEqual(properties["moduleErrors"][0]["test"], "ENUMPIPES")
+        report.set_status.assert_called_once_with("error", "MSRPC module failure(s): ENUMPIPES")
+        smb.disconnectTree.assert_called_once()
+        smb.close.assert_called_once()
+
+    def test_ipc_denial_stops_without_operational_error(self):
+        smb = Mock()
+        smb.connectTree.side_effect = SessionError(STATUS_ACCESS_DENIED)
+        engine, _, _, found = self._run(smb)
+        self.assertEqual(found, [])
+        self.assertEqual(engine.results.module_errors, {})
+        smb.openFile.assert_not_called()
+        smb.disconnectTree.assert_not_called()
+        smb.logoff.assert_called_once()
+        smb.close.assert_called_once()
+
+    def test_cleanup_failure_keeps_evidence_and_redacts_credentials(self):
+        smb = Mock()
+        smb.closeFile.side_effect = OSError("user-marker password-marker domain-marker")
+        engine, report, _, found = self._run(
+            smb, pipes=["samr", "svcctl"],
+            username="user-marker", password="password-marker", domain="domain-marker",
+        )
+        self.assertEqual(found, ["samr"])
+        smb.openFile.assert_called_once()
+        self.assertIn("ENUMPIPES", engine.results.module_errors)
+        observed = repr(report.create_node_object.call_args) + repr(engine.ptprint.call_args_list)
+        for secret in ("user-marker", "password-marker", "domain-marker"):
+            self.assertNotIn(secret, observed)
+        smb.disconnectTree.assert_called_once()
+        smb.logoff.assert_called_once()
+        smb.close.assert_called_once()
+
+
+class MSRPCPolicyPartialRegressionTests(unittest.TestCase):
+    def _run(self, responses, domain_names=("EXAMPLE",), lookup_errors=None, domain_pages=None):
+        module, report = msrpc_main(tests="SAMRPOLICY", output="unused-policy.txt")
+        engine = module.engine
+        engine.ptprint = Mock()
+        engine.write_to_file = Mock()
+        smb = Mock()
+        smb.isGuestSession.return_value = False
+        rpc, dce = rpc_transport()
+        sid = canonical_sid("S-1-5-21-1-2-3")
+        with (
+            patch("ptsrvtester.protocols.msrpc.utils.engine.SMBConnection", return_value=smb),
+            patch("ptsrvtester.protocols.msrpc.utils.engine.transport.DCERPCTransportFactory", return_value=rpc),
+            patch.object(engine, "_enumerate_samr_domain_names", return_value=list(domain_names)),
+            patch.object(samr, "hSamrConnect5", return_value={"ServerHandle": "server"}),
+            patch.object(samr, "hSamrLookupDomainInSamServer",
+                         side_effect=lookup_errors, return_value={"DomainId": sid}),
+            patch.object(samr, "hSamrOpenDomain", return_value={"DomainHandle": "domain"}),
+            patch.object(samr, "hSamrQueryInformationDomain", side_effect=responses),
+            patch.object(samr, "hSamrCloseHandle") as close_handle,
+        ):
+            if domain_pages is not None:
+                # Restore the real streaming wrapper while keeping all network calls mocked.
+                engine._enumerate_samr_domain_names = type(engine)._enumerate_samr_domain_names.__get__(engine)
+                pages = patch.object(samr, "hSamrEnumerateDomainsInSamServer", side_effect=domain_pages)
+            else:
+                pages = ExitStack()
+            with pages:
+                result = engine.query_samr_policy()
+        engine.results.SamrPolicy = result
+        engine.output()
+        self.assertEqual(close_handle.call_args_list, [call(dce, "domain"), call(dce, "server")])
+        dce.disconnect.assert_called_once()
+        smb.logoff.assert_called_once()
+        smb.close.assert_called_once()
+        return engine, report, result
+
+    def test_password_policy_survives_lockout_timeout_in_json_and_text(self):
+        engine, report, result = self._run([
+            {"Buffer": {"Password": password_policy_fixture()}}, TimeoutError("offline timeout"),
+        ])
+        self.assertEqual(result["status"], "partial")
+        domain = result["domains"][0]
+        self.assertEqual(domain["status"], "partial")
+        self.assertEqual(domain["passwordPolicy"]["minimumPasswordLength"], 14)
+        self.assertIsNone(domain["lockoutPolicy"])
+        self.assertEqual(domain["errors"], [{"section": "lockoutPolicy", "reason": "operational_error"}])
+        properties = report.create_node_object.call_args.args[3]
+        self.assertEqual(properties["samrPolicy"], result)
+        self.assertEqual(properties["moduleErrors"][0]["test"], "SAMRPOLICY")
+        self.assertIn("Minimum password length: 14", engine.write_to_file.call_args.args[0])
+        report.add_vulnerability.assert_not_called()
+
+    def test_malformed_password_does_not_discard_available_lockout_policy(self):
+        engine, _, result = self._run([
+            {"Buffer": {"Password": {}}}, {"Buffer": {"Lockout": lockout_policy_fixture()}},
+        ])
+        self.assertEqual(result["status"], "partial")
+        self.assertIsNone(result["domains"][0]["passwordPolicy"])
+        self.assertEqual(result["domains"][0]["lockoutPolicy"]["lockoutThreshold"], 5)
+        self.assertIn("SAMRPOLICY", engine.results.module_errors)
+
+    def test_both_sections_failing_are_error_not_empty_success(self):
+        engine, _, result = self._run([TimeoutError("first"), TimeoutError("second")])
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["domains"][0]["status"], "error")
+        self.assertEqual(len(result["domains"][0]["errors"]), 2)
+        self.assertIn("SAMRPOLICY", engine.results.module_errors)
+
+    def test_later_domain_lookup_failure_preserves_previous_domain(self):
+        engine, _, result = self._run(
+            [{"Buffer": {"Password": password_policy_fixture()}},
+             {"Buffer": {"Lockout": lockout_policy_fixture()}}],
+            domain_names=("EXAMPLE", "SECOND"),
+            lookup_errors=[{"DomainId": canonical_sid("S-1-5-21-1-2-3")},
+                           TimeoutError("offline timeout")],
+        )
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(len(result["domains"]), 1)
+        self.assertEqual(result["domains"][0]["status"], "complete")
+        self.assertEqual(result["domains"][0]["passwordPolicy"]["minimumPasswordLength"], 14)
+        self.assertIn("SAMRPOLICY", engine.results.module_errors)
+        engine.write_to_file.assert_called_once()
+
+    def test_policy_keeps_completed_domain_when_next_domain_page_fails(self):
+        engine, _, result = self._run(
+            [{"Buffer": {"Password": password_policy_fixture()}},
+             {"Buffer": {"Lockout": lockout_policy_fixture()}}],
+            domain_pages=[
+                samr_enum_page([{"Name": "EXAMPLE"}], context=7, status=STATUS_MORE_ENTRIES),
+                TimeoutError("later page"),
+            ],
+        )
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["domains"][0]["passwordPolicy"]["minimumPasswordLength"], 14)
+        self.assertIn("SAMRPOLICY", engine.results.module_errors)
+
+    def test_policy_retains_domain_when_domain_page_limit_is_reached(self):
+        with patch("ptsrvtester.protocols.msrpc.utils.samr_session.MAX_ENUMERATION_PAGES", 1):
+            engine, _, result = self._run(
+                [{"Buffer": {"Password": password_policy_fixture()}},
+                 {"Buffer": {"Lockout": lockout_policy_fixture()}}],
+                domain_pages=[samr_enum_page([{"Name": "EXAMPLE"}], context=7, status=STATUS_MORE_ENTRIES)],
+            )
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(len(result["domains"]), 1)
+        self.assertIn("page limit", engine.results.module_errors["SAMRPOLICY"])
 
 
 if __name__ == "__main__":

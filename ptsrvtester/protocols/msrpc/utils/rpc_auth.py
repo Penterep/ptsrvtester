@@ -21,6 +21,7 @@ from impacket.dcerpc.v5.ndr import NDRCALL
 from impacket.dcerpc.v5.rpcrt import (
     DCERPCException,
     DCERPC_v5,
+    MSRPCHeader,
     MSRPC_FAULT,
     MSRPC_RESPONSE,
     MSRPCRespHeader,
@@ -48,6 +49,20 @@ class RpcAuthenticationUnconfirmed(DCERPCException):
     """The RPC exchange did not provide verifiable authentication evidence."""
 
 
+class _BindResponseTransport:
+    """Delegate transport operations, framing only the upstream bind receive."""
+
+    def __init__(self, transport, receive):
+        self.transport = transport
+        self._receive = receive
+
+    def __getattr__(self, name):
+        return getattr(self.transport, name)
+
+    def recv(self):
+        return self._receive()
+
+
 class VerifiedDCERPC(DCERPC_v5):
     """Impacket sender with strictly verified NTLM packet-integrity responses.
 
@@ -58,6 +73,7 @@ class VerifiedDCERPC(DCERPC_v5):
 
     MAX_RESPONSE_BYTES = 1024 * 1024
     MAX_RESPONSE_FRAGMENTS = 256
+    MAX_BIND_RESPONSE_BYTES = 0xFFFF
 
     def __init__(self, rpc_transport):
         super().__init__(rpc_transport)
@@ -71,6 +87,9 @@ class VerifiedDCERPC(DCERPC_v5):
 
     def bind(self, iface_uuid, *args, **kwargs):
         self._verification_ready = False
+        self._receive_buffer = b""
+        self._expected_call_id = None
+        self.verified_responses = 0
         if not self.get_credentials()[0]:
             raise RpcAuthenticationUnconfirmed("Anonymous RPC credentials do not establish a user identity")
         # These negotiated values have no public accessor in Impacket >=0.12.
@@ -80,7 +99,15 @@ class VerifiedDCERPC(DCERPC_v5):
         if (self.get_auth_type() != RPC_C_AUTHN_WINNT
                 or auth_level != RPC_C_AUTHN_LEVEL_PKT_INTEGRITY):
             raise RpcAuthenticationUnconfirmed("RPC confirmation requires NTLM packet integrity")
-        response = super().bind(iface_uuid, *args, **kwargs)
+        # Upstream bind assumes one transport.recv() returns the whole PDU;
+        # TCP can return a short header or body. Keep its NTLM handshake, but
+        # supply that one receive through a per-connection framing adapter.
+        rpc_transport = self._transport
+        self._transport = _BindResponseTransport(rpc_transport, self._read_bind_response)
+        try:
+            response = super().bind(iface_uuid, *args, **kwargs)
+        finally:
+            self._transport = rpc_transport
         flags = getattr(self, "_DCERPC_v5__flags", None)
         required = ntlm.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY | ntlm.NTLMSSP_NEGOTIATE_SIGN
         if not isinstance(flags, int) or flags & required != required:
@@ -92,10 +119,29 @@ class VerifiedDCERPC(DCERPC_v5):
         self._server_signing_key = ntlm.SIGNKEY(flags, session_key, "Server")
         self._server_sealing_handle = ARC4.new(ntlm.SEALKEY(flags, session_key, "Server")).encrypt
         self._server_sequence = 0
-        self._receive_buffer = b""
-        self.verified_responses = 0
         self._verification_ready = True
         return response
+
+    def get_rpc_transport(self):
+        # Callers and the exact reader always see the original transport, even
+        # while upstream bind is using the temporary receive adapter.
+        transport = super().get_rpc_transport()
+        return transport.transport if isinstance(transport, _BindResponseTransport) else transport
+
+    def _read_bind_response(self):
+        header = self._read_exact(MSRPCHeader._SIZE, 0)
+        if header[:2] != b"\x05\x00" or header[4:8] != b"\x10\x00\x00\x00":
+            raise RpcAuthenticationUnconfirmed("Unsupported RPC bind response encoding")
+        size, auth_size = unpack_from("<HH", header, 8)
+        if size < MSRPCHeader._SIZE:
+            raise RpcAuthenticationUnconfirmed("Invalid RPC bind fragment length")
+        if size > min(self.MAX_BIND_RESPONSE_BYTES, self.MAX_RESPONSE_BYTES):
+            raise RpcAuthenticationUnconfirmed("RPC bind response exceeds the confirmation size limit")
+        if auth_size and size < MSRPCHeader._SIZE + 8 + auth_size:
+            raise RpcAuthenticationUnconfirmed("Invalid RPC bind authentication length")
+        if header[3] & (PFC_FIRST_FRAG | PFC_LAST_FRAG) != (PFC_FIRST_FRAG | PFC_LAST_FRAG):
+            raise RpcAuthenticationUnconfirmed("Fragmented RPC bind responses are unsupported")
+        return header + self._read_exact(size - len(header), 0)
 
     def _transport_send(self, rpc_packet, forceWriteAndx=0, forceRecv=0):
         if not self._verification_ready:

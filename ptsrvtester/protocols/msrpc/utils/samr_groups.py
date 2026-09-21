@@ -168,7 +168,7 @@ def _print_result(engine, result):
     lines = [
         f"SAMR group enumeration status: {result['status']}",
         f"Groups and aliases returned: {result['returned']}",
-        "Direct members only; member limit bounds retained output per group.",
+        "Direct members only.",
     ]
     if result["reason"]:
         lines.append(f"Reason: {result['reason']}")

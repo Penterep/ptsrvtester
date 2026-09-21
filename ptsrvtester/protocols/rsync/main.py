@@ -17,6 +17,7 @@ import socket
 
 from .._base import BaseMain, BaseArgs
 from .utils.cli import RsyncArgs
+from ptsrvtester.protocols.rsync.utils.registry import check_rsync_path
 
 
 class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
@@ -64,5 +65,6 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
             "ip": self.target[0],
             "port": self.target[1],
             "timeout": getattr(self.args, "timeout", None),
-            "modules": getattr(self.args, "modules", None)
+            "modules": getattr(self.args, "modules", None),
+            "rsync_path": check_rsync_path()
         }

@@ -1,4 +1,4 @@
-import socket
+import socket, shutil, argparse
 
 
 def receive(sock: socket.socket) -> bytes:
@@ -19,6 +19,11 @@ def receive(sock: socket.socket) -> bytes:
             break
 
     return data
+
+def check_rsync_path() -> str:
+    path = shutil.which("rsync")
+
+    return path    
 
 def split_module_list(modules: str) -> list:
     return modules.split(",")

@@ -15,7 +15,9 @@ __all__ = ['DHCPArgs']
 
 DHCP_TEST_GROUPS = [
     ("Enumeration", ["SERVER_INFO"]),
-    ("Denial-of-Service", ["DENIAL", "STARVATION"])
+    ("Denial-of-Service", ["DENIAL", "STARVATION"]),
+    ("Spoofing", ["ACK", "REQUEST", "ROGUE_DHCP"])
+    
 ]
 
 # Per-test definitions:
@@ -78,7 +80,7 @@ DHCP_TESTS: dict[str, dict] = {
         "flags": {"starvation": True}
     },
     "REQUEST": {
-        "desc": "DHCP REQUEST sender",
+        "desc": "DHCP REQUEST spoofer",
         "long": ["Sends a DHCP REQUEST to the server without previous DISCOVER and",
                  "OFFER messages to see if the server assigns an IP address or not"],
         "mods": [

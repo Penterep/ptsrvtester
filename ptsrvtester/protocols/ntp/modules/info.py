@@ -125,6 +125,7 @@ def run(ctx):
     # only 4.2.8p15 - CVE-2023-26551 to CVE-2023-26555 (DoS through errors in code)
     # from 0.3.0 to 0.3.2 - CVE-2023-33192 (DoS through crafted cookies)
     # up to (excluding) 4.2.7p26 - CVE-2013-5211 (traffic amplification through monolist)
+    # TODO: check monolist availability
     
     if not mode_6_scan_success:
         if ntp.version < 4:

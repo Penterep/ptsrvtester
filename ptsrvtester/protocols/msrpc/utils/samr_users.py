@@ -77,6 +77,8 @@ def unavailable_samr_user(
     rid: int,
     domain_sid: str,
     reason: str,
+    *,
+    status: str = "denied",
 ) -> dict[str, object]:
     normalized_name = str(name).rstrip("\x00")
     normalized_rid = int(rid)
@@ -88,7 +90,7 @@ def unavailable_samr_user(
         "name": normalized_name,
         "rid": normalized_rid,
         "sid": f"{domain_sid}-{normalized_rid}",
-        "stateStatus": "denied",
+        "stateStatus": status,
         "stateReason": str(reason),
         "accountControl": None,
         "accountControlFlags": [],

@@ -18,11 +18,11 @@ BRUTE_REQUIREMENTS = {
     "BRUTESMB": (),
     "BRUTETCP": (
         "--uuid",
-        "12345778-1234-abcd-ef00-0123456789ab",
+        "12345778-1234-abcd-ef00-0123456789ab:0.0",
     ),
     "BRUTEHTTP": (),
 }
-DIRECT_SAMR_TESTS = ("SAMRPOLICY", "SAMRUSERS")
+DIRECT_SAMR_TESTS = ("SAMRPOLICY", "SAMRUSERS", "SAMRGROUPS", "SAMRUSERINFO")
 
 
 def parse_msrpc_args(*arguments: str) -> MSRPCArgs:
@@ -308,7 +308,7 @@ class MSRPCCLIParserTests(unittest.TestCase):
 
     def test_brutetcp_requires_uuid_and_explicit_target_port(self):
         credentials = ("-u", "audit-user", "-pw", "audit-password")
-        uuid = "12345778-1234-abcd-ef00-0123456789ab"
+        uuid = "12345778-1234-abcd-ef00-0123456789ab:0.0"
 
         self.assert_selection_rejected(
             "-tg",
@@ -430,6 +430,8 @@ class MSRPCCLIParserTests(unittest.TestCase):
                 {
                     "SAMRPOLICY",
                     "SAMRUSERS",
+                    "SAMRGROUPS",
+                    "SAMRUSERINFO",
                     "BRUTEPIPE",
                     "BRUTESMB",
                     "BRUTETCP",

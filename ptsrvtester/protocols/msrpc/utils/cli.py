@@ -62,6 +62,23 @@ def _bounded_samr_users(value: str) -> int:
     return parsed
 
 
+def _bounded_samr_inventory(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("SAMR inventory limit must be an integer") from exc
+    if not 1 <= parsed <= 10_000:
+        raise argparse.ArgumentTypeError("SAMR inventory limit must be between 1 and 10000")
+    return parsed
+
+
+def _samr_name(value: str) -> str:
+    name = value.strip()
+    if not name or "\x00" in name:
+        raise argparse.ArgumentTypeError("SAMR name must be nonempty and contain no NUL")
+    return name
+
+
 def _pipe_name(value: str) -> str:
     pipe = value.strip().replace("/", "\\")
     while pipe.lower().startswith("\\pipe\\"):
@@ -112,6 +129,10 @@ class MSRPCArgs(BaseArgs):
     threads: int
     max_attempts: int
     samr_max_users: int
+    samr_max_groups: int
+    samr_max_members: int
+    samr_user: str | None
+    samr_domain: str | None
     timeout_seconds: float
     module_threads: int
     debug: bool
@@ -130,23 +151,29 @@ class MSRPCArgs(BaseArgs):
                 "ptsrvtester msrpc -ts ENUMPIPES -tg 192.168.1.1 -u auditor -pw secret",
                 "ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.1 -u auditor -pw secret",
                 "ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.1 -u auditor -pw secret",
+                "ptsrvtester msrpc -ts SAMRGROUPS -tg 192.168.1.1 -u auditor -pw secret",
+                "ptsrvtester msrpc -ts SAMRUSERINFO -tg 192.168.1.1 -u auditor -pw secret --samr-user alice",
                 "ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.1 --pipe svcctl -ul users.txt -pl passwords.txt",
-                "ptsrvtester msrpc -ts BRUTETCP -tg 192.168.1.1:49154 --uuid 367abb81-9844-35f1-ad32-98f038001003:2.0 -u auditor -pw secret",
+                "ptsrvtester msrpc -ts BRUTETCP -tg 192.168.1.1:49154 --uuid 12345778-1234-abcd-ef00-0123456789ac:1.0 -u auditor -pw secret",
             ]},
             {"options": [
                 ["-ts", "--tests", "<test>", f"{tests}; ALL/default safe suite: {safe}"],
                 ["-tg", "--target", "<host>", "IPv4 or HOST[:PORT]; defaults: RPC 135, SMB 445, HTTPS RPC Proxy 443"],
-                ["", "--pipe", "<name>", "BRUTEPIPE: named-pipe name"],
-                ["", "--pipes", "<names>", "ENUMPIPES: comma-separated named-pipe names"],
+                ["", "--pipe", "<name>", "BRUTEPIPE: pipe to open after SMB login; no RPC bind/call"],
+                ["", "--pipes", "<names>", "ENUMPIPES: names to try opening; not a complete pipe inventory"],
                 ["-d", "--domain", "<domain>", "Authentication domain"],
-                ["", "--uuid", "<uuid[:ver]>", "BRUTETCP: interface UUID and optional version (default 1.0)"],
+                ["", "--uuid", "<uuid[:ver]>", "BRUTETCP: supported EPM/MGMT/SAMR/LSAD interface UUID and version"],
                 ["-u", "--username", "<user>", "One username"],
                 ["-ul", "--username-file", "<file>", "Username wordlist"],
                 ["-pw", "--password", "<password>", "One password"],
                 ["-pl", "--password-file", "<file>", "Password wordlist"],
-                ["", "--threads", "<1-100>", "Credential-test concurrency (default 10)"],
-                ["", "--max-attempts", "<1-100000>", "Reject larger credential products (default 1000)"],
-                ["", "--samr-max-users", "<1-10000>", "SAMRUSERS: maximum returned users (default 1000)"],
+                ["", "--threads", "<1-100>", "Credential-test concurrency across accounts (default 10; one active attempt per account)"],
+                ["", "--max-attempts", "<1-100000>", "Maximum credential product per test (default 1000); confirmed lockout stops further attempts for that account"],
+                ["", "--samr-max-users", "<1-10000>", "SAMRUSERS/SAMRUSERINFO: global user limit (default 1000)"],
+                ["", "--samr-max-groups", "<1-10000>", "SAMRGROUPS: global group/alias limit (default 1000)"],
+                ["", "--samr-max-members", "<1-10000>", "SAMRGROUPS: returned members per group (default 1000; server response is not paginated)"],
+                ["", "--samr-user", "<name>", "SAMRUSERINFO: look up one account instead of enumerating users"],
+                ["", "--samr-domain", "<name>", "SAMRUSERINFO: target SAM domain; distinct from authentication --domain"],
                 ["", "--timeout-seconds", "<1-60>", "Per-connection timeout (default 5)"],
                 ["-o", "--output", "<file>", "Append positive enumeration/credential results"],
                 ["-j", "--json", "", "JSON output"],
@@ -189,6 +216,10 @@ class MSRPCArgs(BaseArgs):
             default=1000,
             dest="samr_max_users",
         )
+        parser.add_argument("--samr-max-groups", type=_bounded_samr_inventory, default=1000)
+        parser.add_argument("--samr-max-members", type=_bounded_samr_inventory, default=1000)
+        parser.add_argument("--samr-user", type=_samr_name, default=None)
+        parser.add_argument("--samr-domain", type=_samr_name, default=None)
         parser.add_argument("--timeout-seconds", type=_bounded_timeout, default=5.0)
         parser.add_argument("-o", "--output", default=None)
         parser.add_argument(
@@ -246,6 +277,8 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
             )
     if "BRUTEPIPE" in selected and not getattr(args, "pipe", None):
         raise argparse.ArgumentError(None, "BRUTEPIPE requires --pipe")
+    if (getattr(args, "samr_user", None) or getattr(args, "samr_domain", None)) and "SAMRUSERINFO" not in selected:
+        raise argparse.ArgumentError(None, "--samr-user and --samr-domain require SAMRUSERINFO")
     if "BRUTETCP" in selected:
         if not getattr(args, "uuid", None):
             raise argparse.ArgumentError(None, "BRUTETCP requires --uuid")
@@ -263,6 +296,18 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
                 None,
                 "BRUTETCP endpoint port cannot also be used by "
                 f"{', '.join(other_rpc_tests)}; run BRUTETCP separately",
+            )
+        from impacket import uuid
+        from .rpc_auth import SUPPORTED_RPC_PROBES
+        normalized = normalize_interface_uuid(args.uuid)
+        interface_uuid, version = normalized.rsplit(":", 1)
+        if uuid.uuidtup_to_bin((interface_uuid, version)) not in SUPPORTED_RPC_PROBES:
+            supported = ", ".join(
+                f"{interface}:{ver}"
+                for interface, ver in (uuid.bin_to_uuidtup(value) for value in SUPPORTED_RPC_PROBES)
+            )
+            raise argparse.ArgumentError(
+                None, f"BRUTETCP has no read-only confirmation call for {normalized}. Supported: {supported}",
             )
     if "BRUTEHTTP" in selected and getattr(target, "port", 0) not in (0, 80, 443):
         raise argparse.ArgumentError(

@@ -162,6 +162,100 @@ def grab_banner(ip: str, port: int) -> str:
             pass
 
 
+SSH_MSG_KEXINIT = 20
+_KEXINIT_NAMELIST_KEYS = (
+    "kex", "server_host_key", "enc_c2s", "enc_s2c", "mac_c2s", "mac_s2c",
+    "comp_c2s", "comp_s2c", "lang_c2s", "lang_s2c",
+)
+
+
+def read_kexinit(ip: str, port: int, timeout: float = BANNER_TIMEOUT) -> dict:
+    """Pre-auth raw handshake: read the server banner and its KEXINIT name-lists.
+
+    Returns a dict with ``banner`` / ``protoversion`` and, for an SSH-2 server, the
+    ten KEXINIT name-lists (``kex``, ``enc_c2s`` … as lists). paramiko strips the
+    ``kex-strict-*-v00@openssh.com`` markers from its parsed options, so this reads
+    the wire directly (needed for the Terrapin strict-kex check). No auth is
+    performed; only an identification string is sent. Raises on protocol errors.
+    """
+    result: dict = {"banner": None, "protoversion": None}
+    for k in _KEXINIT_NAMELIST_KEYS:
+        result[k] = []
+
+    sock = socket.create_connection((ip, port), timeout=timeout)
+    sock.settimeout(timeout)
+    try:
+        sock.sendall(b"SSH-2.0-PTSRVTESTER_probe\r\n")
+
+        buf = b""
+        banner = None
+        while banner is None:
+            # The server MAY send preamble lines before the SSH- identification line.
+            while b"\n" in buf and banner is None:
+                line, buf = buf.split(b"\n", 1)
+                line = line.rstrip(b"\r")
+                if line.startswith(b"SSH-"):
+                    banner = line.decode(errors="replace")
+            if banner is not None:
+                break
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ValueError("no SSH identification string received")
+            buf += chunk
+            if len(buf) > 65535:
+                raise ValueError("SSH identification string too long")
+
+        result["banner"] = banner
+        parts = banner.split("-", 2)
+        protoversion = parts[1] if len(parts) >= 2 else ""
+        result["protoversion"] = protoversion
+
+        # An SSH-1-only server does not speak the SSH-2 binary protocol.
+        if protoversion.startswith("1.") and protoversion != "1.99":
+            result["ssh1_only"] = True
+            return result
+
+        def _need(n: int) -> None:
+            nonlocal buf
+            while len(buf) < n:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ValueError("connection closed while reading KEXINIT")
+                buf += chunk
+
+        _need(4)
+        pkt_len = int.from_bytes(buf[:4], "big")
+        if not (1 < pkt_len <= 200000):
+            raise ValueError(f"implausible KEXINIT packet length {pkt_len}")
+        _need(4 + pkt_len)
+        packet = buf[4:4 + pkt_len]
+        pad_len = packet[0]
+        payload = packet[1:len(packet) - pad_len]
+        if not payload or payload[0] != SSH_MSG_KEXINIT:
+            raise ValueError(f"first packet is not KEXINIT (type {payload[0] if payload else 'none'})")
+
+        off = 1 + 16  # skip msg type + 16-byte cookie
+        names: list[list[str]] = []
+        for _ in range(10):
+            if off + 4 > len(payload):
+                break
+            ln = int.from_bytes(payload[off:off + 4], "big")
+            off += 4
+            if off + ln > len(payload):
+                break
+            val = payload[off:off + ln].decode(errors="replace")
+            off += ln
+            names.append([x for x in val.split(",") if x])
+        for key, value in zip(_KEXINIT_NAMELIST_KEYS, names):
+            result[key] = value
+        return result
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 def get_host_key(ip: str, port: int) -> str:
     """Return the remote host key as ``"<name> <base64>"`` (raises on failure)."""
     trans = paramiko.Transport((ip, port))

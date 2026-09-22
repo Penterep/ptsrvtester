@@ -43,3 +43,24 @@ class VULNS(Enum):
     RootLoginPermitted = "PTV-SSH-ROOTLOGIN"
     # Shell / command execution permitted after login (SHELL test):
     ShellAccess = "PTV-SSH-SHELLACCESS"
+    # Post-auth privileges & access (PRIVS test):
+    PrivilegedGroup = "PTV-SSH-PRIVGROUP"
+    SensitiveFileAccess = "PTV-SSH-SENSITIVEFILE"
+    SudoAccess = "PTV-SSH-SUDOACCESS"
+    # Port forwarding & tunneling (FORWARD test):
+    PortForwarding = "PTV-SSH-PORTFORWARDING"
+    AgentForwarding = "PTV-SSH-AGENTFORWARDING"
+    X11Forwarding = "PTV-SSH-X11FORWARDING"
+    # SFTP access control & confinement (SFTP test):
+    SftpNoChroot = "PTV-SSH-SFTPNOCHROOT"
+    SftpTraversal = "PTV-SSH-SFTPTRAVERSAL"
+    SftpSymlinkEscape = "PTV-SSH-SFTPSYMLINK"
+    SftpUnrestricted = "PTV-SSH-SFTPUNRESTRICTED"
+    SftpADS = "PTV-SSH-SFTPADS"
+    # SFTP content scanning & resource limits (SFTPDATA test):
+    SftpNoAntivirus = "PTV-SSH-SFTPNOAV"
+    SftpContentProcessingDoS = "PTV-SSH-SFTPPROCESSINGDOS"
+    SftpNoQuota = "PTV-SSH-SFTPNOQUOTA"
+    # Protocol & config hygiene (TERRAPIN / SSHV1 tests):
+    Terrapin = "PTV-SSH-TERRAPIN"
+    SSHv1 = "PTV-SSH-SSHV1"

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os, ipaddress, socket, argparse
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Literal
+from base64 import b64decode, b64encode
+import re
 
 from ptlibs.threads import ptthreads
 
@@ -353,6 +355,29 @@ def get_mode(args: argparse.Namespace) -> str:
         return "PLAIN"
 
 
+def one_cli_user(user: str | list[str] | None) -> str | None:
+    """Single ``-u`` name, or ``None`` when ``-u`` has zero or several names."""
+    names = [x.strip() for x in text_or_file(user, None) if str(x).strip()]
+    return names[0] if len(names) == 1 else None
+
+
+_ENUM_ALL_METHODS = frozenset({"EXPN", "VRFY", "RCPT"})
+
+
+def enum_methods_from_arg(value) -> set[str]:
+    """Methods selected by ``-e``. Missing value and ``ALL`` mean VRFY, EXPN and RCPT."""
+    if value is None:
+        return set(_ENUM_ALL_METHODS)
+    if isinstance(value, (list, tuple, set)):
+        methods = {str(item).strip().upper() for item in value if str(item).strip()}
+    else:
+        text = str(value).strip().upper()
+        methods = {text} if text else set()
+    if not methods or "ALL" in methods:
+        return set(_ENUM_ALL_METHODS)
+    return methods
+
+
 def text_or_file(text: str | list[str] | None, filepath: str | None) -> list[str]:
     """Returns either `text` or `filepath` contents while prefering `text`
 
@@ -427,3 +452,378 @@ def text(data: bytes) -> str | None:
         return data.decode()
     except:
         return None
+
+
+# SMTP-specific helpers (formerly protocols/smtp/helpers.py)
+
+_vendor_from_cpe = vendor_from_cpe
+
+
+def _registrable_domain_psl(host: str) -> str | None:
+    """Get registrable domain from hostname using Public Suffix List (e.g. relay01.prod.amazon.co.jp -> amazon.co.jp).
+    Returns None on failure or if ptlibs.tldparser is unavailable.
+    """
+    host = (host or "").strip()
+    if not host or "." not in host:
+        return None
+    try:
+        from ptlibs.tldparser import parse
+        r = parse(host)
+        if r is None:
+            return None
+        domain = getattr(r, "domain", None)
+        suffix = getattr(r, "suffix", None)
+        if domain and suffix:
+            return f"{domain}.{suffix}"
+        # Unknown suffix (private names such as .home): the parser's domain
+        # field is only the last label. Callers keep the original hostname.
+        return None
+    except Exception:
+        return None
+
+
+class TestFailedError(Exception):
+    """Raised when a test fails in run-all mode; caught to continue with next test."""
+
+
+def _is_private_ip(ip: str) -> bool:
+    """True if ip is a private (RFC 1918 / ULA) address. Blacklist services only check public IPs."""
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
+
+
+def valid_target_smtp(target: str) -> Target:
+    return valid_target(target, domain_allowed=True)
+
+
+def _is_valid_hostname(host: str) -> bool:
+    """True if host looks like a valid FQDN (contains dot, not just IP or generic label)."""
+    if not host or not isinstance(host, str):
+        return False
+    host = host.strip()
+    if "." not in host or len(host) < 4:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    parts = host.split(".")
+    return len(parts) >= 2
+
+
+SMTP_KNOWN_EXTENSIONS = frozenset(
+    {
+        "HELO", "EHLO", "MAIL", "RCPT", "DATA", "RSET", "NOOP", "QUIT",
+        "VRFY", "EXPN", "HELP", "SEND", "SOML", "SAML", "TURN", "ETRN", "ATRN",
+        "8BITMIME", "SIZE", "CHUNKING", "BINARYMIME", "CHECKPOINT", "DELIVERBY",
+        "PIPELINING", "DSN", "AUTH", "BURL", "SMTPUTF8", "STARTTLS", "ENHANCEDSTATUSCODES",
+        "VERB", "DEBUG",
+    }
+)
+SMTP_AUTH_METHOD_LEVEL_PLAIN = {
+    "PLAIN": "ERROR", "LOGIN": "ERROR", "CRAM-MD5": "ERROR", "DIGEST-MD5": "ERROR",
+    "NTLM": "ERROR", "ANONYMOUS": "ERROR", "KERBEROS_V4": "ERROR", "GSSAPI": "ERROR",
+    "EXTERNAL": "WARNING",
+    "XOAUTH2": "OK", "OAUTHBEARER": "OK", "SCRAM-SHA-1": "OK", "SCRAM-SHA-256": "OK",
+}
+SMTP_CMD_ERROR = frozenset({"VRFY", "EXPN", "TURN", "VERB", "SEND", "SOML", "SAML", "DEBUG"})
+SMTP_CMD_WARNING = frozenset({"ETRN", "ATRN"})
+SIZE_OK_MAX = 26214400
+SIZE_WARNING_MAX = 52428800
+
+
+_SIZE_TOKEN_RE = re.compile(r"(?:^|\s)SIZE(?:\s+(\d+))?(?=\s|$)", re.IGNORECASE)
+
+
+def _size_offer_from_ehlo(ehlo_raw: str | bytes | None) -> tuple[bool, int | None]:
+    """Return ``(keyword_present, fixed_maximum)`` from an EHLO reply (RFC 1870).
+
+    ``fixed_maximum`` is the decimal parameter when one was given, including 0
+    (0 means no fixed maximum). It is ``None`` when the keyword is absent or
+    has no parameter. ``smtp.ehlo()`` strips the ``250`` / ``250-`` prefix;
+    a raw transcript may still contain it. A single-line EHLO is scanned too.
+    """
+    if ehlo_raw is None:
+        return False, None
+    if isinstance(ehlo_raw, bytes):
+        ehlo_raw = ehlo_raw.decode(errors="replace")
+    if not isinstance(ehlo_raw, str) or not ehlo_raw.strip():
+        return False, None
+    present = False
+    limit: int | None = None
+    for line in ehlo_raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        upper = line.upper()
+        if upper.startswith("250-"):
+            line = line[4:].strip()
+        elif upper.startswith("250 "):
+            line = line[3:].strip()
+        for match in _SIZE_TOKEN_RE.finditer(line):
+            present = True
+            if match.group(1) is not None:
+                limit = int(match.group(1))
+    return present, limit
+
+
+def _parse_size_from_ehlo(ehlo_raw: str | bytes | None) -> int | None:
+    """Parse EHLO for SIZE extension (RFC 1870).
+
+    Returns the advertised fixed maximum in bytes, ``0`` when the parameter is
+    zero, or ``None`` when SIZE is absent or has no number.
+    """
+    _present, limit = _size_offer_from_ehlo(ehlo_raw)
+    return limit
+
+
+def _parse_rcptmax_from_ehlo(ehlo_raw: str) -> int | None:
+    """Parse EHLO for LIMITS RCPTMAX=N (RFC 9422). Returns N or None."""
+    if not ehlo_raw or not ehlo_raw.strip():
+        return None
+    for line in ehlo_raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip().upper()
+        if "LIMITS" not in line:
+            continue
+        match = re.search(r"RCPTMAX\s*=\s*(\d+)", line, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _parse_ehlo_extension_names(ehlo_raw: str | bytes | None) -> list[str]:
+    """Parse EHLO response and return list of ESMTP extension display strings."""
+    if ehlo_raw is None:
+        return []
+    if isinstance(ehlo_raw, bytes):
+        ehlo_raw = ehlo_raw.decode(errors="replace")
+    if not isinstance(ehlo_raw, str) or not ehlo_raw.strip():
+        return []
+    lines = ehlo_raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    extensions: list[str] = []
+    first_line = True
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("250-"):
+            rest = line[4:].strip()
+        elif line.startswith("250 "):
+            rest = line[3:].strip()
+        else:
+            continue
+        rest = rest.replace("\r", " ").strip()
+        if not rest:
+            continue
+        parts = rest.split(None, 1)
+        key = (parts[0] or "").upper().strip()
+        if key == "OK":
+            continue
+        if "." in key and key not in SMTP_KNOWN_EXTENSIONS:
+            continue
+        if key not in SMTP_KNOWN_EXTENSIONS and "." not in key:
+            if first_line:
+                first_line = False
+                continue
+        extensions.append(rest)
+        first_line = False
+    return extensions
+
+
+def _parse_ehlo_commands(ehlo_raw: str, connection_encrypted: bool = False) -> list[tuple[str, str]]:
+    """Parse EHLO response into list of (display_string, level) for output."""
+    if not ehlo_raw or not ehlo_raw.strip():
+        return []
+    lines = ehlo_raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    result: list[tuple[str, str]] = []
+    seen_starttls = False
+    first_line = True
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("250-"):
+            rest = line[4:].strip()
+        elif line.startswith("250 "):
+            rest = line[3:].strip()
+        else:
+            rest = line.strip()
+        if not rest:
+            continue
+        rest = rest.replace("\r", " ").strip()
+        if not rest:
+            continue
+        parts = rest.split(None, 1)
+        key = (parts[0] or "").upper().strip()
+        value = (parts[1] or "").strip() if len(parts) > 1 else ""
+
+        if key == "OK":
+            continue
+
+        if "." in key and key not in SMTP_KNOWN_EXTENSIONS:
+            continue
+        if key not in SMTP_KNOWN_EXTENSIONS and "." not in key:
+            if first_line:
+                first_line = False
+                continue
+            result.append((rest, "OK"))
+            if key == "STARTTLS":
+                seen_starttls = True
+            continue
+
+        if key == "STARTTLS":
+            seen_starttls = True
+
+        if key == "AUTH":
+            methods = value.split() if value else []
+            for method in methods:
+                method_upper = method.upper()
+                level = "OK" if connection_encrypted else SMTP_AUTH_METHOD_LEVEL_PLAIN.get(method_upper, "OK")
+                result.append((f"AUTH {method_upper}", level))
+            continue
+
+        if key == "SIZE":
+            try:
+                size_val = int(value) if value else 0
+                if size_val <= SIZE_OK_MAX:
+                    level = "OK"
+                elif size_val <= SIZE_WARNING_MAX:
+                    level = "WARNING"
+                else:
+                    level = "ERROR"
+            except (ValueError, TypeError):
+                level = "OK"
+            result.append((f"SIZE {value}".strip() or "SIZE", level))
+            continue
+
+        if key in SMTP_CMD_ERROR:
+            level = "ERROR"
+        elif key in SMTP_CMD_WARNING:
+            level = "WARNING"
+        else:
+            level = "OK"
+        display = f"{key} {value}".strip() if value else key
+        result.append((display, level))
+
+    if not seen_starttls and not connection_encrypted:
+        result.append(("STARTTLS (is not allowed)", "ERROR"))
+
+    return result
+
+
+def _normalize_auth_response_for_comparison(response: str) -> str:
+    """Normalize SMTP auth response for enumeration comparison."""
+    if not response:
+        return ""
+    normalized = " ".join(response.split())
+    normalized = re.sub(r"\s+[a-zA-Z0-9.-]{15,}\s+-\s+[a-zA-Z0-9.]+$", "", normalized)
+    return normalized.strip()
+
+
+def _auth_enum_plain_initial_b64(user: str, password: str) -> str:
+    """RFC 4616 PLAIN SASL message, then base64 (ASCII)."""
+    authcid = (user or "").encode("utf-8")
+    passwd = (password or "").encode("utf-8")
+    blob = b"\x00" + authcid + b"\x00" + passwd
+    return b64encode(blob).decode("ascii")
+
+
+def _auth_enum_login_stage_signature(
+    stage: Literal["u", "p"],
+    code: int,
+    resp: bytes,
+    bytes_to_str: Callable[[bytes], str],
+) -> str:
+    """Comparison token for AUTH LOGIN enumeration."""
+    txt = bytes_to_str(resp).strip()
+    line = f"{code} {txt}" if txt else str(code)
+    return f"LOGIN:{stage}:{_normalize_auth_response_for_comparison(line)}"
+
+
+def _get_auth_methods_from_ehlo(ehlo_raw: str | None) -> set[str]:
+    """Extract AUTH method names (LOGIN, NTLM, etc.) from EHLO response."""
+    if not ehlo_raw:
+        return set()
+    methods: set[str] = set()
+    for line in ehlo_raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        rest = line[4:].strip() if line.startswith("250-") else (line[3:].strip() if line.startswith("250 ") else line)
+        parts = rest.split(None, 1)
+        key = (parts[0] or "").upper()
+        if key == "AUTH" and len(parts) > 1:
+            for m in parts[1].split():
+                methods.add(m.upper())
+    return methods
+
+
+def _get_ehlo_extension_keys(ehlo_raw: str | None) -> list[str]:
+    """Extract extension keys from EHLO response. Skips hostname line."""
+    if not ehlo_raw:
+        return []
+    keys: list[str] = []
+    first_line = True
+    for line in ehlo_raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        rest = line[4:].strip() if line.startswith("250-") else (line[3:].strip() if line.startswith("250 ") else line)
+        parts = rest.split(None, 1)
+        key = (parts[0] or "").upper()
+        if not key or key == "OK":
+            continue
+        if first_line and "." in key and key not in SMTP_KNOWN_EXTENSIONS:
+            first_line = False
+            continue
+        first_line = False
+        keys.append(key)
+    return keys
+
+
+def _get_hostname_from_ehlo_raw(ehlo_raw: str | None) -> str | None:
+    """Extract server hostname from first line of EHLO response."""
+    if not ehlo_raw:
+        return None
+    for line in ehlo_raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        rest = line[4:].strip() if line.startswith("250-") else (line[3:].strip() if line.startswith("250 ") else line)
+        parts = rest.split(None, 1)
+        first = (parts[0] or "").strip()
+        if first and "." in first and _is_valid_hostname(first):
+            return first.lower()
+    return None
+
+
+def _auth_format_decode_login_challenge(resp: bytes | None) -> str | None:
+    """Decode first base64 token in SMTP 334 body (typically 'Username:')."""
+    if not resp:
+        return None
+    raw = resp.strip().split()
+    if not raw:
+        return None
+    try:
+        return b64decode(raw[0]).decode(errors="replace")
+    except Exception:
+        return None
+
+
+def _auth_format_hint_from_challenge_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    low = text.lower()
+    if "email" in low or "@" in low:
+        return "full email address"
+    if "domain\\" in low or "domain/" in low:
+        return "NetBIOS format"
+    if "username" in low or "login" in low or "user name" in low:
+        return "username (ambiguous)"
+    return None
+
+
+# Mixins use `from .helpers import *`; include underscored SMTP helpers (star-import skips `_` names otherwise).
+__all__ = [n for n in globals() if not n.startswith("__")]

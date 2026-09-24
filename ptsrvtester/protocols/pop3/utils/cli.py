@@ -38,7 +38,7 @@ class POP3Args(ArgsWithBruteforce):
             ["", "--starttls", "", "Use explicit STLS (default port 110)"],
             ["", "", "", ""],
             [get_colored_text("Credentials (BRUTE)", "TITLE")],
-            ["-u", "--user", "<name>", "Single username"],
+            ["-u", "--user", "<name> …", "Username(s) for BRUTE"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
@@ -62,7 +62,7 @@ class POP3Args(ArgsWithBruteforce):
                 "ptsrvtester pop3 -ts ALL --tls -tg 127.0.0.1:995",
                 "ptsrvtester pop3 -ts ANON,HELPINFO -tg 127.0.0.1",
                 "ptsrvtester pop3 -ts RATELIMIT -tg 127.0.0.1",
-                "ptsrvtester pop3 -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:110",
+                "ptsrvtester pop3 -ts BRUTE -u admin harry -P passwords.txt -tg 127.0.0.1:110",
                 "ptsrvtester pop3 -ts BRUTE -h",
             ]},
             {"options": options},
@@ -141,7 +141,7 @@ class POP3Args(ArgsWithBruteforce):
             dest="noop1_delay",
             help=argparse.SUPPRESS,
         )
-        add_bruteforce_args(parser)
+        add_bruteforce_args(parser, user_nargs="+")
 
 
 def validate_brute_selection(args) -> None:

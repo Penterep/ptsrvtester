@@ -351,11 +351,17 @@ def test_encryption(args, *, debug: DebugFn | None = None) -> EncryptionResult:
     return EncryptionResult(plaintext_ok, stls_ok, tls_ok)
 
 
+def _text_is_timeout(text: object) -> bool:
+    t = str(text or "").lower()
+    return "timed out" in t or "timeout" in t or "could not connect" in t
+
+
 def auth_anonymous(
     pop3: poplib.POP3 | poplib.POP3_SSL,
     *,
     debug: DebugFn | None = None,
-) -> bool:
+) -> bool | None:
+    """True = accepted, False = rejected, None = timed out / not confirmed."""
     try:
         res: bytes = pop3._shortcmd("AUTH ANONYMOUS")
         if debug:
@@ -369,35 +375,38 @@ def auth_anonymous(
     except Exception as e:
         if debug:
             debug(f"AUTH ANONYMOUS failed: {e}")
+        if _text_is_timeout(e):
+            return None
         return False
 
 
 def auth_ntlm(args, *, debug: DebugFn | None = None) -> NTLMResult:
+    pop3 = connect_pop3(args, debug=debug)
     try:
-        pop3 = connect_pop3(args, debug=debug)
-        try:
-            res: bytes = pop3._shortcmd("AUTH NTLM")
+        res: bytes = pop3._shortcmd("AUTH NTLM")
+        if debug:
+            debug(f"AUTH NTLM → {_snip(res)}")
+        if res.strip().startswith(b"+"):
+            b64_neg = b64encode(get_NegotiateMessage_data()).decode()
+            res = pop3._shortcmd(b64_neg).strip()
             if debug:
-                debug(f"AUTH NTLM → {_snip(res)}")
-            if res.strip().startswith(b"+"):
-                b64_neg = b64encode(get_NegotiateMessage_data()).decode()
-                res = pop3._shortcmd(b64_neg).strip()
-                if debug:
-                    debug(f"AUTH NTLM after negotiate → {_snip(res)}")
-                b64_chal = b"+".join(res.split(b"+")[1:])
-                info = decode_ChallengeMessage_blob(b64decode(b64_chal))
-                if debug:
-                    debug("NTLM challenge decoded OK")
-                return NTLMResult(True, info)
+                debug(f"AUTH NTLM after negotiate → {_snip(res)}")
+            b64_chal = b"+".join(res.split(b"+")[1:])
+            info = decode_ChallengeMessage_blob(b64decode(b64_chal))
             if debug:
-                debug("AUTH NTLM: server did not return challenge (+)")
-            return NTLMResult(False, None)
-        finally:
-            pop3.close()
+                debug("NTLM challenge decoded OK")
+            return NTLMResult(True, info)
+        if debug:
+            debug("AUTH NTLM: server did not return challenge (+)")
+        return NTLMResult(False, None)
     except Exception as e:
         if debug:
             debug(f"AUTH NTLM failed: {e}")
+        if _text_is_timeout(e):
+            raise
         return NTLMResult(False, None)
+    finally:
+        pop3.close()
 
 
 def test_catch_all(args, *, debug: DebugFn | None = None) -> str:
@@ -424,6 +433,8 @@ def test_catch_all(args, *, debug: DebugFn | None = None) -> str:
         except Exception as e:
             if debug:
                 debug(f"Catch-all rejected (not configured): {e}")
+            if _text_is_timeout(e):
+                return "unreachable"
             return "not_configured"
     finally:
         try:

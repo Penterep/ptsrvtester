@@ -66,7 +66,7 @@ POP3_TESTS: dict[str, dict] = {
         ],
         "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
         "mods": [
-            ["-u", "--user", "<name>", "Single username"],
+            ["-u", "--user", "<name> …", "Username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],

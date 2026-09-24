@@ -11,7 +11,6 @@ from ptsrvtester.protocols._shared.utils.cli import rate_limit_help_rows
 from .results import (
     _IMAP_LOAD_APPEND_MAX_DEFAULT,
     _IMAP_LOAD_SEARCH_MAX_DEFAULT,
-    _IMAP_USRENUM_DEFAULT_PASSWORD,
 )
 
 __all__ = ["IMAPArgs"]
@@ -29,7 +28,6 @@ class IMAPArgs(ArgsWithBruteforce):
     zipbomb_variant_small: bool
     zipbomb_variant_medium: bool
     zipbomb_variant_huge: bool
-    imap_usrenum_password: str | None
     imap_usrenum_max: int
     imap_resource_load_append_max: int
     imap_resource_load_search_max: int
@@ -164,8 +162,6 @@ class IMAPArgs(ArgsWithBruteforce):
                           help=argparse.SUPPRESS)
         mods.add_argument("--variant-huge", action="store_true", dest="zipbomb_variant_huge",
                           help=argparse.SUPPRESS)
-        mods.add_argument("--usrenum-password", metavar="STR", dest="imap_usrenum_password", default=None,
-                          help=f"USRENUM/USRENUMPLAIN: wrong password (default {_IMAP_USRENUM_DEFAULT_PASSWORD!r})")
         mods.add_argument("--usrenum-max", type=int, default=0, metavar="N", dest="imap_usrenum_max",
                           help="USRENUM/USRENUMPLAIN: limit names from wordlist (0 = no limit)")
         mods.add_argument("--resource-load-append-max", type=int, default=_IMAP_LOAD_APPEND_MAX_DEFAULT,

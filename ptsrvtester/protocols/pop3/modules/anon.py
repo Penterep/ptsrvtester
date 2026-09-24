@@ -18,7 +18,9 @@ def run(ctx):
         ctx.out(f"Anonymous probe failed: {e}", "ERROR", indent=4)
         return
 
-    if enabled:
+    if enabled is None:
+        ctx.out("AUTH ANONYMOUS timed out (not confirmed)", "WARNING", indent=4)
+    elif enabled:
         ctx.out("Enabled", "VULN", indent=4)
         ctx.report.add_vulnerability(
             vuln_code=VULNS.Anonymous.value,

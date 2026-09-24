@@ -586,6 +586,16 @@ class ImapEngine:
                 sys.stdout.flush()
                 _live_dirty = True
 
+        def _commit_live(text: str) -> None:
+            nonlocal _live_dirty
+            if not _show_progress:
+                return
+            line = get_colored_text(text, "ADDITIONS")
+            with _print_lock:
+                sys.stdout.write(f"\033[2K\r{line}\n")
+                sys.stdout.flush()
+                _live_dirty = False
+
         def _fmt_mmss(seconds: float) -> str:
             return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
 
@@ -903,6 +913,7 @@ class ImapEngine:
                 _dbg(f"Session B (CAPABILITY): connect failed — {exc}")
 
             if not connections:
+                _commit_live("Connected: 0")
                 raise OSError(_first_error[0] or "Could not establish any IMAP connection")
 
             banned = False
@@ -3330,7 +3341,7 @@ class ImapEngine:
         body = "ptsrvtester content probe"
 
         for var_name in variants:
-            if var_name in ("xxe_zip", "xxe_docx", "xxe_body") and not canary_url:
+            if var_name in ("xxe_zip", "xxe_docx", "xxe_xml", "xxe_body") and not canary_url:
                 continue
             sent, accepted, rejected, err_count = 0, 0, 0, 0
             imap_trace: list[str] = []
@@ -3354,6 +3365,11 @@ class ImapEngine:
                         subject, body, build_minimal_docx_with_xxe(canary_url),
                         "document.docx", zip_test_id,
                         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                elif var_name == "xxe_xml":
+                    raw_msg = _build_mime_with_attachment(
+                        subject, body, xxe_xml_template(canary_url).encode("utf-8"),
+                        "xxe.xml", zip_test_id, "application/xml",
                     )
                 elif var_name == "xxe_body":
                     raw_msg = _build_xml_body(subject, xxe_xml_template(canary_url), zip_test_id)
@@ -3461,7 +3477,7 @@ class ImapEngine:
         canary = str(getattr(self.args, "canary_url", None) or getattr(self.args, "zipxxe_canary_url", None) or "").strip()
         return self.test_imap_xxe_suite(
             suite="xxessrf",
-            variants=["xxe_zip", "xxe_docx", "xxe_body"],
+            variants=["xxe_zip", "xxe_docx", "xxe_xml", "xxe_body"],
             canary_url=canary,
             verification=(
                 "For XXE variants, check canary for HTTP requests. "
@@ -4825,7 +4841,7 @@ class ImapEngine:
         self._dbg_usrenum_row(row_method, row, output=output)
         hit = self._usrenum_note_row(row, live_state)
         if hit and not self.use_json:
-            output.add_string_to_output("    " + hit)
+            output.add_string_to_output(hit)
 
     def _usrenum_progress_item(
         self,
@@ -5166,7 +5182,7 @@ class ImapEngine:
                 login_disabled_advertised=False,
                 auth_plain_advertised=False,
             )
-        pwd = getattr(self.args, "imap_usrenum_password", None) or _IMAP_USRENUM_DEFAULT_PASSWORD
+        pwd = getattr(self.args, "password", None) or _IMAP_USRENUM_DEFAULT_PASSWORD
         threads = self._imap_usrenum_threads()
 
         login_disabled_advertised = False
@@ -5223,7 +5239,7 @@ class ImapEngine:
                 login_disabled_advertised=False,
                 auth_plain_advertised=False,
             )
-        pwd = getattr(self.args, "imap_usrenum_password", None) or _IMAP_USRENUM_DEFAULT_PASSWORD
+        pwd = getattr(self.args, "password", None) or _IMAP_USRENUM_DEFAULT_PASSWORD
         threads = self._imap_usrenum_threads()
 
         auth_plain_advertised = False
@@ -6273,7 +6289,7 @@ class ImapEngine:
             shown = getattr(self, "_usrenum_live_hit_names", set())
             for u in ur.enumerated_usernames:
                 if u not in shown:
-                    pp(u, bullet_type="TEXT", condition=show, indent=8)
+                    pp(u, bullet_type="TEXT", condition=show, indent=4)
         else:
             pp(ur.detail, bullet_type="NOTVULN", condition=show, indent=4)
 

@@ -2,6 +2,7 @@
 import sys
 
 from ..utils.connection import test_noop_duration_preauth, test_noop_duration_postauth
+from ..utils.helpers import one_cli_user
 from ..utils.results import (
     NOOP1_ERROR_RATE_OK_MAX_PCT,
     POP3_NOOP_PREAUTH_DUR_HIGH_MIN,
@@ -145,13 +146,14 @@ def run(ctx):
     elif result_preauth:
         ctx.out(f"Test error: {result_preauth.error_message}", "ERROR", indent=8)
 
-    if ctx.args.user and ctx.args.password:
+    user = one_cli_user(ctx.args.user)
+    if user and ctx.args.password:
         ctx.out("Post-authentication", "TITLE", indent=4)
         _flush_ctx(ctx)
 
         try:
             result_postauth = test_noop_duration_postauth(
-                ctx.args, ctx.args.user, ctx.args.password,
+                ctx.args, user, ctx.args.password,
                 debug=ctx.debug, flush=lambda: _flush_ctx(ctx),
             )
         except Exception as e:

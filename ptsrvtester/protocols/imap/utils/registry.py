@@ -83,13 +83,15 @@ IMAP_TESTS: dict[str, dict] = {
         "long": [
             "LOGIN each name from -u/-U with a fixed wrong password and",
             "compare status, error text and auth time against non-existent",
-            "baselines.",
+            "baselines. Add one real username to the list, so you can",
+            "check that the server answers it differently from names",
+            "that do not exist.",
         ],
         "requires": ["-u/--user or -U/--users"],
         "mods": [
             ["-u", "--user", "<name> …", "Candidate username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist (required unless -u)"],
-            ["", "--usrenum-password", "<str>", "Wrong password for every probe (default: PtSrv_IMAP_USRENUM_!@#_2026)"],
+            ["-p", "--password", "<str>", "Wrong password for every probe (default: PtSrv_IMAP_USRENUM_!@#_2026)"],
             ["", "--usrenum-max", "<n>", "Limit names read from wordlist (default: 0 = no limit)"],
             ["-t", "--threads", "<n>", "Parallel TCP sessions (default 1)"],
         ],
@@ -99,13 +101,15 @@ IMAP_TESTS: dict[str, dict] = {
         "long": [
             "AUTHENTICATE PLAIN (SASL) each name from -u/-U with a wrong",
             "password; compare status, error text and auth time against",
-            "baselines. Use when CAPABILITY lists LOGINDISABLED.",
+            "baselines. Use when CAPABILITY lists LOGINDISABLED. Add one",
+            "real username to the list, so you can check that the server",
+            "answers it differently from names that do not exist.",
         ],
         "requires": ["-u/--user or -U/--users"],
         "mods": [
             ["-u", "--user", "<name> …", "Candidate username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist (required unless -u)"],
-            ["", "--usrenum-password", "<str>", "Wrong password for every probe (default: PtSrv_IMAP_USRENUM_!@#_2026)"],
+            ["-p", "--password", "<str>", "Wrong password for every probe (default: PtSrv_IMAP_USRENUM_!@#_2026)"],
             ["", "--usrenum-max", "<n>", "Limit names read from wordlist (default: 0 = no limit)"],
             ["-t", "--threads", "<n>", "Parallel TCP sessions (default 1)"],
         ],
@@ -138,8 +142,9 @@ IMAP_TESTS: dict[str, dict] = {
         "desc": "SSRF through XXE vulnerability",
         "long": [
             "APPEND RFC 822 messages with an external XML entity pointing at",
-            "the canary URL (ZIP, DOCX, and XML body). Check the canary for",
-            "HTTP requests. APPEND OK only means the store accepted the message.",
+            "the canary URL (ZIP, DOCX, XML attachment, and XML body).",
+            "Check the canary for HTTP requests. APPEND OK only means the",
+            "store accepted the message.",
         ],
         "requires": ["-u/--user and -p/--password (no wordlists)", "--canary-url"],
         "mods": [
@@ -259,8 +264,12 @@ IMAP_TESTS: dict[str, dict] = {
 
 # Tests that SELECT/APPEND via --mailbox (shown in imap -ts <TEST> -h).
 _IMAP_FOLDER_OPT = ["", "--mailbox", "<name>", "IMAP Folder"]
+_IMAP_FOLDER_APPEND_OPT = ["", "--mailbox", "<name>", "IMAP folder for APPEND"]
 _IMAP_FOLDER_TESTS = frozenset({
     "EICAR", "XXESSRF", "XXEEXP", "ZIPBOMB", "RESLOAD", "MBOXISO",
+})
+_IMAP_CONTENT_FOLDER_TESTS = frozenset({
+    "EICAR", "XXESSRF", "XXEEXP", "ZIPBOMB",
 })
 
 
@@ -283,7 +292,8 @@ def imap_test_help(codes: list[str]):
         if code in _IMAP_FOLDER_TESTS and not any(
             len(row) > 1 and row[1] == "--mailbox" for row in mods
         ):
-            mods.insert(0, list(_IMAP_FOLDER_OPT))
+            opt = _IMAP_FOLDER_APPEND_OPT if code in _IMAP_CONTENT_FOLDER_TESTS else _IMAP_FOLDER_OPT
+            mods.insert(0, list(opt))
         has_opts = bool(mods or spec.get("requires"))
         usage = f"ptsrvtester imap -ts {code} " + ("<options> -tg <target>" if has_opts else "-tg <target>")
         blocks.append({"description": desc})

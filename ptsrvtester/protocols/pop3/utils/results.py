@@ -87,6 +87,11 @@ def conn_limit_count_verdict(
     threshold: int = CONN_LIMIT_CONN_IP_THRESHOLD,
 ) -> tuple[str, str]:
     """Console category + text for the concurrent-session limit check."""
+    if connected <= 0:
+        return (
+            "WARNING",
+            "Could not open any connection. Connection limit was not tested.",
+        )
     if max_attempts <= threshold and connected >= max_attempts:
         return (
             "WARNING",

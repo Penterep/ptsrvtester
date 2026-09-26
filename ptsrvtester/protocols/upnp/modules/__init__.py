@@ -1,0 +1,1 @@
+"""UPnP/SSDP test adapters."""

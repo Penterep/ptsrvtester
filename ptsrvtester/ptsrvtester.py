@@ -48,6 +48,7 @@ MODULES: dict[str, tuple[str, str]] = {
     "smb":   ("ptsrvtester.protocols.smb:SMB",     "SMB testing module"),
     "rsync": ("ptsrvtester.protocols.rsync:Rsync", "Rsync testing module"),
     "ntp":   ("ptsrvtester.protocols.ntp:NTP",     "NTP testing module"),
+    "upnp":  ("ptsrvtester.protocols.upnp:UPnP",   "UPnP/SSDP testing module"),
 }
 
 
@@ -231,7 +232,8 @@ def parse_args() -> BaseArgs:
     module_args.add_subparser(module, subparsers)
     subparsers.choices[module].add_argument("-j", "--json", action="store_true", default=argparse.SUPPRESS, help="use Penterep JSON output format")
     subparsers.choices[module].add_argument("-vv", "--verbose", action="store_true", dest="debug", default=argparse.SUPPRESS, help="Enable verbose mode")
-    add_shared_rate_limit_args(subparsers.choices[module])
+    if module != "upnp":  # SSDP uses UDP; the shared RATELIMIT probe uses TCP.
+        add_shared_rate_limit_args(subparsers.choices[module])
 
     _LAST_ERROR["message"] = None
     try:

@@ -44,6 +44,7 @@ ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.10 -u auditor -pw secret
 ptsrvtester msrpc -ts SAMRGROUPS -tg 192.168.1.10 -u auditor -pw secret
 ptsrvtester msrpc -ts SAMRUSERINFO -tg 192.168.1.10 -u auditor -pw secret --samr-user alice
 ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.10 --pipe svcctl -u auditor -pw secret
+ptsrvtester upnp -ts ALL -tg 192.168.1.1
 ptsrvtester <module> -h     for help for module use
 ```
 
@@ -64,6 +65,7 @@ ptsrvtester <module> -h     for help for module use
                          dhcp   DHCP testing module
                          xrdp   XRDP testing module
                          rdp    RDP testing module
+                         upnp   UPnP/SSDP testing module
 
    -v        --version          Show script version and exit
    -h        --help             Show this help message and exit
@@ -105,6 +107,10 @@ ptsrvtester <module> -h     for help for module use
 - SAM user, group and membership enumeration
 - User account details and logon statistics
 - Named-pipe, SMB, RPC/TCP and RPC-over-HTTP credential testing
+
+**UPnP/SSDP Module**
+- Targeted IPv4 SSDP discovery
+- UPnP device and service description retrieval
 
 **FTP Module**
 - Banner and Service Identification

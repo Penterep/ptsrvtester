@@ -42,8 +42,8 @@ __MODULECODE__ = "INFO"
 __ORDER__ = 10
 
 from datetime import datetime, timezone, timedelta
-from ..ntp_utils.ntp_classes import NTPResults
-from ..ntp_utils.connection import gather_info
+from ptsrvtester.protocols.ntp.ntp_utils.ntp_classes import NTPResults
+from ptsrvtester.protocols.ntp.ntp_utils.connection import gather_info
 
 _NTP_EPOCH = datetime(1900, 1, 1, tzinfo=timezone.utc)
 

@@ -34,6 +34,7 @@ def gather_info(ip: str, port: int) -> NTPResults:
     # -------------- nmap test to gather more info (mode 6) --------------
 
     fullver, processor, system_os = "", "", ""
+    nmap_worked = False
     nm = nmap.PortScanner()
     # first nmap scan sometimes fails, maybe not necessary but seems to help
     for _ in range(2):
@@ -63,7 +64,10 @@ def gather_info(ip: str, port: int) -> NTPResults:
     
     results.kod_sent = ntp.leap == 3 and ntp.stratum == 0
     results.version = fullver if fullver != "" else ntp.version
-    results.hostname = nm[ip].hostname() if nm[ip].hostname() != "" else "Unknown"
+    if nmap_worked:
+        results.hostname = nm[ip].hostname() if nm[ip].hostname() != "" else "Unknown"
+    else:
+        results.hostname = "Unknown"
     results.processor = processor
     results.system_os = system_os
     results.mode = ntp.mode

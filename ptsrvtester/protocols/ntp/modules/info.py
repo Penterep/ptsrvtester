@@ -41,12 +41,7 @@ __MODULELABEL__ = "Information about server"
 __MODULECODE__ = "INFO"
 __ORDER__ = 10
 
-import socket
-import nmap
-from scapy.layers.ntp import NTP
 from datetime import datetime, timezone, timedelta
-from _common import eng
-
 from ..ntp_utils.ntp_classes import NTPResults
 from ..ntp_utils.connection import gather_info
 

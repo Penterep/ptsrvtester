@@ -64,10 +64,14 @@ def run(ctx):
     }
     
     ip, port = ctx.target
-    results = NTPResults()
-    results = gather_info(ip, port)
-    if results.error:
-        ctx.out(f"An error occured while trying to connect to server: {results.error_info}", "ERROR", indent=4)
+    if not ctx.results.has_ran:
+        gather_info(ip, port, ctx.results)
+        results = ctx.results
+        if results.error:
+            ctx.out(f"An error occured while trying to connect to server: {results.error_info}", "ERROR", indent=4)
+        ctx.results = results
+    else:
+        results = ctx.results
 
     ctx.out(f"IP:                   {ip}", "INFO", indent=4)
     ctx.out(f"Port:                 {port}", "INFO", indent=4)
@@ -114,35 +118,3 @@ def run(ctx):
     ctx.out(f"Reference timestamp:  {_ntp_to_utc(results.ref_time)}", "INFO", indent=4)
     ctx.out(f"Transmit timestamp:   {_ntp_to_utc(results.transmit_time)}", "INFO", indent=4)
 
-
-    # ------- Vulnerabilites (will put into another module once problems are figured out) -------
-    
-    ctx.out(f"Possible vulnerabilities (temporarily in info)", "INFO", indent=0)
-    
-    # only 4.2.8p15 - CVE-2023-26551 to CVE-2023-26555 (DoS through errors in code)
-    # from 0.3.0 to 0.3.2 - CVE-2023-33192 (DoS through crafted cookies)
-    # up to (excluding) 4.2.7p26 - CVE-2013-5211 (traffic amplification through monolist)
-    # TODO: check monolist availability
-    
-    if not results.accepts_mode_6:
-        if not isinstance(results.version, int):
-            raise TypeError
-        elif results.version < 4:
-            ctx.out(f"CVE-2013-5211", "VULN", indent=4)
-        return
-    
-    if not isinstance(results.version, str):
-        raise TypeError
-    
-    parsed_ver = tuple(int(x) for x in results.version.replace("p", ".").split("."))
-    error_DoS_ver = (4, 2, 8, 15)
-    cookies_DoS_ver_min = (0, 3, 0)
-    cookies_DoS_ver_max = (0, 3, 2)
-    monolist_ver = (4, 2, 7, 26)
-    
-    if parsed_ver == error_DoS_ver:
-        ctx.out(f"from CVE-2023-26551 to CVE-2023-26555", "VULN", indent=4)
-    if cookies_DoS_ver_min <= parsed_ver <= cookies_DoS_ver_max:
-        ctx.out(f"CVE-2023-33192", "VULN", indent=4)
-    if parsed_ver < monolist_ver:
-        ctx.out(f"CVE-2013-5211", "VULN", indent=4)

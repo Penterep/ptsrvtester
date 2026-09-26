@@ -17,6 +17,7 @@ import socket
 
 from .._base import BaseMain, BaseArgs
 from .ntp_utils.cli import NTPArgs
+from .ntp_utils.ntp_classes import NTPResults
 
 
 class NTP(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
@@ -58,4 +59,5 @@ class NTP(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
             "host": self.target_host,
             "ip": self.target[0],
             "port": self.target[1],
+            "results": NTPResults(),
         }

@@ -10,9 +10,9 @@ from .ntp_classes import NTPResults
 # TODO: add IPv6 support
 # TODO: add nmap scan to determine if port+ip combo resolve to NTP
 
-def gather_info(ip: str, port: int) -> NTPResults:
+def gather_info(ip: str, port: int, results: NTPResults) -> None:
+    results.has_ran = True
     data = None
-    results = NTPResults()
     
     # ----------------- First test using regular mode 3 -----------------
     

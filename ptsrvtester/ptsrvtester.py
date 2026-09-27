@@ -47,6 +47,7 @@ MODULES: dict[str, tuple[str, str]] = {
     "rdp":   ("ptsrvtester.protocols.rdp:RDP",     "RDP testing module"),
     "smb":   ("ptsrvtester.protocols.smb:SMB",     "SMB testing module"),
     "rsync": ("ptsrvtester.protocols.rsync:Rsync", "Rsync testing module"),
+    "ntp":   ("ptsrvtester.protocols.ntp:NTP",     "NTP testing module"),
 }
 
 

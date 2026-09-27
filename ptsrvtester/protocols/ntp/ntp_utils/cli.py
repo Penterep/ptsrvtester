@@ -1,21 +1,20 @@
 import argparse
 from ptsrvtester.protocols._base import BaseArgs
 
-from .helpers import Target, valid_target_smb
+from .helpers import Target, valid_target_ntp
 
 
-class SMBArgs(BaseArgs):
+class NTPArgs(BaseArgs):
     target: Target
 
     @staticmethod
     def get_help():
         return [
-            {"description": ["SMB Testing Module"]},
-            {"usage": ["ptsrvtesNTPArgster smb <IP:PORT> <command> <options>"]},
+            {"description": ["NTP Testing Module"]},
+            {"usage": ["ptsrvtester ntp <IP:PORT> <command> <options>"]},
             {"usage_example": [
-                "ptsrvtester smb 192.168.1.1 -ts info,dialects",
-                "ptsrvtester smb localhost:1234 -ts encryption"
-                "ptsrvtester smb -h",
+                "ptsrvtester ntp 192.168.1.1 -ts info",
+                "ptsrvtester ntp -h",
             ]},
             {"options": [
                 ["-h", "--help", "", "Prints this menu"],
@@ -24,8 +23,8 @@ class SMBArgs(BaseArgs):
         ]
 
     def add_subparser(self, name: str, subparsers) -> None:
-        examples = """ptsrvtester smb 192.168.1.1 -ts info
-ptsrvtester smb -h"""
+        examples = """ptsrvtester ntp 192.168.1.1 -ts info
+ptsrvtester ntp -h"""
         parser = subparsers.add_parser(
             name,
             epilog=examples,
@@ -38,8 +37,8 @@ ptsrvtester smb -h"""
         
         parser.add_argument(
             "target",
-            type=valid_target_smb,
-            help="""IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 445 is default""",
+            type=valid_target_ntp,
+            help="""IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 123 is default""",
         )
         
         tests = parser.add_argument_group(
@@ -49,5 +48,5 @@ ptsrvtester smb -h"""
         
         tests.add_argument(
             "-ts", "--tests", type=str, default=None, metavar="<test>", dest="tests",
-            help="Comma-separated test codes (e.g. info,dialects) or ALL. Options: info, dialects, encryption",
+            help="Comma-separated test codes (e.g. info,template) or ALL. Options: info",
         )

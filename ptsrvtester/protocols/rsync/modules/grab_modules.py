@@ -13,7 +13,6 @@ class RsyncEntry:
     size: int
     mtime: str
     name: str
-    writable: bool
     symlink_target: str | None = None
     
 @dataclass

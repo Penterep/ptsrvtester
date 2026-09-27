@@ -15,12 +15,38 @@ from ptsrvtester.protocols.dhcp.utils.registry import (
 )
 
 from scapy.sendrecv import AsyncSniffer
-from scapy.layers.inet import UDP
+from scapy.layers.inet import UDP, IP
+from scapy.layers.l2 import Ether
+from scapy.all import PacketList
 
 
 __MODULELABEL__ = "DHCP server information enumeration"
 __MODULECODE__ = "server_info"
 __ORDER__ = 100
+
+
+def _check_broadcast(res: PacketList) -> str:
+    if res is None or len(res) == 0:
+        return ""
+    
+    for pkt in res:
+        if pkt.haslayer(BOOTP) and pkt[BOOTP].op == 2  and \
+            pkt.haslayer(DHCP) and _is_packet_broadcast(pkt) == "UNICAST":
+            return pkt[Ether].dst
+
+    return ""
+
+def _is_packet_broadcast(pkt) -> str:
+    if pkt.haslayer(BOOTP) and pkt[BOOTP].op == 2:
+        eth_dst = pkt[Ether].dst
+        ip_dst = pkt[IP].dst
+        if eth_dst == "ff:ff:ff:ff:ff:ff":
+            return "BROADCAST"
+        else:
+            return "UNICAST"
+    
+    return ""
+        
 
 
 def _is_relay(offered_ip: str|None, server_ip: str, subnet_mask: str|None):
@@ -73,7 +99,7 @@ def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
         ctx.out(f"Error sending DHCP discover to server on a different subnet: {e}", "ERROR", indent=12)
 
 
-def _get_server_info(ctx, src_mac: str):
+def _get_server_info(ctx, src_mac: str, broadcast=False):
     """Retrieve DHCP server information"""
 
     transaction_id = ctx.xid or random_xid()
@@ -84,15 +110,17 @@ def _get_server_info(ctx, src_mac: str):
             if packet.haslayer(DHCP):
                 offered_ip = packet[BOOTP].yiaddr if packet.haslayer(BOOTP) else None
                 options = packet[DHCP].options
-                ctx.out("DHCP Server Information", "VULN", indent=8)
+                delivery_method = _is_packet_broadcast(packet)
+                options.insert(1, ("delivery_method", delivery_method))
+                ctx.out(f"DHCP offer received DHCP Server Information:", "VULN", indent=8)
                 print_dhcp_options(ctx, options, 8)
-
-                if server_ip := get_option(options, "server_id"):
+                
+                if server_ip := get_option(options, "server_id"):   # Check if the server is a relay
                     if _is_relay(offered_ip, server_ip, get_option(options, "subnet_mask")):
                         ctx.out(f"DHCP relay detected", "INFO", indent=16)
                         _contact_server(ctx, src_mac, get_option(options, "router"),
                                         get_option(options, "server_id"), transaction_id)
-
+                
                 return True
 
             return False
@@ -108,13 +136,15 @@ def _get_server_info(ctx, src_mac: str):
         sniffer.start()
         time.sleep(0.05)
 
-        sendp(prepare_discover_packet(src_mac, transaction_id), ctx.interface, verbose=False)
+        sendp(prepare_discover_packet(src_mac, transaction_id, broadcast=broadcast), ctx.interface, verbose=False)
 
         sniffer.join()
         res = sniffer.results
 
         if res is None or len(res) == 0:
             ctx.out("No DHCP server information accessible", "OK", indent=8)
+        return res
+
     except Exception as e:
         ctx.out(f"Error retrieving DHCP information: {str(e)}", "ERROR", indent=8)
 
@@ -124,7 +154,11 @@ def run(ctx):
     real_iface_mac = get_interface_mac(ctx.interface)
 
     ctx.out(f"Trying to contact DHCP server using the real MAC address", "INFO", indent=4)
-    _get_server_info(ctx, real_iface_mac)
+    res = _get_server_info(ctx, real_iface_mac)
 
     ctx.out(f"Trying to contact DHCP server using the fake/provided MAC address", "INFO", indent=4)
-    _get_server_info(ctx, fake_mac)
+    res.append(_get_server_info(ctx, fake_mac))
+    
+    if mac := _check_broadcast(res):
+        ctx.out(f"Trying to contact DHCP server using the fake/provided MAC address and broadcast flag set", "INFO", indent=4)
+        _get_server_info(ctx, mac, True)

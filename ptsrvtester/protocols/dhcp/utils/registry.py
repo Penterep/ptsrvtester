@@ -8,7 +8,7 @@ import netifaces as ni
 # DHCP dependencies
 try:
     from dhcppython.utils import random_mac
-    from scapy.layers.dhcp import BOOTP, DHCP
+    from scapy.layers.dhcp import BOOTP, DHCP, DHCPOptions
     from scapy.layers.l2 import Ether, arping, ARPingResult
     from scapy.layers.inet import IP, UDP
     from scapy.sendrecv import sendp, sniff
@@ -109,9 +109,9 @@ def prepare_bootp(src_mac, dst_mac, sport, dport, src_ip, dst_ip, transaction_id
     return eth / ip / udp / bootp
 
 
-def prepare_discover_packet(src_mac, transaction_id):
+def prepare_discover_packet(src_mac, transaction_id, broadcast=False):
     dhcp = DHCP(options=[("message-type", "discover"), "end"])
-    return prepare_bootp(src_mac, MAC_BROADCAST, 68, 67, "0.0.0.0", IP_BROADCAST, transaction_id) / dhcp
+    return prepare_bootp(src_mac, MAC_BROADCAST, 68, 67, "0.0.0.0", IP_BROADCAST, transaction_id, broadcast) / dhcp
 
 def prepare_discover_packet_unicast(src_mac, dst_mac, src_ip, dst_ip, transaction_id):
     dhcp = DHCP(options=[("message-type", "discover"), "end"])
@@ -199,7 +199,9 @@ def print_dhcp_options(ctx, options, base_indent) -> None:
         if key == "lease_time" and check_lease(value_str):
             b_type = "WARN"
 
-        ctx.out(f"{key + ':':<24}{value_str}", b_type, indent=base_indent+4)
+        option_num = get_option_number(key)
+        numbered_key = f"{key} ({option_num})" if option_num else key
+        ctx.out(f"{numbered_key + ':':<24}{value_str}", b_type, indent=base_indent+4)
 
 
 def get_option(options: list|None, search_term: str) -> str|None:
@@ -212,5 +214,12 @@ def get_option(options: list|None, search_term: str) -> str|None:
             key, value = o
             if key == search_term:
                 return value
+
+    return None
+
+def get_option_number(option: str) -> int | None:
+    for number, option_field in DHCPOptions.items():
+        if getattr(option_field, "name", option_field) == option:
+            return number
 
     return None

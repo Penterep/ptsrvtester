@@ -65,6 +65,8 @@ def is_valid_mac_address(mac_a: str) -> str:
 def get_interface_ip(interface: str) -> str:
     return ni.ifaddresses(interface)[ni.AF_INET][0]['addr']
 
+def get_interface_mac(interface: str) -> str:
+    return ni.ifaddresses(interface)[ni.AF_LINK][0]['addr']
 
 def is_valid_xid(xid: str) -> int:
     try:
@@ -96,11 +98,14 @@ def random_xid():
     return random.randint(0, 2**32-1)
 
 
-def prepare_bootp(src_mac, dst_mac, sport, dport, src_ip, dst_ip, transaction_id):
+def prepare_bootp(src_mac, dst_mac, sport, dport, src_ip, dst_ip, transaction_id, broadcast=False):
     eth = Ether(src=src_mac, dst=dst_mac, type=IPv4_TYPE)
     ip = IP(src=src_ip, dst=dst_ip)
     udp = UDP(sport=sport, dport=dport)
-    bootp = BOOTP(chaddr=bytes.fromhex(mac_remove_colons(src_mac)), xid=transaction_id)
+    if broadcast:
+        bootp = BOOTP(chaddr=bytes.fromhex(mac_remove_colons(src_mac)), xid=transaction_id, flags=0x8000)
+    else:
+        bootp = BOOTP(chaddr=bytes.fromhex(mac_remove_colons(src_mac)), xid=transaction_id)
     return eth / ip / udp / bootp
 
 

@@ -9,6 +9,7 @@ from ptsrvtester.protocols.dhcp.utils.registry import (
     prepare_discover_packet_unicast,
     get_gateway_mac,
     get_interface_ip,
+    get_interface_mac,
     print_dhcp_options,
     get_option
 )
@@ -38,7 +39,7 @@ def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
     offer_filter = "udp and src port 67"
 
     if gw_mac is None:
-        ctx.out(f"Failed fetching MAC address of gateway", "ERROR", indent=16)
+        ctx.out(f"Failed fetching MAC address of gateway", "ERROR", indent=20)
         return
     try:
         def is_offer_packet(packet):
@@ -66,15 +67,15 @@ def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
         res = sniffer.results
 
         if res is None or len(res) == 0:
-            ctx.out("Could not contact the DHCP server", "OK", indent=16)
+            ctx.out("Could not contact the DHCP server", "OK", indent=20)
 
     except Exception as e:
-        ctx.out(f"Error sending DHCP discover to server on a different subnet: {e}", "ERROR", indent=8)
+        ctx.out(f"Error sending DHCP discover to server on a different subnet: {e}", "ERROR", indent=12)
 
 
-def _get_server_info(ctx):
+def _get_server_info(ctx, src_mac: str):
     """Retrieve DHCP server information"""
-    src_mac = ctx.mac or random_mac()
+
     transaction_id = ctx.xid or random_xid()
     offer_filter = f"udp and src port 67 and (ether dst ff:ff:ff:ff:ff:ff or ether dst {src_mac})"
 
@@ -83,12 +84,12 @@ def _get_server_info(ctx):
             if packet.haslayer(DHCP):
                 offered_ip = packet[BOOTP].yiaddr if packet.haslayer(BOOTP) else None
                 options = packet[DHCP].options
-                ctx.out("DHCP Server Information", "VULN", indent=4)
-                print_dhcp_options(ctx, options, 4)
+                ctx.out("DHCP Server Information", "VULN", indent=8)
+                print_dhcp_options(ctx, options, 8)
 
                 if server_ip := get_option(options, "server_id"):
                     if _is_relay(offered_ip, server_ip, get_option(options, "subnet_mask")):
-                        ctx.out(f"DHCP relay detected", "INFO", indent=12)
+                        ctx.out(f"DHCP relay detected", "INFO", indent=16)
                         _contact_server(ctx, src_mac, get_option(options, "router"),
                                         get_option(options, "server_id"), transaction_id)
 
@@ -113,10 +114,17 @@ def _get_server_info(ctx):
         res = sniffer.results
 
         if res is None or len(res) == 0:
-            ctx.out("No DHCP server information accessible", "OK", indent=4)
+            ctx.out("No DHCP server information accessible", "OK", indent=8)
     except Exception as e:
-        ctx.out(f"Error retrieving DHCP information: {str(e)}", "ERROR", indent=4)
+        ctx.out(f"Error retrieving DHCP information: {str(e)}", "ERROR", indent=8)
 
 
 def run(ctx):
-    _get_server_info(ctx)
+    fake_mac = ctx.mac or random_mac()
+    real_iface_mac = get_interface_mac(ctx.interface)
+
+    ctx.out(f"Trying to contact DHCP server using the real MAC address", "INFO", indent=4)
+    _get_server_info(ctx, real_iface_mac)
+
+    ctx.out(f"Trying to contact DHCP server using the fake/provided MAC address", "INFO", indent=4)
+    _get_server_info(ctx, fake_mac)

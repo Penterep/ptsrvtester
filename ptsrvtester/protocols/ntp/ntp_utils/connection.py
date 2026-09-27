@@ -39,7 +39,7 @@ def sec_to_readable(seconds: float) -> str:
     return " ".join(parts) if parts else "0s"
 
 
-def get_ntp_time(server: str = "pool.ntp.org", port: int = 123, timeout: float = 5) -> float:
+def get_ntp_time(server: str = "pool.ntp.org", port: int = 123, timeout: float = 2) -> float:
     """Query a public NTP server and return the timestamp."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -53,11 +53,10 @@ def get_ntp_time(server: str = "pool.ntp.org", port: int = 123, timeout: float =
     finally:
         sock.close()
 
-
+# TODO: Add variable timeout, retry count, maybe sleep between retries?
 def gather_info(ip: str, port: int, results: NTPResults) -> None:
     results.has_ran = True
     data = None
-    
     
     # ------------------------------------------ First test using regular mode 3 ------------------------------------------
 
@@ -112,7 +111,7 @@ def gather_info(ip: str, port: int, results: NTPResults) -> None:
             pass
 
 
-    # --------------------------------------------- Data parsing into results ---------------------------------------------
+    # --------------------------------------------- Parsing data into results ---------------------------------------------
 
     ntp = NTP(data)
     

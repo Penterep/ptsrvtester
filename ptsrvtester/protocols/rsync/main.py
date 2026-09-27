@@ -91,6 +91,6 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
             "ip": self.target[0],
             "port": self.target[1],
             "timeout": getattr(self.args, "timeout", None),
-            "modules": modules,
+            "modules": getattr(self.args, "modules", None) or modules,
             "rsync_path": check_rsync_path()
         }

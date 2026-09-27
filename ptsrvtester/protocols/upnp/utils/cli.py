@@ -18,7 +18,7 @@ class Target:
 
 
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-_TESTS = frozenset({"DISCOVER", "DESCRIBE"})
+_TESTS = frozenset({"DISCOVER", "DESCRIBE", "IGDINFO", "SCPD", "PORTMAPS"})
 
 
 def valid_target(value: str) -> Target:
@@ -54,7 +54,7 @@ def valid_tests(value: str) -> str:
     if invalid or not codes:
         raise argparse.ArgumentTypeError(
             f"unknown UPnP test(s): {', '.join(invalid) if invalid else value}; "
-            "choose from ALL, DISCOVER, DESCRIBE"
+            "choose from ALL, DISCOVER, DESCRIBE, IGDINFO, SCPD, PORTMAPS"
         )
     return ",".join(dict.fromkeys(codes))
 
@@ -92,32 +92,57 @@ def _search_target(value: str) -> str:
     return value
 
 
+def _interface_ip(value: str) -> str:
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        raise argparse.ArgumentTypeError("--interface-ip must be a local unicast IPv4 address") from None
+    if address.is_multicast or address.is_unspecified or str(address) == "255.255.255.255":
+        raise argparse.ArgumentTypeError("--interface-ip must be a local unicast IPv4 address")
+    return str(address)
+
+
 class UPnPArgs(BaseArgs):
     target: Target
     tests: str | None
     timeout_seconds: float
     search_target: str
+    multicast: bool
+    interface_ip: str | None
+    mx: int
+    ttl: int
     max_responses: int
     max_description_bytes: int
+    max_scpd: int
+    max_mappings: int
     output: str | None
 
     @staticmethod
     def get_help():
         return [
             {"description": ["UPnP/SSDP Testing Module"]},
-            {"usage": ["ptsrvtester upnp -tg <host> [-ts DISCOVER,DESCRIBE] <options>"]},
+            {"usage": ["ptsrvtester upnp -tg <host> [-ts DISCOVER,DESCRIBE,IGDINFO,SCPD,PORTMAPS] <options>"]},
             {"usage_example": [
                 "ptsrvtester upnp -tg 192.168.1.1",
                 "ptsrvtester upnp -ts DISCOVER -tg 192.168.1.1 --search-target upnp:rootdevice",
+                "ptsrvtester upnp -ts DISCOVER -tg 192.168.1.1 --multicast --interface-ip 192.168.1.10",
                 "ptsrvtester upnp -ts DESCRIBE -tg router.example.test -j",
+                "ptsrvtester upnp -ts SCPD -tg 192.168.1.1 --max-scpd 20",
+                "ptsrvtester upnp -ts PORTMAPS -tg 192.168.1.1 --max-mappings 100",
             ]},
             {"options": [
                 ["-tg", "--target", "<host>", "IPv4 address or hostname[:UDP port]; default port 1900"],
-                ["-ts", "--tests", "<test>", "DISCOVER, DESCRIBE, ALL; default is both"],
+                ["-ts", "--tests", "<test>", "DISCOVER, DESCRIBE, IGDINFO, SCPD, PORTMAPS, ALL; default excludes SCPD and PORTMAPS"],
                 ["", "--timeout-seconds", "<seconds>", "UDP/HTTP timeout (default 3; range 0.1-60; DNS uses system timeout)"],
                 ["", "--search-target", "<ST>", "SSDP search target (default ssdp:all)"],
+                ["", "--multicast", "", "Send SSDP M-SEARCH to 239.255.255.250:1900; keep results scoped to -tg"],
+                ["-i", "--interface-ip", "<IPv4>", "Local IPv4 address for multicast; requires --multicast"],
+                ["", "--mx", "<seconds>", "Multicast response delay, 1-5 seconds (default 2)"],
+                ["", "--ttl", "<hops>", "Multicast IPv4 TTL, 1-255 (default 2)"],
                 ["", "--max-responses", "<n>", "Maximum SSDP responses (default 100)"],
                 ["", "--max-description-bytes", "<n>", "Maximum bytes per description (default 1048576; 50 URLs/32 MiB per run)"],
+                ["", "--max-scpd", "<n>", "Maximum service descriptions to fetch (default 20; range 1-100)"],
+                ["", "--max-mappings", "<n>", "Global PORTMAPS entry limit (default 100; range 1-1000)"],
                 ["-o", "--output", "<file>", "Save results"],
                 ["-j", "--json", "", "JSON output"],
                 ["-vv", "--verbose", "", "Verbose output"],
@@ -133,6 +158,10 @@ class UPnPArgs(BaseArgs):
         parser.add_argument("-ts", "--tests", type=valid_tests, default=None, metavar="<test>")
         parser.add_argument("--timeout-seconds", type=_timeout, default=3.0)
         parser.add_argument("--search-target", type=_search_target, default="ssdp:all")
+        parser.add_argument("--multicast", action="store_true", default=False)
+        parser.add_argument("-i", "--interface-ip", type=_interface_ip, default=None)
+        parser.add_argument("--mx", type=_bounded_int("--mx", 1, 5), default=2)
+        parser.add_argument("--ttl", type=_bounded_int("--ttl", 1, 255), default=2)
         parser.add_argument(
             "--max-responses", type=_bounded_int("--max-responses", 1, 1000), default=100
         )
@@ -140,6 +169,10 @@ class UPnPArgs(BaseArgs):
             "--max-description-bytes",
             type=_bounded_int("--max-description-bytes", 1, 16 * 1024 * 1024),
             default=1024 * 1024,
+        )
+        parser.add_argument("--max-scpd", type=_bounded_int("--max-scpd", 1, 100), default=20)
+        parser.add_argument(
+            "--max-mappings", type=_bounded_int("--max-mappings", 1, 1000), default=100
         )
         parser.add_argument("-o", "--output", default=None)
 

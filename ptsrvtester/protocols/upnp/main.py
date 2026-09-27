@@ -31,6 +31,14 @@ class UPnP(BaseMain):
 
     def _prepare_target(self) -> None:
         target = self.args.target
+        multicast = bool(self.args.multicast)
+        interface_ip = self.args.interface_ip
+        if multicast and not interface_ip:
+            raise argparse.ArgumentError(None, "--multicast requires --interface-ip")
+        if interface_ip and not multicast:
+            raise argparse.ArgumentError(None, "--interface-ip requires --multicast")
+        if multicast and target.port not in (0, 1900):
+            raise argparse.ArgumentError(None, "multicast SSDP uses UDP port 1900")
         if target.port == 0:
             target.port = 1900
         self.target_host = target.ip
@@ -62,11 +70,20 @@ class UPnP(BaseMain):
     def _select_codes(self, discovered) -> list[str]:
         raw = getattr(self.args, "tests", None)
         requested = raw.split(",") if raw else ["ALL"]
-        if "ALL" in requested or "DESCRIBE" in requested:
-            # DESCRIBE needs discovery evidence; always run the two in order.
-            selected = ["DISCOVER", "DESCRIBE"]
-        else:
-            selected = ["DISCOVER"]
+        run_default = "ALL" in requested
+        needs_description = run_default or any(
+            code in requested for code in ("DESCRIBE", "IGDINFO", "SCPD", "PORTMAPS")
+        )
+        selected = ["DISCOVER"]
+        if needs_description:
+            selected.append("DESCRIBE")
+        if run_default or "IGDINFO" in requested:
+            selected.append("IGDINFO")
+        if "SCPD" in requested:
+            selected.append("SCPD")
+        # Enumerating mappings may be expensive, so ALL does not imply PORTMAPS.
+        if "PORTMAPS" in requested:
+            selected.append("PORTMAPS")
         missing = [code for code in selected if code not in discovered]
         if missing:
             raise argparse.ArgumentError(

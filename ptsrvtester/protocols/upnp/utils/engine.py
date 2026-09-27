@@ -12,6 +12,16 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urljoin, urlsplit
 from xml.parsers import expat
 
+from .igd import (
+    MAX_SOAP_BYTES,
+    SUPPORTED_SERVICE_TYPES,
+    SoapFault,
+    build_soap_request,
+    parse_soap_response,
+)
+from .multicast import MULTICAST_ADDRESS, MULTICAST_PORT, build_multicast_msearch
+from .scpd import parse_service_description
+
 MAX_DATAGRAM_BYTES = 8192
 MAX_XML_ELEMENTS = 5000
 MAX_XML_NESTING = 64
@@ -19,11 +29,39 @@ MAX_DEVICE_DEPTH = 16
 MAX_LOCATION_LENGTH = 2048
 MAX_DESCRIPTION_FETCHES = 50
 MAX_TOTAL_DESCRIPTION_BYTES = 32 * 1024 * 1024
+MAX_IGD_SERVICES = 5
+MAX_IGD_SERVICE_CANDIDATES = 20
+MAX_TOTAL_SOAP_BYTES = 32 * 1024 * 1024
+MAX_MULTICAST_DATAGRAMS = 20_000
+MAX_SCPD_SERVICE_CANDIDATES = 100
+MAX_SCPD_BYTES = 256 * 1024
+MAX_TOTAL_SCPD_BYTES = 8 * 1024 * 1024
+IGD_INFO_ACTIONS = (
+    "GetStatusInfo", "GetNATRSIPStatus", "GetExternalIPAddress",
+)
 _MAX_AGE = re.compile(r"(?:^|,)\s*max-age\s*=\s*(\d+)\s*(?:,|$)", re.IGNORECASE)
 
 
 class OutOfScopeLocation(ValueError):
     """A device description URL is outside the selected target."""
+
+
+class HttpAccessDenied(Exception):
+    def __init__(self, status: int):
+        self.status = status
+        super().__init__(f"HTTP {status} access denied")
+
+
+class SoapBudgetExceeded(Exception):
+    """The shared response budget for read-only IGD requests has been reached."""
+
+
+class ResponseSizeExceeded(ValueError):
+    """A bounded HTTP read exceeded its cap; retain bytes read for accounting."""
+
+    def __init__(self, read_bytes: int = 0):
+        self.read_bytes = read_bytes
+        super().__init__("HTTP response exceeds size limit")
 
 
 def build_msearch(search_target: str, host: str, port: int) -> bytes:
@@ -292,6 +330,19 @@ class UpnpEngine:
         self.discovery_truncated = False
         self.description_truncated = False
         self.description_bytes = 0
+        self.scpd_results: list[dict] = []
+        self.scpd_status = "not_run"
+        self.scpd_truncated = False
+        self.scpd_bytes = 0
+        self.scpd_fetches = 0
+        self.igd_results: list[dict] = []
+        self.port_mapping_results: list[dict] = []
+        self.igd_status = "not_run"
+        self.port_mapping_status = "not_run"
+        self.igd_truncated = False
+        self.port_mapping_truncated = False
+        self.soap_bytes = 0
+        self.soap_budget_exhausted = False
 
     def _error(self, test: str, error: Exception | str, **details) -> None:
         self.module_errors.append({"test": test, "error": str(error)[:300], **details})
@@ -299,17 +350,34 @@ class UpnpEngine:
     def discover(self) -> list[dict]:
         if self.discovery_status != "not_run":
             return self.discoveries
-        payload = build_msearch(self.args.search_target, self.target_ip, self.port)
+        multicast = bool(getattr(self.args, "multicast", False))
+        if multicast:
+            payload = build_multicast_msearch(self.args.search_target, self.args.mx)
+            destination = (MULTICAST_ADDRESS, MULTICAST_PORT)
+            interface_ip = self.args.interface_ip
+        else:
+            payload = build_msearch(self.args.search_target, self.target_ip, self.port)
+            destination = (self.target_ip, self.port)
+            interface_ip = "0.0.0.0"
         seen: set[tuple] = set()
         received = 0
         max_responses = int(self.args.max_responses)
+        receive_limit = MAX_MULTICAST_DATAGRAMS if multicast else max_responses * 4
         timeout = float(self.args.timeout_seconds)
+        if multicast:
+            timeout = max(timeout, float(self.args.mx))
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.bind(("0.0.0.0", 0))
-                sock.sendto(payload, (self.target_ip, self.port))
+                sock.bind((interface_ip, 0))
+                if multicast:
+                    sock.setsockopt(
+                        socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                        socket.inet_aton(interface_ip),
+                    )
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, self.args.ttl)
+                sock.sendto(payload, destination)
                 deadline = time.monotonic() + timeout
-                while len(self.discoveries) < max_responses and received < max_responses * 4:
+                while len(self.discoveries) < max_responses and received < receive_limit:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
@@ -319,6 +387,8 @@ class UpnpEngine:
                     except TimeoutError:
                         break
                     received += 1
+                    if multicast and source[0] != self.target_ip:
+                        continue
                     response = parse_ssdp_response(packet, source)
                     if response["sourceIp"] != self.target_ip:
                         response["validationErrors"].append("unexpected_source")
@@ -335,7 +405,7 @@ class UpnpEngine:
                         seen.add(key)
                         self.discoveries.append(response)
                 self.discovery_truncated = (
-                    len(self.discoveries) >= max_responses or received >= max_responses * 4
+                    len(self.discoveries) >= max_responses or received >= receive_limit
                 )
         except OSError as exc:
             self._error("DISCOVER", exc)
@@ -395,8 +465,17 @@ class UpnpEngine:
                 raise
             raise OutOfScopeLocation(f"invalid LOCATION: {exc}") from exc
 
-    def _fetch_description(self, location: str) -> bytes:
-        scheme, host, port, path, authority = self._description_url(location)
+    def _request_target(
+        self,
+        url: str,
+        method: str,
+        *,
+        headers: dict[str, str],
+        max_bytes: int,
+        body: bytes | None = None,
+    ) -> tuple[int, bytes]:
+        """Issue one bounded HTTP request pinned to the selected device IP."""
+        scheme, host, port, path, authority = self._description_url(url)
         timeout = float(self.args.timeout_seconds)
         if scheme == "https":
             connection = _PinnedHTTPSConnection(host, self.target_ip, port, timeout)
@@ -418,35 +497,52 @@ class UpnpEngine:
         deadline.daemon = True
         deadline.start()
         try:
+            request_headers = {"Host": authority, **headers}
             connection.request(
-                "GET", path,
-                headers={"Host": authority, "Accept": "text/xml, application/xml"},
+                method, path, body=body, headers=request_headers,
             )
             response = connection.getresponse()
-            if response.status != 200:
-                raise ValueError(f"description returned HTTP {response.status}")
             encoding = (response.getheader("Content-Encoding") or "identity").lower()
             if encoding != "identity":
                 raise ValueError(f"unsupported Content-Encoding: {encoding}")
-            limit = int(self.args.max_description_bytes)
             length = response.getheader("Content-Length")
             if length is not None:
                 try:
-                    if int(length) > limit:
-                        raise ValueError("device description exceeds size limit")
+                    declared_length = int(length)
                 except ValueError as exc:
-                    if "exceeds" in str(exc):
-                        raise
                     raise ValueError("invalid Content-Length") from exc
-            body = response.read(limit + 1)
+                if declared_length < 0:
+                    raise ValueError("invalid Content-Length")
+                if declared_length > max_bytes:
+                    raise ResponseSizeExceeded()
+            response_body = response.read(max_bytes + 1)
             if expired.is_set():
-                raise TimeoutError("device description request exceeded total timeout")
-            if len(body) > limit:
-                raise ValueError("device description exceeds size limit")
-            return body
+                raise TimeoutError("HTTP request exceeded total timeout")
+            if len(response_body) > max_bytes:
+                raise ResponseSizeExceeded(len(response_body))
+            return response.status, response_body
         finally:
             deadline.cancel()
             connection.close()
+
+    def _fetch_description(self, location: str) -> bytes:
+        remaining = MAX_TOTAL_DESCRIPTION_BYTES - self.description_bytes
+        if remaining <= 0:
+            raise ValueError("description byte budget reached")
+        try:
+            status, body = self._request_target(
+                location,
+                "GET",
+                headers={"Accept": "text/xml, application/xml"},
+                max_bytes=min(int(self.args.max_description_bytes), remaining),
+            )
+        except ResponseSizeExceeded as exc:
+            self.description_bytes += exc.read_bytes
+            raise
+        self.description_bytes += len(body)
+        if status != 200:
+            raise ValueError(f"description returned HTTP {status}")
+        return body
 
     def describe(self) -> list[dict]:
         if self.description_status != "not_run":
@@ -473,14 +569,13 @@ class UpnpEngine:
             try:
                 fetched += 1
                 xml_bytes = self._fetch_description(location)
-                if self.description_bytes + len(xml_bytes) > MAX_TOTAL_DESCRIPTION_BYTES:
+                if self.description_bytes > MAX_TOTAL_DESCRIPTION_BYTES:
                     item["status"] = "skipped"
                     item["error"] = "total_description_size_limit_reached"
                     self.description_truncated = True
                     self.devices.append(item)
                     continue
                 description = parse_device_description(xml_bytes, location)
-                self.description_bytes += len(xml_bytes)
                 item["description"] = description
                 item["status"] = "described"
                 known_udns = _all_udns(description["device"])
@@ -506,6 +601,363 @@ class UpnpEngine:
             self.description_status = "error" if self.module_errors else "partial"
         return self.devices
 
+    def _igd_services(self) -> list[dict]:
+        if self.description_status == "not_run":
+            self.describe()
+        found: list[dict] = []
+        seen: set[tuple] = set()
+        for item in self.devices:
+            if item["status"] != "described":
+                continue
+            pending = [item["description"]["device"]]
+            while pending:
+                device = pending.pop()
+                udn = device["udn"]
+                for service in device["services"]:
+                    service_type = service["serviceType"]
+                    if service_type not in SUPPORTED_SERVICE_TYPES:
+                        continue
+                    control_url = service["controlUrl"]
+                    key = (udn, service_type, control_url)
+                    if key not in seen:
+                        seen.add(key)
+                        found.append({
+                            "udn": udn,
+                            "serviceType": service_type,
+                            "controlUrl": control_url,
+                        })
+                        if len(found) > MAX_IGD_SERVICE_CANDIDATES:
+                            return found
+                pending.extend(reversed(device["embeddedDevices"]))
+        return found
+
+    def _scpd_services(self) -> list[dict]:
+        if self.description_status == "not_run":
+            self.describe()
+        found: list[dict] = []
+        seen: set[tuple] = set()
+        for item in self.devices:
+            if item["status"] != "described":
+                continue
+            pending = [item["description"]["device"]]
+            while pending:
+                device = pending.pop()
+                for service in device["services"]:
+                    reference = {
+                        "udn": device["udn"],
+                        "serviceType": service["serviceType"],
+                        "scpdUrl": service["scpdUrl"],
+                    }
+                    key = tuple(reference.values())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    found.append(reference)
+                    if len(found) > MAX_SCPD_SERVICE_CANDIDATES:
+                        return found
+                pending.extend(reversed(device["embeddedDevices"]))
+        return found
+
+    def scpd(self) -> list[dict]:
+        """Fetch selected-target service descriptions under request and byte budgets."""
+        if self.scpd_status != "not_run":
+            return self.scpd_results
+        max_fetches = min(max(1, int(getattr(self.args, "max_scpd", 20))), 100)
+        for position, service in enumerate(self._scpd_services()):
+            result = {**service, "status": "skipped"}
+            url = service["scpdUrl"]
+            if position >= MAX_SCPD_SERVICE_CANDIDATES:
+                result["error"] = "service_candidate_limit_reached"
+                self.scpd_truncated = True
+                self.scpd_results.append(result)
+                break
+            if not url:
+                result["error"] = "missing_scpd_url"
+                self.scpd_results.append(result)
+                continue
+            try:
+                self._description_url(url)
+            except OutOfScopeLocation as exc:
+                result["error"] = str(exc)
+                self.scpd_results.append(result)
+                continue
+            if self.scpd_fetches >= max_fetches or self.scpd_bytes >= MAX_TOTAL_SCPD_BYTES:
+                result["error"] = "scpd_fetch_or_byte_limit_reached"
+                self.scpd_truncated = True
+                self.scpd_results.append(result)
+                break
+            try:
+                self.scpd_fetches += 1
+                try:
+                    status, body = self._request_target(
+                        url, "GET",
+                        headers={"Accept": "text/xml, application/xml"},
+                        max_bytes=min(
+                            MAX_SCPD_BYTES, MAX_TOTAL_SCPD_BYTES - self.scpd_bytes
+                        ),
+                    )
+                except ResponseSizeExceeded as exc:
+                    self.scpd_bytes += exc.read_bytes
+                    if self.scpd_bytes >= MAX_TOTAL_SCPD_BYTES:
+                        self.scpd_truncated = True
+                    raise
+                self.scpd_bytes += len(body)
+                if self.scpd_bytes > MAX_TOTAL_SCPD_BYTES:
+                    result["error"] = "scpd_byte_limit_reached"
+                    self.scpd_truncated = True
+                    self.scpd_results.append(result)
+                    break
+                if status in (401, 403):
+                    result["status"] = "denied"
+                    result["httpStatus"] = status
+                elif status != 200:
+                    raise ValueError(f"service description returned HTTP {status}")
+                else:
+                    result["description"] = parse_service_description(body)
+                    result["status"] = "described"
+            except (OSError, ValueError, http.client.HTTPException) as exc:
+                result["status"] = "error"
+                result["error"] = str(exc)[:300]
+                self._error("SCPD", exc, scpdUrl=url)
+            self.scpd_results.append(result)
+        if not self.scpd_results:
+            self.scpd_status = (
+                "no_services" if self.description_status == "complete" else "inconclusive"
+            )
+        elif all(item["status"] == "described" for item in self.scpd_results):
+            self.scpd_status = "complete"
+        elif all(item["status"] == "error" for item in self.scpd_results):
+            self.scpd_status = "error"
+        else:
+            self.scpd_status = "partial"
+        return self.scpd_results
+
+    def _soap_request(
+        self,
+        service_type: str,
+        control_url: str,
+        action: str,
+        arguments: dict[str, str | int],
+    ) -> dict[str, str]:
+        if self.soap_budget_exhausted or self.soap_bytes >= MAX_TOTAL_SOAP_BYTES:
+            self.soap_budget_exhausted = True
+            raise SoapBudgetExceeded("SOAP response byte budget reached")
+        payload = build_soap_request(service_type, action, arguments)
+        try:
+            status, response = self._request_target(
+                control_url,
+                "POST",
+                headers={
+                    "Content-Type": 'text/xml; charset="utf-8"',
+                    "SOAPACTION": f'"{service_type}#{action}"',
+                    "Accept": "text/xml, application/xml",
+                },
+                max_bytes=min(MAX_SOAP_BYTES, MAX_TOTAL_SOAP_BYTES - self.soap_bytes),
+                body=payload,
+            )
+        except ResponseSizeExceeded as exc:
+            self.soap_bytes += exc.read_bytes
+            if self.soap_bytes >= MAX_TOTAL_SOAP_BYTES:
+                self.soap_budget_exhausted = True
+            raise
+        self.soap_bytes += len(response)
+        if self.soap_bytes > MAX_TOTAL_SOAP_BYTES:
+            self.soap_budget_exhausted = True
+            raise SoapBudgetExceeded("SOAP response byte budget reached")
+        if status in (401, 403):
+            raise HttpAccessDenied(status)
+        if status not in (200, 500):
+            raise ValueError(f"SOAP request returned HTTP {status}")
+        values = parse_soap_response(response, action, service_type)
+        if status != 200:
+            raise ValueError("SOAP success response used HTTP 500")
+        return values
+
+    @staticmethod
+    def _overall_igd_status(results: list[dict]) -> str:
+        if not results:
+            return "no_services"
+        if all(item["status"] == "complete" for item in results):
+            return "complete"
+        if all(item["status"] == "error" for item in results):
+            return "error"
+        return "partial"
+
+    def igd_info(self) -> list[dict]:
+        if self.igd_status != "not_run":
+            return self.igd_results
+        eligible = 0
+        for position, service in enumerate(self._igd_services()):
+            result = {**service, "status": "skipped", "actions": {}}
+            control_url = service["controlUrl"]
+            if position >= MAX_IGD_SERVICE_CANDIDATES:
+                result["error"] = "service_candidate_limit_reached"
+                self.igd_truncated = True
+                self.igd_results.append(result)
+                break
+            if self.soap_budget_exhausted:
+                result["error"] = "soap_byte_budget_reached"
+                self.igd_truncated = True
+                self.igd_results.append(result)
+                continue
+            if not control_url:
+                result["error"] = "missing_control_url"
+                self.igd_results.append(result)
+                continue
+            try:
+                self._description_url(control_url)
+            except OutOfScopeLocation as exc:
+                result["error"] = str(exc)
+                self.igd_results.append(result)
+                continue
+            if eligible >= MAX_IGD_SERVICES:
+                result["error"] = "service_limit_reached"
+                self.igd_truncated = True
+                self.igd_results.append(result)
+                break
+            eligible += 1
+            for action in IGD_INFO_ACTIONS:
+                try:
+                    values = self._soap_request(
+                        service["serviceType"], control_url, action, {}
+                    )
+                    result["actions"][action] = {"status": "ok", "values": values}
+                except SoapFault as exc:
+                    kind = (
+                        "unsupported" if exc.code in (401, 602)
+                        else "denied" if exc.code == 606
+                        else "fault"
+                    )
+                    result["actions"][action] = {
+                        "status": kind,
+                        "errorCode": exc.code,
+                        "error": exc.description,
+                    }
+                except HttpAccessDenied as exc:
+                    result["actions"][action] = {
+                        "status": "denied", "httpStatus": exc.status,
+                    }
+                except SoapBudgetExceeded:
+                    result["actions"][action] = {
+                        "status": "skipped", "error": "soap_byte_budget_reached",
+                    }
+                    self.igd_truncated = True
+                    break
+                except (OSError, ValueError, http.client.HTTPException) as exc:
+                    result["actions"][action] = {
+                        "status": "error", "error": str(exc)[:300],
+                    }
+                    self._error(
+                        "IGDINFO", exc,
+                        serviceType=service["serviceType"], action=action,
+                    )
+            action_states = [entry["status"] for entry in result["actions"].values()]
+            if self.soap_budget_exhausted:
+                result["status"] = "partial" if "ok" in action_states else "skipped"
+            elif all(state == "ok" for state in action_states):
+                result["status"] = "complete"
+            elif "ok" in action_states:
+                result["status"] = "partial"
+            elif all(state == "error" for state in action_states):
+                result["status"] = "error"
+            else:
+                result["status"] = "partial"
+            self.igd_results.append(result)
+        self.igd_status = self._overall_igd_status(self.igd_results)
+        if self.igd_status == "no_services" and self.description_status != "complete":
+            self.igd_status = "inconclusive"
+        return self.igd_results
+
+    def port_mappings(self) -> list[dict]:
+        if self.port_mapping_status != "not_run":
+            return self.port_mapping_results
+        remaining = min(max(1, int(getattr(self.args, "max_mappings", 100))), 1000)
+        eligible = 0
+        for position, service in enumerate(self._igd_services()):
+            result = {**service, "status": "skipped", "entries": [], "truncated": False}
+            control_url = service["controlUrl"]
+            if position >= MAX_IGD_SERVICE_CANDIDATES:
+                result["error"] = "service_candidate_limit_reached"
+                result["truncated"] = True
+                self.port_mapping_truncated = True
+                self.port_mapping_results.append(result)
+                break
+            if remaining == 0:
+                result["error"] = "service_or_mapping_limit_reached"
+                result["truncated"] = True
+                self.port_mapping_truncated = True
+                self.port_mapping_results.append(result)
+                continue
+            if self.soap_budget_exhausted:
+                result["error"] = "soap_byte_budget_reached"
+                result["truncated"] = True
+                self.port_mapping_truncated = True
+                self.port_mapping_results.append(result)
+                continue
+            if not control_url:
+                result["error"] = "missing_control_url"
+                self.port_mapping_results.append(result)
+                continue
+            try:
+                self._description_url(control_url)
+            except OutOfScopeLocation as exc:
+                result["error"] = str(exc)
+                self.port_mapping_results.append(result)
+                continue
+            if eligible >= MAX_IGD_SERVICES:
+                result["error"] = "service_limit_reached"
+                result["truncated"] = True
+                self.port_mapping_truncated = True
+                self.port_mapping_results.append(result)
+                break
+            eligible += 1
+            index = 0
+            while remaining:
+                try:
+                    values = self._soap_request(
+                        service["serviceType"], control_url,
+                        "GetGenericPortMappingEntry",
+                        {"NewPortMappingIndex": index},
+                    )
+                    result["entries"].append({"index": index, **values})
+                    index += 1
+                    remaining -= 1
+                except SoapFault as exc:
+                    if exc.code == 713:
+                        result["status"] = "complete"
+                    else:
+                        result["status"] = "partial"
+                        result["errorCode"] = exc.code
+                        result["error"] = exc.description
+                    break
+                except HttpAccessDenied as exc:
+                    result["status"] = "partial"
+                    result["httpStatus"] = exc.status
+                    break
+                except SoapBudgetExceeded:
+                    result["status"] = "partial" if result["entries"] else "skipped"
+                    result["error"] = "soap_byte_budget_reached"
+                    result["truncated"] = True
+                    self.port_mapping_truncated = True
+                    break
+                except (OSError, ValueError, http.client.HTTPException) as exc:
+                    result["status"] = "partial" if result["entries"] else "error"
+                    result["error"] = str(exc)[:300]
+                    self._error(
+                        "PORTMAPS", exc,
+                        serviceType=service["serviceType"], index=index,
+                    )
+                    break
+            else:
+                result["status"] = "partial"
+                result["truncated"] = True
+                self.port_mapping_truncated = True
+            self.port_mapping_results.append(result)
+        self.port_mapping_status = self._overall_igd_status(self.port_mapping_results)
+        if self.port_mapping_status == "no_services" and self.description_status != "complete":
+            self.port_mapping_status = "inconclusive"
+        return self.port_mapping_results
+
     def output(self) -> None:
         properties = {
             "software_type": None,
@@ -521,6 +973,20 @@ class UpnpEngine:
             "discoveryTruncated": self.discovery_truncated,
             "descriptionTruncated": self.description_truncated,
             "descriptionBytes": self.description_bytes,
+            "scpdStatus": self.scpd_status,
+            "scpdTruncated": self.scpd_truncated,
+            "scpdBytes": self.scpd_bytes,
+            "scpdFetches": self.scpd_fetches,
+            "serviceDescriptions": self.scpd_results,
+            "soapBytes": self.soap_bytes,
+            "soapByteLimit": MAX_TOTAL_SOAP_BYTES,
+            "soapTruncated": self.soap_budget_exhausted,
+            "igdInfoStatus": self.igd_status,
+            "igdInfoTruncated": self.igd_truncated,
+            "igdInfo": self.igd_results,
+            "portMappingStatus": self.port_mapping_status,
+            "portMappingTruncated": self.port_mapping_truncated,
+            "portMappings": self.port_mapping_results,
             "discoveries": self.discoveries,
             "devices": self.devices,
         }

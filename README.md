@@ -45,6 +45,8 @@ ptsrvtester msrpc -ts SAMRGROUPS -tg 192.168.1.10 -u auditor -pw secret
 ptsrvtester msrpc -ts SAMRUSERINFO -tg 192.168.1.10 -u auditor -pw secret --samr-user alice
 ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.10 --pipe svcctl -u auditor -pw secret
 ptsrvtester upnp -ts ALL -tg 192.168.1.1
+ptsrvtester upnp -ts DISCOVER -tg 192.168.1.1 --multicast -i 192.168.1.10
+ptsrvtester upnp -ts SCPD,PORTMAPS -tg 192.168.1.1
 ptsrvtester <module> -h     for help for module use
 ```
 
@@ -109,8 +111,11 @@ ptsrvtester <module> -h     for help for module use
 - Named-pipe, SMB, RPC/TCP and RPC-over-HTTP credential testing
 
 **UPnP/SSDP Module**
-- Targeted IPv4 SSDP discovery
+- Targeted IPv4 SSDP discovery and multicast search
 - UPnP device and service description retrieval
+- Read-only IGD status and external IP inspection
+- Service action and state variable enumeration (`SCPD`)
+- Read-only existing port mapping enumeration (`PORTMAPS`)
 
 **FTP Module**
 - Banner and Service Identification

@@ -3,9 +3,8 @@ __MODULELABEL__ = "Enumerate named pipes"
 __MODULECODE__ = "ENUMPIPES"
 __ORDER__ = 30
 
-from ._common import eng
+from ._common import run_probe
 
 
 def run(ctx):
-    e = eng(ctx)
-    e.results.Pipes = e.enumerate_pipes()
+    run_probe(ctx, __MODULECODE__, "Pipes", "enumerate_pipes")

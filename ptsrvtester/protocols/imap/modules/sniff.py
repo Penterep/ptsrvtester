@@ -1,4 +1,4 @@
-"""SNIFF — cleartext sniffable AUTHENTICATE probe."""
+"""SNIFF — cleartext LOGIN + SELECT INBOX (mailbox traffic without TLS)."""
 from ._common import eng
 
 __MODULELABEL__ = "Cleartext sniffable"

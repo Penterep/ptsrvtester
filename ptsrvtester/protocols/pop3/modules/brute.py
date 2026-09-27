@@ -1,6 +1,6 @@
 """BRUTE — catch-all probe + USER/PASS bruteforce."""
 from ..utils.connection import test_catch_all, try_login
-from ..utils.helpers import check_if_brute, simple_bruteforce
+from ..utils.helpers import check_if_brute, simple_bruteforce, text_or_file
 from ..utils.results import VULNS
 
 __MODULELABEL__ = "Login bruteforce"
@@ -21,7 +21,7 @@ def run(ctx):
     ctx.out("Catch-all test", "INFO", colortext=True)
     catch_all = test_catch_all(ctx.args, debug=ctx.debug)
     if catch_all == "unreachable":
-        ctx.out("Could not reach server for catch-all / bruteforce", "ERROR", indent=4)
+        ctx.out("Catch-all timed out or could not connect. Not confirmed.", "WARNING", indent=4)
         return
     if catch_all == "indeterminate":
         ctx.out(
@@ -54,9 +54,10 @@ def run(ctx):
         if ctx.json:
             for cred in creds:
                 ctx.out(f"user: {cred.user}, password: {cred.passw}", "TEXT", indent=4)
+        names = text_or_file(ctx.args.user, None)
         user_str = (
-            f"username: {ctx.args.user}"
-            if ctx.args.user is not None
+            "username: " + ", ".join(names)
+            if names
             else f"usernames: {ctx.args.users}"
         )
         pass_str = (

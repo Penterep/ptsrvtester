@@ -13,6 +13,7 @@ class NTLMResult(NamedTuple):
     success: bool
     ntlm: NTLMInfo | None
     auth_ntlm_advertised: bool  # AUTH=NTLM in pre-login CAPABILITY (or banner)
+    incomplete: bool = False  # connect/AUTH timed out — not a confirmed reject
 
 
 class InfoResult(NamedTuple):
@@ -29,22 +30,47 @@ class EncryptionResult(NamedTuple):
     tls_ok: bool
 
 
+class ImapAuthMechRow(NamedTuple):
+    """One AUTH= mechanism: advertised in CAPABILITY, then AUTHENTICATE probe."""
+
+    name: str
+    usable: bool
+    outcome: str  # continuation | tagged_no | tagged_bad | io_error | other_response
+    dangerous: bool  # IMAP_AUTH_METHOD_LEVEL ERROR (cleartext credential/SASL risk)
+
+
+class ImapAuthListPath(NamedTuple):
+    path: str  # cleartext | starttls | tls
+    available: bool
+    skip_reason: str | None
+    methods: tuple[ImapAuthMechRow, ...]
+
+
+class ImapAuthListResult(NamedTuple):
+    """AUTHLIST: advertised AUTH= on cleartext / STARTTLS / implicit TLS."""
+
+    paths: tuple[ImapAuthListPath, ...]
+    vulnerable: bool  # dangerous mechanism usable on cleartext
+    detail: str
+
+
 class SniffableResult(NamedTuple):
     """
-    Cleartext IMAP probe for sniffable authentication (pre-STARTTLS).
-    PTV-SVC-SNIFFABLE when plain TCP IMAP is usable without STARTTLS upgrade path
-    or when a credential-bearing AUTHENTICATE exchange is accepted on cleartext (continuation '+').
+    Cleartext LOGIN + SELECT INBOX (PTV-SVC-SNIFFABLE).
+    Requires a single -u/-p. Meaningful only on plain TCP (not --tls).
     """
+
     skipped: bool
     skip_reason: str | None
-    plain_ok: bool
-    starttls_advertised: bool
-    auth_methods: tuple[str, ...]
-    probes: tuple[tuple[str, str], ...]  # (SASL mechanism, outcome label)
+    login_ok: bool
+    select_ok: bool
+    select_typ: str | None
+    select_detail: str | None
     vulnerable: bool
+    detail: str
 
 
-CatchAllResult = str  # "configured" | "not_configured" | "indeterminate"
+CatchAllResult = str  # "configured" | "not_configured" | "indeterminate" | "unreachable"
 
 # Order of AUTHENTICATE probes when multiple mechanisms are advertised (most sensitive first).
 _SNIFFABLE_AUTH_PROBE_PRIORITY = (
@@ -58,16 +84,13 @@ _SNIFFABLE_AUTH_PROBE_PRIORITY = (
     "ANONYMOUS",
 )
 
-# Connection limits / rate / idle (-cl): aligned with SMTP -rt methodology (parallel ramp, idle probes).
+# Connection limits / idle: parallel ramp, idle probes.
 CONN_LIMIT_DEFAULT_ATTEMPTS = 100
-CONN_LIMIT_CONN_IP_THRESHOLD = 50  # PTV-SVC-IMAP-CONNCNTIP — many simultaneous sessions from one client
-CONN_LIMIT_CONN_GLOB_THRESHOLD = 100  # PTV-SVC-IMAP-CONNCNTGLOB — extreme concurrency without refusal
-CONN_LIMIT_RATE_SEQ_ATTEMPTS = 50
-CONN_LIMIT_RATE_SEQ_DELAY_SEC = 0.08
-CONN_LIMIT_RATE_VULN_MIN_OK = 40  # rapid connect+logout successes → weak connect-rate limiting
+CONN_LIMIT_CONN_IP_THRESHOLD = 50  # finding if connected > 50; --count must be > 50 to decide
 CONN_LIMIT_TIMEOUT_CAP_SECONDS = 300.0
 CONN_LIMIT_PREAUTH_IDLE_MAX_OK_SEC = 60.0  # banner-only idle (compare SMTP initial timeout)
 CONN_LIMIT_POST_CAP_IDLE_MAX_OK_SEC = 180.0  # after CAPABILITY (compare SMTP post-EHLO idle)
+CONN_LIMIT_DURATION_RECOMMENDED_SEC = 180.0  # --duration must be > 180 to decide CAPABILITY/IDLE
 CONN_LIMIT_BAN_MIN_SECONDS = 30.0
 # Post-login probes (require `-u` / `-p` without wordlists)
 CONN_LIMIT_AUTH_PARALLEL_MAX = 30
@@ -86,16 +109,24 @@ _IMAP_USRENUM_MARKER_LABEL = "(fixed_wrong_password)"
 # TCP + IMAP greeting; limits hangs on filtered hosts / silent packet drops (RFC-style clients often use similar bounds).
 _IMAP_CONNECT_TIMEOUT_SEC = 8.0
 # Authenticated resource-load probe: bounded APPEND burst + SEARCH burst (PTV-SVC-IMAP-RESLOAD).
-# Inspired by rate/limit tooling (e.g. SMTP NOOP flood): measure disconnect, errors, RT slowdown — not unbounded DoS.
+# Safety caps only (not RFC numbers). RFC 9208: APPEND over quota → tagged NO [OVERQUOTA].
+# Completing the cap with OK = missing limit; connection drop = instability; slowdown = warning.
 _IMAP_LOAD_APPEND_MAX_DEFAULT = 400
 _IMAP_LOAD_SEARCH_MAX_DEFAULT = 600
 _IMAP_LOAD_PER_CMD_TIMEOUT_SEC = 30.0
 _IMAP_LOAD_PROGRESS_APPEND_INTERVAL = 25
 _IMAP_LOAD_SEARCH_INTERVAL = 50
 _IMAP_LOAD_SLOWDOWN_RATIO = 1.5
-_IMAP_LOAD_SLOWDOWN_ABS_SEC = 0.5
-_IMAP_LOAD_ERR_OK_MAX_PCT = 5.0
-_IMAP_LOAD_DISCONNECT_EARLY_MAX = 120  # ≤ this many APPENDs before disconnect → noteworthy
+_IMAP_LOAD_SLOWDOWN_MIN_DELTA_SEC = 0.1
+_IMAP_LOAD_SUBJECT_PREFIX = "ptsrv-resload-"
+_IMAP_LOAD_LIMIT_CODES = (
+    "OVERQUOTA",
+    "TOOBIG",
+    "MESSAGELIMIT",
+    "MAXCONVERTS",
+    "LIMIT",
+    "QUOTA",
+)
 # Post-login mailbox isolation / shared-folder hygiene (PTV-SVC-IMAP-AUTHZ-BYPASS).
 # Methodology aligns with RFC 3501 (SELECT), RFC 2342 (NAMESPACE), RFC 4314/2086 (GETACL), and common
 # configuration-review practice (LIST surveys, "anyone"/authenticated ACL checks — cf. Dovecot/Cyrus docs).
@@ -122,7 +153,11 @@ _IMAP_MBOX_ISO_LIST_DICTIONARY_PATTERNS: tuple[str, ...] = (
 )
 _IMAP_MBOX_ISO_ENUM_MIN_TOTAL_LISTED = 15  # heuristic: many hits across guessed LIST patterns
 _IMAP_MBOX_ISO_ENUM_MIN_NONZERO_PATTERNS = 3
-# Strict TLS + certificate audit (PTV-SVC-IMAP-TLSAUDIT): RFC 7817 identity, OWASP-style transport review.
+_IMAP_MBOX_ISO_GETACL_MAX = 20
+_IMAP_ACL_WORLD_IDS = frozenset({"anyone", "anonymous", "guest", "authenticated"})
+_IMAP_ACL_SKIP_IDS = frozenset({"owner", "administrators", "admin", "authuser", "-authuser"})
+# TLS + certificate audit (PTV-SVC-IMAP-TLSAUDIT): RFC 8996 / NIST SP 800-52r2 /
+# TLSRef Intermediate cipher policy; RFC 9525 identity.
 _IMAP_TLS_AUDIT_TIMEOUT_SEC = 12.0
 _IMAP_TLS_EXPIRY_WARN_DAYS = 30
 _IMAP_TLS_EXPIRY_VULN_DAYS = 14
@@ -137,7 +172,6 @@ _INVCOMM_INFO_LEAK_MARKERS = (
     b"c:\\",
     b"internal server",
     b"stack trace",
-    b" line ",
     b".py",
     b".java",
     b"0x000",
@@ -150,6 +184,7 @@ class InvCommImapCase(NamedTuple):
     """One invalid / malformed IMAP command probe (PTV-SVC-IMAP-INVCOMM)."""
     category: str
     command_display: str
+    send_text: str
     outcome: str
     reply_snippet: str | None
     response_time_sec: float | None
@@ -168,6 +203,31 @@ class InvCommImapResult(NamedTuple):
     baseline_latency_sec: float | None
 
 
+def conn_limit_count_verdict(
+    connected: int,
+    max_attempts: int,
+    threshold: int = CONN_LIMIT_CONN_IP_THRESHOLD,
+) -> tuple[str, str]:
+    """Console category + text for the concurrent-session limit check.
+
+    Vuln only when more than ``threshold`` sessions were accepted. If ``--count``
+    is too low to prove that, return WARNING instead of a false OK/VULN.
+    """
+    if connected <= 0:
+        return (
+            "WARNING",
+            "Could not open any connection. Connection limit was not tested.",
+        )
+    if max_attempts <= threshold and connected >= max_attempts:
+        return (
+            "WARNING",
+            f"Cannot determine connection limit (count too low, Recommended > {threshold})",
+        )
+    if connected > threshold:
+        return "VULN", f"Connection limit > {threshold}"
+    return "NOTVULN", f"Connection limit ≤ {threshold}"
+
+
 def _imap_conn_duration_display(seconds: float | None, exceeded: bool) -> str:
     """Format idle/ban durations for console / JSON (same idea as SMTP _rate_limit_duration_display)."""
     if seconds is None:
@@ -179,11 +239,15 @@ def _imap_conn_duration_display(seconds: float | None, exceeded: bool) -> str:
 
 
 class ImapConnLimitsResult(NamedTuple):
-    """IMAP connection policy probe: concurrency ramp, connect-rate, pre/post-CAPABILITY idle."""
+    """IMAP connection policy probe: concurrency ramp, idle probes, optional post-login."""
 
     connected: int
     max_attempts: int
     banned: bool
+    establish_errors: int
+    establish_disconnected: int
+    establish_timeout: int
+    dropped_while_idle: int
     ban_duration_probe_ran: bool
     ban_duration_seconds: float | None
     ban_duration_exceeded: bool
@@ -191,9 +255,6 @@ class ImapConnLimitsResult(NamedTuple):
     preauth_idle_exceeded: bool
     post_cap_idle_seconds: float | None
     post_cap_idle_exceeded: bool
-    sequential_accepted: int
-    sequential_attempts: int
-    sequential_refused: int
     # Optional post-login phase (same-account credentials on CLI only)
     auth_parallel_accepted: int
     auth_parallel_attempted: int
@@ -202,6 +263,18 @@ class ImapConnLimitsResult(NamedTuple):
     idle_logged_exceeded: bool
     auth_phase_skip_reason: str | None
     idle_probe_detail: str | None
+    idle_disconnected: int
+    idle_disconnected_all: bool
+    terminated_connections: tuple[tuple[int, str, str], ...]
+
+
+class AnonymousLoginProbe(NamedTuple):
+    """One LOGIN probe (anonymous / guest / public, empty or matching password)."""
+
+    username: str
+    password: str
+    accepted: bool
+    detail: str | None = None
 
 
 class AnonymousAccessResult(NamedTuple):
@@ -212,16 +285,85 @@ class AnonymousAccessResult(NamedTuple):
     weak_credentials_ok: tuple[str, ...]  # e.g. "guest / guest"
     vulnerable: bool
     detail: str
+    auth_probed: bool
+    login_probed: bool
+    authenticate_detail: str | None = None
+    login_attempts: tuple[AnonymousLoginProbe, ...] = ()
+
+
+class EicarVariantResult(NamedTuple):
+    """One EICAR APPEND payload (plain body, .com/.txt attachment, or ZIP)."""
+
+    label: str
+    append_typ: str | None
+    append_detail: str | None
+    accepted: bool
 
 
 class EicarAppendResult(NamedTuple):
-    """APPEND minimal RFC 822 message containing EICAR test line (PTV-SVC-IMAP-EICAR when accepted)."""
+    """APPEND EICAR variants (PTV-SVC-IMAP-EICAR when any payload is accepted)."""
     skipped: bool
     skip_reason: str | None
     mailbox: str
     append_typ: str | None
     append_detail: str | None
     vulnerable: bool
+    variants: tuple[EicarVariantResult, ...] = ()
+
+
+# Same titles / payload filenames as SMTP ZIPXXE (terminal + JSON stay aligned).
+ZIPXXE_VARIANT_TITLES: dict[str, str] = {
+    "billion_laughs_attach": "Billion laughs attachment test",
+    "billion_laughs_body": "Billion laughs body test",
+    "xxe_zip": "XXE in ZIP test",
+    "xxe_docx": "XXE in DOCX test",
+    "xxe_xml": "XXE in XML attachment test",
+    "xxe_body": "XXE in body test",
+    "zip_bomb": "Zip bomb small",
+    "zip_bomb_small": "Zip bomb small",
+    "zip_bomb_full": "Zip bomb medium",
+    "zip_bomb_medium": "Zip bomb medium",
+    "zip_bomb_huge": "Zip bomb huge (≥1 TiB)",
+}
+
+ZIPXXE_VARIANT_PAYLOAD_LABELS: dict[str, str] = {
+    "billion_laughs_attach": "billion_laughs.xml",
+    "billion_laughs_body": "body (XML)",
+    "xxe_zip": "report.zip",
+    "xxe_docx": "document.docx",
+    "xxe_xml": "xxe.xml",
+    "xxe_body": "body (XML)",
+    "zip_bomb": "zipbomb-small.zip",
+    "zip_bomb_small": "zipbomb-small.zip",
+    "zip_bomb_full": "zipbomb-medium.zip",
+    "zip_bomb_medium": "zipbomb-medium.zip",
+    "zip_bomb_huge": "zipbomb-huge.zip",
+}
+
+
+class ZipxxeVariantResult(NamedTuple):
+    """One ZIPXXE APPEND variant (PTL-SVC-IMAP-ZIPXXE; manual verification)."""
+    variant: str
+    sent: int
+    accepted: int
+    rejected: int
+    error: int
+    imap_trace: tuple[str, ...]
+    detail: str | None
+    test_id: str = ""
+
+
+class ZipxxeResult(NamedTuple):
+    """ZIPXXE via APPEND: zip bomb / Billion Laughs / XXE (PTL-SVC-IMAP-ZIPXXE)."""
+    manual_verification_required: bool
+    canary_url: str
+    mailbox: str
+    variants: tuple[ZipxxeVariantResult, ...]
+    elapsed_sec: float
+    auth_used: bool
+    detail: str | None
+    verification_instructions: str
+    all_rejected_at_append: bool
 
 
 class ImapResourceLoadPhase(NamedTuple):
@@ -231,9 +373,13 @@ class ImapResourceLoadPhase(NamedTuple):
     attempted: int
     ok: int
     failed: int
+    limited: int
     disconnected: bool
     disconnect_after: int | None
     hit_cap: bool
+    limit_enforced: bool
+    limit_code: str | None
+    limit_after: int | None
     min_rt_seconds: float | None
     max_rt_seconds: float | None
     avg_rt_seconds: float | None
@@ -244,7 +390,7 @@ class ImapResourceLoadPhase(NamedTuple):
 
 
 class ImapResourceLoadResult(NamedTuple):
-    """Bounded authenticated APPEND + SEARCH stress (PTV-SVC-IMAP-RESLOAD heuristic)."""
+    """Bounded authenticated APPEND + SEARCH resource-limit check (PTV-SVC-IMAP-RESLOAD)."""
 
     skipped: bool
     skip_reason: str | None
@@ -254,8 +400,19 @@ class ImapResourceLoadResult(NamedTuple):
     append: ImapResourceLoadPhase | None
     search: ImapResourceLoadPhase | None
     search_skipped_reason: str | None
+    quota_advertised: bool
+    quota_root_detail: str | None
+    cleanup_deleted: int | None
+    cleanup_detail: str | None
     vulnerable: bool
     detail: str
+    io_login: tuple[str, str] | None = None
+    io_select: tuple[str, str] | None = None
+    io_capability: tuple[str, str] | None = None
+    io_quota: tuple[tuple[str, str], ...] = ()
+    io_append: tuple[str, str] | None = None
+    io_search: tuple[str, str] | None = None
+    io_cleanup: tuple[str, str] | None = None
 
 
 class ImapMailboxIsoSelectRow(NamedTuple):
@@ -266,6 +423,8 @@ class ImapMailboxIsoSelectRow(NamedTuple):
     typ: str | None
     detail: str | None
     ok_selected: bool
+    send_text: str | None = None
+    recv_text: str | None = None
 
 
 class ImapMailboxIsoListSurveyRow(NamedTuple):
@@ -277,6 +436,23 @@ class ImapMailboxIsoListSurveyRow(NamedTuple):
     detail: str | None
     listed_count: int
     sample_mailboxes: tuple[str, ...]
+    send_text: str | None = None
+    recv_text: str | None = None
+
+
+class ImapMailboxIsoAclRow(NamedTuple):
+    """GETACL on one mailbox (own INBOX or a LIST-discovered folder)."""
+
+    mailbox: str
+    typ: str | None
+    anyone_rights: str | None
+    anonymous_rights: str | None
+    authenticated_rights: str | None
+    overbroad_world: bool
+    user_like_ids: tuple[str, ...]
+    raw: str | None
+    send_text: str | None = None
+    recv_text: str | None = None
 
 
 class ImapMailboxIsoResult(NamedTuple):
@@ -311,10 +487,41 @@ class ImapMailboxIsoResult(NamedTuple):
     foreign_examine_ok: bool
     vulnerable: bool
     detail: str
+    acl_folder_probes: tuple[ImapMailboxIsoAclRow, ...] = ()
+    acl_enumerated_users: tuple[str, ...] = ()
+    getacl_command_ok: bool = False
+    login_send: str | None = None
+    login_recv: str | None = None
+    select_own_send: str | None = None
+    select_own_recv: str | None = None
+    namespace_send: str | None = None
+    namespace_recv: str | None = None
+    list_root_send: str | None = None
+    list_root_recv: str | None = None
+
+
+class ImapTlsCipherOffer(NamedTuple):
+    """One cipher suite the server accepted for a TLS version."""
+
+    name: str
+    rating: str  # ok | warn | bad
+    reason: str
+
+
+class ImapTlsVersionScan(NamedTuple):
+    """Offered TLS protocol version and the cipher suites accepted under it."""
+
+    version: str  # TLS 1.0 / TLS 1.1 / TLS 1.2 / TLS 1.3
+    offered: bool
+    rating: str  # ok | warn | bad
+    rating_reason: str
+    cipher_order: str | None  # server | client | mixed | None
+    cipher_order_note: str | None
+    ciphers: tuple[ImapTlsCipherOffer, ...]
 
 
 class ImapTlsAuditProbeResult(NamedTuple):
-    """One strict-verification TLS path (implicit TLS or STARTTLS), PTV-SVC-IMAP-TLSAUDIT."""
+    """One TLS path (implicit TLS or STARTTLS), PTV-SVC-IMAP-TLSAUDIT."""
 
     mode: str  # implicit_tls | starttls
     attempted: bool
@@ -340,6 +547,13 @@ class ImapTlsAuditProbeResult(NamedTuple):
     peer_key_summary: str | None
     peer_signature_hash: str | None
     crypto_warnings: tuple[str, ...]
+    versions: tuple[ImapTlsVersionScan, ...] = ()
+    imap_trace: tuple[str, ...] = ()
+    identity_ok: bool = False
+    identity_detail: str | None = None
+    identity_wildcard: bool = False
+    cert_trust_ok: bool = False
+    connection_mode: str = "No certificate"
 
 
 class ImapTlsAuditResult(NamedTuple):
@@ -381,6 +595,169 @@ class ImapUserEnumResult(NamedTuple):
     auth_plain_advertised: bool  # AUTH=PLAIN in merged pre-auth CAPABILITY / banner
 
 
+# ─── NOOP Connection Limit Tests ──────────────────────────────────────────────
+# IMAP4rev2: 30-minute minimum autologout for authenticated sessions; servers may
+# use shorter pre-auth timeouts for DoS protection. Pre-auth limits should be stricter.
+# Note: IDLE is distinct from NOOP — IDLE is for waiting on mailbox changes; NOOP
+# is a normal command that can reset the inactivity timer.
+
+# Pre-authentication duration test (NOOPLIM1)
+IMAP_NOOP_PREAUTH_DUR_TEST_SECONDS = 35 * 60  # Test for 35 minutes (captures "high" threshold)
+IMAP_NOOP_PREAUTH_DUR_INTERVAL_SECONDS = 4 * 60  # Send NOOP every 4 minutes (shorter pre-auth for DoS protection)
+IMAP_NOOP_PREAUTH_DUR_TIMEOUT_SECONDS = 30    # Socket recv timeout
+
+# Pre-authentication duration thresholds (in seconds)
+IMAP_NOOP_PREAUTH_DUR_INCREASED_MIN = 5 * 60   # >5 min → increased
+IMAP_NOOP_PREAUTH_DUR_SIGNIFICANT_MIN = 10 * 60 # >10 min → significant
+IMAP_NOOP_PREAUTH_DUR_HIGH_MIN = 30 * 60       # >30 min → high
+
+# NOOP1 timing: throttling if last-window avg is ≥ 0.1s slower than baseline.
+NOOP1_SLOWDOWN_MIN_DELTA_SECONDS = 0.1
+NOOP1_ERROR_RATE_OK_MAX_PCT = 5.0
+NOOP2_AVG_TIME_OK_MAX_SECONDS = 5.0
+NOOP2_ERROR_RATE_OK_MAX_PCT = 5.0
+
+
+def noop2_count_from_args(args, default: int, cap: int | None = None) -> int:
+    n = getattr(args, "noop2_count", None)
+    if n is None:
+        n = getattr(args, "noop2_connections", None)
+    if n is None:
+        n = default
+    n = int(n)
+    if cap is not None:
+        n = min(n, cap)
+    return max(1, n)
+
+
+NOOP1_RT_WINDOW = 10
+NOOP1_PROGRESS_EVERY = 25  # live progress + -vv snapshot interval (commands)
+
+# Pre-authentication connection count test (NOOPLIM2)
+IMAP_NOOP_PREAUTH_CONN_TEST_SECONDS = 120     # Hold connections for 2 minutes
+IMAP_NOOP_PREAUTH_CONN_INTERVAL_SECONDS = 60  # Send NOOP every minute (short interval for connection count test)
+IMAP_NOOP_PREAUTH_CONN_TIMEOUT_SECONDS = 30
+IMAP_NOOP_PREAUTH_CONN_MAX_ATTEMPTS = 150     # Try up to 150 connections (safety cap)
+
+# CLI default for --count
+NOOP2_DEFAULT_CONNECTIONS = IMAP_NOOP_PREAUTH_CONN_MAX_ATTEMPTS
+
+# Pre-authentication connection count thresholds
+IMAP_NOOP_PREAUTH_CONN_INCREASED_MIN = 20     # >20 connections → increased
+IMAP_NOOP_PREAUTH_CONN_SIGNIFICANT_MIN = 50   # >50 connections → significant
+IMAP_NOOP_PREAUTH_CONN_HIGH_MIN = 100         # >100 connections → high
+
+# Post-authentication duration test (NOOPLIM3)
+IMAP_NOOP_POSTAUTH_DUR_TEST_SECONDS = 130 * 60 # Test for 130 minutes (captures "high" threshold)
+IMAP_NOOP_POSTAUTH_DUR_INTERVAL_SECONDS = 20 * 60  # Send NOOP every 20 minutes (RFC: 30min minimum timeout)
+IMAP_NOOP_POSTAUTH_DUR_TIMEOUT_SECONDS = 30
+
+# Post-authentication duration thresholds (in seconds)
+IMAP_NOOP_POSTAUTH_DUR_INCREASED_MIN = 60 * 60  # >60 min → increased
+IMAP_NOOP_POSTAUTH_DUR_SIGNIFICANT_MIN = 120 * 60 # >120 min → significant
+IMAP_NOOP_POSTAUTH_DUR_HIGH_MIN = 180 * 60      # >180 min (unlimited) → high
+
+# Post-authentication connection count test (NOOPLIM4)
+IMAP_NOOP_POSTAUTH_CONN_TEST_SECONDS = 180
+IMAP_NOOP_POSTAUTH_CONN_INTERVAL_SECONDS = 60  # Send NOOP every minute (short interval for connection count test)
+IMAP_NOOP_POSTAUTH_CONN_TIMEOUT_SECONDS = 30
+IMAP_NOOP_POSTAUTH_CONN_MAX_ATTEMPTS = 600    # Try up to 600 connections (safety cap)
+
+# Post-authentication connection count thresholds (per IP)
+IMAP_NOOP_POSTAUTH_CONN_IP_INCREASED_MIN = 50
+IMAP_NOOP_POSTAUTH_CONN_IP_SIGNIFICANT_MIN = 100
+IMAP_NOOP_POSTAUTH_CONN_IP_HIGH_MIN = 500
+
+# Post-authentication connection count thresholds (per account)
+IMAP_NOOP_POSTAUTH_CONN_ACCT_INCREASED_MIN = 20
+IMAP_NOOP_POSTAUTH_CONN_ACCT_SIGNIFICANT_MIN = 50
+IMAP_NOOP_POSTAUTH_CONN_ACCT_HIGH_MIN = 100
+
+
+class NoopDurationResult(NamedTuple):
+    """NOOP connection duration test: keep one connection alive with periodic NOOP."""
+    authenticated: bool                # Pre-auth (False) or post-auth (True)
+    test_duration_seconds: float       # How long the test was configured to run
+    maintained_seconds: float          # How long the connection actually stayed alive
+    noops_sent: int                    # Number of NOOPs successfully sent
+    noops_ok: int                      # Number of OK replies
+    noops_error: int                   # Number of NO/BAD or timeout/socket errors
+    disconnected: bool                 # True if server closed the connection
+    disconnect_after_seconds: float | None  # When the disconnect happened
+    hit_test_cap: bool                 # True if we reached the test duration limit
+    error_message: str | None          # Error detail if test failed to start
+    delay_seconds: float = 0.0
+    min_rt_seconds: float | None = None
+    max_rt_seconds: float | None = None
+    avg_rt_seconds: float | None = None
+    baseline_avg_seconds: float | None = None
+    last_window_avg_seconds: float | None = None
+    slowdown_detected: bool = False
+    error_rate_pct: float = 0.0
+    idle_disconnect: bool = False
+
+
+def noop1_rt_display(value: float | None) -> str:
+    """Format a round-trip time as ``Xs`` / ``X.Ys`` (same as SMTP)."""
+    if value is None:
+        return "N/A"
+    if value >= 10:
+        return f"{int(round(value))}s"
+    if value >= 1:
+        return f"{value:.1f}s"
+    return f"{value:.2f}s"
+
+
+def noop1_stats_from_rtts(rtts: list[float], commands_sent: int, commands_error: int) -> dict:
+    """Baseline / last-window slowdown and error rate (SMTP NOOP1 rules)."""
+    min_rt = min(rtts) if rtts else None
+    max_rt = max(rtts) if rtts else None
+    avg_rt = (sum(rtts) / len(rtts)) if rtts else None
+    window = NOOP1_RT_WINDOW
+    baseline_avg = (sum(rtts[:window]) / min(len(rtts), window)) if rtts else None
+    last_rtts = rtts[-window:] if rtts else []
+    last_window_avg = (sum(last_rtts) / len(last_rtts)) if last_rtts else None
+    slowdown = False
+    if baseline_avg is not None and last_window_avg is not None and len(rtts) >= window * 2:
+        slowdown = (last_window_avg - baseline_avg) >= NOOP1_SLOWDOWN_MIN_DELTA_SECONDS
+    error_rate = (100.0 * commands_error / commands_sent) if commands_sent else 0.0
+    return {
+        "min_rt_seconds": min_rt,
+        "max_rt_seconds": max_rt,
+        "avg_rt_seconds": avg_rt,
+        "baseline_avg_seconds": baseline_avg,
+        "last_window_avg_seconds": last_window_avg,
+        "slowdown_detected": slowdown,
+        "error_rate_pct": error_rate,
+    }
+
+
+class NoopConnectionCountResult(NamedTuple):
+    """NOOP connection count test: how many connections can be maintained with NOOP."""
+    authenticated: bool                # Pre-auth (False) or post-auth (True)
+    max_connections_attempted: int     # How many connections we tried to open
+    connections_established: int       # How many got past the greeting
+    connections_maintained: int        # How many stayed alive for the test duration
+    test_duration_seconds: float       # How long we held the connections
+    total_noops_sent: int              # Total NOOPs across all connections
+    total_noops_ok: int
+    total_noops_error: int
+    early_disconnect_count: int        # Connections that died during the test
+    error_message: str | None
+    establish_errors: int = 0
+    establish_disconnected: int = 0
+    establish_timeouts: int = 0
+    reaped_before_storm: int = 0
+    storm_pool_connections: int = 0
+    min_rt_seconds: float | None = None
+    max_rt_seconds: float | None = None
+    avg_rt_seconds: float | None = None
+    error_rate_pct: float = 0.0
+    early_exit_no_connections: bool = False
+    terminated_connections: tuple[tuple[int, str, str], ...] = ()
+    delay_seconds: float = 0.0
+
+
 @dataclass
 class IMAPResults:
     info: InfoResult | None = None
@@ -394,12 +771,20 @@ class IMAPResults:
     encryption_error: str | None = None
     sniffable: SniffableResult | None = None
     sniffable_error: str | None = None
+    imap_authlist: ImapAuthListResult | None = None
+    imap_authlist_error: str | None = None
     inv_comm: InvCommImapResult | None = None
     inv_comm_error: str | None = None
     catch_all: CatchAllResult | None = None
     conn_limits: "ImapConnLimitsResult | None" = None
     conn_limits_error: str | None = None
     eicar: EicarAppendResult | None = None
+    xxessrf: ZipxxeResult | None = None
+    xxessrf_error: str | None = None
+    xxeexp: ZipxxeResult | None = None
+    xxeexp_error: str | None = None
+    zipbomb: ZipxxeResult | None = None
+    zipbomb_error: str | None = None
     imap_usrenum: ImapUserEnumResult | None = None
     imap_usrenum_error: str | None = None
     imap_usrenum_plain: ImapUserEnumResult | None = None
@@ -410,12 +795,21 @@ class IMAPResults:
     imap_mailbox_iso_error: str | None = None
     imap_tls_audit: ImapTlsAuditResult | None = None
     imap_tls_audit_error: str | None = None
+    noop_duration_preauth: NoopDurationResult | None = None
+    noop_duration_preauth_error: str | None = None
+    noop_conn_count_preauth: NoopConnectionCountResult | None = None
+    noop_conn_count_preauth_error: str | None = None
+    noop_duration_postauth: NoopDurationResult | None = None
+    noop_duration_postauth_error: str | None = None
+    noop_conn_count_postauth: NoopConnectionCountResult | None = None
+    noop_conn_count_postauth_error: str | None = None
 
 
 class VULNS(Enum):
     Anonymous = "PTL-SVC-IMAP-ANONYMOUS"
     NTLM = "PTL-SVC-IMAP-NTLMINFO"
     WeakCreds = "PTV-GENERAL-WEAKCREDENTIALS"
+    AuthMethods = "PTV-SVC-IMAP-AUTHMETHODS"
     Sniffable = "PTV-SVC-SNIFFABLE"
     InvComm = "PTV-SVC-IMAP-INVCOMM"
     ConnCntIp = "PTV-SVC-IMAP-CONNCNTIP"
@@ -423,9 +817,16 @@ class VULNS(Enum):
     ConnLong = "PTV-SVC-IMAP-CONNLONG"
     ConnRate = "PTV-SVC-IMAP-CONNRATE"
     Eicar = "PTV-SVC-IMAP-EICAR"
+    Xxessrf = "PTL-SVC-IMAP-XXESSRF"
+    Xxeexp = "PTL-SVC-IMAP-XXEEXP"
+    Zipbomb = "PTL-SVC-IMAP-ZIPBOMB"
     UserEnumLogin = "PTV-SVC-IMAP-USRENUM"
     ResourceLoad = "PTV-SVC-IMAP-RESLOAD"
     AuthzBypass = "PTV-SVC-IMAP-AUTHZ-BYPASS"
     TlsAudit = "PTV-SVC-IMAP-TLSAUDIT"
+    NoopDurationPreauth = "PTV-SVC-IMAP-NOOPLIMDUR-PREAUTH"
+    NoopDurationPostauth = "PTV-SVC-IMAP-NOOPLIMDUR-POSTAUTH"
+    NoopConnCountPreauth = "PTV-SVC-IMAP-NOOPLIMCONN-PREAUTH"
+    NoopConnCountPostauth = "PTV-SVC-IMAP-NOOPLIMCONN-POSTAUTH"
 
 

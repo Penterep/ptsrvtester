@@ -1,0 +1,1 @@
+"""Discoverable MSRPC test adapters."""

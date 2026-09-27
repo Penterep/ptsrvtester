@@ -8,7 +8,7 @@ def run(ctx):
     e = eng(ctx)
     try:
         if e.ftp is None:
-            e.ftp = e.connect()
+            e.ftp = e.connect(trace=True)
         e.results.anonymous = e.anonymous()
     except Exception as ex:
         e.results.anonymous_error = str(ex)

@@ -1,13 +1,16 @@
 """IMAP -ts registry — help text only (execution is module discovery)."""
 from __future__ import annotations
 
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
+
 IMAP_TEST_GROUPS: list[tuple[str, list[str]]] = [
-    ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "NTLM"]),
+    ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "AUTHLIST", "NTLM"]),
     ("Protocol & validation", ["SNIFF", "INVCMD"]),
     ("Authentication & enumeration", ["ANON", "USRENUM", "USRENUMPLAIN", "BRUTE"]),
-    ("Content security", ["EICAR"]),
-    ("Rate limiting & stress", ["CONNLIM", "RESLOAD"]),
+    ("Content security", ["EICAR", "XXESSRF", "XXEEXP", "ZIPBOMB"]),
+    ("Connection limits & stress", ["NOOP1", "NOOP2", "CONNLIM", "RESLOAD"]),
     ("Access control & TLS", ["MBOXISO", "TLSAUDIT"]),
+    ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
 ]
 
 # Default suite when -ts omitted or ALL (matches previous IMAP default recon behaviour).
@@ -31,10 +34,10 @@ IMAP_TESTS: dict[str, dict] = {
         ],
     },
     "ENCRYPT": {
-        "desc": "Test encryption options (plaintext / STARTTLS / TLS)",
+        "desc": "Test encryption options (cleartext / STARTTLS / TLS)",
         "long": [
-            "Inspect supported transport encryption on the port: plaintext",
-            "login, explicit STARTTLS upgrade and implicit TLS.",
+            "Inspect supported transport encryption on the port: cleartext",
+            "TCP, explicit STARTTLS upgrade and implicit TLS.",
         ],
     },
     "NTLM": {
@@ -44,12 +47,22 @@ IMAP_TESTS: dict[str, dict] = {
             "and decode the server Challenge for leaked domain / host info.",
         ],
     },
-    "SNIFF": {
-        "desc": "Cleartext sniffable probe",
+    "AUTHLIST": {
+        "desc": "List AUTH= mechanisms (cleartext / STARTTLS / TLS)",
         "long": [
-            "Probe cleartext IMAP: CAPABILITY, STARTTLS advertisement and",
-            "whether AUTHENTICATE accepts a continuation on plain TCP.",
+            "Read AUTH= from CAPABILITY on cleartext, STARTTLS and implicit TLS,",
+            "then probe AUTHENTICATE for each advertised method. A dangerous",
+            "method that is advertised but not usable is reported as a warning.",
         ],
+    },
+    "SNIFF": {
+        "desc": "Cleartext LOGIN + SELECT INBOX",
+        "long": [
+            "On a cleartext IMAP session, LOGIN with -u/-p and SELECT INBOX",
+            "to check whether mailbox access (and thus message traffic) is",
+            "possible without TLS. Skipped with --tls or on port 993.",
+        ],
+        "requires": ["-u/--user and -p/--password (no wordlists)"],
     },
     "INVCMD": {
         "desc": "Test invalid / non-standard commands",
@@ -68,29 +81,37 @@ IMAP_TESTS: dict[str, dict] = {
     "USRENUM": {
         "desc": "LOGIN user enumeration",
         "long": [
-            "LOGIN each name from the wordlist with a fixed wrong password and",
-            "compare errors against non-existent baselines.",
+            "LOGIN each name from -u/-U with a fixed wrong password and",
+            "compare status, error text and auth time against non-existent",
+            "baselines. Add one real username to the list, so you can",
+            "check that the server answers it differently from names",
+            "that do not exist.",
         ],
-        "requires": ["--usrenum-wordlist <file>"],
+        "requires": ["-u/--user or -U/--users"],
         "mods": [
-            ["", "--usrenum-wordlist", "<file>", "Username list (required)"],
-            ["", "--usrenum-password", "<str>", "Wrong password for every probe"],
-            ["", "--usrenum-max", "<n>", "Limit names read from wordlist (0 = no limit)"],
-            ["", "--usrenum-threads", "<n>", "Parallel TCP sessions (default 1)"],
+            ["-u", "--user", "<name> …", "Candidate username(s)"],
+            ["-U", "--users", "<wordlist>", "Username wordlist (required unless -u)"],
+            ["-p", "--password", "<str>", "Wrong password for every probe (default: PtSrv_IMAP_USRENUM_!@#_2026)"],
+            ["", "--usrenum-max", "<n>", "Limit names read from wordlist (default: 0 = no limit)"],
+            ["-t", "--threads", "<n>", "Parallel TCP sessions (default 1)"],
         ],
     },
     "USRENUMPLAIN": {
         "desc": "AUTHENTICATE PLAIN user enumeration",
         "long": [
-            "AUTHENTICATE PLAIN (SASL) each name from the wordlist with a wrong",
-            "password; use when CAPABILITY lists LOGINDISABLED.",
+            "AUTHENTICATE PLAIN (SASL) each name from -u/-U with a wrong",
+            "password; compare status, error text and auth time against",
+            "baselines. Use when CAPABILITY lists LOGINDISABLED. Add one",
+            "real username to the list, so you can check that the server",
+            "answers it differently from names that do not exist.",
         ],
-        "requires": ["--usrenum-wordlist <file>"],
+        "requires": ["-u/--user or -U/--users"],
         "mods": [
-            ["", "--usrenum-wordlist", "<file>", "Username list (required)"],
-            ["", "--usrenum-password", "<str>", "Wrong password for every probe"],
-            ["", "--usrenum-max", "<n>", "Limit names read from wordlist (0 = no limit)"],
-            ["", "--usrenum-threads", "<n>", "Parallel TCP sessions (default 1)"],
+            ["-u", "--user", "<name> …", "Candidate username(s)"],
+            ["-U", "--users", "<wordlist>", "Username wordlist (required unless -u)"],
+            ["-p", "--password", "<str>", "Wrong password for every probe (default: PtSrv_IMAP_USRENUM_!@#_2026)"],
+            ["", "--usrenum-max", "<n>", "Limit names read from wordlist (default: 0 = no limit)"],
+            ["-t", "--threads", "<n>", "Parallel TCP sessions (default 1)"],
         ],
     },
     "BRUTE": {
@@ -101,44 +122,117 @@ IMAP_TESTS: dict[str, dict] = {
         ],
         "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
         "mods": [
-            ["-u", "--user", "<name>", "Single username"],
+            ["-u", "--user", "<name> …", "Username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
         ],
     },
     "EICAR": {
         "desc": "APPEND EICAR antivirus probe",
         "long": [
-            "APPEND an RFC 822 message containing the EICAR test line to a",
-            "mailbox to check server-side antivirus / content filtering.",
+            "APPEND EICAR as a plain body, eicar.com / eicar.com.txt",
+            "attachments, and ZIP / nested ZIP.",
+        ],
+        "requires": ["-u/--user and -p/--password (no wordlists)"],
+    },
+    "XXESSRF": {
+        "desc": "SSRF through XXE vulnerability",
+        "long": [
+            "APPEND RFC 822 messages with an external XML entity pointing at",
+            "the canary URL (ZIP, DOCX, XML attachment, and XML body).",
+            "Check the canary for HTTP requests. APPEND OK only means the",
+            "store accepted the message.",
+        ],
+        "requires": ["-u/--user and -p/--password (no wordlists)", "--canary-url"],
+        "mods": [
+            ["", "--canary-url", "<URL>", "Canary/callback URL (required)"],
+            ["", "--timeout", "<sec>", "Per-message timeout (default: 30)"],
+        ],
+    },
+    "XXEEXP": {
+        "desc": "XML Entity Expansion (Billion of Lolz) via XXE vulnerability (DoS)",
+        "long": [
+            "APPEND Billion Laughs as an XML attachment and as an XML body.",
+            "Impact is processing-side: watch CPU, memory and IMAP responsiveness.",
         ],
         "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [
-            ["", "--eicar-mailbox", "<name>", "Mailbox name for APPEND (default INBOX)"],
+            ["", "--timeout", "<sec>", "Per-message timeout (default: 30)"],
+        ],
+    },
+    "ZIPBOMB": {
+        "desc": "Zip bomb (DoS)",
+        "long": [
+            "APPEND zip bombs as mail attachments. Without --variant-* flags,",
+            "sends the small and medium payloads. --variant-huge unpacks to",
+            "about 1 TiB in a single extract.",
+            "Watch disk, memory and IMAP responsiveness.",
+        ],
+        "requires": ["-u/--user and -p/--password (no wordlists)"],
+        "mods": [
+            ["", "--variant-small", "", "Small zip bomb (sent by default)"],
+            ["", "--variant-medium", "", "Medium zip bomb, ~100 MB unpacked (sent by default)"],
+            ["", "--variant-huge", "", "Huge zip bomb, ~1 TiB unpacked (not default; extreme DoS)"],
+            ["", "--timeout", "<sec>", "Per-message timeout (default: 30)"],
+        ],
+    },
+    "NOOP1": {
+        "desc": "NOOP connection duration",
+        "long": [
+            "Test how long connections can be maintained with periodic NOOP.",
+            "Pre-authentication test always runs; post-authentication test runs",
+            "if -u/-p provided. IMAP4rev2 specifies 30-minute minimum for auth.",
+            "Note: NOOP is distinct from IDLE (which is for mailbox changes).",
+        ],
+        "mods": [
+            ["", "--duration", "<sec>", "How long the test runs (default: 35 min pre-auth / 130 min post-auth)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (default: 4 min pre-auth / 20 min post-auth; 0 = max speed)"],
+            ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
+            ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
+        ],
+    },
+    "NOOP2": {
+        "desc": "NOOP connection count",
+        "long": [
+            "Test how many connections can be established and maintained with",
+            "periodic NOOP. Pre-authentication test always runs; post-authentication",
+            "test runs if -u/-p provided. Evaluates per-IP and per-account limits.",
+        ],
+        "mods": [
+            ["", "--count", "<n>", "Max connections to attempt (default: 150)"],
+            ["", "--duration", "<sec>", "How long the test runs (default: 120s pre-auth / 180s post-auth)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (default: 60s; 0 = max speed)"],
+            ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
+            ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
+            ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
         ],
     },
     "CONNLIM": {
-        "desc": "Connection limits / rate / idle probes",
+        "desc": "Connection limits / idle probes",
         "long": [
-            "Connection-count, connect-rate and idle-time probes; with -u/-p",
-            "also probes parallel LOGIN sessions and IDLE lifetime.",
+            "Connection-count and idle-time probes; with -u/-p also probes",
+            "parallel LOGIN sessions and IDLE lifetime.",
         ],
         "mods": [
-            ["", "--cl-max", "<n>", "Max concurrent connections in ramp-up"],
+            ["", "--count", "<n>", "Max concurrent connections in ramp-up (default: 100)"],
+            ["", "--duration", "<sec>", "How long idle/ban probes wait (default: 300)"],
+            ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
+            ["-u", "--user", "<name>", "Username for authenticated probes (optional)"],
+            ["-p", "--password", "<pass>", "Password for authenticated probes (optional)"],
         ],
     },
     "RESLOAD": {
-        "desc": "APPEND + SEARCH resource-load stress",
+        "desc": "APPEND + SEARCH resource-limit check",
         "long": [
-            "Bounded authenticated APPEND burst followed by a UID SEARCH ALL",
-            "loop; watches for disconnects, errors and slowdown.",
+            "Logs in, APPENDs many small messages, then runs UID SEARCH ALL.",
         ],
         "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [
-            ["", "--resource-load-mailbox", "<name>", "Mailbox for APPEND phase (default INBOX)"],
-            ["", "--resource-load-append-max", "<n>", "Max APPEND operations (hard cap 5000)"],
-            ["", "--resource-load-search-max", "<n>", "Max UID SEARCH ALL commands (0 skips)"],
+            ["", "--resource-load-append-max", "<n>", "Max APPEND operations (default 400)"],
+            ["", "--resource-load-search-max", "<n>", "Max UID SEARCH ALL commands (default 600; 0 skips)"],
         ],
     },
     "MBOXISO": {
@@ -150,18 +244,33 @@ IMAP_TESTS: dict[str, dict] = {
         "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [
             ["", "--mailbox-iso-foreign-user", "<name>", "Token for cross-user heuristics (default user2)"],
-            ["", "--mailbox-iso-mailbox", "<name>", "Own baseline mailbox (default INBOX)"],
         ],
     },
     "TLSAUDIT": {
-        "desc": "Strict TLS handshake + certificate audit",
+        "desc": "TLS version / cipher enumeration + certificate audit",
         "long": [
-            "Strict TLS handshake with platform trust store and hostname check;",
-            "reports TLS version, cipher and certificate subject / issuer / SAN.",
+            "Enumerates offered TLS versions and cipher suites (not only the",
+            "negotiated pair) and rates them against RFC 8996, NIST SP 800-52r2",
+            "and TLSRef Intermediate (Mozilla Server Side TLS lineage).",
+            "Certificate identity uses RFC 9525 wildcard matching.",
             "Implicit TLS on 993 (or --tls), otherwise STARTTLS when advertised.",
         ],
+        "mods": [
+            ["-t", "--threads", "<n>", "Parallel TLS handshakes (default: 5)"],
+        ],
     },
+    "RATELIMIT": rate_limit_test_spec(),
 }
+
+# Tests that SELECT/APPEND via --mailbox (shown in imap -ts <TEST> -h).
+_IMAP_FOLDER_OPT = ["", "--mailbox", "<name>", "IMAP Folder"]
+_IMAP_FOLDER_APPEND_OPT = ["", "--mailbox", "<name>", "IMAP folder for APPEND"]
+_IMAP_FOLDER_TESTS = frozenset({
+    "EICAR", "XXESSRF", "XXEEXP", "ZIPBOMB", "RESLOAD", "MBOXISO",
+})
+_IMAP_CONTENT_FOLDER_TESTS = frozenset({
+    "EICAR", "XXESSRF", "XXEEXP", "ZIPBOMB",
+})
 
 
 def imap_test_help(codes: list[str]):
@@ -175,18 +284,20 @@ def imap_test_help(codes: list[str]):
     blocks = []
     for code in valid:
         spec = IMAP_TESTS[code]
-        options: list[list[str]] = []
-        for line in spec.get("long", []) or []:
-            options.append(["", "", "", line])
+        desc = [f"IMAP — {code}: {spec['desc']}"]
+        desc.extend(spec.get("long", []) or [])
         if spec.get("requires"):
-            options.append(["", "", "", ""])
-            options.append(["", "", "", "Requires: " + "; ".join(spec["requires"])])
-        for row in spec.get("mods", []) or []:
-            options.append(row)
-        has_opts = bool(spec.get("mods") or spec.get("requires"))
+            desc.append("Requires: " + "; ".join(spec["requires"]))
+        mods = list(spec.get("mods", []) or [])
+        if code in _IMAP_FOLDER_TESTS and not any(
+            len(row) > 1 and row[1] == "--mailbox" for row in mods
+        ):
+            opt = _IMAP_FOLDER_APPEND_OPT if code in _IMAP_CONTENT_FOLDER_TESTS else _IMAP_FOLDER_OPT
+            mods.insert(0, list(opt))
+        has_opts = bool(mods or spec.get("requires"))
         usage = f"ptsrvtester imap -ts {code} " + ("<options> -tg <target>" if has_opts else "-tg <target>")
-        blocks.append({"description": [f"IMAP — {code}: {spec['desc']}"]})
+        blocks.append({"description": desc})
         blocks.append({"usage": [usage]})
-        if options:
-            blocks.append({"options": options})
+        if mods:
+            blocks.append({"options": mods})
     return blocks

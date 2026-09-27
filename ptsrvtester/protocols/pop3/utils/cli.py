@@ -7,6 +7,7 @@ from .capa import valid_target_pop3
 from .helpers import ArgsWithBruteforce, Target, add_bruteforce_args, check_if_brute
 from .ptprinthelper import get_colored_text
 from .registry import POP3_TEST_GROUPS, POP3_TESTS, pop3_test_help
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_help_rows
 
 __all__ = ["POP3Args"]
 
@@ -37,12 +38,13 @@ class POP3Args(ArgsWithBruteforce):
             ["", "--starttls", "", "Use explicit STLS (default port 110)"],
             ["", "", "", ""],
             [get_colored_text("Credentials (BRUTE)", "TITLE")],
-            ["-u", "--user", "<name>", "Single username"],
+            ["-u", "--user", "<name> …", "Username(s) for BRUTE"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            *rate_limit_help_rows(get_colored_text),
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
             ["-j", "--json", "", "Output in JSON format"],
@@ -59,7 +61,8 @@ class POP3Args(ArgsWithBruteforce):
                 "ptsrvtester pop3 -ts ENCRYPT -tg 127.0.0.1",
                 "ptsrvtester pop3 -ts ALL --tls -tg 127.0.0.1:995",
                 "ptsrvtester pop3 -ts ANON,HELPINFO -tg 127.0.0.1",
-                "ptsrvtester pop3 -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:110",
+                "ptsrvtester pop3 -ts RATELIMIT -tg 127.0.0.1",
+                "ptsrvtester pop3 -ts BRUTE -u admin harry -P passwords.txt -tg 127.0.0.1:110",
                 "ptsrvtester pop3 -ts BRUTE -h",
             ]},
             {"options": options},
@@ -104,11 +107,48 @@ class POP3Args(ArgsWithBruteforce):
             "--module-threads", type=int, default=1, metavar="n", dest="module_threads",
             help=argparse.SUPPRESS,
         )
-        add_bruteforce_args(parser)
+        parser.add_argument(
+            "--count",
+            nargs="?",
+            type=int,
+            const=None,
+            default=None,
+            metavar="N",
+            dest="noop2_count",
+            help=argparse.SUPPRESS,  # Shown in test-specific help via registry
+        )
+        parser.add_argument(
+            "-t", "--threads",
+            type=int,
+            default=None,
+            metavar="N",
+            dest="noop2_threads",
+            help=argparse.SUPPRESS,  # Shown in NOOP2 test help via registry
+        )
+        parser.add_argument(
+            "--duration",
+            type=float,
+            default=None,
+            metavar="SEC",
+            dest="noop1_duration",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--delay",
+            type=float,
+            default=None,
+            metavar="SEC",
+            dest="noop1_delay",
+            help=argparse.SUPPRESS,
+        )
+        add_bruteforce_args(parser, user_nargs="+")
 
 
 def validate_brute_selection(args) -> None:
     """Raise if BRUTE was explicitly selected without credentials."""
+    th = getattr(args, "noop2_threads", None)
+    if th is not None and int(th) < 1:
+        raise argparse.ArgumentError(None, "-t/--threads must be >= 1")
     raw = getattr(args, "tests", None) or ""
     codes = [c.strip().upper() for c in raw.split(",") if c.strip()]
     if "BRUTE" in codes and "ALL" not in codes and not check_if_brute(args):

@@ -1,5 +1,0 @@
-{
-  "subject": "EICAR antivirus test - eicar.com attachment (PTL-SVC-SMTP-ANTIVIRUS)",
-  "body": "EICAR standard test file as attachment (eicar.org variant 1). Harmless but should be detected by antivirus.",
-  "attachments": ["eicar.com"]
-}

@@ -11,7 +11,7 @@ class SMBArgs(BaseArgs):
     def get_help():
         return [
             {"description": ["SMB Testing Module"]},
-            {"usage": ["ptsrvtesNTPArgster smb <IP:PORT> <command> <options>"]},
+            {"usage": ["ptsrvtester smb <IP:PORT> <command> <options>"]},
             {"usage_example": [
                 "ptsrvtester smb 192.168.1.1 -ts info,dialects",
                 "ptsrvtester smb localhost:1234 -ts encryption"

@@ -31,6 +31,13 @@ def run(ctx):
             "WARNING",
             indent=4,
         )
+    elif catch_all == "unreachable":
+        ctx.out(
+            "Catch-all timed out or could not connect. Not confirmed.",
+            "WARNING",
+            indent=4,
+        )
+        return
     else:
         ctx.out("Not configured (server rejects invalid creds)", "NOTVULN", indent=4)
 

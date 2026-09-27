@@ -1,16 +1,4 @@
-"""TEMPLATE — copy this file to modules/<yourmodule>.py to add a module.
-
-The generic main (main.py) discovers every ``modules/*.py`` that is NOT
-prefixed with ``_`` and exposes a callable ``run(ctx)``. This file starts with
-``_`` on purpose, so it is documentation only and is never executed.
-
-Required / optional module-level attributes
---------------------------------------------
-    __MODULELABEL__  (str, required)  one-line label; the main prints it as the
-                                    section header before your run() executes.
-    __MODULECODE__   (str, optional)  the -ts code; defaults to FILENAME.upper().
-    __ORDER__      (int, optional)  run/print order; smaller runs first (default 100).
-
+"""
 The run(ctx) entry point
 ------------------------
 ``ctx`` carries everything you need — you do NOT manage threads, output ordering
@@ -37,12 +25,29 @@ Contract:
     aborting the other selected modules.
 """
 
-__TESTLABEL__ = "The dialects used by the target system"
-__TESTCODE__ = ""
+__MODULELABEL__ = "The dialects used by the target system"
+__MODULECODE__ = "DIALECTS"
 __ORDER__ = 11
 
-def run(ctx):
+from ..smb_utils.helpers import SMBContext
+from ..smb_utils.server_connection import ServerConnection
+
+
+def run(ctx: SMBContext) -> None:
     ip, port = ctx.target
-    ctx.out(f"Would check {ip}:{port} here.", "TEXT")
+    # ctx.out(f"Would check {ip}:{port} here.", "TEXT")
     # For JSON mode, add structured findings instead of text, e.g.:
     #   ctx.ptjsonlib.add_vulnerability("PTV-SMTP-...")
+
+    sc = ServerConnection(ctx)
+    out = {}
+    for dialect in ctx.mapping.keys():
+        if ctx.mapping[dialect]:
+            continue
+        out = sc.connect(dialect, try_login=False, parse_info=False)
+        if out is not None:
+            ctx.successful_dialects.append(sc.dial_str_converter(dialect))
+    
+    for dialect in ctx.successful_dialects:
+        ctx.out(dialect, category="VULN" if dialect == "SMBv1" else "NOTVULN",
+                condition=True, indent=4)

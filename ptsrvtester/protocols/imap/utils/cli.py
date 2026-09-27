@@ -4,14 +4,13 @@ from __future__ import annotations
 import argparse
 
 from .capa import valid_target_imap
-from .helpers import ArgsWithBruteforce, Target, add_bruteforce_args, check_if_brute
+from .helpers import ArgsWithBruteforce, Target, add_bruteforce_args, check_if_brute, one_cli_user
 from .ptprinthelper import get_colored_text
 from .registry import IMAP_TEST_GROUPS, IMAP_TESTS, imap_test_help
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_help_rows
 from .results import (
-    CONN_LIMIT_DEFAULT_ATTEMPTS,
     _IMAP_LOAD_APPEND_MAX_DEFAULT,
     _IMAP_LOAD_SEARCH_MAX_DEFAULT,
-    _IMAP_USRENUM_DEFAULT_PASSWORD,
 )
 
 __all__ = ["IMAPArgs"]
@@ -23,17 +22,16 @@ class IMAPArgs(ArgsWithBruteforce):
     starttls: bool
     tests: str | None
     module_threads: int
-    eicar_mailbox: str
-    conn_limits_max: int | None
-    imap_usrenum_wordlist: str | None
-    imap_usrenum_password: str | None
+    mailbox: str
+    canary_url: str | None
+    xxe_timeout: float
+    zipbomb_variant_small: bool
+    zipbomb_variant_medium: bool
+    zipbomb_variant_huge: bool
     imap_usrenum_max: int
-    imap_usrenum_threads: int
-    imap_resource_load_mailbox: str
     imap_resource_load_append_max: int
     imap_resource_load_search_max: int
     imap_mailbox_iso_foreign_user: str
-    imap_mailbox_iso_mailbox: str
 
     @staticmethod
     def get_help():
@@ -54,12 +52,14 @@ class IMAPArgs(ArgsWithBruteforce):
             ["", "--starttls", "", "Use explicit STARTTLS (default port 143)"],
             ["", "", "", ""],
             [get_colored_text("Credentials (BRUTE / authenticated tests)", "TITLE")],
-            ["-u", "--user", "<name>", "Single username"],
+            ["-u", "--user", "<name> …", "Username(s) for BRUTE / USRENUM"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--mailbox", "<name>", "IMAP Folder"],
             ["", "--spray", "", "Try one password against all users"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            *rate_limit_help_rows(get_colored_text),
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
             ["-j", "--json", "", "Output in JSON format"],
@@ -74,10 +74,17 @@ class IMAPArgs(ArgsWithBruteforce):
                 "ptsrvtester imap -ts BANNER,CAPA -tg 127.0.0.1",
                 "ptsrvtester imap -ts ALL -tg 127.0.0.1",
                 "ptsrvtester imap -ts ALL --tls -tg 127.0.0.1:993",
-                "ptsrvtester imap -ts ENCRYPT,SNIFF -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts AUTHLIST -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts SNIFF -u user -p pass -tg 127.0.0.1:143",
                 "ptsrvtester imap -ts EICAR -u user -p pass -tg 127.0.0.1:143",
-                "ptsrvtester imap -ts USRENUM --usrenum-wordlist users.txt --usrenum-threads 4 -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts XXESSRF -u user -p pass --canary-url http://cb -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts XXEEXP -u user -p pass -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts ZIPBOMB -u user -p pass -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts ZIPBOMB -u user -p pass --variant-huge -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts USRENUM -U users.txt -t 4 -tg 127.0.0.1:143",
+                "ptsrvtester imap -ts USRENUM -u admin harry tereza -tg 127.0.0.1:143",
                 "ptsrvtester imap -ts TLSAUDIT -tg mail.example.com:993",
+                "ptsrvtester imap -ts RATELIMIT -tg 127.0.0.1",
                 "ptsrvtester imap -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:143",
                 "ptsrvtester imap -ts USRENUM -h",
             ]},
@@ -94,14 +101,20 @@ class IMAPArgs(ArgsWithBruteforce):
   ptsrvtester imap -ts BANNER,CAPA -tg 127.0.0.1
   ptsrvtester imap -ts ALL -tg 127.0.0.1
   ptsrvtester imap -ts ALL --tls -tg 127.0.0.1:993
-  ptsrvtester imap -ts ENCRYPT,SNIFF -tg 127.0.0.1:143
-  ptsrvtester imap -ts CONNLIM --cl-max 50 -tg mail.example.com
+  ptsrvtester imap -ts AUTHLIST -tg 127.0.0.1:143
+  ptsrvtester imap -ts SNIFF -u user -p pass -tg 127.0.0.1:143
+  ptsrvtester imap -ts CONNLIM --count 50 -t 10 --duration 60 -tg mail.example.com
   ptsrvtester imap -ts EICAR -u user -p pass -tg 127.0.0.1:143
+  ptsrvtester imap -ts XXESSRF -u user -p pass --canary-url http://cb -tg 127.0.0.1:143
+  ptsrvtester imap -ts XXEEXP -u user -p pass -tg 127.0.0.1:143
+  ptsrvtester imap -ts ZIPBOMB -u user -p pass -tg 127.0.0.1:143
+  ptsrvtester imap -ts ZIPBOMB -u user -p pass --variant-huge -tg 127.0.0.1:143
   ptsrvtester imap -ts RESLOAD -u user -p pass -tg 127.0.0.1:143
   ptsrvtester imap -ts MBOXISO -u user -p pass -tg 127.0.0.1:143
   ptsrvtester imap -ts TLSAUDIT -tg mail.example.com:993
-  ptsrvtester imap -ts USRENUM --usrenum-wordlist users.txt --usrenum-threads 4 -tg 127.0.0.1:143
-  ptsrvtester imap -ts USRENUMPLAIN --usrenum-wordlist users.txt -tg 127.0.0.1:143
+  ptsrvtester imap -ts USRENUM -U users.txt -t 4 -tg 127.0.0.1:143
+  ptsrvtester imap -ts USRENUM -u admin harry tereza -tg 127.0.0.1:143
+  ptsrvtester imap -ts USRENUMPLAIN -U users.txt -tg 127.0.0.1:143
   ptsrvtester -j imap -ts BRUTE -u admin -P passwords.txt --brute-threads 20 -tg 127.0.0.1:143
   ptsrvtester imap -ts USRENUM -h"""
 
@@ -130,36 +143,72 @@ class IMAPArgs(ArgsWithBruteforce):
             help=argparse.SUPPRESS,
         )
 
+        parser.add_argument(
+            "--mailbox",
+            default="INBOX",
+            metavar="NAME",
+            dest="mailbox",
+            help="IMAP Folder",
+        )
+
         mods = parser.add_argument_group("TEST OPTIONS")
-        mods.add_argument("--eicar-mailbox", default="INBOX", metavar="NAME", dest="eicar_mailbox",
-                          help="EICAR: mailbox name for APPEND (default INBOX)")
-        mods.add_argument("--cl-max", type=int, default=None, metavar="N", dest="conn_limits_max",
-                          help=f"CONNLIM: max concurrent connections in ramp-up (default {CONN_LIMIT_DEFAULT_ATTEMPTS})")
-        mods.add_argument("--usrenum-wordlist", metavar="FILE", dest="imap_usrenum_wordlist", default=None,
-                          help="USRENUM/USRENUMPLAIN: path to username list (required)")
-        mods.add_argument("--usrenum-password", metavar="STR", dest="imap_usrenum_password", default=None,
-                          help=f"USRENUM/USRENUMPLAIN: wrong password (default {_IMAP_USRENUM_DEFAULT_PASSWORD!r})")
+        mods.add_argument("--canary-url", metavar="URL", dest="canary_url", default=None,
+                          help="XXESSRF: canary/callback URL (required)")
+        mods.add_argument("--timeout", type=float, default=30.0, metavar="SEC", dest="xxe_timeout",
+                          help=argparse.SUPPRESS)
+        mods.add_argument("--variant-small", action="store_true", dest="zipbomb_variant_small",
+                          help=argparse.SUPPRESS)
+        mods.add_argument("--variant-medium", action="store_true", dest="zipbomb_variant_medium",
+                          help=argparse.SUPPRESS)
+        mods.add_argument("--variant-huge", action="store_true", dest="zipbomb_variant_huge",
+                          help=argparse.SUPPRESS)
         mods.add_argument("--usrenum-max", type=int, default=0, metavar="N", dest="imap_usrenum_max",
                           help="USRENUM/USRENUMPLAIN: limit names from wordlist (0 = no limit)")
-        mods.add_argument("--usrenum-threads", type=int, default=1, metavar="N", dest="imap_usrenum_threads",
-                          help="USRENUM/USRENUMPLAIN: parallel TCP sessions (default 1)")
-        mods.add_argument("--resource-load-mailbox", default="INBOX", metavar="NAME",
-                          dest="imap_resource_load_mailbox",
-                          help="RESLOAD: mailbox for APPEND phase (default INBOX)")
         mods.add_argument("--resource-load-append-max", type=int, default=_IMAP_LOAD_APPEND_MAX_DEFAULT,
                           metavar="N", dest="imap_resource_load_append_max",
-                          help=f"RESLOAD: max APPEND operations (default {_IMAP_LOAD_APPEND_MAX_DEFAULT}; hard cap 5000)")
+                          help=f"RESLOAD: max APPEND operations (default {_IMAP_LOAD_APPEND_MAX_DEFAULT})")
         mods.add_argument("--resource-load-search-max", type=int, default=_IMAP_LOAD_SEARCH_MAX_DEFAULT,
                           metavar="N", dest="imap_resource_load_search_max",
                           help=f"RESLOAD: max UID SEARCH ALL (default {_IMAP_LOAD_SEARCH_MAX_DEFAULT}; 0 skips)")
         mods.add_argument("--mailbox-iso-foreign-user", default="user2", metavar="NAME",
                           dest="imap_mailbox_iso_foreign_user",
                           help="MBOXISO: token for cross-user heuristics (default user2)")
-        mods.add_argument("--mailbox-iso-mailbox", default="INBOX", metavar="NAME",
-                          dest="imap_mailbox_iso_mailbox",
-                          help="MBOXISO: own baseline mailbox (default INBOX)")
+        parser.add_argument(
+            "--count",
+            nargs="?",
+            type=int,
+            const=None,
+            default=None,
+            metavar="N",
+            dest="noop2_count",
+            help=argparse.SUPPRESS,  # Shown in test-specific help via registry
+        )
+        parser.add_argument(
+            "-t", "--threads",
+            type=int,
+            default=None,
+            metavar="N",
+            dest="noop2_threads",
+            help=argparse.SUPPRESS,  # Shown in NOOP2 / CONNLIM / TLSAUDIT / USRENUM / USRENUMPLAIN test help
+        )
+        parser.add_argument(
+            "--duration",
+            type=float,
+            default=None,
+            metavar="SEC",
+            dest="noop1_duration",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--delay",
+            type=float,
+            default=None,
+            metavar="SEC",
+            dest="noop1_delay",
+            help=argparse.SUPPRESS,
+        )
 
-        add_bruteforce_args(parser)
+        add_bruteforce_args(parser, user_nargs="+")
 
 
 def _selected_codes(args) -> list[str]:
@@ -170,6 +219,9 @@ def _selected_codes(args) -> list[str]:
 def validate_imap_selection(args) -> None:
     """Raise if selected tests lack required modifiers / credentials."""
     codes = _selected_codes(args)
+    th = getattr(args, "noop2_threads", None)
+    if th is not None and int(th) < 1:
+        raise argparse.ArgumentError(None, "-t/--threads must be >= 1")
     if not codes or "ALL" in codes:
         return
 
@@ -178,21 +230,34 @@ def validate_imap_selection(args) -> None:
             None, "BRUTE requires -u/--user or -U/--users; -p/--password or -P/--passwords",
         )
 
-    if ("USRENUM" in codes or "USRENUMPLAIN" in codes) and not getattr(args, "imap_usrenum_wordlist", None):
-        raise argparse.ArgumentError(None, "--usrenum-wordlist is required with USRENUM / USRENUMPLAIN")
+    if ("USRENUM" in codes or "USRENUMPLAIN" in codes) and not (
+        getattr(args, "user", None) or getattr(args, "users", None)
+    ):
+        raise argparse.ArgumentError(
+            None, "USRENUM / USRENUMPLAIN requires -u/--user or -U/--users",
+        )
 
-    need_single_login = {"EICAR", "RESLOAD", "MBOXISO"} & set(codes)
+    need_single_login = {"EICAR", "RESLOAD", "MBOXISO", "XXESSRF", "XXEEXP", "ZIPBOMB"} & set(codes)
     if need_single_login:
-        u = getattr(args, "user", None)
         p = getattr(args, "password", None)
-        if not u or not p or getattr(args, "users", None) or getattr(args, "passwords", None):
+        if (
+            one_cli_user(getattr(args, "user", None)) is None
+            or not p
+            or getattr(args, "users", None)
+            or getattr(args, "passwords", None)
+        ):
             raise argparse.ArgumentError(
                 None, f"{', '.join(sorted(need_single_login))} requires -u/--user and -p/--password (no wordlists)",
             )
 
+    if "XXESSRF" in codes:
+        canary = getattr(args, "canary_url", None) or ""
+        if not str(canary).strip():
+            raise argparse.ArgumentError(
+                None, "XXESSRF requires --canary-url (canary/callback URL)",
+            )
+
     if "USRENUM" in codes or "USRENUMPLAIN" in codes:
-        if int(getattr(args, "imap_usrenum_threads", 1) or 1) < 1:
-            raise argparse.ArgumentError(None, "--usrenum-threads must be >= 1")
         if int(getattr(args, "imap_usrenum_max", 0) or 0) < 0:
             raise argparse.ArgumentError(None, "--usrenum-max must be >= 0")
 
@@ -217,6 +282,7 @@ def validate_imap_selection(args) -> None:
                 raise argparse.ArgumentError(
                     None, "--mailbox-iso-foreign-user must not contain CR, LF, NUL, or double-quote",
                 )
-        mb = (getattr(args, "imap_mailbox_iso_mailbox", None) or "INBOX").strip()
-        if not mb:
-            raise argparse.ArgumentError(None, "--mailbox-iso-mailbox must be non-empty after trim")
+
+    mb = (getattr(args, "mailbox", None) or "INBOX").strip()
+    if not mb:
+        raise argparse.ArgumentError(None, "--mailbox must be non-empty after trim")

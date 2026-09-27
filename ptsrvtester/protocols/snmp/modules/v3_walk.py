@@ -9,7 +9,7 @@ __MODULECODE__ = "v3_walk"
 __ORDER__ = 100
 
 
-async def getBulk_SNMPv3(ctx) -> str:
+async def getBulk_SNMPv3(ctx) -> list:
     """
         Executes an SNMPv3 bulk walk on the target device to retrieve MIB object values based on the specified OID.
 
@@ -73,6 +73,7 @@ async def getBulk_SNMPv3(ctx) -> str:
     # self.ctx.out("Starting SNMPv3 bulk walk...", title=True)
     # self.drawDoubleLine()
     results = None
+    oids = {}
 
     objects = walk_cmd(
         SnmpEngine(),
@@ -112,11 +113,18 @@ async def getBulk_SNMPv3(ctx) -> str:
 
                 # Construct the final formatted string
                 formatted_output = f"{oid} = {value_output}"
+                oids.update({str(oid): value_output})
                 ctx.out(formatted_output, "TEXT",  indent=8)
             results = "success"
 
-    if ctx.write_to_file:
+    if ctx.write_to_file and results:
         write_to_file(ctx.write_to_file, results)
+
+    if results:
+        node = ctx.ptjsonlib.create_node_object("snmpv3_walk_results", properties=oids)
+        ctx.ptjsonlib.add_node(node)
+        ctx.ptjsonlib.add_vulnerability("PTV-SNMP-V3-WALK")
+
     return results
 
 

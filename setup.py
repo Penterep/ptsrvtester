@@ -48,7 +48,8 @@ setuptools.setup(
     "python-xlib>=0.33",
     "pynput>=1.8.0",
     "XWindows>=0.0.7",
-    "netifaces>=0.11.0"
+    "netifaces>=0.11.0",
+    "ptthreads"
 ],
     entry_points={"console_scripts": ["ptsrvtester = ptsrvtester.ptsrvtester:main"]},
     include_package_data=True,

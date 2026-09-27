@@ -1,4 +1,6 @@
 """CONNLIM — connection limits / rate / idle probes."""
+import sys
+
 from ._common import eng
 
 __MODULELABEL__ = "Connection limits"
@@ -13,6 +15,8 @@ def run(ctx):
         e.results.conn_limits = e.test_connection_limits_imap()
     except Exception as ex:
         e.results.conn_limits_error = str(ex)
+        sys.stdout.write("\033[2K\r")
+        sys.stdout.flush()
         ctx.out(f"CONNLIM failed: {ex}", "ERROR", indent=4)
         return
     e._stream_conn_limits_result()

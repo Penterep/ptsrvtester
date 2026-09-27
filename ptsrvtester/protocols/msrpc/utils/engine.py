@@ -5,19 +5,21 @@ import argparse
 import socket
 import sys
 import threading
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import product
-from typing import NamedTuple
+from typing import Iterator, NamedTuple
 
 from impacket import uuid
-from impacket.dcerpc.v5 import epm, mgmt, transport
+from impacket.dcerpc.v5 import epm, mgmt, samr, transport
 from impacket.dcerpc.v5.epm import MSRPC_UUID_PORTMAP
-from impacket.dcerpc.v5.rpcrt import RPC_C_AUTHN_WINNT
+from impacket.dcerpc.v5.rpcrt import (
+    DCERPCException, RPC_C_AUTHN_WINNT, RPC_C_AUTHN_LEVEL_PKT_INTEGRITY,
+)
 from impacket.dcerpc.v5.rpch import RPCProxyClientException
 from impacket.http import AUTH_NTLM
 from impacket.nt_errors import (
+    STATUS_ACCESS_DENIED,
     STATUS_ACCOUNT_DISABLED,
     STATUS_ACCOUNT_EXPIRED,
     STATUS_ACCOUNT_LOCKED_OUT,
@@ -26,7 +28,14 @@ from impacket.nt_errors import (
     STATUS_INVALID_WORKSTATION,
     STATUS_LOGON_FAILURE,
     STATUS_LOGON_TYPE_NOT_GRANTED,
+    STATUS_INVALID_INFO_CLASS,
+    STATUS_MORE_ENTRIES,
+    STATUS_NO_MORE_ENTRIES,
+    STATUS_NOT_SUPPORTED,
     STATUS_NO_SUCH_USER,
+    STATUS_NO_SUCH_FILE,
+    STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND,
     STATUS_PASSWORD_EXPIRED,
     STATUS_PASSWORD_MUST_CHANGE,
     STATUS_WRONG_PASSWORD,
@@ -35,6 +44,18 @@ from impacket.nt_errors import (
 from impacket.smbconnection import SMBConnection, SessionError
 
 from .helpers import text_or_file
+from .samr_policy import format_interval, parse_lockout_policy, parse_password_policy
+from .samr_users import parse_samr_user, unavailable_samr_user
+from .samr_session import (
+    ENUMERATION_PAGE_BYTES, MAX_ENUMERATION_PAGES, enumeration_page, iter_samr_domains,
+)
+from .epm_inventory import EpmEnumerationLimit, MAX_EPM_ENTRIES, iter_epm_entries
+from .shares import enumerate_shares
+from .credential_attempts import iter_credential_attempts
+from .rpc_auth import (
+    VerifiedDCERPC, SUPPORTED_RPC_PROBES, UnsupportedRpcProbe, confirm_rpc_access,
+)
+from .rpc_proxy import ObservedRPCProxyTransport, is_http_auth_rejection
 
 
 class Out(Enum):
@@ -70,18 +91,28 @@ class _AttemptResult:
     accepted: bool = False
     rejected: bool = False
     error: Exception | None = None
+    evidence: dict | None = None
+    stop_account: bool = False
 
 
 @dataclass
 class MSRPCResult:
     EpmapEndpoints: dict | None = None
+    EpmapEnumeration: dict | None = None
     MgmtEndpoints: list[str] | None = None
+    MgmtInterfaces: list[dict] | None = None
     Pipes: list[str] | None = None
     PipesCreds: list[Credential] | None = None
     Anonymous: list[str] | None = None
+    AnonymousAccess: dict | None = None
+    SamrPolicy: dict | None = None
+    SamrUsers: dict | None = None
+    SamrGroups: dict | None = None
+    SamrUserInfo: dict | None = None
     SMB_Brute: list[Credential] | None = None
     TCP_Brute: list[Credential] | None = None
     HTTP_Brute: list[Credential] | None = None
+    credential_checks: dict[str, list[dict]] = field(default_factory=dict)
     module_errors: dict[str, str] = field(default_factory=dict)
 
 
@@ -195,6 +226,7 @@ class MsrpcEngine(_PrintMixin):
         self.ptjsonlib = ptjsonlib
         self.use_json = bool(getattr(args, "json", False))
         self.results = MSRPCResult()
+        self._locked_accounts: set[str] = set()
 
     @property
     def rpc_port(self) -> int:
@@ -264,7 +296,8 @@ class MsrpcEngine(_PrintMixin):
             getattr(self.args, "username", None), getattr(self.args, "username_file", None)
         )
         passwords = text_or_file(
-            getattr(self.args, "password", None), getattr(self.args, "password_file", None)
+            getattr(self.args, "password", None), getattr(self.args, "password_file", None),
+            preserve_whitespace=True,
         )
         return usernames, passwords
 
@@ -318,13 +351,18 @@ class MsrpcEngine(_PrintMixin):
     def enumerate_epm(self) -> dict:
         endpoints: dict[str, dict] = {}
         dce = None
+        entries = None
+        evidence = {"status": "error", "reason": None, "limit": MAX_EPM_ENTRIES,
+                    "entriesReturned": 0, "interfacesReturned": 0, "truncated": False}
+        self.results.EpmapEnumeration = evidence
         try:
             binding = f"ncacn_ip_tcp:{self.args.ip}[{self.rpc_port}]"
             rpc_transport = transport.DCERPCTransportFactory(binding)
             rpc_transport.set_connect_timeout(self.connect_timeout)
             dce = rpc_transport.get_dce_rpc()
             dce.connect()
-            entries = epm.hept_lookup(None, dce=dce)
+            dce.bind(epm.MSRPC_UUID_PORTMAP)
+            entries = iter_epm_entries(dce)
 
             for entry in entries:
                 floors = entry["tower"]["Floors"]
@@ -346,41 +384,54 @@ class MsrpcEngine(_PrintMixin):
                 string_binding = str(epm.PrintStringBinding(floors))
                 if string_binding not in item["Bindings"]:
                     item["Bindings"].append(string_binding)
+                evidence["entriesReturned"] += 1
 
-            for endpoint, item in endpoints.items():
-                self.ptprint(f"Protocol: {item['Protocol']}")
-                self.ptprint(f"Provider: {item['EXE']}")
-                self.ptprint(f"UUID: {endpoint} {item['annotation']}".rstrip())
-                self.ptprint("Bindings:")
-                for string_binding in item["Bindings"]:
-                    self.ptprint(f"  {string_binding}")
-            self.ptprint(f"Total endpoints found: {len(endpoints)}", out=Out.INFO)
-
-            if getattr(self.args, "output", None):
-                lines: list[str] = []
-                for endpoint, item in endpoints.items():
-                    lines.extend(
-                        [
-                            f"Protocol: {item['Protocol']}",
-                            f"Provider: {item['EXE']}",
-                            f"UUID: {endpoint} {item['annotation']}".rstrip(),
-                            "Bindings:",
-                            *(f"  {value}" for value in item["Bindings"]),
-                            "",
-                        ]
-                    )
-                lines.append(f"Total endpoints found: {len(endpoints)}")
-                self.write_to_file(lines)
-            return endpoints
+            evidence["status"] = "complete"
+        except EpmEnumerationLimit as exc:
+            evidence.update(status="partial", reason=exc.reason, truncated=True)
+            self.ptprint(f"Endpoint Mapper enumeration stopped: {exc.reason}", out=Out.WARNING)
         except Exception as exc:
+            evidence.update(status="partial" if endpoints else "error", reason="operational_error")
             self.record_module_error("ENUMEPM", exc)
             self.ptprint(f"Endpoint Mapper enumeration failed: {exc}", out=Out.ERROR)
-            return endpoints
         finally:
+            evidence["interfacesReturned"] = len(endpoints)
+            close = getattr(entries, "close", None)
+            if callable(close):
+                close()
             self._disconnect(dce)
 
+        lines: list[str] = []
+        for endpoint, item in endpoints.items():
+            lines.extend([
+                f"Protocol: {item['Protocol']}",
+                f"Provider: {item['EXE']}",
+                f"UUID: {endpoint} {item['annotation']}".rstrip(),
+                "Bindings:",
+                *(f"  {value}" for value in item["Bindings"]),
+                "",
+            ])
+        for line in lines:
+            self.ptprint(line)
+        summary = f"Total endpoints found: {len(endpoints)}"
+        self.ptprint(summary, out=Out.INFO)
+        lines.append(summary)
+        if evidence["status"] != "complete":
+            summary = f"Enumeration {evidence['status']}: {evidence['reason'].replace('_', ' ')}"
+            self.ptprint(summary, out=Out.WARNING)
+            lines.append(summary)
+        if getattr(self.args, "output", None):
+            try:
+                self.write_to_file(lines)
+            except argparse.ArgumentError as exc:
+                self.record_module_error("ENUMEPM", exc)
+                self.ptprint(f"Endpoint Mapper output failed: {exc}", out=Out.ERROR)
+        return endpoints
+
     def enumerate_mgmt(self) -> list[str]:
-        dangerous: list[str] = []
+        found: list[str] = []
+        details_list: list[dict] = []
+        self.results.MgmtInterfaces = details_list
         dce = None
         try:
             binding = f"ncacn_ip_tcp:{self.args.ip}[{self.rpc_port}]"
@@ -395,10 +446,10 @@ class MsrpcEngine(_PrintMixin):
                 uuid.bin_to_uuidtup(vector["if_id"][index]["Data"].getData())
                 for index in range(vector["count"])
             }
-            interfaces.add(("AFA8BD80-7D8A-11C9-BEF4-08002B102989", "1.0"))
-
             for interface_uuid, version in sorted(interfaces):
                 canonical = interface_uuid.lower()
+                if canonical not in found:
+                    found.append(canonical)
                 binary_key = uuid.uuidtup_to_bin((interface_uuid, version))[:18]
                 provider = self._provider_name(epm.KNOWN_UUIDS.get(binary_key))
                 protocol = self._provider_name(epm.KNOWN_PROTOCOLS.get(canonical))
@@ -406,19 +457,23 @@ class MsrpcEngine(_PrintMixin):
                 self.ptprint(f"Provider: {provider}")
                 self.ptprint(f"UUID: {interface_uuid} v{version}")
                 details = KNOWN_INTERFACE_UUIDS.get(canonical)
+                details_list.append({
+                    "uuid": canonical, "version": version,
+                    "provider": provider, "protocol": protocol,
+                    "knownPipe": details["pipe"] if details else None,
+                })
                 if details is not None:
-                    dangerous.append(canonical)
                     self.ptprint(f"Named Pipe: {details['pipe']}")
                     self.ptprint(f"Description: {details['description']}")
 
             self.ptprint(f"Interfaces found: {len(interfaces)}", out=Out.INFO)
             if getattr(self.args, "output", None):
-                self.write_to_file(dangerous)
-            return dangerous
+                self.write_to_file([f"{item['uuid']}:{item['version']}" for item in details_list])
+            return found
         except Exception as exc:
             self.record_module_error("ENUMMGMT", exc)
             self.ptprint(f"RPC management enumeration failed: {exc}", out=Out.ERROR)
-            return []
+            return found
         finally:
             self._disconnect(dce)
 
@@ -443,6 +498,7 @@ class MsrpcEngine(_PrintMixin):
                 credential.username or "",
                 credential.password or "",
                 getattr(self.args, "domain", "") or "",
+                ntlmFallback=False,
             )
             if require_identity and smb.isGuestSession():
                 return _AttemptResult(credential, rejected=True)
@@ -458,8 +514,14 @@ class MsrpcEngine(_PrintMixin):
             return _AttemptResult(credential, accepted=True)
         except SessionError as exc:
             if exc.getErrorCode() in _AUTH_REJECTION_STATUSES:
-                return _AttemptResult(credential, rejected=True)
-            if not strict_session_errors:
+                return _AttemptResult(
+                    credential, rejected=True,
+                    stop_account=exc.getErrorCode() == STATUS_ACCOUNT_LOCKED_OUT,
+                )
+            if not strict_session_errors and exc.getErrorCode() in {
+                STATUS_ACCESS_DENIED, STATUS_NO_SUCH_FILE,
+                STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+            }:
                 return _AttemptResult(credential, rejected=True)
             return _AttemptResult(credential, error=exc)
         except Exception as exc:
@@ -480,33 +542,777 @@ class MsrpcEngine(_PrintMixin):
         return outcome.accepted
 
     def enumerate_pipes(self) -> list[str]:
+        """Open selected pipes through one session; never retry rejected credentials."""
         pipes = getattr(self.args, "pipes", None) or list(DEFAULT_PIPES)
         credential = Credential(
             getattr(self.args, "username", None) or "",
             getattr(self.args, "password", None) or "",
         )
         found: list[str] = []
-        connection_errors: list[Exception] = []
-        for pipe in pipes:
+        smb = None
+        tree = None
+        logged_in = False
+        try:
+            smb = SMBConnection(
+                self.args.ip, self.args.ip, sess_port=self.smb_port,
+                timeout=self.connect_timeout,
+            )
             try:
-                if self.try_authenticated_pipe_bind(
-                    pipe,
-                    credential.username,
-                    credential.password,
-                    getattr(self.args, "domain", "") or "",
-                ):
+                smb.login(
+                    credential.username, credential.password,
+                    getattr(self.args, "domain", "") or "", ntlmFallback=False,
+                )
+                logged_in = True
+            except SessionError as exc:
+                if exc.getErrorCode() in _AUTH_REJECTION_STATUSES | {STATUS_ACCESS_DENIED}:
+                    self.ptprint("Named-pipe enumeration authentication was denied", out=Out.WARNING)
+                    return found
+                raise
+            try:
+                tree = smb.connectTree("IPC$")
+            except SessionError as exc:
+                if exc.getErrorCode() == STATUS_ACCESS_DENIED:
+                    self.ptprint("Named-pipe enumeration IPC$ access was denied", out=Out.WARNING)
+                    return found
+                raise
+            for pipe in pipes:
+                handle = None
+                try:
+                    handle = smb.openFile(tree, "\\" + pipe)
                     found.append(pipe)
-            except Exception as exc:
-                connection_errors.append(exc)
-                self.ptprint(f"Could not test named pipe '{pipe}': {exc}", out=Out.WARNING)
-        if connection_errors and not found:
-            self.record_module_error("ENUMPIPES", connection_errors[0])
+                except SessionError as exc:
+                    if exc.getErrorCode() not in {
+                        STATUS_ACCESS_DENIED, STATUS_NO_SUCH_FILE,
+                        STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+                    }:
+                        raise
+                finally:
+                    if handle is not None:
+                        smb.closeFile(tree, handle)
+        except Exception as exc:
+            safe_error = self._sanitized_samr_error(exc)
+            self.record_module_error("ENUMPIPES", safe_error)
+            self.ptprint(f"Named-pipe enumeration failed: {safe_error}", out=Out.WARNING)
+        finally:
+            if smb is not None:
+                if tree is not None:
+                    try:
+                        smb.disconnectTree(tree)
+                    except Exception:
+                        pass
+                if logged_in:
+                    self._close_smb(smb)
+                else:
+                    try:
+                        smb.close()
+                    except Exception:
+                        pass
         self.ptprint(f"Reachable named pipes: {len(found)}", out=Out.INFO)
         for pipe in found:
             self.ptprint(pipe)
         if getattr(self.args, "output", None):
             self.write_to_file(found)
         return found
+
+    @staticmethod
+    def _samr_error_code(exc: Exception) -> int | None:
+        code = getattr(exc, "error_code", None)
+        if code is not None:
+            return int(code)
+        getter = getattr(exc, "get_error_code", None)
+        if callable(getter):
+            value = getter()
+            return int(value) if value is not None else None
+        getter = getattr(exc, "getErrorCode", None)
+        if callable(getter):
+            value = getter()
+            return int(value) if value is not None else None
+        return None
+
+    @classmethod
+    def _samr_access_denied(cls, exc: Exception) -> bool:
+        if cls._samr_error_code(exc) in {5, STATUS_ACCESS_DENIED}:
+            return True
+        return (
+            isinstance(exc, DCERPCException)
+            and getattr(exc, "error_string", None) == "rpc_s_access_denied"
+        )
+
+    @staticmethod
+    def _close_samr_handle(dce, handle) -> None:
+        if dce is None or handle is None:
+            return
+        try:
+            samr.hSamrCloseHandle(dce, handle)
+        except Exception:
+            pass
+
+    def _enumerate_samr_domain_names(self, dce, server_handle) -> Iterator[str]:
+        # Process each page before requesting the next, retaining earlier data
+        # if a later page fails or reaches a safety limit.
+        return iter_samr_domains(self, dce, server_handle)
+
+    def _print_samr_policy(self, result: dict) -> list[str]:
+        lines = [
+            f"SAMR policy source: {result['sourceHost']}",
+            "Policy scope: queried SAM domain (local account policy or AD domain default)",
+            "Effective per-user password and lockout policies: not queried; "
+            "AD users may have different policies",
+        ]
+        self.ptprint(f"SAMR policy query status: {result['status']}", out=Out.INFO)
+        for line in lines:
+            self.ptprint(line, out=Out.INFO)
+        for domain in result["domains"]:
+            name = domain.get("name", "unknown")
+            sid = domain.get("sid", "unknown")
+            self.ptprint(f"Domain: {name} ({sid})")
+            lines.append(f"Domain: {name} ({sid})")
+            if domain["status"] == "denied":
+                self.ptprint("Policy access denied", out=Out.WARNING)
+                lines.append("Policy access denied")
+                continue
+
+            password = domain.get("passwordPolicy")
+            if password is not None:
+                password_lines = [
+                    f"Minimum password length: {password['minimumPasswordLength']}",
+                    f"Password history length: {password['passwordHistoryLength']}",
+                    "Password complexity required: "
+                    + ("yes" if password["passwordComplexityRequired"] else "no"),
+                    "Reversible encryption enabled: "
+                    + ("yes" if password["reversibleEncryptionEnabled"] else "no"),
+                    f"Minimum password age: {format_interval(password['minimumPasswordAge'])}",
+                    f"Maximum password age: {format_interval(password['maximumPasswordAge'])}",
+                ]
+                for line in password_lines:
+                    self.ptprint(line)
+                lines.extend(password_lines)
+
+            lockout = domain.get("lockoutPolicy")
+            if lockout is not None:
+                duration = lockout["lockoutDuration"]
+                duration_text = (
+                    "until administrator unlocks"
+                    if duration.get("untilAdministratorUnlock")
+                    else format_interval(duration)
+                )
+                lockout_lines = [
+                    "Account lockout enabled: "
+                    + ("yes" if lockout["lockoutEnabled"] else "no"),
+                    f"Lockout threshold: {lockout['lockoutThreshold']}",
+                    f"Lockout duration: {duration_text}",
+                    "Lockout observation window: "
+                    + format_interval(lockout["lockoutObservationWindow"]),
+                ]
+                for line in lockout_lines:
+                    self.ptprint(line)
+                lines.extend(lockout_lines)
+
+            for error in domain.get("errors", []):
+                self.ptprint(
+                    f"{error['section']} unavailable: {error['reason']}", out=Out.WARNING
+                )
+                lines.append(f"{error['section']} unavailable: {error['reason']}")
+            lines.append("")
+        return lines
+
+    def _sanitized_samr_error(self, exc: Exception) -> str:
+        message = str(exc)
+        for value in (
+            getattr(self.args, "password", None),
+            getattr(self.args, "username", None),
+            getattr(self.args, "domain", None),
+        ):
+            if value:
+                message = message.replace(str(value), "[redacted]")
+        return f"{type(exc).__name__}: {message}"
+
+    def query_samr_policy(self) -> dict:
+        result: dict[str, object] = {
+            "status": "error",
+            "reason": None,
+            "sourceHost": self.args.ip,
+            "policyScope": "sam_domain",
+            "effectiveUserPolicyChecked": False,
+            "domains": [],
+        }
+        smb = None
+        dce = None
+        server_handle = None
+        logged_in = False
+        try:
+            smb = SMBConnection(
+                self.args.ip,
+                self.args.ip,
+                sess_port=self.smb_port,
+                timeout=self.connect_timeout,
+            )
+            try:
+                smb.login(
+                    self.args.username,
+                    self.args.password,
+                    getattr(self.args, "domain", "") or "",
+                    ntlmFallback=False,
+                )
+                logged_in = True
+            except SessionError as exc:
+                if self._samr_error_code(exc) in (
+                    _AUTH_REJECTION_STATUSES | {STATUS_ACCESS_DENIED}
+                ):
+                    result.update(status="denied", reason="authentication_denied")
+                    self.ptprint("SAMR authentication was denied", out=Out.WARNING)
+                    return result
+                raise
+
+            if smb.isGuestSession():
+                result.update(status="denied", reason="guest_session")
+                self.ptprint(
+                    "SAMR policy was not queried because authentication mapped to Guest",
+                    out=Out.WARNING,
+                )
+                return result
+
+            binding = f"ncacn_np:{self.args.ip}[\\pipe\\samr]"
+            rpc_transport = transport.DCERPCTransportFactory(binding)
+            rpc_transport.set_dport(self.smb_port)
+            rpc_transport.set_connect_timeout(self.connect_timeout)
+            rpc_transport.setRemoteHost(self.args.ip)
+            rpc_transport.set_smb_connection(smb)
+            dce = rpc_transport.get_dce_rpc()
+            dce.connect()
+            dce.bind(samr.MSRPC_UUID_SAMR)
+
+            server_access = (
+                samr.SAM_SERVER_ENUMERATE_DOMAINS | samr.SAM_SERVER_LOOKUP_DOMAIN
+            )
+            try:
+                connected = samr.hSamrConnect5(dce, desiredAccess=server_access)
+            except Exception as exc:
+                if self._samr_access_denied(exc):
+                    result.update(status="denied", reason="sam_server_access_denied")
+                    self.ptprint("SAM server policy access was denied", out=Out.WARNING)
+                    return result
+                raise
+            server_handle = connected["ServerHandle"]
+            domain_names = self._enumerate_samr_domain_names(dce, server_handle)
+
+            domain_results: list[dict[str, object]] = []
+            result["domains"] = domain_results
+            for domain_name in domain_names:
+                domain_handle = None
+                lookup = samr.hSamrLookupDomainInSamServer(
+                    dce, server_handle, domain_name
+                )
+                domain_sid = lookup["DomainId"]
+                sid_text = domain_sid.formatCanonical()
+                if sid_text == "S-1-5-32":
+                    continue
+
+                domain_result: dict[str, object] = {
+                    "status": "complete",
+                    "name": domain_name,
+                    "sid": sid_text,
+                    "passwordPolicy": None,
+                    "lockoutPolicy": None,
+                    "errors": [],
+                }
+                domain_results.append(domain_result)
+                try:
+                    domain_access = samr.DOMAIN_READ_PASSWORD_PARAMETERS
+                    try:
+                        opened = samr.hSamrOpenDomain(
+                            dce,
+                            server_handle,
+                            desiredAccess=domain_access,
+                            domainId=domain_sid,
+                        )
+                    except Exception as exc:
+                        if self._samr_access_denied(exc):
+                            domain_result.update(status="denied")
+                            domain_result["errors"].append(
+                                {"section": "domain", "reason": "access_denied"}
+                            )
+                            continue
+                        raise
+                    domain_handle = opened["DomainHandle"]
+
+                    sections = (
+                        (
+                            "passwordPolicy",
+                            samr.DOMAIN_INFORMATION_CLASS.DomainPasswordInformation,
+                            "Password",
+                            parse_password_policy,
+                        ),
+                        (
+                            "lockoutPolicy",
+                            samr.DOMAIN_INFORMATION_CLASS.DomainLockoutInformation,
+                            "Lockout",
+                            parse_lockout_policy,
+                        ),
+                    )
+                    for section, info_class, union_name, parser in sections:
+                        try:
+                            response = samr.hSamrQueryInformationDomain(
+                                dce, domain_handle, info_class
+                            )
+                            domain_result[section] = parser(
+                                response["Buffer"][union_name]
+                            )
+                        except Exception as exc:
+                            code = self._samr_error_code(exc)
+                            if self._samr_access_denied(exc):
+                                reason = "access_denied"
+                            elif code in {STATUS_INVALID_INFO_CLASS, STATUS_NOT_SUPPORTED}:
+                                reason = "not_supported"
+                            else:
+                                reason = "operational_error"
+                                self.record_module_error("SAMRPOLICY", self._sanitized_samr_error(exc))
+                            domain_result["status"] = "partial"
+                            domain_result["errors"].append(
+                                {"section": section, "reason": reason}
+                            )
+                    if (
+                        domain_result["passwordPolicy"] is None
+                        and domain_result["lockoutPolicy"] is None
+                    ):
+                        reasons = {
+                            error["reason"] for error in domain_result["errors"]
+                        }
+                        domain_result["status"] = (
+                            "denied"
+                            if reasons and reasons == {"access_denied"}
+                            else ("error" if "operational_error" in reasons else "partial")
+                        )
+                except Exception as exc:
+                    denied = self._samr_access_denied(exc)
+                    domain_result["status"] = "denied" if denied else "error"
+                    domain_result["errors"].append({
+                        "section": "domain",
+                        "reason": "access_denied" if denied else "operational_error",
+                    })
+                    if not denied:
+                        self.record_module_error("SAMRPOLICY", self._sanitized_samr_error(exc))
+                finally:
+                    self._close_samr_handle(dce, domain_handle)
+
+            if not domain_results:
+                result.update(status="complete", reason="no_account_domains")
+                self._print_samr_policy(result)
+                return result
+            statuses = {domain["status"] for domain in domain_results}
+            if statuses == {"denied"}:
+                result.update(status="denied", reason="policy_access_denied")
+            elif statuses == {"error"}:
+                result.update(status="error", reason="operational_error")
+            elif statuses == {"complete"}:
+                result.update(status="complete", reason=None)
+            else:
+                result.update(status="partial", reason="some_policy_data_unavailable")
+
+        except Exception as exc:
+            if self._samr_access_denied(exc):
+                result.update(status="partial" if result["domains"] else "denied", reason="samr_access_denied")
+                self.ptprint("SAMR policy access was denied", out=Out.WARNING)
+            else:
+                result.update(status="partial" if result["domains"] else "error", reason="operational_error")
+                safe_error = self._sanitized_samr_error(exc)
+                self.record_module_error("SAMRPOLICY", safe_error)
+                self.ptprint(f"SAMR policy query failed: {safe_error}", out=Out.ERROR)
+        finally:
+            self._close_samr_handle(dce, server_handle)
+            self._disconnect(dce)
+            if smb is not None and logged_in:
+                self._close_smb(smb)
+            elif smb is not None:
+                close = getattr(smb, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
+        output_lines = self._print_samr_policy(result)
+        if getattr(self.args, "output", None) and output_lines:
+            self.write_to_file(output_lines)
+        return result
+
+    def _enumerate_samr_domain_users(
+        self,
+        dce,
+        domain_handle,
+        domain_sid: str,
+        limit: int,
+        domain_result: dict[str, object],
+    ) -> tuple[list[dict[str, object]], bool]:
+        users = domain_result["users"]
+        users_by_rid = {int(user["rid"]): user for user in users}
+        context = 0
+        seen_contexts: set[int] = set()
+        page_count = 0
+
+        while True:
+            page_count += 1
+            if page_count > MAX_ENUMERATION_PAGES:
+                raise RuntimeError("SAMR user enumeration exceeded its page limit")
+
+            remaining = limit - len(users)
+            if remaining <= 0:
+                return users, True
+            try:
+                response = samr.hSamrEnumerateUsersInDomain(
+                    dce,
+                    domain_handle,
+                    userAccountControl=samr.USER_NORMAL_ACCOUNT,
+                    enumerationContext=context,
+                    preferedMaximumLength=ENUMERATION_PAGE_BYTES,
+                )
+            except samr.DCERPCSessionError as exc:
+                status = self._samr_error_code(exc)
+                if status == STATUS_NO_MORE_ENTRIES and exc.get_packet() is None:
+                    return users, False
+                if status not in {STATUS_MORE_ENTRIES, STATUS_NO_MORE_ENTRIES}:
+                    raise
+                response = exc.get_packet()
+                if response is None:
+                    raise RuntimeError(
+                        "SAMR user enumeration continuation had no response"
+                    ) from exc
+
+            entries, next_context, more = enumeration_page(response)
+            page_users = []
+            truncated = False
+            # Save the page's identities before detail calls can fail or an
+            # account can disappear between enumeration and opening its handle.
+            for entry in entries:
+                try:
+                    name = str(entry["Name"]).rstrip("\x00")
+                    rid = int(entry["RelativeId"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("malformed SAMR user entry") from exc
+                previous = users_by_rid.get(rid)
+                if previous is not None:
+                    if previous["name"] != name:
+                        raise ValueError(
+                            f"SAMR returned conflicting records for RID {rid}"
+                        )
+                    continue
+                if len(users) >= limit:
+                    truncated = True
+                    break
+                user = unavailable_samr_user(name, rid, domain_sid, "not_queried", status="unavailable")
+                users_by_rid[rid] = user
+                users.append(user)
+                page_users.append(user)
+
+            truncated = truncated or (more and len(users) >= limit)
+            domain_result["truncated"] = truncated
+            for user in page_users:
+                name, rid = user["name"], user["rid"]
+                user_handle = None
+                try:
+                    try:
+                        opened = samr.hSamrOpenUser(
+                            dce,
+                            domain_handle,
+                            desiredAccess=samr.USER_READ_ACCOUNT,
+                            userId=rid,
+                        )
+                        user_handle = opened["UserHandle"]
+                        information = samr.hSamrQueryInformationUser(
+                            dce,
+                            user_handle,
+                            userInformationClass=(
+                                samr.USER_INFORMATION_CLASS.UserControlInformation
+                            ),
+                        )
+                        account_control = int(
+                            information["Buffer"]["Control"]["UserAccountControl"]
+                        )
+                        parsed = parse_samr_user(
+                            name, rid, account_control, domain_sid
+                        )
+                    except Exception as exc:
+                        if self._samr_access_denied(exc):
+                            parsed = unavailable_samr_user(name, rid, domain_sid, "access_denied")
+                        elif self._samr_error_code(exc) == STATUS_NO_SUCH_USER:
+                            parsed = unavailable_samr_user(
+                                name, rid, domain_sid, "no_such_user", status="unavailable"
+                            )
+                        else:
+                            user.update(stateStatus="error", stateReason="operational_error")
+                            raise
+                finally:
+                    self._close_samr_handle(dce, user_handle)
+
+                user.update(parsed)
+
+            if truncated:
+                return users, True
+            if not more:
+                return users, False
+            if not page_users:
+                raise RuntimeError("SAMR user enumeration did not make progress")
+
+            if next_context == context or next_context in seen_contexts:
+                raise RuntimeError("SAMR user enumeration context did not advance")
+            seen_contexts.add(context)
+            context = next_context
+
+    def _print_samr_users(self, result: dict) -> list[str]:
+        lines: list[str] = []
+        self.ptprint(
+            f"SAMR user enumeration status: {result['status']}", out=Out.INFO
+        )
+        if result.get("reason"):
+            reason = str(result["reason"]).replace("_", " ")
+            line = f"Reason: {reason}"
+            self.ptprint(line, out=Out.WARNING)
+            lines.append(line)
+        for domain in result["domains"]:
+            name = domain.get("name", "unknown")
+            sid = domain.get("sid") or "unknown"
+            header = f"Domain: {name} ({sid})"
+            self.ptprint(header)
+            lines.append(header)
+            if domain["status"] == "denied":
+                self.ptprint("User enumeration access denied", out=Out.WARNING)
+                lines.append("User enumeration access denied")
+                continue
+            for user in domain["users"]:
+                if user["stateStatus"] == "complete":
+                    state = (
+                        f"disabled: {'yes' if user['disabled'] else 'no'}, "
+                        f"locked: {'yes' if user['lockedOut'] else 'no'}"
+                    )
+                else:
+                    reason = str(user["stateReason"] or user["stateStatus"]).replace("_", " ")
+                    state = f"account state: {reason}"
+                line = (
+                    f"{user['name']} (RID {user['rid']}, SID {user['sid']}, "
+                    f"{state})"
+                )
+                self.ptprint(line)
+                lines.append(line)
+            self.ptprint(f"Users returned: {domain['returned']}", out=Out.INFO)
+            lines.append(f"Users returned: {domain['returned']}")
+            lines.append("")
+        return lines
+
+    def enumerate_samr_users(self) -> dict:
+        limit = int(getattr(self.args, "samr_max_users", 1000) or 1000)
+        result: dict[str, object] = {
+            "status": "error",
+            "reason": None,
+            "limit": limit,
+            "returned": 0,
+            "truncated": False,
+            "domains": [],
+        }
+        smb = None
+        dce = None
+        server_handle = None
+        logged_in = False
+        try:
+            smb = SMBConnection(
+                self.args.ip,
+                self.args.ip,
+                sess_port=self.smb_port,
+                timeout=self.connect_timeout,
+            )
+            try:
+                smb.login(
+                    self.args.username,
+                    self.args.password,
+                    getattr(self.args, "domain", "") or "",
+                    ntlmFallback=False,
+                )
+                logged_in = True
+            except SessionError as exc:
+                if self._samr_error_code(exc) in (
+                    _AUTH_REJECTION_STATUSES | {STATUS_ACCESS_DENIED}
+                ):
+                    result.update(status="denied", reason="authentication_denied")
+                    self.ptprint("SAMR authentication was denied", out=Out.WARNING)
+                    return result
+                raise
+
+            if smb.isGuestSession():
+                result.update(status="denied", reason="guest_session")
+                self.ptprint(
+                    "SAMR users were not enumerated because authentication mapped to Guest",
+                    out=Out.WARNING,
+                )
+                return result
+
+            binding = f"ncacn_np:{self.args.ip}[\\pipe\\samr]"
+            rpc_transport = transport.DCERPCTransportFactory(binding)
+            rpc_transport.set_dport(self.smb_port)
+            rpc_transport.set_connect_timeout(self.connect_timeout)
+            rpc_transport.setRemoteHost(self.args.ip)
+            rpc_transport.set_smb_connection(smb)
+            dce = rpc_transport.get_dce_rpc()
+            dce.connect()
+            dce.bind(samr.MSRPC_UUID_SAMR)
+
+            server_access = (
+                samr.SAM_SERVER_ENUMERATE_DOMAINS | samr.SAM_SERVER_LOOKUP_DOMAIN
+            )
+            try:
+                connected = samr.hSamrConnect5(dce, desiredAccess=server_access)
+            except Exception as exc:
+                if self._samr_access_denied(exc):
+                    result.update(status="denied", reason="sam_server_access_denied")
+                    self.ptprint("SAM user enumeration access was denied", out=Out.WARNING)
+                    return result
+                raise
+            server_handle = connected["ServerHandle"]
+            domain_names = self._enumerate_samr_domain_names(dce, server_handle)
+
+            domain_results: list[dict[str, object]] = []
+            result["domains"] = domain_results
+            for domain_name in domain_names:
+                domain_handle = None
+                domain_result: dict[str, object] | None = None
+                try:
+                    try:
+                        lookup = samr.hSamrLookupDomainInSamServer(
+                            dce, server_handle, domain_name
+                        )
+                    except Exception as exc:
+                        if self._samr_access_denied(exc):
+                            domain_results.append(
+                                {
+                                    "status": "denied",
+                                    "reason": "access_denied",
+                                    "name": domain_name,
+                                    "sid": None,
+                                    "returned": 0,
+                                    "truncated": False,
+                                    "users": [],
+                                }
+                            )
+                            continue
+                        raise
+                    domain_sid = lookup["DomainId"]
+                    sid_text = domain_sid.formatCanonical()
+                    if sid_text == "S-1-5-32":
+                        continue
+                    if int(result["returned"]) >= limit:
+                        result.update(
+                            status="partial", reason="limit_reached", truncated=True
+                        )
+                        break
+
+                    domain_result = {
+                        "status": "complete",
+                        "reason": None,
+                        "name": domain_name,
+                        "sid": sid_text,
+                        "returned": 0,
+                        "truncated": False,
+                        "users": [],
+                    }
+                    domain_results.append(domain_result)
+                    try:
+                        opened = samr.hSamrOpenDomain(
+                            dce,
+                            server_handle,
+                            desiredAccess=(
+                                samr.DOMAIN_LIST_ACCOUNTS | samr.DOMAIN_LOOKUP
+                            ),
+                            domainId=domain_sid,
+                        )
+                    except Exception as exc:
+                        if self._samr_access_denied(exc):
+                            domain_result.update(
+                                status="denied", reason="access_denied"
+                            )
+                            continue
+                        domain_result.update(status="error", reason="operational_error")
+                        raise
+                    domain_handle = opened["DomainHandle"]
+
+                    remaining = limit - int(result["returned"])
+                    users = domain_result["users"]
+                    try:
+                        users, truncated = self._enumerate_samr_domain_users(
+                            dce, domain_handle, sid_text, remaining, domain_result
+                        )
+                    except Exception as exc:
+                        domain_result["returned"] = len(users)
+                        result["returned"] = int(result["returned"]) + len(users)
+                        result["truncated"] = result["truncated"] or domain_result["truncated"]
+                        if self._samr_access_denied(exc):
+                            domain_result.update(
+                                status=("partial" if users else "denied"),
+                                reason="access_denied",
+                            )
+                            continue
+                        domain_result.update(status="partial" if users else "error", reason="operational_error")
+                        raise
+                    domain_result["users"] = users
+                    domain_result["returned"] = len(users)
+                    domain_result["truncated"] = truncated
+                    result["returned"] = int(result["returned"]) + len(users)
+                    if truncated:
+                        domain_result.update(status="partial", reason="limit_reached")
+                        result.update(
+                            status="partial", reason="limit_reached", truncated=True
+                        )
+                        break
+                    if any(
+                        user["stateStatus"] != "complete" for user in users
+                    ):
+                        domain_result.update(
+                            status="partial",
+                            reason="some_account_state_unavailable",
+                        )
+                finally:
+                    self._close_samr_handle(dce, domain_handle)
+
+            if not result["truncated"]:
+                if not domain_results:
+                    result.update(status="complete", reason="no_account_domains")
+                else:
+                    statuses = {domain["status"] for domain in domain_results}
+                    if statuses == {"denied"}:
+                        result.update(
+                            status="denied", reason="account_enumeration_denied"
+                        )
+                    elif statuses == {"complete"}:
+                        result.update(status="complete", reason=None)
+                    else:
+                        result.update(
+                            status="partial",
+                            reason="some_account_data_unavailable",
+                        )
+
+        except Exception as exc:
+            if self._samr_access_denied(exc):
+                result.update(status="partial" if result["domains"] else "denied", reason="samr_access_denied")
+                self.ptprint("SAM user enumeration access was denied", out=Out.WARNING)
+            else:
+                result.update(status="partial" if result["returned"] else "error", reason="operational_error")
+                safe_error = self._sanitized_samr_error(exc)
+                self.record_module_error("SAMRUSERS", safe_error)
+                self.ptprint(f"SAM user enumeration failed: {safe_error}", out=Out.ERROR)
+        finally:
+            self._close_samr_handle(dce, server_handle)
+            self._disconnect(dce)
+            if smb is not None and logged_in:
+                self._close_smb(smb)
+            elif smb is not None:
+                close = getattr(smb, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
+        output_lines = self._print_samr_users(result)
+        if getattr(self.args, "output", None) and output_lines:
+            self.write_to_file(output_lines)
+        return result
 
     def _run_credential_attempts(self, code: str, attempt) -> list[Credential]:
         usernames, passwords = self._credential_sources()
@@ -523,18 +1329,14 @@ class MsrpcEngine(_PrintMixin):
             )
 
         workers = min(int(getattr(self.args, "threads", 10) or 10), total)
-        pending_limit = max(1, workers * 2)
-        credentials = enumerate(self._iter_credentials(usernames, passwords))
+        credentials = self._iter_credentials(usernames, passwords)
         accepted: list[tuple[int, Credential]] = []
+        checks: list[tuple[int, dict]] = []
         error_count = 0
         first_error: tuple[int, Exception] | None = None
 
-        def resolve(future, index: int, credential: Credential) -> None:
+        def resolve(outcome, index: int, credential: Credential) -> None:
             nonlocal error_count, first_error
-            try:
-                outcome = future.result()
-            except Exception as exc:
-                outcome = _AttemptResult(credential, error=exc)
             if not isinstance(outcome, _AttemptResult):
                 outcome = _AttemptResult(
                     credential,
@@ -542,33 +1344,46 @@ class MsrpcEngine(_PrintMixin):
                 )
             if outcome.accepted:
                 accepted.append((index, outcome.credential))
+            if outcome.evidence is not None or outcome.stop_account:
+                checks.append((index, {
+                    "attempt": index + 1,
+                    "status": "accepted" if outcome.accepted else ("rejected" if outcome.rejected else "inconclusive"),
+                    **(outcome.evidence or {}),
+                    **({"reason": "account_locked_out"} if outcome.stop_account else {}),
+                }))
             if outcome.error is not None:
                 error_count += 1
                 if first_error is None or index < first_error[0]:
                     first_error = (index, outcome.error)
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            pending = {}
-
-            def submit_next() -> bool:
-                try:
-                    index, credential = next(credentials)
-                except StopIteration:
-                    return False
-                pending[executor.submit(attempt, credential)] = (index, credential)
-                return True
-
-            while len(pending) < pending_limit and submit_next():
-                pass
-            while pending:
-                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    index, credential = pending.pop(future)
-                    resolve(future, index, credential)
-                while len(pending) < pending_limit and submit_next():
-                    pass
+        skipped = 0
+        for item in iter_credential_attempts(
+            credentials, attempt, workers=workers,
+            account_key=lambda credential: (credential.username or "").casefold(),
+            stop_account=lambda outcome: isinstance(outcome, _AttemptResult) and outcome.stop_account,
+            stopped_accounts=self._locked_accounts,
+        ):
+            if item.skipped:
+                skipped += 1
+                checks.append((item.index, {
+                    "attempt": item.index + 1, "status": "skipped", "reason": "account_locked_out",
+                }))
+                continue
+            outcome = item.outcome if item.error is None else _AttemptResult(item.credential, error=item.error)
+            resolve(outcome, item.index, item.credential)
+        if skipped:
+            self.ptprint(f"Credential attempts skipped after account lockout: {skipped}", out=Out.WARNING)
 
         found = [credential for _, credential in sorted(accepted)]
+        if checks:
+            evidence = [value for _, value in sorted(checks)]
+            self.results.credential_checks[code] = evidence
+            if code == "BRUTEHTTP":
+                tunnels = sum(item.get("rpcTunnel") == "established" for item in evidence)
+                self.ptprint(f"RPC Proxy tunnels established: {tunnels}/{len(evidence)}", out=Out.INFO)
+            if code in {"BRUTETCP", "BRUTEHTTP"}:
+                confirmed = sum(item.get("rpcCall") == "confirmed" for item in evidence)
+                self.ptprint(f"Read-only RPC calls confirmed: {confirmed}/{len(evidence)}", out=Out.INFO)
         if first_error is not None:
             self.record_module_error(code, first_error[1])
             self.ptprint(
@@ -599,8 +1414,17 @@ class MsrpcEngine(_PrintMixin):
         )
 
     def Anonymous_smb(self) -> list[str]:
+        """Retain legacy null-session flags and publish separate access evidence."""
         smb = None
         logged_in = False
+        legacy: list[str] = []
+        stage = "login"
+        evidence = {
+            "status": "error", "reason": None, "sessionType": "unknown",
+            "login": "not_tested", "ipcAccess": "not_tested",
+            "shareEnumeration": "not_tested", "shares": [],
+        }
+        self.results.AnonymousAccess = evidence
         try:
             smb = SMBConnection(
                 self.args.ip,
@@ -611,36 +1435,62 @@ class MsrpcEngine(_PrintMixin):
             try:
                 smb.login("", "")
                 logged_in = True
-            except SessionError:
-                self.ptprint("Anonymous SMB login is denied", out=Out.NOTVULN)
-                return []
+            except SessionError as exc:
+                if exc.getErrorCode() in _AUTH_REJECTION_STATUSES | {STATUS_ACCESS_DENIED}:
+                    evidence.update(status="denied", reason="authentication_denied", login="denied")
+                    self.ptprint("Anonymous SMB login is denied", out=Out.NOTVULN)
+                    return []
+                raise
 
-            # Verify the exact IPC$ access represented by the second legacy flag.
+            guest = bool(smb.isGuestSession())
+            evidence.update(login="accepted", sessionType="guest" if guest else "null")
+            if not guest:
+                legacy = ["True", "Unknown"]
+            self.ptprint(
+                "Empty SMB credentials mapped to Guest" if guest else "SMB null session accepted",
+                out=Out.INFO if guest else Out.VULN,
+            )
+            stage = "ipcAccess"
             try:
                 smb.connectTree("IPC$")
-            except SessionError:
-                self.ptprint(
-                    "Anonymous SMB login is allowed, but IPC$ access is denied",
-                    out=Out.VULN,
-                )
-                return ["True", "False"]
-
-            self.ptprint("Anonymous SMB login and IPC$ access are allowed", out=Out.VULN)
-            try:
-                shares = smb.listShares()
             except SessionError as exc:
-                shares = []
-                self.ptprint(
-                    f"Anonymous share enumeration is denied: {exc}",
-                    out=Out.WARNING,
-                )
-            for share in shares:
-                try:
-                    name = share["shi1_netname"]
-                except (KeyError, TypeError):
-                    continue
-                self.ptprint(f"Share: {str(name).rstrip(chr(0))}")
-            return ["True", "True"]
+                if exc.getErrorCode() != STATUS_ACCESS_DENIED:
+                    raise
+                evidence.update(status="partial", reason="ipc_access_denied", ipcAccess="denied")
+                if legacy:
+                    legacy[1] = "False"
+                self.ptprint("IPC$ access is denied", out=Out.WARNING)
+                return legacy
+
+            evidence["ipcAccess"] = "allowed"
+            if legacy:
+                legacy[1] = "True"
+            self.ptprint("IPC$ access is allowed", out=Out.INFO)
+            stage = "shareEnumeration"
+            inventory = enumerate_shares(smb)
+            evidence["shares"] = inventory["shares"]
+            evidence["shareEnumeration"] = inventory["status"]
+            evidence["shareEnumerationDetails"] = {
+                key: value for key, value in inventory.items() if key not in {"shares", "error"}
+            }
+            evidence.update(
+                status=inventory["status"] if inventory["status"] in {"complete", "error"} else "partial",
+                reason=inventory["reason"],
+            )
+            for share in inventory["shares"]:
+                self.ptprint(f"Share: {share['name']}")
+            if inventory["error"] is not None:
+                self.record_module_error("ANONSMB", self._sanitized_samr_error(inventory["error"]))
+            if inventory["reason"]:
+                self.ptprint(f"Share enumeration: {inventory['reason']}", out=Out.WARNING)
+            return legacy
+        except Exception as exc:
+            evidence.update(status="error", reason="operational_error")
+            evidence[stage] = "error"
+            safe_error = self._sanitized_samr_error(exc)
+            self.record_module_error("ANONSMB", safe_error)
+            self.ptprint(f"SMB anonymous access check failed: {safe_error}", out=Out.ERROR)
+            return legacy
         finally:
             if smb is not None and logged_in:
                 self._close_smb(smb)
@@ -667,6 +1517,7 @@ class MsrpcEngine(_PrintMixin):
                 credential.username or "",
                 credential.password or "",
                 getattr(self.args, "domain", "") or "",
+                ntlmFallback=False,
             )
             logged_in = True
             if smb.isGuestSession():
@@ -674,7 +1525,10 @@ class MsrpcEngine(_PrintMixin):
             return _AttemptResult(credential, accepted=True)
         except SessionError as exc:
             if exc.getErrorCode() in _AUTH_REJECTION_STATUSES:
-                return _AttemptResult(credential, rejected=True)
+                return _AttemptResult(
+                    credential, rejected=True,
+                    stop_account=exc.getErrorCode() == STATUS_ACCOUNT_LOCKED_OUT,
+                )
             return _AttemptResult(credential, error=exc)
         except Exception as exc:
             return _AttemptResult(credential, error=exc)
@@ -691,6 +1545,14 @@ class MsrpcEngine(_PrintMixin):
 
     def smb_brute(self) -> list[Credential]:
         return self._run_credential_attempts("BRUTESMB", self._smb_attempt)
+
+    def enumerate_samr_groups(self) -> dict:
+        from .samr_groups import enumerate_samr_groups
+        return enumerate_samr_groups(self)
+
+    def query_samr_user_info(self) -> dict:
+        from .samr_userinfo import query_samr_user_info
+        return query_samr_user_info(self)
 
     @staticmethod
     def _interface_uuid_binary(interface: str) -> bytes:
@@ -717,27 +1579,37 @@ class MsrpcEngine(_PrintMixin):
     ) -> _AttemptResult:
         interface_binary = self._interface_uuid_binary(interface)
         dce = None
+        evidence = {"interface": interface, "rpcBind": "not_tested", "rpcCall": "not_tested"}
+        stage = "rpcBind"
         try:
+            if interface_binary not in SUPPORTED_RPC_PROBES:
+                raise UnsupportedRpcProbe(f"No read-only credential confirmation probe for {interface}")
             rpc_transport = transport.DCERPCTransportFactory(f"ncacn_ip_tcp:{host}[{port}]")
             rpc_transport.set_connect_timeout(self.connect_timeout)
             rpc_transport.set_credentials(
                 credential.username or "", credential.password or "", domain or ""
             )
-            dce = rpc_transport.get_dce_rpc()
+            dce = VerifiedDCERPC(rpc_transport)
             dce.set_credentials(
                 credential.username or "", credential.password or "", domain or ""
             )
             dce.set_auth_type(RPC_C_AUTHN_WINNT)
+            dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_INTEGRITY)
             dce.connect()
             dce.bind(interface_binary)
-            return _AttemptResult(credential, accepted=True)
-        except SessionError:
-            return _AttemptResult(credential, rejected=True)
+            evidence["rpcBind"] = "accepted"
+            stage = "rpcCall"
+            confirm_rpc_access(dce, interface_binary)
+            evidence["rpcCall"] = "confirmed"
+            return _AttemptResult(credential, accepted=True, evidence=evidence)
         except Exception as exc:
-            error_code = getattr(exc, "error_code", None)
-            if error_code == 5:
-                return _AttemptResult(credential, rejected=True)
-            return _AttemptResult(credential, error=exc)
+            # Access denied can mean method authorization rather than a wrong
+            # password. Only explicit logon rejection statuses classify as such.
+            rejected = self._samr_error_code(exc) in _AUTH_REJECTION_STATUSES
+            evidence[stage] = "denied" if rejected else "unconfirmed"
+            evidence["reason"] = "authentication_denied" if rejected else ("unsupported_interface" if isinstance(exc, UnsupportedRpcProbe) else "rpc_access_unconfirmed")
+            return _AttemptResult(credential, rejected=rejected, error=None if rejected else exc, evidence=evidence,
+                                  stop_account=self._samr_error_code(exc) == STATUS_ACCOUNT_LOCKED_OUT)
         finally:
             self._disconnect(dce)
 
@@ -764,9 +1636,13 @@ class MsrpcEngine(_PrintMixin):
 
     def _http_attempt(self, credential: Credential) -> _AttemptResult:
         dce = None
+        rpc_transport = None
+        evidence = {"proxyChannels": {"in": "not_tested", "out": "not_tested"},
+                    "rpcTunnel": "not_tested", "rpcBind": "not_tested", "rpcCall": "not_tested"}
+        stage = "rpcTunnel"
         try:
             proxy_host = getattr(self.args, "host", None) or self.args.ip
-            rpc_transport = transport.DCERPCTransportFactory(
+            rpc_transport = ObservedRPCProxyTransport(
                 f"ncacn_http:[593,RpcProxy={proxy_host}:{self.http_port}]"
             )
             rpc_transport.set_connect_timeout(self.connect_timeout)
@@ -776,13 +1652,14 @@ class MsrpcEngine(_PrintMixin):
                 getattr(self.args, "domain", "") or "",
             )
             rpc_transport.set_auth_type(AUTH_NTLM)
-            dce = rpc_transport.get_dce_rpc()
+            dce = VerifiedDCERPC(rpc_transport)
             dce.set_credentials(
                 credential.username or "",
                 credential.password or "",
                 getattr(self.args, "domain", "") or "",
             )
             dce.set_auth_type(RPC_C_AUTHN_WINNT)
+            dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_INTEGRITY)
             with _HTTP_PROXY_CONNECT_LOCK:
                 previous_timeout = socket.getdefaulttimeout()
                 socket.setdefaulttimeout(self.connect_timeout)
@@ -790,20 +1667,24 @@ class MsrpcEngine(_PrintMixin):
                     dce.connect()
                 finally:
                     socket.setdefaulttimeout(previous_timeout)
+            evidence["rpcTunnel"] = "established"
+            stage = "rpcBind"
             dce.bind(MSRPC_UUID_PORTMAP)
-            return _AttemptResult(credential, accepted=True)
-        except SessionError:
-            return _AttemptResult(credential, rejected=True)
-        except RPCProxyClientException as exc:
-            if "401 Unauthorized" in str(exc):
-                return _AttemptResult(credential, rejected=True)
-            return _AttemptResult(credential, error=exc)
+            evidence["rpcBind"] = "accepted"
+            stage = "rpcCall"
+            confirm_rpc_access(dce, MSRPC_UUID_PORTMAP)
+            evidence["rpcCall"] = "confirmed"
+            return _AttemptResult(credential, accepted=True, evidence=evidence)
         except Exception as exc:
-            error_code = getattr(exc, "error_code", None)
-            if error_code == 5:
-                return _AttemptResult(credential, rejected=True)
-            return _AttemptResult(credential, error=exc)
+            proxy_rejected = isinstance(exc, RPCProxyClientException) and is_http_auth_rejection(exc)
+            rejected = proxy_rejected or self._samr_error_code(exc) in _AUTH_REJECTION_STATUSES
+            evidence[stage] = "denied" if rejected else "unconfirmed"
+            evidence["reason"] = "proxy_authentication_denied" if proxy_rejected else ("authentication_denied" if rejected else "proxy_or_backend_access_unconfirmed")
+            return _AttemptResult(credential, rejected=rejected, error=None if rejected else exc, evidence=evidence,
+                                  stop_account=self._samr_error_code(exc) == STATUS_ACCOUNT_LOCKED_OUT)
         finally:
+            if rpc_transport is not None:
+                evidence["proxyChannels"] = dict(rpc_transport.channel_status)
             self._disconnect(dce)
 
     def http_brute(self) -> list[Credential]:
@@ -826,16 +1707,25 @@ class MsrpcEngine(_PrintMixin):
             "vendor": None,
             "description": None,
             "epmapEndpoints": self.results.EpmapEndpoints,
+            "epmapEnumeration": self.results.EpmapEnumeration,
             "mgmtEndpoints": self.results.MgmtEndpoints,
+            "mgmtInterfaces": self.results.MgmtInterfaces,
             "pipes": self.results.Pipes,
             "anonymous": (
                 ",".join(self.results.Anonymous) if self.results.Anonymous else None
             ),
+            "samrPolicy": self.results.SamrPolicy,
+            "samrUsers": self.results.SamrUsers,
+            "samrGroups": self.results.SamrGroups,
+            "samrUserInfo": self.results.SamrUserInfo,
+            "anonymousAccess": self.results.AnonymousAccess,
             "pipesCreds": self._credentials_to_string(self.results.PipesCreds),
             "smbBrute": self._credentials_to_string(self.results.SMB_Brute),
             "tcpBrute": self._credentials_to_string(self.results.TCP_Brute),
             "httpBrute": self._credentials_to_string(self.results.HTTP_Brute),
         }
+        if self.results.credential_checks:
+            properties["credentialChecks"] = self.results.credential_checks
         if self.results.module_errors:
             properties["moduleErrors"] = [
                 {"test": code, "error": error}

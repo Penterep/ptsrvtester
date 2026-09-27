@@ -13,7 +13,6 @@ from ptlibs.threads import ptthreads, printlock
 from ptlibs.ptprinthelper import out_if
 
 
-# enum from ptdefs dict
 class Out(Enum):
     TEXT = "TEXT"
     TITLE = "TITLE"
@@ -150,17 +149,14 @@ class BaseModule(ABC):
         """
 
         if json and not self.args.json:
-            # trying to print JSON in normal mode
             return
         elif not json and self.args.json:
-            # trying to print normal text in JSON mode
             return
 
         if title:
             colortext = True
             category = Out.TITLE.value
         else:
-            # Out.INFO should have colored text (yellow) for headings
             colortext = (out == Out.INFO)
             category = out.value
 
@@ -233,10 +229,7 @@ class BaseMain(BaseModule):
     whatever ``build_context()`` injects.
     """
 
-    #: Sub-directory (next to the concrete main file) that holds the protocol's modules.
     MODULES_DIRNAME = "modules"
-
-    # ---- generic machinery (inherited unchanged; do not copy per protocol) ----
 
     def __init__(self, args: BaseArgs, ptjsonlib: PtJsonLib) -> None:
         if not isinstance(args, self.ARGS_CLASS):
@@ -284,13 +277,45 @@ class BaseMain(BaseModule):
             order = int(getattr(module, "__ORDER__", 100))
             discovered[code] = _DiscoveredModule(code, label, order, module)
 
+        for code, entry in self._discover_shared_modules().items():
+            discovered.setdefault(code, entry)
+
         if skipped and getattr(self.args, "debug", False) and not self.use_json:
             sys.stdout.write("[skipped non-module files: " + ", ".join(skipped) + "]\n")
         return discovered
 
+    def _discover_shared_modules(self) -> dict[str, _DiscoveredModule]:
+        """Import every runnable ``_shared/modules/*.py`` as a real package member.
+
+        Shared modules are loaded by dotted path (not spec-from-file) so a
+        protocol that overrides :meth:`_import_module_file` for its own modules
+        does not affect how the shared ones import.
+        """
+        try:
+            import ptsrvtester.protocols._shared.modules as shared_pkg
+        except Exception:
+            return {}
+        shared_dir = os.path.dirname(os.path.abspath(shared_pkg.__file__))
+        discovered: dict[str, _DiscoveredModule] = {}
+        for fname in sorted(os.listdir(shared_dir)):
+            if not fname.endswith(".py") or fname.startswith("_"):
+                continue
+            name = fname[:-3]
+            try:
+                module = importlib.import_module(
+                    f"ptsrvtester.protocols._shared.modules.{name}"
+                )
+            except Exception:
+                continue
+            if not callable(getattr(module, "run", None)):
+                continue
+            code = str(getattr(module, "__MODULECODE__", name.upper())).upper()
+            label = str(getattr(module, "__MODULELABEL__", f"{code} module"))
+            order = int(getattr(module, "__ORDER__", 100))
+            discovered[code] = _DiscoveredModule(code, label, order, module)
+        return discovered
+
     def _import_module_file(self, name: str, path: str):
-        # The sys.modules name is prefixed with the protocol so same-named modules
-        # from different protocols don't collide. NAME comes from the subclass.
         mod_name = f"_ptsrv_{self.NAME}_module_{name}"
         spec = importlib.util.spec_from_file_location(mod_name, path)
         if spec is None or spec.loader is None:
@@ -309,7 +334,11 @@ class BaseMain(BaseModule):
         codes = [c.strip().upper() for c in raw.split(",")] if raw else []
         codes = [c for c in codes if c]
         if not codes or "ALL" in codes:
-            chosen = list(discovered.keys())
+            chosen = [
+                code
+                for code, entry in discovered.items()
+                if getattr(entry.module, "__RUN_IN_ALL__", True)
+            ]
         else:
             unknown = [c for c in codes if c not in discovered]
             if unknown:
@@ -337,15 +366,12 @@ class BaseMain(BaseModule):
 
         extras = self.build_context()
         self._outputs = {}
-        # PtThreads.threads() consumes (mutates) the list it is given, so hand it
-        # a copy and keep `selected` intact for the ordered flush below.
         self.ptthreads.threads(
             list(selected),
             lambda module_code: self._run_module(module_code, discovered, extras),
             self._thread_count(),
         )
 
-        # Flush per-module buffers back in the selected (deterministic) order.
         for code in selected:
             chunk = self._outputs.get(code, "")
             if chunk:
@@ -356,11 +382,10 @@ class BaseMain(BaseModule):
         entry = discovered[code]
         lock = printlock.PrintLock()
         ctx = self._make_context(lock, extras)
-        # The main owns the standardized section header so each module does not.
         ctx.out(entry.label, "INFO", colortext=True)
         try:
             entry.module.run(ctx)
-        except Exception as e:  # one failing module must not abort the rest
+        except Exception as e:
             ctx.out(f"Error in module {code}: {e}", "ERROR")
         with self._lock:
             self._outputs[code] = lock.get_output_string()
@@ -384,11 +409,7 @@ class BaseMain(BaseModule):
         if self.use_json:
             print(self.ptjsonlib.get_result_json())
 
-    # ---- protocol-specific hooks (override in the subclass) ----
-
-    #: Short protocol identity; also namespaces this protocol's modules in sys.modules.
     NAME: str = "base"
-    #: The protocol's argparse namespace class (used for the isinstance check).
     ARGS_CLASS: type = BaseArgs
 
     def _prepare_target(self) -> None:

@@ -66,6 +66,7 @@ def _spoof_ack(ctx):
 
     if ping_res.is_alive:
         ctx.out(f"Successfully changed the clients IP to {ctx.client_ip}", "VULN", indent=4)
+        ctx.ptjsonlib.add_vulnerability("PTV-DHCP-ACK-SPOOFING")
     else:
         ctx.out(f"Could not change the clients IP", "OK", indent=4)
 

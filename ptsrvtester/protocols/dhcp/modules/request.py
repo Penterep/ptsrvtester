@@ -32,6 +32,7 @@ def _request(ctx):
 
                         if msg_type == DHCPTypes.ACK: # DHCPACK
                             ctx.out(f"Successfully requested {ctx.requested_ip} and received a DHCP ACK message", "VULN", indent=4)
+                            ctx.ptjsonlib.add_vulnerabiltiy("PTV-DHCP-UNAUTHORIZED-REQUEST")
                             ctx.out(f"Received DHCP options:", "INFO", indent=4)
                             print_dhcp_options(ctx, packet[DHCP].options, 4)
                             return True

@@ -11,7 +11,8 @@ from ptsrvtester.protocols.dhcp.utils.registry import (
     get_interface_ip,
     get_interface_mac,
     print_dhcp_options,
-    get_option
+    get_option,
+    add_options_to_json
 )
 
 from scapy.sendrecv import AsyncSniffer

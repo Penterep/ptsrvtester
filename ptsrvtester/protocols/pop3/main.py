@@ -4,10 +4,13 @@ from __future__ import annotations
 import argparse
 import importlib
 import socket
+import sys
 
+from ptlibs.ptprinthelper import out_if
 from ptlibs.threads import printlock
 
 from .._base import BaseArgs, BaseMain
+from .._shared.utils.connection import banner_tcp_adapter
 from .utils.cli import POP3Args, validate_brute_selection
 from .utils.connection import ServerInfoCache, connect_pop3
 from .utils.registry import POP3_DEFAULT_SUITE
@@ -43,22 +46,35 @@ class POP3(BaseMain):
         return importlib.import_module(f"ptsrvtester.protocols.pop3.modules.{name}")
 
     def _run_module(self, code: str, discovered, extras: dict) -> None:
-        """Like BaseMain, but skip auto-header when ``__MODULELABEL__`` is empty.
+        """Heading now; ``-vv`` live; verdicts when the test finishes.
 
-        CAPA prints its own ``[+] CAPA command (PLAIN/STLS)`` headings; an extra
-        ``[+] CAPA`` would be redundant. Shared ``_base.BaseMain`` stays unchanged.
+        CAPA uses an empty label (it prints its own ``[+] CAPA command …`` titles).
         """
         entry = discovered[code]
         lock = printlock.PrintLock()
         ctx = self._make_context(lock, extras)
-        if entry.label.strip():
-            ctx.out(entry.label, "INFO", colortext=True)
+        if not self.use_json:
+            def live_debug(string="", *, indent=4):
+                if not ctx.verbose:
+                    return
+                line = out_if(string, "ADDITIONS", True, colortext=True, indent=indent)
+                if line:
+                    sys.stdout.write(line if line.endswith("\n") else line + "\n")
+                    sys.stdout.flush()
+            ctx.debug = live_debug
+        if entry.label.strip() and not self.use_json:
+            sys.stdout.write(out_if(entry.label, "INFO", True, colortext=True) + "\n")
+            sys.stdout.flush()
         try:
             entry.module.run(ctx)
         except Exception as e:
             ctx.out(f"Error in module {code}: {e}", "ERROR")
+        chunk = lock.get_output_string()
+        if chunk and not self.use_json:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
         with self._lock:
-            self._outputs[code] = lock.get_output_string()
+            self._outputs[code] = "" if not self.use_json else chunk
 
     def _prepare_target(self) -> None:
         target = self.args.target
@@ -101,6 +117,7 @@ class POP3(BaseMain):
             "connect": lambda debug=None: connect_pop3(self.args, debug=debug),
             "server_info": cache,
             "report": self.report,
+            "rate_limit_adapter": banner_tcp_adapter(self.target[0], self.target[1], self.args),
         }
 
     def output(self) -> None:

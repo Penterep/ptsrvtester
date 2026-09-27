@@ -1535,6 +1535,17 @@ def identify_smtp_server(
         anomalous_identity = False
         behavior_matches = None
         integrity_note = "Standard Exim EHLO profile often overlaps Enterprise Cloud Gateway signature; integrity verified."
+    # Sendmail: stock EHLO (ETRN, CRAM-MD5, HELP, PIPELINING, …) overlaps the same broad profile
+    elif (
+        _product_identity_key(product or "") == "sendmail"
+        and behavior_matches == "Enterprise Cloud Gateway"
+    ):
+        anomalous_identity = False
+        behavior_matches = None
+        integrity_note = (
+            "Standard Sendmail EHLO often overlaps Enterprise Cloud Gateway "
+            "(ETRN, CRAM-MD5, HELP, PIPELINING); this is not by itself evidence of a gateway or honeypot."
+        )
     # Appliance/Gateway: banner product vs Postfix/Exim-like EHLO — expected stack overlap, not honeypot
     elif (
         product

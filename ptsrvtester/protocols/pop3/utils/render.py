@@ -35,28 +35,29 @@ def emit_banner(ctx, info) -> None:
         ctx.report.update_properties(description=f"Banner: {info.banner}")
 
 
+def emit_capa_section(ctx, title: str, capa: dict, enc: bool) -> list[str]:
+    ctx.out(title, "INFO", colortext=True)
+    lines = []
+    for display, level in parse_capa_commands(capa, enc):
+        ctx.out(display, capa_level_bullet(level), indent=4)
+        lines.append(display)
+    return lines
+
+
 def emit_capa(ctx, info) -> None:
     if not info or not (info.capability or info.capability_stls):
         return
     encrypted = ctx.port == 995 or ctx.tls
     capa_stls = info.capability_stls
 
-    def _section(title: str, capa: dict, enc: bool) -> list[str]:
-        ctx.out(title, "INFO", colortext=True)
-        lines = []
-        for display, level in parse_capa_commands(capa, enc):
-            ctx.out(display, capa_level_bullet(level), indent=4)
-            lines.append(display)
-        return lines
-
     json_lines: list[str] = []
     if info.capability is not None and capa_stls is not None:
-        json_lines = _section("CAPA command (PLAIN)", info.capability, False)
+        json_lines = emit_capa_section(ctx, "CAPA command (PLAIN)", info.capability, False)
         json_lines.append("---")
-        json_lines += _section("CAPA command (STLS)", capa_stls, True)
+        json_lines += emit_capa_section(ctx, "CAPA command (STLS)", capa_stls, True)
     elif info.capability is not None:
         title = "CAPA command (TLS)" if encrypted else "CAPA command (PLAIN)"
-        json_lines = _section(title, info.capability, encrypted)
+        json_lines = emit_capa_section(ctx, title, info.capability, encrypted)
     if json_lines:
         ctx.report.update_properties(capability="\n".join(json_lines))
 

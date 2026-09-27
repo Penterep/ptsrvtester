@@ -1,9 +1,13 @@
 """POP3 -ts registry — used for help text only (execution is module discovery)."""
 from __future__ import annotations
 
+from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
+
 POP3_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "NTLM", "HELPINFO"]),
     ("Authentication & credentials", ["ANON", "BRUTE"]),
+    ("Connection limits & stress", ["NOOP1", "NOOP2"]),
+    ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
 ]
 
 # Default suite when -ts is omitted or ALL (preserves previous POP3 behaviour).
@@ -62,12 +66,45 @@ POP3_TESTS: dict[str, dict] = {
         ],
         "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
         "mods": [
-            ["-u", "--user", "<name>", "Single username"],
+            ["-u", "--user", "<name> …", "Username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
         ],
     },
+    "NOOP1": {
+        "desc": "NOOP connection duration",
+        "long": [
+            "Test how long connections can be maintained with periodic NOOP.",
+            "Pre-authentication test always runs; post-authentication test runs",
+            "if -u/-p provided. RFC 1939 specifies 10-minute minimum timeout.",
+        ],
+        "mods": [
+            ["", "--duration", "<sec>", "How long the test runs (default: 35 min pre-auth / 70 min post-auth)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (default: 4 min pre-auth / 5 min post-auth; 0 = max speed)"],
+            ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
+            ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
+        ],
+    },
+    "NOOP2": {
+        "desc": "NOOP connection count",
+        "long": [
+            "Test how many connections can be established and maintained with",
+            "periodic NOOP. Pre-authentication test always runs; post-authentication",
+            "test runs if -u/-p provided. Evaluates per-IP and per-account limits.",
+        ],
+        "mods": [
+            ["", "--count", "<n>", "Max connections to attempt (default: 150)"],
+            ["", "--duration", "<sec>", "How long the test runs (default: 120s pre-auth / 180s post-auth)"],
+            ["", "--delay", "<sec>", "Wait between NOOPs (default: 60s; 0 = max speed)"],
+            ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
+            ["-u", "--user", "<name>", "Username for post-auth test (optional)"],
+            ["-p", "--password", "<pass>", "Password for post-auth test (optional)"],
+        ],
+    },
+    "RATELIMIT": rate_limit_test_spec(),
 }
 
 
@@ -83,18 +120,15 @@ def pop3_test_help(codes: list[str]):
     blocks = []
     for code in valid:
         spec = POP3_TESTS[code]
-        options: list[list[str]] = []
-        for line in spec.get("long", []) or []:
-            options.append(["", "", "", line])
+        desc = [f"POP3 — {code}: {spec['desc']}"]
+        desc.extend(spec.get("long", []) or [])
         if spec.get("requires"):
-            options.append(["", "", "", ""])
-            options.append(["", "", "", "Requires: " + "; ".join(spec["requires"])])
-        for row in spec.get("mods", []) or []:
-            options.append(row)
-        has_opts = bool(spec.get("mods") or spec.get("requires"))
+            desc.append("Requires: " + "; ".join(spec["requires"]))
+        mods = list(spec.get("mods", []) or [])
+        has_opts = bool(mods or spec.get("requires"))
         usage = f"ptsrvtester pop3 -ts {code} " + ("<options> -tg <target>" if has_opts else "-tg <target>")
-        blocks.append({"description": [f"POP3 — {code}: {spec['desc']}"]})
+        blocks.append({"description": desc})
         blocks.append({"usage": [usage]})
-        if options:
-            blocks.append({"options": options})
+        if mods:
+            blocks.append({"options": mods})
     return blocks

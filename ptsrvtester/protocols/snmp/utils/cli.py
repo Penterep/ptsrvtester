@@ -295,9 +295,6 @@ class SNMPArgs(ArgsWithBruteforce):
         # SNMPv2 Brute Force
         snmpv2_brute_parser = snmp_subparsers.add_argument_group(title="v2brute",
                                                                  description="SNMPv2 dictionary attack")
-        snmp_subparsers.add_argument("-w", "--write-to-file", help="File to save the output results.",
-                                         default=None,
-                                         type=str)
 
         # user_group1 = snmpv2_brute_parser.add_mutually_exclusive_group(required=True)
         snmp_subparsers.add_argument("-c", "--single-community", "--community", help="Single community string")
@@ -305,7 +302,7 @@ class SNMPArgs(ArgsWithBruteforce):
 
         # SNMPv2 Write Permission
         snmpv2_write_parser = snmp_subparsers.add_argument_group("v2write", description="Test SNMPv2 write permission")
-        snmpv2_write_parser.add_argument("-v", "--value", default="Testvalue123",
+        snmpv2_write_parser.add_argument("-val", "--value", default="Testvalue123",
                                          help="Value to write to the specified OID (default: 'Testvalue123')")
 
         # SNMPv2 GetBulk (Walk)

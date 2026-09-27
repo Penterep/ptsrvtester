@@ -31,7 +31,7 @@ def run(ctx):
             ctx.out("TLS", "NOTVULN", indent=4)
     else:
         ctx.out(
-            "No connection mode available (plaintext, STLS, TLS failed)",
-            "VULN",
+            "Could not connect. Encryption was not tested.",
+            "WARNING",
             indent=4,
         )

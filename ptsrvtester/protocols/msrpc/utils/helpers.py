@@ -55,10 +55,18 @@ def valid_target(value: str) -> Target:
     return Target(host, port)
 
 
-def text_or_file(text: str | None, filepath: str | None) -> list[str]:
-    """Return one direct value or non-empty lines from a wordlist."""
+def text_or_file(
+    text: str | None, filepath: str | None, *, preserve_whitespace: bool = False,
+) -> list[str]:
+    """Read direct values or a wordlist, optionally preserving password whitespace.
+
+    Empty values are excluded. Password wordlists remove only CR/LF line
+    separators, so a line containing spaces is a password, not a blank line.
+    """
     if text is not None:
-        value = str(text).strip()
+        value = str(text)
+        if not preserve_whitespace:
+            value = value.strip()
         return [value] if value else []
     if filepath is None:
         return []
@@ -83,6 +91,8 @@ def text_or_file(text: str | None, filepath: str | None) -> list[str]:
             continue
     else:  # latin-1 always succeeds; retained as a defensive fallback.
         decoded = raw.decode("utf-8", errors="replace")
+    if preserve_whitespace:
+        return [line for line in re.split(r"\r\n|\r|\n", decoded) if line]
     return [line.strip() for line in decoded.splitlines() if line.strip()]
 
 

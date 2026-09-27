@@ -65,7 +65,7 @@ class SNMP(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
             "port": self.target[1],
             "single_community": getattr(self.args, "single_community", None),
             "community_file": getattr(self.args, "community_file", None),
-            "write_to_file": getattr(self.args, "output", None),
+            "write_to_file": getattr(self.args, "write_to_file", None),
             "oid": getattr(self.args, "oid", None),
             "oid_format": getattr(self.args, "oid_format", None),
             "auth_protocols": getattr(self.args, "auth_protocols", None),
@@ -75,6 +75,6 @@ class SNMP(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
             "password_file": getattr(self.args, "password_file", None),
             "username_file": getattr(self.args, "username_file", None),
             "valid_credentials_file": getattr(self.args, "valid_credentials_file", None),
-            "value": getattr(self.args, "valid_credentials_file", None),
+            "value": getattr(self.args, "value", None),
             "spray": getattr(self.args, "spray", None)
         }

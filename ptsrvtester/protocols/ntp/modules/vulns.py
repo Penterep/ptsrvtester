@@ -49,29 +49,47 @@ def run(ctx):
     if not ctx.results.has_ran:
         gather_info(ip, port, ctx.results)
         results = ctx.results
-        if results.error:
-            ctx.out(f"An error occured while trying to connect to server: {results.error_info}", "ERROR", indent=4)
         ctx.results = results
     else:
         results = ctx.results
-    
+    if results.error:
+        ctx.out(f"An error occured while trying to connect to server: {results.error_info}", "ERROR", indent=4)
+        ctx.out(f"It is possible the server accepts only a specific IP range or needs authentication", "ERROR", indent=4)
+        return
     
     # only 4.2.8p15 - CVE-2023-26551 to CVE-2023-26555 (DoS through errors in code)
     # from 0.3.0 to 0.3.2 - CVE-2023-33192 (DoS through crafted cookies)
-    # up to (excluding) 4.2.7p26 - CVE-2013-5211 (traffic amplification through monolist)
-    # TODO: check monolist availability
+    # up to (excluding) 4.2.7p26 - CVE-2013-5211 (traffic amplification through monlist)
+
+    # TODO: check monlist availability
     
-    if not results.accepts_mode_6:
-        if not isinstance(results.version, int):
-            raise TypeError
-        elif results.version < 4:
+    if isinstance(results.version, str):
+        try:
+            results.version = int(results.version)
+        except:
+            pass
+
+    if isinstance(results.version, int):
+        ctx.out(f"Server did not return specific version", "INFO", indent=4)
+        ctx.out(f"Detected version:     {results.version}", "INFO", indent=4)
+        if results.version == 4:
+            ctx.out(f"Version 4 has multiple vulnerabilities, but only on specific versions", "INFO", indent=4)
+        elif results.version == 3:
             ctx.out(f"CVE-2013-5211", "VULN", indent=4)
+            ctx.out(f"Possibly CV-2023-33192 (3.0<=ver<=3.2)", "VULN", indent=4)
+        else:
+            ctx.out(f"Unable to process version: returned in unexpected format ({results.version})", "ERROR", indent=4)
         return
+
+    # TODO: figure out what a full ver 0.3.0 response looks like
+    try:
+        parsed_ver = tuple(int(x) for x in results.version.replace("p", ".").split("."))
+    except:
+        ctx.out(f"Unable to process version: returned in unexpected format ({results.version})", "ERROR", indent=4)
+        return
+
+    ctx.out(f"Detected version:     {str(parsed_ver)[1:-1].replace(", ", ".")}", "INFO", indent=4)
     
-    if not isinstance(results.version, str):
-        raise TypeError
-    
-    parsed_ver = tuple(int(x) for x in results.version.replace("p", ".").split("."))
     error_DoS_ver = (4, 2, 8, 15)
     cookies_DoS_ver_min = (0, 3, 0)
     cookies_DoS_ver_max = (0, 3, 2)

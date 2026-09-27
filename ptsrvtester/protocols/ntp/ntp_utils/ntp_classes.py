@@ -4,6 +4,8 @@ from typing import Any
 @dataclass
 class NTPResults:
     has_ran: bool
+    query_attempts: int
+    control_attempts: int
     error: bool
     error_info: str
     accepts_mode_6: bool
@@ -22,6 +24,8 @@ class NTPResults:
 
     def __init__(self) -> None:
         self.has_ran = False
+        self.query_attempts = 0
+        self.control_attempts = 0
         self.error = False
         self.error_info = ""
         self.accepts_mode_6 = False

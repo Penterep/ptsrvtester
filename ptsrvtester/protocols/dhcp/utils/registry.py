@@ -24,6 +24,18 @@ IP_BROADCAST = "255.255.255.255"
 DISCOVER_FILTER = "udp and src port 68 and dst port 67 and ether dst ff:ff:ff:ff:ff:ff"
 REQUEST_FILTER = "udp and src port 68 and dst port 67"
 
+PARAMETER_REQUEST_LIST = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38,
+    39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
+    57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74,
+    75, 76, 77, 78, 79, 80, 81, 82, 83, 85, 86, 87, 88, 89, 90, 91, 92, 93,
+    94, 95, 97, 98, 99, 100, 101, 112, 113, 114, 116, 117, 118, 119, 120,
+    121, 122, 123, 124, 125, 136, 137, 138, 139, 140, 141, 142, 143, 144,
+    145, 146, 150, 159, 160, 161, 175, 176, 177, 208, 209, 210, 211, 212,
+    213, 220, 221, 252
+]
+
 class VULNS(Enum):
     DHCP_DOS = "PTV-DHCP-DOS"
     DHCP_STARVATION = "PTV-DHCP-STARVATION"
@@ -110,11 +122,11 @@ def prepare_bootp(src_mac, dst_mac, sport, dport, src_ip, dst_ip, transaction_id
 
 
 def prepare_discover_packet(src_mac, transaction_id, broadcast=False):
-    dhcp = DHCP(options=[("message-type", "discover"), "end"])
+    dhcp = DHCP(options=[("message-type", "discover"), ("param_req_list", PARAMETER_REQUEST_LIST), "end"])
     return prepare_bootp(src_mac, MAC_BROADCAST, 68, 67, "0.0.0.0", IP_BROADCAST, transaction_id, broadcast) / dhcp
 
 def prepare_discover_packet_unicast(src_mac, dst_mac, src_ip, dst_ip, transaction_id):
-    dhcp = DHCP(options=[("message-type", "discover"), "end"])
+    dhcp = DHCP(options=[("message-type", "discover"), ("param_req_list", PARAMETER_REQUEST_LIST), "end"])
     return prepare_bootp(src_mac, dst_mac, 68, 67, src_ip, dst_ip, transaction_id) / dhcp
 
 def get_gateway_mac(ip: str, interface: str) -> str|None:

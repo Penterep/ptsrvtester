@@ -1,5 +1,7 @@
+import os
 import socket, subprocess, re
 from dataclasses import dataclass
+from ptsrvtester.protocols.rsync.utils.registry import rsync_grab_modules
 
 __MODULELABEL__ = "Rsync module enumeration"
 __MODULECODE__ = "grab_modules"
@@ -11,12 +13,18 @@ class RsyncEntry:
     size: int
     mtime: str
     name: str
+    writable: bool
     symlink_target: str | None = None
     
 @dataclass
 class Module:
     name: str
     entries: list[RsyncEntry]
+
+
+class RsyncPasswordRequired(RuntimeError):
+    pass
+
 
 # Matches lines like:
 # drwxr-xr-x          4,096 2024/01/15 10:30:00 somedir
@@ -30,18 +38,8 @@ _LINE_RE = re.compile(
 )
 
 
-def _sanitize_rsync_data(data: list):
-    if '\n' in data:
-        data.remove('\n')
-
-    for e in data:
-        if "@RSYNCD" in e:
-            data.pop(data.index(e))
-
-    return list(filter(None, data))
-
 def _print_modules(modules: list[Module], ctx) -> None:
-    ctx.out("Grabbed available modules", "VULN", indent=4)
+    ctx.out("Grabbed available modules", "VULN", indent=4, condition=modules)
     for module in modules:
         ctx.out(f"{module.name}", "INFO", indent=8)
         for entry in module.entries:
@@ -76,11 +74,20 @@ def list_module_contents(host, module, recursive=False, timeout=15):
         cmd.append("-r")
     cmd.append(url)
 
+    env = os.environ.copy()
+    env["RSYNC_PASSWORD"] = "ptsrvtester-auth-probe-invalid"
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout
+        cmd, capture_output=True, text=True, input="", env=env, timeout=timeout
     )
+    output = f"{result.stdout}\n{result.stderr}"
+    if re.search(
+        r"password\s*:|@RSYNCD:\s*AUTHREQD|auth(?:entication)?\s+(?:is\s+)?(?:required|failed)",
+        output,
+        re.IGNORECASE,
+    ):
+        return []
     if result.returncode != 0:
-        raise RuntimeError(f"rsync failed ({result.returncodewd}): {result.stderr.strip()}")
+        return []
 
     entries = []
     for line in result.stdout.splitlines():
@@ -101,30 +108,6 @@ def list_module_contents(host, module, recursive=False, timeout=15):
     return entries 
 
 
-def rsync_grab_modules(ctx, print=True):
-    try:
-        with socket.create_connection((ctx.ip, ctx.port), timeout=ctx.timeout) as sock:
-            sock.settimeout(ctx.timeout)
-
-            data = receive(sock)
-            banner = data.decode(errors="replace")
-
-            if not banner:
-                return
-
-            sock.sendall(b"@RSYNCD: 31.0\n")
-            sock.sendall(b"\n")
-
-            data = receive(sock)
-
-            modules = data.decode(errors="replace")
-
-            modules = _sanitize_rsync_data(modules.split('\n'))
-            return [module.split('\t')[0].strip() for module in modules]
-
-    except Exception as e:
-        ctx.out(f"Error grabbing modules: {e}", "ERROR", condition=not ctx.json and print, indent=4)
-
 def run(ctx):
     module_names = rsync_grab_modules(ctx)
     modules: list[Module] = []
@@ -134,7 +117,11 @@ def run(ctx):
             if ctx.rsync_path is None:
                 entries = []
             else:
-                entries = list_module_contents(ctx.ip, module_name)
+                try:
+                    entries = list_module_contents(ctx.ip, module_name)
+                except RsyncPasswordRequired as e:
+                    ctx.out(str(e), "OK", indent=8)
+                    entries = []
             modules.append(Module(name=module_name, entries=entries))        
     else:
         ctx.out("Could not list modules or server doesn't have any", "OK", indent=4,

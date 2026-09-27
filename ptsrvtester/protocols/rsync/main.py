@@ -18,7 +18,14 @@ import socket
 from .._base import BaseMain, BaseArgs
 from .utils.cli import RsyncArgs
 from ptsrvtester.protocols.rsync.utils.registry import check_rsync_path
+from ptsrvtester.protocols.rsync.modules.grab_modules import rsync_grab_modules 
+from dataclasses import dataclass
 
+@dataclass
+class TmpCtx:
+    ip: str
+    port: int
+    timeout: int
 
 class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
     #: Short protocol identity (also namespaces this protocol's tests).
@@ -60,11 +67,30 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
 
         Modules read them as ``ctx.<name>``. Return {} if none are needed.
         """
+        tests = getattr(self.args, "tests", None)
+        
+        if getattr(self.args, "modules", None) is None:
+            print_module_grab = tests is None or "grab_modules" in tests.lower()
+            
+            if print_module_grab and tests is not None:
+                ts = [t.lower() for t in tests.split(',')]
+                ts.remove("grab_modules")
+                setattr(self.args, "tests", ','.join(ts))
+            
+            modules = rsync_grab_modules(
+                TmpCtx(
+                    self.target[0],
+                    self.target[1],
+                    getattr(self.args, "timeout", None)
+                ),
+                print=print_module_grab
+            )
+        
         return {
             "host": self.target_host,
             "ip": self.target[0],
             "port": self.target[1],
             "timeout": getattr(self.args, "timeout", None),
-            "modules": getattr(self.args, "modules", None),
+            "modules": modules,
             "rsync_path": check_rsync_path()
         }

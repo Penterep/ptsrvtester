@@ -45,10 +45,8 @@ from ptsrvtester.protocols.ntp.ntp_utils.ntp_classes import NTPResults
 from ptsrvtester.protocols.ntp.ntp_utils.connection import gather_info, ntp_to_utc, get_ntp_time, sec_to_readable
 
 def _spacer(ctx) -> None:
-    ctx.out(f"----------------------------------------------------", "", indent=4)
+    ctx.out(f"--------------------------------------------------------", "", indent=4)
 
-
-# TODO: check and add comments
 
 def run(ctx):
     mode_translate = {
@@ -106,6 +104,9 @@ def run(ctx):
     ctx.out(f"IP:                   {ip}", "INFO", indent=4)
     ctx.out(f"Port:                 {port}", "INFO", indent=4)
 
+
+    # -------------------------------------------- Getting results from server --------------------------------------------
+
     if not ctx.results.has_ran:
         gather_info(ip, port, ctx.results)
         results = ctx.results
@@ -118,6 +119,9 @@ def run(ctx):
         return
 
     ctx.out(f"NTP version:          {results.version}", "INFO", indent=4)
+
+
+    # ---------------------------------------- Kiss of Death detection and parsing ----------------------------------------
 
     if results.kod_sent:
         _spacer(ctx)
@@ -136,7 +140,9 @@ def run(ctx):
         else:
             ctx.out(f"Could not determine KoD: RefID is empty", "ERROR", indent=4)
         ctx.out(f"Information in KoD packets is not reliable", "WARNING", indent=4)
-        
+
+
+    # ------------------------------------------------ System information -------------------------------------------------
 
     if results.accepts_mode_6:
         _spacer(ctx)
@@ -148,7 +154,10 @@ def run(ctx):
     ctx.out(f"Mode:                 {results.mode} ({mode_translate[results.mode]})", "INFO", indent=4)
     ctx.out(f"Accepts mode 6:       {results.accepts_mode_6}", "INFO", indent=4)
 
+
+    # -------------------------------------------------- Stratum parsing --------------------------------------------------
     # TODO: fake or misconfigured servers can apparently return a weird combination of stratum and refID, should try detecting that
+
     stratum_status = "Unsynchronized"
     if results.stratum == 0:
         stratum_status = "Invalid"
@@ -159,6 +168,8 @@ def run(ctx):
     ctx.out(f"Stratum:              {results.stratum} ({stratum_status})", "INFO", indent=4)
 
 
+    # ----------------------------------------------- Reference ID parsing ------------------------------------------------
+
     info = ""
     ref_id = str(results.ref_id).upper()
     if ref_id != "":
@@ -168,12 +179,14 @@ def run(ctx):
             info = ": Experimental"
     else:
         ref_id = "Empty"
-
     ctx.out(f"Reference ID:         {ref_id}{info}", "INFO", indent=4)
 
     _spacer(ctx)
 
+
+    # --------------------------------------------- Time and sync information ---------------------------------------------
     # TODO: check if leap seconds coincide with global events (very low priority)
+
     leap_status = "Unsynchronized"
     if results.leap == 0:
         leap_status = "Last minute had 60s"
@@ -183,7 +196,6 @@ def run(ctx):
         leap_status = "Last minute had 59s"
     ctx.out(f"Leap indicator:       {results.leap} ({leap_status})", "INFO", indent=4)
 
-    # TODO: check if server was synchronized recently 
     precision_sec = 2 ** int(results.precision)
     ctx.out(f"Precision:            2^{results.precision} = {precision_sec * 1e6:.3f} µs", "INFO", indent=4)
     ctx.out(f"Last upstream sync:   {ntp_to_utc(results.ref_time)}", "INFO", indent=4)
@@ -220,6 +232,9 @@ def run(ctx):
     ctx.out(f"Diff from last sync:  {sec_to_readable(sync_diff)} ({sync_rating})", "INFO", indent=4)
 
     _spacer(ctx)
+    
+    
+    # ----------------------------------------------- Response information ------------------------------------------------
     
     ctx.out(f"Server responded to mode 3 in {results.query_attempts} attempt{"s" if results.query_attempts > 1 else ""}", "INFO", indent=4)
     ctx.out(f"Server responded to mode 6 in {results.control_attempts} attempt{"s" if results.control_attempts > 1 else ""}", "INFO", indent=4, condition=results.accepts_mode_6)

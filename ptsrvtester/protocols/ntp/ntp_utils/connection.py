@@ -58,7 +58,8 @@ def gather_info(ip: str, port: int, results: NTPResults) -> None:
     results.has_ran = True
     data = None
     
-    # ----------------- First test using regular mode 3 -----------------
+    
+    # ------------------------------------------ First test using regular mode 3 ------------------------------------------
 
     # Sending multiple requests is not ideal, but some servers reply only to repeats
     for _ in range(3):
@@ -79,23 +80,25 @@ def gather_info(ip: str, port: int, results: NTPResults) -> None:
         results.error = True
     else:
         results.error_info = ""
-        
-    # -------------- nmap test to gather more info (mode 6) --------------
+
+
+    # -------------------------------------- nmap test to gather more info (mode 6) ---------------------------------------
+    # TODO: version parsing needs testing (couldn't find server with lower version than 4.2.0)
 
     fullver, processor, system_os = "", "", ""
     nmap_worked = False
     nm = nmap.PortScanner()
-    # first nmap scan sometimes fails, maybe not necessary but seems to help
+
+    # Sending multiple requests is not ideal, but some servers reply only to repeats
     for _ in range(3):
         try:
             results.control_attempts += 1
-            # TODO: version parsing needs testing (couldn't find server with lower version than 4.2.0)
             # Trying to get better version and system information in control mode (mode 6)
             nm.scan(ip, str(port), "-sU --script ntp-info", False, 3)
             nm_out = str(nm[ip]['udp'][port]['script']['ntp-info']).split("\n  ")[2:]
 
             # string before -o in ver is the upstream revision identity,
-            # it's not necessary for vuln evaluation
+                # it's not necessary for vuln evaluation
             fullver = nm_out[0][14:].split(" ")[0]
             if fullver[-2:] == "-o":
                 fullver = fullver.split("@")[0]
@@ -108,7 +111,8 @@ def gather_info(ip: str, port: int, results: NTPResults) -> None:
         except:
             pass
 
-    # --------------------- Data parsing into results ---------------------
+
+    # --------------------------------------------- Data parsing into results ---------------------------------------------
 
     ntp = NTP(data)
     

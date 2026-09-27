@@ -45,6 +45,9 @@ from ptsrvtester.protocols.ntp.ntp_utils.ntp_classes import NTPResults
 from ptsrvtester.protocols.ntp.ntp_utils.connection import gather_info
 
 def run(ctx):
+    
+    # -------------------------------------------- Getting results from server --------------------------------------------
+
     ip, port = ctx.target
     if not ctx.results.has_ran:
         gather_info(ip, port, ctx.results)
@@ -57,11 +60,17 @@ def run(ctx):
         ctx.out(f"It is possible the server accepts only a specific IP range or needs authentication", "ERROR", indent=4)
         return
     
+    
+    # --------------------------------------------- Vulnerability assessment ----------------------------------------------
+    
     # only 4.2.8p15 - CVE-2023-26551 to CVE-2023-26555 (DoS through errors in code)
     # from 0.3.0 to 0.3.2 - CVE-2023-33192 (DoS through crafted cookies)
     # up to (excluding) 4.2.7p26 - CVE-2013-5211 (traffic amplification through monlist)
 
     # TODO: check monlist availability
+    
+    
+    # ------------------------------------------ Short version format processing ------------------------------------------
     
     if isinstance(results.version, str):
         try:
@@ -81,7 +90,10 @@ def run(ctx):
             ctx.out(f"Unable to process version: returned in unexpected format ({results.version})", "ERROR", indent=4)
         return
 
+
+    # ------------------------------------------ Long version format processing -------------------------------------------
     # TODO: figure out what a full ver 0.3.0 response looks like
+
     try:
         parsed_ver = tuple(int(x) for x in results.version.replace("p", ".").split("."))
     except:

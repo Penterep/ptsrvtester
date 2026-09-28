@@ -115,7 +115,7 @@ def run(ctx):
         results = ctx.results
     if results.error:
         ctx.out(f"An error occured while trying to connect to server: {results.error_info}", "ERROR", indent=4)
-        ctx.out(f"It is possible the server accepts only a specific IP range or needs authentication", "ERROR", indent=4)
+        ctx.out(f"It is possible the server accepts only a specific IP range or needs authentication", "INFO", indent=4)
         return
 
     ctx.out(f"NTP version:          {results.version}", "INFO", indent=4)

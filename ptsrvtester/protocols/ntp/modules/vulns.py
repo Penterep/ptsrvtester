@@ -57,7 +57,7 @@ def run(ctx):
         results = ctx.results
     if results.error:
         ctx.out(f"An error occured while trying to connect to server: {results.error_info}", "ERROR", indent=4)
-        ctx.out(f"It is possible the server accepts only a specific IP range or needs authentication", "ERROR", indent=4)
+        ctx.out(f"It is possible the server accepts only a specific IP range or needs authentication", "INFO", indent=4)
         return
     
     
@@ -82,7 +82,7 @@ def run(ctx):
         ctx.out(f"Server did not return specific version", "INFO", indent=4)
         ctx.out(f"Detected version:     {results.version}", "INFO", indent=4)
         if results.version == 4:
-            ctx.out(f"Version 4 has multiple vulnerabilities, but only on specific versions", "INFO", indent=4)
+            ctx.out(f"Version 4 has multiple vulnerabilities, but only on specific versions", "WARNING", indent=4)
         elif results.version == 3:
             ctx.out(f"CVE-2013-5211", "VULN", indent=4)
             ctx.out(f"Possibly CV-2023-33192 (3.0<=ver<=3.2)", "VULN", indent=4)

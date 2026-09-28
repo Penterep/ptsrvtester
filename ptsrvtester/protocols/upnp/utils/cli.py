@@ -18,7 +18,7 @@ class Target:
 
 
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-_TESTS = frozenset({"DISCOVER", "DESCRIBE", "IGDINFO", "SCPD", "PORTMAPS"})
+_TESTS = frozenset({"DISCOVER", "DESCRIBE", "IGDINFO", "SCPD", "PORTMAPS", "NOTIFY"})
 
 
 def valid_target(value: str) -> Target:
@@ -54,7 +54,7 @@ def valid_tests(value: str) -> str:
     if invalid or not codes:
         raise argparse.ArgumentTypeError(
             f"unknown UPnP test(s): {', '.join(invalid) if invalid else value}; "
-            "choose from ALL, DISCOVER, DESCRIBE, IGDINFO, SCPD, PORTMAPS"
+            "choose from ALL, DISCOVER, DESCRIBE, IGDINFO, SCPD, PORTMAPS, NOTIFY"
         )
     return ",".join(dict.fromkeys(codes))
 
@@ -79,6 +79,16 @@ def _timeout(value: str) -> float:
         raise argparse.ArgumentTypeError("--timeout-seconds must be a number") from None
     if not math.isfinite(number) or not 0.1 <= number <= 60:
         raise argparse.ArgumentTypeError("--timeout-seconds must be between 0.1 and 60")
+    return number
+
+
+def _notify_seconds(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("--notify-seconds must be a number") from None
+    if not math.isfinite(number) or not 0.1 <= number <= 60:
+        raise argparse.ArgumentTypeError("--notify-seconds must be between 0.1 and 60")
     return number
 
 
@@ -115,13 +125,15 @@ class UPnPArgs(BaseArgs):
     max_description_bytes: int
     max_scpd: int
     max_mappings: int
+    notify_seconds: float
+    max_notifications: int
     output: str | None
 
     @staticmethod
     def get_help():
         return [
             {"description": ["UPnP/SSDP Testing Module"]},
-            {"usage": ["ptsrvtester upnp -tg <host> [-ts DISCOVER,DESCRIBE,IGDINFO,SCPD,PORTMAPS] <options>"]},
+            {"usage": ["ptsrvtester upnp -tg <host> [-ts DISCOVER,DESCRIBE,IGDINFO,SCPD,PORTMAPS,NOTIFY] <options>"]},
             {"usage_example": [
                 "ptsrvtester upnp -tg 192.168.1.1",
                 "ptsrvtester upnp -ts DISCOVER -tg 192.168.1.1 --search-target upnp:rootdevice",
@@ -129,20 +141,23 @@ class UPnPArgs(BaseArgs):
                 "ptsrvtester upnp -ts DESCRIBE -tg router.example.test -j",
                 "ptsrvtester upnp -ts SCPD -tg 192.168.1.1 --max-scpd 20",
                 "ptsrvtester upnp -ts PORTMAPS -tg 192.168.1.1 --max-mappings 100",
+                "ptsrvtester upnp -ts NOTIFY -tg 192.168.1.1 -i 192.168.1.10 --notify-seconds 10",
             ]},
             {"options": [
                 ["-tg", "--target", "<host>", "IPv4 address or hostname[:UDP port]; default port 1900"],
-                ["-ts", "--tests", "<test>", "DISCOVER, DESCRIBE, IGDINFO, SCPD, PORTMAPS, ALL; default excludes SCPD and PORTMAPS"],
+                ["-ts", "--tests", "<test>", "DISCOVER, DESCRIBE, IGDINFO, SCPD, PORTMAPS, NOTIFY, ALL; default excludes SCPD, PORTMAPS and NOTIFY"],
                 ["", "--timeout-seconds", "<seconds>", "UDP/HTTP timeout (default 3; range 0.1-60; DNS uses system timeout)"],
                 ["", "--search-target", "<ST>", "SSDP search target (default ssdp:all)"],
                 ["", "--multicast", "", "Send SSDP M-SEARCH to 239.255.255.250:1900; keep results scoped to -tg"],
-                ["-i", "--interface-ip", "<IPv4>", "Local IPv4 address for multicast; requires --multicast"],
+                ["-i", "--interface-ip", "<IPv4>", "Local IPv4 address for multicast discovery or NOTIFY listening"],
                 ["", "--mx", "<seconds>", "Multicast response delay, 1-5 seconds (default 2)"],
                 ["", "--ttl", "<hops>", "Multicast IPv4 TTL, 1-255 (default 2)"],
                 ["", "--max-responses", "<n>", "Maximum SSDP responses (default 100)"],
                 ["", "--max-description-bytes", "<n>", "Maximum bytes per description (default 1048576; 50 URLs/32 MiB per run)"],
                 ["", "--max-scpd", "<n>", "Maximum service descriptions to fetch (default 20; range 1-100)"],
                 ["", "--max-mappings", "<n>", "Global PORTMAPS entry limit (default 100; range 1-1000)"],
+                ["", "--notify-seconds", "<seconds>", "NOTIFY listen duration (default 10; range 0.1-60)"],
+                ["", "--max-notifications", "<n>", "Maximum target NOTIFY messages (default 100; range 1-1000)"],
                 ["-o", "--output", "<file>", "Save results"],
                 ["-j", "--json", "", "JSON output"],
                 ["-vv", "--verbose", "", "Verbose output"],
@@ -173,6 +188,11 @@ class UPnPArgs(BaseArgs):
         parser.add_argument("--max-scpd", type=_bounded_int("--max-scpd", 1, 100), default=20)
         parser.add_argument(
             "--max-mappings", type=_bounded_int("--max-mappings", 1, 1000), default=100
+        )
+        parser.add_argument("--notify-seconds", type=_notify_seconds, default=10.0)
+        parser.add_argument(
+            "--max-notifications", type=_bounded_int("--max-notifications", 1, 1000),
+            default=100,
         )
         parser.add_argument("-o", "--output", default=None)
 

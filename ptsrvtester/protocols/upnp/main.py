@@ -33,12 +33,15 @@ class UPnP(BaseMain):
         target = self.args.target
         multicast = bool(self.args.multicast)
         interface_ip = self.args.interface_ip
+        notify = "NOTIFY" in (self.args.tests or "").split(",")
         if multicast and not interface_ip:
             raise argparse.ArgumentError(None, "--multicast requires --interface-ip")
-        if interface_ip and not multicast:
-            raise argparse.ArgumentError(None, "--interface-ip requires --multicast")
-        if multicast and target.port not in (0, 1900):
-            raise argparse.ArgumentError(None, "multicast SSDP uses UDP port 1900")
+        if notify and not interface_ip:
+            raise argparse.ArgumentError(None, "NOTIFY requires --interface-ip")
+        if interface_ip and not (multicast or notify):
+            raise argparse.ArgumentError(None, "--interface-ip requires --multicast or NOTIFY")
+        if (multicast or notify) and target.port not in (0, 1900):
+            raise argparse.ArgumentError(None, "multicast SSDP and NOTIFY use UDP port 1900")
         if target.port == 0:
             target.port = 1900
         self.target_host = target.ip
@@ -74,7 +77,9 @@ class UPnP(BaseMain):
         needs_description = run_default or any(
             code in requested for code in ("DESCRIBE", "IGDINFO", "SCPD", "PORTMAPS")
         )
-        selected = ["DISCOVER"]
+        selected = []
+        if run_default or "DISCOVER" in requested or needs_description:
+            selected.append("DISCOVER")
         if needs_description:
             selected.append("DESCRIBE")
         if run_default or "IGDINFO" in requested:
@@ -84,6 +89,8 @@ class UPnP(BaseMain):
         # Enumerating mappings may be expensive, so ALL does not imply PORTMAPS.
         if "PORTMAPS" in requested:
             selected.append("PORTMAPS")
+        if "NOTIFY" in requested:
+            selected.append("NOTIFY")
         missing = [code for code in selected if code not in discovered]
         if missing:
             raise argparse.ArgumentError(

@@ -47,6 +47,7 @@ ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.10 --pipe svcctl -u auditor -pw se
 ptsrvtester upnp -ts ALL -tg 192.168.1.1
 ptsrvtester upnp -ts DISCOVER -tg 192.168.1.1 --multicast -i 192.168.1.10
 ptsrvtester upnp -ts SCPD,PORTMAPS -tg 192.168.1.1
+ptsrvtester upnp -ts NOTIFY -tg 192.168.1.1 -i 192.168.1.10
 ptsrvtester <module> -h     for help for module use
 ```
 
@@ -116,6 +117,7 @@ ptsrvtester <module> -h     for help for module use
 - Read-only IGD status and external IP inspection
 - Service action and state variable enumeration (`SCPD`)
 - Read-only existing port mapping enumeration (`PORTMAPS`)
+- Passive SSDP notifications
 
 **FTP Module**
 - Banner and Service Identification

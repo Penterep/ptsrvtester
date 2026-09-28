@@ -20,6 +20,7 @@ from .igd import (
     parse_soap_response,
 )
 from .multicast import MULTICAST_ADDRESS, MULTICAST_PORT, build_multicast_msearch
+from .notify import listen_ssdp_notify
 from .scpd import parse_service_description
 
 MAX_DATAGRAM_BYTES = 8192
@@ -326,6 +327,10 @@ class UpnpEngine:
         self.devices: list[dict] = []
         self.module_errors: list[dict] = []
         self.discovery_status = "not_run"
+        self.notifications: list[dict] = []
+        self.notify_status = "not_run"
+        self.notify_truncated = False
+        self.notify_received_datagrams = 0
         self.description_status = "not_run"
         self.discovery_truncated = False
         self.description_truncated = False
@@ -418,6 +423,27 @@ class UpnpEngine:
         else:
             self.discovery_status = "no_response"
         return self.discoveries
+
+    def notify(self) -> list[dict]:
+        """Observe SSDP advertisements from the selected host for a fixed time."""
+        if self.notify_status != "not_run":
+            return self.notifications
+        try:
+            result = listen_ssdp_notify(
+                self.target_ip,
+                self.args.interface_ip,
+                float(self.args.notify_seconds),
+                int(self.args.max_notifications),
+            )
+        except (OSError, ValueError) as exc:
+            self._error("NOTIFY", exc)
+            self.notify_status = "error"
+            return self.notifications
+        self.notifications = result["notifications"]
+        self.notify_status = result["status"]
+        self.notify_truncated = result["truncated"]
+        self.notify_received_datagrams = result["receivedDatagrams"]
+        return self.notifications
 
     def _description_url(self, location: str):
         if len(location) > MAX_LOCATION_LENGTH:
@@ -969,6 +995,10 @@ class UpnpEngine:
             "targetIp": self.target_ip,
             "udpPort": self.port,
             "discoveryStatus": self.discovery_status,
+            "notifyStatus": self.notify_status,
+            "notifyTruncated": self.notify_truncated,
+            "notifyReceivedDatagrams": self.notify_received_datagrams,
+            "notifications": self.notifications,
             "descriptionStatus": self.description_status,
             "discoveryTruncated": self.discovery_truncated,
             "descriptionTruncated": self.description_truncated,

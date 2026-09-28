@@ -1,77 +1,118 @@
-"""DNS CLI."""
-from __future__ import annotations
+"""DNS CLI: the ``DNSArgs`` argparse namespace and its help.
 
+Tests are selected with ``-ts/--tests`` (codes matched against the modules'
+``__MODULECODE__`` by :class:`BaseMain`). Mirrors ``ssh/utils/cli.py``.
+
+Empty skeleton: only the universal options are defined (target, test selection,
+output). When modules are added, register them in ``registry.py`` (so they show
+in the help) and add any per-module input options to :meth:`add_subparser`.
+"""
 import argparse
 
-from ..._base import BaseArgs
-from .helpers import valid_target
+from ptlibs.ptprinthelper import get_colored_text
 
-DNS_DEFAULT_SUITE = ("INFO",)
+from ..._base import BaseArgs
+from .helpers import Target, valid_target
+from .registry import DNS_TEST_GROUPS, DNS_TESTS, dns_test_help
+
+__all__ = ["DNSArgs", "valid_target_dns"]
+
+
+def valid_target_dns(target: str) -> Target:
+    """argparse helper: IP or hostname with an optional port."""
+    return valid_target(target, domain_allowed=True)
 
 
 class DNSArgs(BaseArgs):
-    target: object | None
     tests: str | None
-    ip: str | None
-    port: int
-    domain: str | None
-    subdomains: str | None
-    ip_file: str | None
-    domain_file: str | None
+    target: Target | None
     output: str | None
-    threads: int
-    lookup_records: list | None
     module_threads: int
 
     @staticmethod
     def get_help():
-        return [
-            {"description": ["DNS Testing Module"]},
-            {"usage": ["ptsrvtester dns -ts <test>[,...] <options>"]},
-            {"usage_example": [
-                "ptsrvtester dns -ts INFO -tg 8.8.8.8",
-                "ptsrvtester dns -ts LOOKUP -d example.com",
-                "ptsrvtester dns -ts WHOIS -d example.com",
-                "ptsrvtester dns -ts ZONEXFR -d example.com",
-                "ptsrvtester dns -ts BRUTESUB -d example.com -sub wordlist.txt",
-            ]},
-            {"options": [
-                ["-ts", "--tests", "<test>", "INFO, REVERSE, ZONEXFR, LOOKUP, WHOIS, BRUTESUB, DNSSEC, ZONEWALK, ZONEWALKFULL"],
-                ["-tg", "--target", "<host>", "DNS server IP[:PORT] (INFO/REVERSE; default port 53)"],
-                ["-ip", "--ip", "<ip>", "Alias for target IP (legacy)"],
-                ["-ips", "--ip_file", "<file>", "File with DNS server IPs"],
-                ["-d", "--domain", "<dom>", "Domain name"],
-                ["-dl", "--domain_file", "<file>", "File with domains"],
-                ["-sub", "--subdomains", "<file>", "BRUTESUB: subdomain wordlist"],
-                ["-rec", "--lookup-records", "<t>", "LOOKUP: record types"],
-                ["", "--threads", "<n>", "BRUTESUB threads (default 10)"],
-                ["-o", "--output", "<file>", "Save results"],
-                ["-j", "--json", "", "JSON output"],
-                ["-h", "--help", "", "Show this help"],
-            ]},
+        options: list[list[str]] = [
+            ["-tg", "--target", "<server>", "DNS server IP[:PORT] to query (default port 53; optional — else system resolver)"],
+            ["-ts", "--tests", "<test>", "One or more tests, comma-separated; ALL runs everything:"],
+        ]
+        for group_title, codes in DNS_TEST_GROUPS:
+            options.append(["", "", "", ""])
+            options.append(["", "", get_colored_text(group_title, "TITLE")])
+            for code in codes:
+                options.append(["", "", code, DNS_TESTS[code]["desc"]])
+
+        options += [
+            ["", "", "", ""],
+            [get_colored_text("Output", "TITLE")],
+            ["-o", "--output", "<file>", "Append results to a file"],
+            ["-j", "--json", "", "Output in JSON format"],
+            ["-vv", "--verbose", "", "Enable verbose mode"],
+            ["-v", "--version", "", "Show version and exit"],
+            ["-h", "--help", "", "Show this help; 'dns -ts <TEST> -h' for test options"],
         ]
 
-    def add_subparser(self, name, subparsers):
+        return [
+            {"description": ["DNS Testing Module"]},
+            {"usage": ["ptsrvtester dns -ts <test>[,<test>...] <options>"]},
+            {"usage_example": [
+                "ptsrvtester dns -tg 8.8.8.8 -ts ALL",
+                "ptsrvtester dns -tg 8.8.8.8 -ts VERSION,NSID,EDNS",
+                "ptsrvtester dns -tg ns1.example.com -ts ROLE,TRANSPORT",
+                "ptsrvtester dns -tg 8.8.8.8 -ts CVE",
+                "ptsrvtester dns -ts VERSION -h",
+            ]},
+            {"options": options},
+        ]
+
+    @staticmethod
+    def get_test_help(codes):
+        """Per-test help object (used by ``dns -ts <TEST> -h``)."""
+        return dns_test_help(codes)
+
+    def add_subparser(self, name: str, subparsers) -> None:
         examples = """example usage:
-  ptsrvtester dns -ts INFO -tg 8.8.8.8
-  ptsrvtester dns -ts LOOKUP -d example.com
-  ptsrvtester dns -ts ZONEXFR -d example.com
-  ptsrvtester dns -ts BRUTESUB -d example.com -sub subs.txt"""
-        p = subparsers.add_parser(
-            name, add_help=True, epilog=examples, formatter_class=argparse.RawTextHelpFormatter
+  ptsrvtester dns -h
+  ptsrvtester dns -tg 8.8.8.8 -ts ALL
+  ptsrvtester dns -tg 8.8.8.8 -ts VERSION,NSID,EDNS
+  ptsrvtester dns -tg ns1.example.com -ts ROLE,TRANSPORT
+  ptsrvtester dns -ts VERSION -h"""
+
+        parser = subparsers.add_parser(
+            name,
+            epilog=examples,
+            add_help=True,
+            formatter_class=argparse.RawTextHelpFormatter,
         )
-        p.add_argument(
-            "-tg", "--target", type=lambda t: valid_target(t, domain_allowed=True),
-            default=None, dest="target",
+
+        if not isinstance(parser, argparse.ArgumentParser):
+            raise TypeError  # IDE typing
+
+        parser.add_argument(
+            "-tg",
+            "--target",
+            type=valid_target_dns,
+            default=None,
+            metavar="<server>",
+            dest="target",
+            help="DNS server IP[:PORT] to query (default port 53; optional)",
         )
-        p.add_argument("-ts", "--tests", default=None, dest="tests")
-        p.add_argument("-ip", "--ip", dest="ip", default=None)
-        p.add_argument("-p", "--port", type=int, default=53, dest="port")
-        p.add_argument("-ips", "--ip_file", dest="ip_file", default=None)
-        p.add_argument("-d", "--domain", dest="domain", default=None)
-        p.add_argument("-dl", "--domain_file", dest="domain_file", default=None)
-        p.add_argument("-sub", "--subdomains", dest="subdomains", default=None)
-        p.add_argument("-rec", "--lookup-records", nargs="+", dest="lookup_records", default=None)
-        p.add_argument("--threads", type=int, default=10, dest="threads")
-        p.add_argument("-o", "--output", dest="output", default=None)
-        p.add_argument("--module-threads", type=int, default=1, dest="module_threads", help=argparse.SUPPRESS)
+        parser.add_argument(
+            "-ts",
+            "--tests",
+            type=str,
+            default=None,
+            metavar="<test>",
+            dest="tests",
+            help="Comma-separated test codes or ALL; 'dns -ts <TEST> -h' for test options",
+        )
+
+        output = parser.add_argument_group("Output")
+        output.add_argument(
+            "-o", "--output", type=str, default=None, dest="output",
+            metavar="<file>", help="Append results to a file",
+        )
+
+        parser.add_argument(
+            "--module-threads", type=int, default=1, dest="module_threads",
+            help=argparse.SUPPRESS,
+        )

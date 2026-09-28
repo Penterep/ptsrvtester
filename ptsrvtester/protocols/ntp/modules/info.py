@@ -44,9 +44,6 @@ __ORDER__ = 10
 from ptsrvtester.protocols.ntp.ntp_utils.ntp_classes import NTPResults
 from ptsrvtester.protocols.ntp.ntp_utils.connection import gather_info, ntp_to_utc, get_ntp_time, sec_to_readable
 
-def _spacer(ctx) -> None:
-    ctx.out(f"--------------------------------------------------------", "", indent=4)
-
 
 def run(ctx):
     mode_translate = {
@@ -124,8 +121,6 @@ def run(ctx):
     # ---------------------------------------- Kiss of Death detection and parsing ----------------------------------------
 
     if results.kod_sent:
-        _spacer(ctx)
-        
         ctx.out(f"Server sent a KoD (Kiss of Death) packet", "WARNING", indent=4)
         
         # KoD code translation
@@ -145,12 +140,10 @@ def run(ctx):
     # ------------------------------------------------ System information -------------------------------------------------
 
     if results.accepts_mode_6:
-        _spacer(ctx)
         ctx.out(f"Server hostname:      {results.hostname}", "INFO", indent=4)
         ctx.out(f"Processor:            {results.processor}", "INFO", indent=4)
         ctx.out(f"System OS:            {results.system_os}", "INFO", indent=4)
 
-    _spacer(ctx)
     ctx.out(f"Mode:                 {results.mode} ({mode_translate[results.mode]})", "INFO", indent=4)
     ctx.out(f"Accepts mode 6:       {results.accepts_mode_6}", "INFO", indent=4)
 
@@ -180,8 +173,6 @@ def run(ctx):
     else:
         ref_id = "Empty"
     ctx.out(f"Reference ID:         {ref_id}{info}", "INFO", indent=4)
-
-    _spacer(ctx)
 
 
     # --------------------------------------------- Time and sync information ---------------------------------------------
@@ -230,8 +221,6 @@ def run(ctx):
     ctx.out(f"Verified time:        {ntp_to_utc(acc_time)}", "INFO", indent=4)
     ctx.out(f"Diff with verified:   {sec_to_readable(acc_diff)} ({diff_rating})", "INFO", indent=4)
     ctx.out(f"Diff from last sync:  {sec_to_readable(sync_diff)} ({sync_rating})", "INFO", indent=4)
-
-    _spacer(ctx)
     
     
     # ----------------------------------------------- Response information ------------------------------------------------

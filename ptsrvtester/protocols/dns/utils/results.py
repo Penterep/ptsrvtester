@@ -64,3 +64,7 @@ class VULNS(Enum):
     AmpFactor = "PTV-DNS-AMPFACTOR"                   # high response/query amplification factor
     NoRrl = "PTV-DNS-NORRL"                           # no Response Rate Limiting observed
     TcpFallback = "PTV-DNS-TCPFALLBACK"               # TCP fallback broken (TCP/53 not answering)
+
+    # Dynamic update (RFC 2136)
+    DynUpdate = "PTV-DNS-DYNUPDATE"                   # unauthenticated dynamic update accepted (record injection)
+    TsigAcl = "PTV-DNS-TSIGACL"                       # TSIG key not ACL-restricted (can write arbitrary names)

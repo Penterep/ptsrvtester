@@ -36,6 +36,7 @@ class DNSArgs(BaseArgs):
     subdomains: str | None
     threads: int
     dkim_selectors: list[str] | None
+    tsig_key: str | None
 
     @staticmethod
     def get_help():
@@ -59,6 +60,7 @@ class DNSArgs(BaseArgs):
             ["-sub", "--subdomains", "<wordlist>", "BRUTESUB: subdomain label wordlist"],
             ["", "--brute-threads", "<n>", "BRUTESUB/PTRSWEEP threads (default: 10)"],
             ["", "--dkim-selectors", "<sel...>", "EMAILSEC: DKIM selectors to try (default: common list)"],
+            ["", "--tsig-key", "<name:secret>", "TSIGUPDATE: TSIG key (name:secret or name:alg:secret)"],
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
             ["-o", "--output", "<file>", "Append results to a file"],
@@ -83,6 +85,8 @@ class DNSArgs(BaseArgs):
                 "ptsrvtester dns -ts DNSSEC,DNSSECALG,RRSIG,CHAIN,NSEC -d cloudflare.com",
                 "ptsrvtester dns -ts ZONEWALK,NSEC3CRACK -d nic.cz -sub subs.txt",
                 "ptsrvtester dns -ts AMPFACTOR,TCPFALLBACK -d cloudflare.com",
+                "ptsrvtester dns -ts DYNUPDATE -d internal.example.com",
+                "ptsrvtester dns -ts TSIGUPDATE -d example.com --tsig-key mykey:hmac-sha256:BASE64SECRET",
                 "ptsrvtester dns -ts EMAILSEC -h",
             ]},
             {"options": options},
@@ -148,6 +152,8 @@ class DNSArgs(BaseArgs):
                             metavar="<n>", help="BRUTESUB/PTRSWEEP threads (default: 10)")
         inputs.add_argument("--dkim-selectors", nargs="+", default=None, dest="dkim_selectors",
                             metavar="<sel>", help="EMAILSEC: DKIM selectors to try (default: common list)")
+        inputs.add_argument("--tsig-key", type=str, default=None, dest="tsig_key",
+                            metavar="<name:secret>", help="TSIGUPDATE: TSIG key (name:secret or name:alg:secret)")
 
         output = parser.add_argument_group("Output")
         output.add_argument(

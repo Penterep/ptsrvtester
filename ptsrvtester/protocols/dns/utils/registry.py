@@ -31,6 +31,7 @@ DNS_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("DNSSEC", ["DNSSEC", "DNSSECALG", "RRSIG", "CHAIN", "NSEC"]),
     ("Zone walking", ["ZONEWALK", "NSEC3CRACK"]),
     ("Amplification / DoS", ["AMPFACTOR", "RRL", "TCPFALLBACK"]),
+    ("Dynamic update (write)", ["DYNUPDATE", "TSIGUPDATE", "GSSTSIG"]),
 ]
 
 DNS_TESTS: dict[str, dict] = {
@@ -355,6 +356,43 @@ DNS_TESTS: dict[str, dict] = {
         "requires": ["-d/--domain or -dl/--domain-file"],
         "mods": [
             ["-d", "--domain", "<domain>", "Domain whose servers are checked"],
+            ["-dl", "--domain-file", "<file>", "File with domains"],
+        ],
+    },
+    "DYNUPDATE": {
+        "desc": "Unauthenticated dynamic update (RFC 2136)",
+        "long": ["WRITE test: send an UNauthenticated UPDATE adding a unique benign TXT",
+                 "record to the zone's primary, verify it, then delete it. If accepted,",
+                 "anyone can inject/modify records (PTV-DNS-DYNUPDATE). Only when named",
+                 "in -ts, and only against systems you are authorized to test."],
+        "requires": ["-d/--domain or -dl/--domain-file"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Zone to test"],
+            ["-dl", "--domain-file", "<file>", "File with domains"],
+        ],
+    },
+    "TSIGUPDATE": {
+        "desc": "TSIG update & ACL scoping",
+        "long": ["WRITE test: with a supplied TSIG key, check whether its update rights",
+                 "are ACL-scoped. If the key can add records under arbitrary/unrelated",
+                 "names it is over-privileged (PTV-DNS-TSIGACL). All test records are",
+                 "benign and deleted. Needs --tsig-key; only when named in -ts."],
+        "requires": ["-d/--domain (or -dl)", "--tsig-key <name:secret> (or name:alg:secret)"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Zone to test"],
+            ["", "--tsig-key", "<name:secret>", "TSIG key (name:secret or name:alg:secret)"],
+        ],
+    },
+    "GSSTSIG": {
+        "desc": "GSS-TSIG / secure update detection (AD)",
+        "long": ["Informational: GSS-TSIG (RFC 3645) is the AD/Kerberos secure-update",
+                 "mechanism (its deployment is good, not a finding). Uses a NON-WRITING",
+                 "prerequisite-only update to reveal whether authenticated update is",
+                 "enforced. A definitive GSS-TSIG / authenticated test needs AD domain",
+                 "credentials — not performed here."],
+        "requires": ["-d/--domain or -dl/--domain-file"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Zone to check"],
             ["-dl", "--domain-file", "<file>", "File with domains"],
         ],
     },

@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urljoin, urlsplit
 from xml.parsers import expat
 
+from .gena import GenaCallbackServer
 from .igd import (
     MAX_SOAP_BYTES,
     SUPPORTED_SERVICE_TYPES,
@@ -19,8 +20,12 @@ from .igd import (
     build_soap_request,
     parse_soap_response,
 )
+from .ipv6 import OutOfScopeIPv6URL, validate_ipv6_url
+from .ipv6_http import PinnedIPv6HTTPConnection, PinnedIPv6HTTPSConnection
+from .ipv6_ssdp import discover_ipv6_packets
 from .multicast import MULTICAST_ADDRESS, MULTICAST_PORT, build_multicast_msearch
 from .notify import listen_ssdp_notify
+from .notify_ipv6 import listen_ssdp_notify_ipv6
 from .scpd import parse_service_description
 
 MAX_DATAGRAM_BYTES = 8192
@@ -37,6 +42,11 @@ MAX_MULTICAST_DATAGRAMS = 20_000
 MAX_SCPD_SERVICE_CANDIDATES = 100
 MAX_SCPD_BYTES = 256 * 1024
 MAX_TOTAL_SCPD_BYTES = 8 * 1024 * 1024
+MAX_EVENT_SERVICE_CANDIDATES = 20
+MAX_EVENT_SERVICES = 5
+MAX_TOTAL_EVENT_BYTES = 8 * 1024 * 1024
+_EVENT_SID = re.compile(r"uuid:[A-Za-z0-9-]{1,128}\Z")
+_EVENT_TIMEOUT = re.compile(r"Second-(?:[0-9]{1,10}|infinite)\Z", re.IGNORECASE)
 IGD_INFO_ACTIONS = (
     "GetStatusInfo", "GetNATRSIPStatus", "GetExternalIPAddress",
 )
@@ -305,8 +315,11 @@ def _all_udns(device: dict) -> set[str]:
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     """Connect to the discovered IP while verifying the advertised TLS name."""
 
-    def __init__(self, host: str, connect_ip: str, port: int, timeout: float):
-        super().__init__(host, port, timeout=timeout)
+    def __init__(
+        self, host: str, connect_ip: str, port: int, timeout: float,
+        source_address: tuple[str, int] | None = None,
+    ):
+        super().__init__(host, port, timeout=timeout, source_address=source_address)
         self._connect_ip = connect_ip
 
     def connect(self):
@@ -323,6 +336,8 @@ class UpnpEngine:
         self.target_ip = str(args._upnp_resolved_ip)
         self.target_host = str(args._upnp_target_host)
         self.port = int(args.target.port or 1900)
+        self.family = int(getattr(args, "_upnp_family", 4))
+        self.ipv6_target = getattr(args, "_upnp_ipv6_target", None)
         self.discoveries: list[dict] = []
         self.devices: list[dict] = []
         self.module_errors: list[dict] = []
@@ -340,6 +355,11 @@ class UpnpEngine:
         self.scpd_truncated = False
         self.scpd_bytes = 0
         self.scpd_fetches = 0
+        self.event_results: list[dict] = []
+        self.event_status = "not_run"
+        self.event_truncated = False
+        self.event_bytes = 0
+        self.event_count = 0
         self.igd_results: list[dict] = []
         self.port_mapping_results: list[dict] = []
         self.igd_status = "not_run"
@@ -355,6 +375,8 @@ class UpnpEngine:
     def discover(self) -> list[dict]:
         if self.discovery_status != "not_run":
             return self.discoveries
+        if self.family == 6:
+            return self._discover_ipv6()
         multicast = bool(getattr(self.args, "multicast", False))
         if multicast:
             payload = build_multicast_msearch(self.args.search_target, self.args.mx)
@@ -424,17 +446,72 @@ class UpnpEngine:
             self.discovery_status = "no_response"
         return self.discoveries
 
+    def _discover_ipv6(self) -> list[dict]:
+        multicast = bool(self.args.multicast)
+        timeout = float(self.args.timeout_seconds)
+        if multicast:
+            timeout = max(timeout, float(self.args.mx))
+        try:
+            result = discover_ipv6_packets(
+                self.ipv6_target,
+                search_target=self.args.search_target,
+                max_responses=int(self.args.max_responses),
+                timeout=timeout,
+                multicast=multicast,
+                interface_index=int(getattr(self.args, "_upnp_interface_index", 0)),
+                interface_ip=self.args.interface_ip,
+                mx=int(self.args.mx),
+                ttl=int(self.args.ttl),
+            )
+        except (OSError, ValueError) as exc:
+            self._error("DISCOVER", exc)
+            self.discovery_status = "error"
+            return self.discoveries
+        seen: set[tuple] = set()
+        for packet, source in result["packets"]:
+            response = parse_ssdp_response(packet, source)
+            if response["sourceIp"].split("%", 1)[0] != self.target_ip:
+                response["validationErrors"].append("unexpected_source")
+                response["valid"] = False
+            if self.args.search_target != "ssdp:all" and response["st"] != self.args.search_target:
+                response["validationErrors"].append("st_mismatch")
+                response["valid"] = False
+            key = (
+                response["sourceIp"], response["st"], response["usn"],
+                response["location"],
+            )
+            if key not in seen:
+                seen.add(key)
+                self.discoveries.append(response)
+        self.discovery_truncated = bool(result["truncated"])
+        if self.discovery_truncated or any(not item["valid"] for item in self.discoveries):
+            self.discovery_status = "partial"
+        elif self.discoveries:
+            self.discovery_status = "complete"
+        else:
+            self.discovery_status = "no_response"
+        return self.discoveries
+
     def notify(self) -> list[dict]:
         """Observe SSDP advertisements from the selected host for a fixed time."""
         if self.notify_status != "not_run":
             return self.notifications
         try:
-            result = listen_ssdp_notify(
-                self.target_ip,
-                self.args.interface_ip,
-                float(self.args.notify_seconds),
-                int(self.args.max_notifications),
-            )
+            if self.family == 6:
+                result = listen_ssdp_notify_ipv6(
+                    self.ipv6_target,
+                    self.args.interface_ip,
+                    int(self.args._upnp_interface_index),
+                    float(self.args.notify_seconds),
+                    int(self.args.max_notifications),
+                )
+            else:
+                result = listen_ssdp_notify(
+                    self.target_ip,
+                    self.args.interface_ip,
+                    float(self.args.notify_seconds),
+                    int(self.args.max_notifications),
+                )
         except (OSError, ValueError) as exc:
             self._error("NOTIFY", exc)
             self.notify_status = "error"
@@ -446,6 +523,15 @@ class UpnpEngine:
         return self.notifications
 
     def _description_url(self, location: str):
+        if self.family == 6:
+            try:
+                validated = validate_ipv6_url(location, self.ipv6_target)
+            except OutOfScopeIPv6URL as exc:
+                raise OutOfScopeLocation(str(exc)) from exc
+            return (
+                validated.scheme, validated.host, validated.port,
+                validated.path, validated.authority,
+            )
         if len(location) > MAX_LOCATION_LENGTH:
             raise OutOfScopeLocation("LOCATION exceeds URL length limit")
         try:
@@ -499,14 +585,36 @@ class UpnpEngine:
         headers: dict[str, str],
         max_bytes: int,
         body: bytes | None = None,
-    ) -> tuple[int, bytes]:
+        include_headers: bool = False,
+        source_ip: str | None = None,
+        read_body: bool = True,
+    ) -> tuple[int, bytes] | tuple[int, bytes, list[tuple[str, str]]]:
         """Issue one bounded HTTP request pinned to the selected device IP."""
         scheme, host, port, path, authority = self._description_url(url)
         timeout = float(self.args.timeout_seconds)
-        if scheme == "https":
-            connection = _PinnedHTTPSConnection(host, self.target_ip, port, timeout)
+        source_address = (source_ip, 0) if source_ip else None
+        if self.family == 6:
+            ipv6_source = (
+                (source_ip, 0, 0, self.ipv6_target.scope_id)
+                if source_ip else None
+            )
+            connection_type = (
+                PinnedIPv6HTTPSConnection if scheme == "https"
+                else PinnedIPv6HTTPConnection
+            )
+            connection = connection_type(
+                host, self.ipv6_target, port, timeout,
+                source_address=ipv6_source,
+            )
+        elif scheme == "https":
+            connection = _PinnedHTTPSConnection(
+                host, self.target_ip, port, timeout, source_address=source_address
+            )
         else:
-            connection = http.client.HTTPConnection(self.target_ip, port, timeout=timeout)
+            connection_options = {"timeout": timeout}
+            if source_address is not None:
+                connection_options["source_address"] = source_address
+            connection = http.client.HTTPConnection(self.target_ip, port, **connection_options)
         expired = threading.Event()
 
         def end_request() -> None:
@@ -541,11 +649,19 @@ class UpnpEngine:
                     raise ValueError("invalid Content-Length")
                 if declared_length > max_bytes:
                     raise ResponseSizeExceeded()
-            response_body = response.read(max_bytes + 1)
+            response_body = response.read(max_bytes + 1) if read_body else b""
             if expired.is_set():
                 raise TimeoutError("HTTP request exceeded total timeout")
             if len(response_body) > max_bytes:
                 raise ResponseSizeExceeded(len(response_body))
+            if include_headers:
+                response_headers = response.getheaders()
+                if (
+                    len(response_headers) > 64
+                    or sum(len(name) + len(value) for name, value in response_headers) > 8192
+                ):
+                    raise ValueError("HTTP response headers exceed limit")
+                return response.status, response_body, response_headers
             return response.status, response_body
         finally:
             deadline.cancel()
@@ -683,6 +799,190 @@ class UpnpEngine:
                         return found
                 pending.extend(reversed(device["embeddedDevices"]))
         return found
+
+    def _event_services(self) -> list[dict]:
+        if self.description_status == "not_run":
+            self.describe()
+        found: list[dict] = []
+        seen: set[tuple] = set()
+        for item in self.devices:
+            if item["status"] != "described":
+                continue
+            pending = [item["description"]["device"]]
+            while pending:
+                device = pending.pop()
+                for service in device["services"]:
+                    reference = {
+                        "udn": device["udn"],
+                        "serviceType": service["serviceType"],
+                        "eventSubUrl": service["eventSubUrl"],
+                    }
+                    key = tuple(reference.values())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    found.append(reference)
+                    if len(found) > MAX_EVENT_SERVICE_CANDIDATES:
+                        return found
+                pending.extend(reversed(device["embeddedDevices"]))
+        return found
+
+    @staticmethod
+    def _single_event_header(headers: list[tuple[str, str]], name: str) -> str:
+        matches = [value.strip() for key, value in headers if key.lower() == name.lower()]
+        if len(matches) != 1 or not matches[0]:
+            raise ValueError(f"GENA response requires one {name} header")
+        return matches[0]
+
+    def events(self) -> list[dict]:
+        """Temporarily subscribe to bounded GENA events from selected-target services."""
+        if self.event_status != "not_run":
+            return self.event_results
+
+        services = self._event_services()
+        if not services:
+            self.event_status = (
+                "no_services" if self.description_status == "complete" else "inconclusive"
+            )
+            return self.event_results
+
+        eligible = 0
+        max_events = min(max(1, int(self.args.max_events)), 1000)
+        for position, service in enumerate(services):
+            result = {**service, "status": "skipped", "events": []}
+            url = service["eventSubUrl"]
+            if position >= MAX_EVENT_SERVICE_CANDIDATES:
+                result["error"] = "service_candidate_limit_reached"
+                self.event_truncated = True
+                self.event_results.append(result)
+                break
+            if not url:
+                result["error"] = "missing_event_subscription_url"
+                self.event_results.append(result)
+                continue
+            try:
+                self._description_url(url)
+            except OutOfScopeLocation as exc:
+                result["error"] = str(exc)
+                self.event_results.append(result)
+                continue
+            if eligible >= MAX_EVENT_SERVICES:
+                result["error"] = "event_service_limit_reached"
+                self.event_truncated = True
+                self.event_results.append(result)
+                continue
+            if self.event_count >= max_events or self.event_bytes >= MAX_TOTAL_EVENT_BYTES:
+                result["error"] = "event_count_or_byte_limit_reached"
+                self.event_truncated = True
+                self.event_results.append(result)
+                break
+
+            eligible += 1
+            listener_options = {
+                "max_events": max_events - self.event_count,
+                "max_total_bytes": MAX_TOTAL_EVENT_BYTES - self.event_bytes,
+            }
+            if self.family == 6:
+                listener_options["target_scope_id"] = self.ipv6_target.scope_id
+                listener_options["local_scope_id"] = (
+                    self.ipv6_target.scope_id
+                    if ipaddress.IPv6Address(self.args.interface_ip).is_link_local else 0
+                )
+            server = GenaCallbackServer(
+                self.target_ip, self.args.interface_ip, **listener_options
+            )
+            sid: str | None = None
+            try:
+                server.start()
+                status, _body, response_headers = self._request_target(
+                    url, "SUBSCRIBE",
+                    headers={
+                        "CALLBACK": f"<{server.callback_url}>",
+                        "NT": "upnp:event",
+                        "TIMEOUT": "Second-60",
+                    },
+                    max_bytes=4096,
+                    include_headers=True,
+                    source_ip=self.args.interface_ip,
+                    read_body=False,
+                )
+                result["subscribeHttpStatus"] = status
+                if status in (401, 403):
+                    result["status"] = "denied"
+                elif status != 200:
+                    raise ValueError(f"GENA SUBSCRIBE returned HTTP {status}")
+                else:
+                    sid = self._single_event_header(response_headers, "SID")
+                    if not _EVENT_SID.fullmatch(sid):
+                        sid = None
+                        raise ValueError("GENA SUBSCRIBE returned invalid SID")
+                    timeout = self._single_event_header(response_headers, "TIMEOUT")
+                    if not _EVENT_TIMEOUT.fullmatch(timeout):
+                        raise ValueError("GENA SUBSCRIBE returned invalid TIMEOUT")
+                    result["sid"] = sid
+                    result["timeout"] = timeout
+                    server.set_sid(sid)
+                    requested_seconds = float(self.args.event_seconds)
+                    granted_seconds = (
+                        requested_seconds if timeout.lower() == "second-infinite"
+                        else min(requested_seconds, float(timeout.split("-", 1)[1]))
+                    )
+                    result["observationSeconds"] = granted_seconds
+                    server.wait(granted_seconds)
+                    if granted_seconds < requested_seconds:
+                        result["status"] = "partial"
+                        result["note"] = "subscription_timeout_shorter_than_observation"
+                    elif server.truncated:
+                        result["status"] = "partial"
+                        result["note"] = "callback_limit_reached"
+                    else:
+                        result["status"] = "complete" if server.events else "no_events"
+            except (OSError, ValueError, http.client.HTTPException) as exc:
+                result["status"] = "error"
+                result["error"] = str(exc)[:300]
+                self._error("EVENTS", exc, eventSubUrl=url)
+            finally:
+                # A device may send its first event before SUBSCRIBE returns.
+                if sid is not None:
+                    try:
+                        unsubscribe_status, _body = self._request_target(
+                            url, "UNSUBSCRIBE", headers={"SID": sid},
+                            max_bytes=4096, source_ip=self.args.interface_ip,
+                            read_body=False,
+                        )
+                        result["unsubscribeHttpStatus"] = unsubscribe_status
+                        if unsubscribe_status != 200:
+                            raise ValueError(
+                                f"GENA UNSUBSCRIBE returned HTTP {unsubscribe_status}"
+                            )
+                    except (OSError, ValueError, http.client.HTTPException) as exc:
+                        result["unsubscribeError"] = str(exc)[:300]
+                        result["status"] = "partial" if result["status"] in (
+                            "complete", "no_events"
+                        ) else result["status"]
+                        self._error("EVENTS", exc, eventSubUrl=url)
+                server.stop()
+                result["events"] = server.events
+                result["receivedBytes"] = server.received_bytes
+                result["truncated"] = server.truncated
+                self.event_count += len(result["events"])
+                self.event_bytes += server.received_bytes
+                self.event_truncated |= server.truncated
+                if server.truncated and result["status"] in ("complete", "no_events"):
+                    result["status"] = "partial"
+                    result["note"] = "callback_limit_reached"
+            self.event_results.append(result)
+
+        statuses = [item["status"] for item in self.event_results]
+        if statuses and all(status == "complete" for status in statuses):
+            self.event_status = "complete"
+        elif statuses and all(status == "no_events" for status in statuses):
+            self.event_status = "no_events"
+        elif statuses and all(status == "error" for status in statuses):
+            self.event_status = "error"
+        else:
+            self.event_status = "partial"
+        return self.event_results
 
     def scpd(self) -> list[dict]:
         """Fetch selected-target service descriptions under request and byte budgets."""
@@ -993,6 +1293,8 @@ class UpnpEngine:
             "description": None,
             "target": self.target_host,
             "targetIp": self.target_ip,
+            "addressFamily": self.family,
+            "targetScopeId": self.ipv6_target.scope_id if self.ipv6_target else None,
             "udpPort": self.port,
             "discoveryStatus": self.discovery_status,
             "notifyStatus": self.notify_status,
@@ -1008,6 +1310,11 @@ class UpnpEngine:
             "scpdBytes": self.scpd_bytes,
             "scpdFetches": self.scpd_fetches,
             "serviceDescriptions": self.scpd_results,
+            "eventStatus": self.event_status,
+            "eventTruncated": self.event_truncated,
+            "eventBytes": self.event_bytes,
+            "eventCount": self.event_count,
+            "events": self.event_results,
             "soapBytes": self.soap_bytes,
             "soapByteLimit": MAX_TOTAL_SOAP_BYTES,
             "soapTruncated": self.soap_budget_exhausted,

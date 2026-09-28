@@ -3,9 +3,10 @@
 Tests are selected with ``-ts/--tests`` (codes matched against the modules'
 ``__MODULECODE__`` by :class:`BaseMain`). Mirrors ``ssh/utils/cli.py``.
 
-Empty skeleton: only the universal options are defined (target, test selection,
-output). When modules are added, register them in ``registry.py`` (so they show
-in the help) and add any per-module input options to :meth:`add_subparser`.
+Universal options (``-tg`` target, ``-ts`` tests, ``-o`` output) plus the input
+options the enumeration modules consume (``-d`` domain, ``-r`` range, ``-sub``
+wordlist, ``-rec`` record types, ``--dkim-selectors``). When a module is added,
+register it in ``registry.py`` and add any new input options here.
 """
 import argparse
 
@@ -28,6 +29,13 @@ class DNSArgs(BaseArgs):
     target: Target | None
     output: str | None
     module_threads: int
+    domain: str | None
+    domain_file: str | None
+    records: list[str] | None
+    ip_range: str | None
+    subdomains: str | None
+    threads: int
+    dkim_selectors: list[str] | None
 
     @staticmethod
     def get_help():
@@ -43,6 +51,15 @@ class DNSArgs(BaseArgs):
 
         options += [
             ["", "", "", ""],
+            [get_colored_text("Enumeration inputs", "TITLE")],
+            ["-d", "--domain", "<domain>", "Domain (RECORDS, WHOIS, BRUTESUB, EMAILSEC, CAA, WILDCARD)"],
+            ["-dl", "--domain-file", "<file>", "File with domains"],
+            ["-rec", "--records", "<type...>", "RECORDS: record types (default: A AAAA MX TXT CNAME NS SRV SOA)"],
+            ["-r", "--range", "<range>", "PTRSWEEP: IP, CIDR (192.0.2.0/24) or start-end (192.0.2.1-50)"],
+            ["-sub", "--subdomains", "<wordlist>", "BRUTESUB: subdomain label wordlist"],
+            ["", "--brute-threads", "<n>", "BRUTESUB/PTRSWEEP threads (default: 10)"],
+            ["", "--dkim-selectors", "<sel...>", "EMAILSEC: DKIM selectors to try (default: common list)"],
+            ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
             ["-o", "--output", "<file>", "Append results to a file"],
             ["-j", "--json", "", "Output in JSON format"],
@@ -57,9 +74,14 @@ class DNSArgs(BaseArgs):
             {"usage_example": [
                 "ptsrvtester dns -tg 8.8.8.8 -ts ALL",
                 "ptsrvtester dns -tg 8.8.8.8 -ts VERSION,NSID,EDNS",
-                "ptsrvtester dns -tg ns1.example.com -ts ROLE,TRANSPORT",
-                "ptsrvtester dns -tg 8.8.8.8 -ts CVE",
-                "ptsrvtester dns -ts VERSION -h",
+                "ptsrvtester dns -ts RECORDS,EMAILSEC,CAA -d example.com",
+                "ptsrvtester dns -ts BRUTESUB -d example.com -sub subs.txt",
+                "ptsrvtester dns -ts PTRSWEEP -r 192.0.2.0/24",
+                "ptsrvtester dns -ts AXFR,IXFR -d zonetransfer.me",
+                "ptsrvtester dns -ts RECURSION,AMPLIFICATION,CACHESNOOP -tg 8.8.8.8",
+                "ptsrvtester dns -ts COOKIES -tg 8.8.8.8",
+                "ptsrvtester dns -ts DNSSEC,DNSSECALG,RRSIG,CHAIN,NSEC -d cloudflare.com",
+                "ptsrvtester dns -ts EMAILSEC -h",
             ]},
             {"options": options},
         ]
@@ -74,8 +96,11 @@ class DNSArgs(BaseArgs):
   ptsrvtester dns -h
   ptsrvtester dns -tg 8.8.8.8 -ts ALL
   ptsrvtester dns -tg 8.8.8.8 -ts VERSION,NSID,EDNS
-  ptsrvtester dns -tg ns1.example.com -ts ROLE,TRANSPORT
-  ptsrvtester dns -ts VERSION -h"""
+  ptsrvtester dns -ts RECORDS,EMAILSEC,CAA -d example.com
+  ptsrvtester dns -ts BRUTESUB -d example.com -sub subs.txt
+  ptsrvtester dns -ts PTRSWEEP -r 192.0.2.0/24
+  ptsrvtester dns -ts AXFR,IXFR -d zonetransfer.me
+  ptsrvtester dns -ts EMAILSEC -h"""
 
         parser = subparsers.add_parser(
             name,
@@ -105,6 +130,22 @@ class DNSArgs(BaseArgs):
             dest="tests",
             help="Comma-separated test codes or ALL; 'dns -ts <TEST> -h' for test options",
         )
+
+        inputs = parser.add_argument_group("Enumeration inputs")
+        inputs.add_argument("-d", "--domain", type=str, default=None, dest="domain",
+                            metavar="<domain>", help="Domain (RECORDS/WHOIS/BRUTESUB/EMAILSEC/CAA/WILDCARD)")
+        inputs.add_argument("-dl", "--domain-file", type=str, default=None, dest="domain_file",
+                            metavar="<file>", help="File with domains")
+        inputs.add_argument("-rec", "--records", nargs="+", default=None, dest="records",
+                            metavar="<type>", help="RECORDS: record types (default: common set)")
+        inputs.add_argument("-r", "--range", type=str, default=None, dest="ip_range",
+                            metavar="<range>", help="PTRSWEEP: IP, CIDR or start-end")
+        inputs.add_argument("-sub", "--subdomains", type=str, default=None, dest="subdomains",
+                            metavar="<wordlist>", help="BRUTESUB: subdomain label wordlist")
+        inputs.add_argument("--brute-threads", type=int, default=10, dest="threads",
+                            metavar="<n>", help="BRUTESUB/PTRSWEEP threads (default: 10)")
+        inputs.add_argument("--dkim-selectors", nargs="+", default=None, dest="dkim_selectors",
+                            metavar="<sel>", help="EMAILSEC: DKIM selectors to try (default: common list)")
 
         output = parser.add_argument_group("Output")
         output.add_argument(

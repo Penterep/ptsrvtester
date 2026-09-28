@@ -1,13 +1,13 @@
 """ROLE — authoritative vs recursive vs forwarder.
 
-Sends a recursive (RD=1) query for an external name and reads the flags/answer.
-Recursion offered to an arbitrary client (an open resolver) is a real finding:
-it enables DNS amplification DDoS abuse. A full recursive resolver and a
-forwarder look the same from the client side, so that distinction is reported
-as "cannot be proven remotely".
+Sends a recursive (RD=1) query for an external name and reads the flags/answer
+to classify the server's role. This is informational recon: the open-recursion
+*finding* (and its amplification/abuse angle) is owned by the RECURSION and
+AMPLIFICATION tests in the "Recursion & resolver abuse" section, so it is not
+re-reported here. A full recursive resolver and a forwarder look the same from
+the client side, so that distinction is reported as "cannot be proven remotely".
 """
 from ptsrvtester.protocols.dns.utils import fingerprint_core as fp
-from ptsrvtester.protocols.dns.utils.results import VULNS
 
 __MODULELABEL__ = "Server role (authoritative / recursive / forwarder)"
 __MODULECODE__ = "ROLE"
@@ -33,8 +33,9 @@ def run(ctx):
     open_resolver = bool(info.recursion_available and info.recursion_answered)
     if open_resolver:
         role = "Recursive resolver — open to this client"
-        ctx.out("Open recursion: the server resolves arbitrary external names for us "
-                "(open resolver → DNS amplification abuse).", "VULN", indent=4)
+        ctx.out("Recursive/open resolver (resolves external names for us); "
+                "see the RECURSION and AMPLIFICATION tests for the abuse findings.", "INFO",
+                colortext=True, indent=4)
         ctx.out("Note: a full recursive resolver and a forwarder cannot be reliably "
                 "distinguished remotely.", "TEXT", indent=4)
     elif info.recursion_available:
@@ -46,9 +47,3 @@ def run(ctx):
 
     with ctx.results_lock:
         ctx.properties["role"] = role
-        if open_resolver:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.OpenRecursion.value,
-                "vuln_request": "RD=1 query for external name (example.com A)",
-                "vuln_response": f"RA=1, answered=yes, rcode={info.rcode}",
-            })

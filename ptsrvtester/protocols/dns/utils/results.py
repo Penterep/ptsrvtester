@@ -20,3 +20,37 @@ class VULNS(Enum):
     NsidDisclosure = "PTV-DNS-NSID"                   # server instance revealed via NSID
     OpenRecursion = "PTV-DNS-OPENRECURSION"           # recursion offered to arbitrary clients
     KnownCve = "PTV-DNS-KNOWNCVE"                     # advertised version matches a known CVE
+
+    # Record enumeration
+    Subdomains = "PTV-DNS-SUBDOMAINS"                 # subdomains discovered via brute force
+    SpfMissing = "PTV-DNS-SPFMISSING"                 # no SPF record (email spoofing surface)
+    SpfWeak = "PTV-DNS-SPFWEAK"                       # SPF present but +all / no fail policy
+    DmarcMissing = "PTV-DNS-DMARCMISSING"             # no DMARC record
+    DmarcWeak = "PTV-DNS-DMARCWEAK"                   # DMARC policy p=none (monitoring only)
+    CaaMissing = "PTV-DNS-CAAMISSING"                 # no CAA record (any CA may issue)
+    Wildcard = "PTV-DNS-WILDCARD"                     # wildcard record (masks enumeration)
+
+    # Zone transfer
+    ZoneTransfer = "PTV-DNS-ZONETRANSFER"             # AXFR allowed (full zone leak)
+    IncrementalTransfer = "PTV-DNS-IXFR"              # IXFR allowed (zone leak via increments)
+
+    # Recursion & resolver abuse
+    # (OpenRecursion, above, is emitted here by the RECURSION module)
+    Amplification = "PTV-DNS-AMPLIFICATION"           # out-of-zone recursion usable for reflection/amplification
+    CacheSnoop = "PTV-DNS-CACHESNOOP"                 # non-recursive RD=0 reveals cache contents
+
+    # Cache-poisoning / spoofing resilience
+    # (source-port / TXID / 0x20 / out-of-bailiwick need an authoritative probe
+    #  server to measure — deferred to a future implementation)
+    NoCookie = "PTV-DNS-NOCOOKIE"                     # no DNS cookies (weaker off-path spoofing protection)
+
+    # DNSSEC (KeyTrap CVE-2023-50387 is version-covered by KnownCve; an active
+    #  test needs an authoritative probe server — deferred)
+    DnssecMissing = "PTV-DNS-NODNSSEC"                # zone not DNSSEC-signed
+    DnssecInvalid = "PTV-DNS-DNSSECINVALID"           # signed but signatures do not validate
+    WeakDnssecAlg = "PTV-DNS-WEAKDNSSECALG"           # deprecated algorithm (RSA/MD5, DSA, SHA-1)
+    RrsigExpired = "PTV-DNS-RRSIGEXPIRED"             # an RRSIG has already expired
+    RrsigExpiring = "PTV-DNS-RRSIGEXPIRING"           # an RRSIG expires soon
+    DnssecChain = "PTV-DNS-DNSSECCHAIN"               # DS (parent) ↔ DNSKEY (child) chain broken
+    NsecWalk = "PTV-DNS-NSECWALK"                     # NSEC in use (zone walking possible)
+    Nsec3Params = "PTV-DNS-NSEC3PARAMS"               # NSEC3 with non-zero iterations / salt (RFC 9276)

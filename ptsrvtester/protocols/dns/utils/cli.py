@@ -81,6 +81,7 @@ class DNSArgs(BaseArgs):
                 "ptsrvtester dns -ts RECURSION,AMPLIFICATION,CACHESNOOP -tg 8.8.8.8",
                 "ptsrvtester dns -ts COOKIES -tg 8.8.8.8",
                 "ptsrvtester dns -ts DNSSEC,DNSSECALG,RRSIG,CHAIN,NSEC -d cloudflare.com",
+                "ptsrvtester dns -ts ZONEWALK,NSEC3CRACK -d nic.cz -sub subs.txt",
                 "ptsrvtester dns -ts EMAILSEC -h",
             ]},
             {"options": options},

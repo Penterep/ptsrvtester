@@ -29,6 +29,7 @@ DNS_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recursion & resolver abuse", ["RECURSION", "AMPLIFICATION", "CACHESNOOP"]),
     ("Cache-poisoning resilience", ["COOKIES"]),
     ("DNSSEC", ["DNSSEC", "DNSSECALG", "RRSIG", "CHAIN", "NSEC"]),
+    ("Zone walking", ["ZONEWALK", "NSEC3CRACK"]),
 ]
 
 DNS_TESTS: dict[str, dict] = {
@@ -284,11 +285,38 @@ DNS_TESTS: dict[str, dict] = {
         "desc": "Authenticated denial: NSEC vs NSEC3",
         "long": ["Query a non-existent name and read the denial records. NSEC allows",
                  "walking the whole zone (PTV-DNS-NSECWALK); NSEC3 with non-zero",
-                 "iterations / a salt is flagged against RFC 9276 (PTV-DNS-NSEC3PARAMS)."],
+                 "iterations / a salt is flagged against RFC 9276 (PTV-DNS-NSEC3PARAMS).",
+                 "Detection only — the ZONEWALK test performs the enumeration."],
         "requires": ["-d/--domain or -dl/--domain-file"],
         "mods": [
             ["-d", "--domain", "<domain>", "Domain to check"],
             ["-dl", "--domain-file", "<file>", "File with domains"],
+        ],
+    },
+    "ZONEWALK": {
+        "desc": "Enumerate the zone via NSEC / NSEC3 walking",
+        "long": ["NSEC: follow the next-name chain from the apex to list every name in",
+                 "plaintext (PTV-DNS-ZONEWALK). NSEC3: collect the hash chain and report",
+                 "the name count (still a disclosure; crack with NSEC3CRACK).",
+                 "Minimal-covering 'black lies' NSEC is not walkable. Active (many",
+                 "queries) — only when named in -ts."],
+        "requires": ["-d/--domain or -dl/--domain-file"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Zone to walk"],
+            ["-dl", "--domain-file", "<file>", "File with domains"],
+        ],
+    },
+    "NSEC3CRACK": {
+        "desc": "Offline dictionary cracking of NSEC3 hashes",
+        "long": ["Collect the zone's NSEC3 hashes, then hash candidate names (from -sub,",
+                 "else a built-in list) with the zone's salt/iterations/algorithm and",
+                 "match them to reveal plaintext names (PTV-DNS-NSEC3CRACK). NSEC3 with",
+                 "iterations=0 and no salt is the easiest to crack. Only when named in",
+                 "-ts."],
+        "requires": ["-d/--domain (or -dl)", "optional -sub/--subdomains <wordlist>"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Zone to crack"],
+            ["-sub", "--subdomains", "<wordlist>", "Candidate labels (default: built-in common list)"],
         ],
     },
 }

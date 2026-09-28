@@ -54,3 +54,7 @@ class VULNS(Enum):
     DnssecChain = "PTV-DNS-DNSSECCHAIN"               # DS (parent) ↔ DNSKEY (child) chain broken
     NsecWalk = "PTV-DNS-NSECWALK"                     # NSEC in use (zone walking possible)
     Nsec3Params = "PTV-DNS-NSEC3PARAMS"               # NSEC3 with non-zero iterations / salt (RFC 9276)
+
+    # Zone walking
+    ZoneWalk = "PTV-DNS-ZONEWALK"                     # subdomains enumerated via NSEC/NSEC3 walking
+    Nsec3Cracked = "PTV-DNS-NSEC3CRACK"               # NSEC3 hashes cracked offline (names revealed)

@@ -58,3 +58,9 @@ class VULNS(Enum):
     # Zone walking
     ZoneWalk = "PTV-DNS-ZONEWALK"                     # subdomains enumerated via NSEC/NSEC3 walking
     Nsec3Cracked = "PTV-DNS-NSEC3CRACK"               # NSEC3 hashes cracked offline (names revealed)
+
+    # Amplification / DoS (water-torture flood and NXNSAttack need a probe server
+    #  — deferred; NXNSAttack is version-covered by KnownCve)
+    AmpFactor = "PTV-DNS-AMPFACTOR"                   # high response/query amplification factor
+    NoRrl = "PTV-DNS-NORRL"                           # no Response Rate Limiting observed
+    TcpFallback = "PTV-DNS-TCPFALLBACK"               # TCP fallback broken (TCP/53 not answering)

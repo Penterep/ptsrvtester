@@ -30,6 +30,7 @@ DNS_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Cache-poisoning resilience", ["COOKIES"]),
     ("DNSSEC", ["DNSSEC", "DNSSECALG", "RRSIG", "CHAIN", "NSEC"]),
     ("Zone walking", ["ZONEWALK", "NSEC3CRACK"]),
+    ("Amplification / DoS", ["AMPFACTOR", "RRL", "TCPFALLBACK"]),
 ]
 
 DNS_TESTS: dict[str, dict] = {
@@ -317,6 +318,44 @@ DNS_TESTS: dict[str, dict] = {
         "mods": [
             ["-d", "--domain", "<domain>", "Zone to crack"],
             ["-sub", "--subdomains", "<wordlist>", "Candidate labels (default: built-in common list)"],
+        ],
+    },
+    "AMPFACTOR": {
+        "desc": "DNS amplification factor (ANY/DNSKEY/large TXT)",
+        "long": ["Measure the response-to-query byte ratio for ANY, DNSKEY and TXT",
+                 "against the domain's authoritative servers. A large factor means the",
+                 "server is usable as a DDoS reflector/amplifier (PTV-DNS-AMPFACTOR); a",
+                 "minimised ANY (RFC 8482) is good. Authoritative-side amplification —",
+                 "open-resolver reflection is the RECURSION-section AMPLIFICATION test."],
+        "requires": ["-d/--domain or -dl/--domain-file"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Domain whose servers are measured"],
+            ["-dl", "--domain-file", "<file>", "File with domains"],
+        ],
+    },
+    "RRL": {
+        "desc": "Response Rate Limiting detection",
+        "long": ["Fire a small bounded burst of identical queries and watch for the RRL",
+                 "signature (drops and/or TC-slip replies). RRL blunts amplification, so",
+                 "its absence is the finding (PTV-DNS-NORRL). Active but bounded (~100",
+                 "packets) — only when named in -ts; not seeing RRL is not proof it is",
+                 "absent."],
+        "requires": ["-d/--domain or -dl/--domain-file"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Domain to query repeatedly"],
+            ["-dl", "--domain-file", "<file>", "File with domains"],
+        ],
+    },
+    "TCPFALLBACK": {
+        "desc": "Truncation (TC) & TCP fallback",
+        "long": ["Check that a large record queried with a 512-byte UDP buffer is",
+                 "truncated (TC set) and that TCP/53 actually answers. A broken TCP",
+                 "path breaks large answers and DNSSEC and forces UDP-only (more",
+                 "amplifiable) — PTV-DNS-TCPFALLBACK."],
+        "requires": ["-d/--domain or -dl/--domain-file"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Domain whose servers are checked"],
+            ["-dl", "--domain-file", "<file>", "File with domains"],
         ],
     },
 }

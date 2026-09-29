@@ -68,3 +68,7 @@ class VULNS(Enum):
     # Dynamic update (RFC 2136)
     DynUpdate = "PTV-DNS-DYNUPDATE"                   # unauthenticated dynamic update accepted (record injection)
     TsigAcl = "PTV-DNS-TSIGACL"                       # TSIG key not ACL-restricted (can write arbitrary names)
+
+    # Encrypted transport (DoT / DoH / DoQ)
+    WeakTls = "PTV-DNS-WEAKTLS"                        # encrypted transport negotiates weak TLS (< 1.2)
+    TlsCert = "PTV-DNS-TLSCERT"                        # invalid TLS certificate (untrusted / expired / name mismatch)

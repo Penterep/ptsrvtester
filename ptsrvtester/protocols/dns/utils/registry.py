@@ -32,6 +32,7 @@ DNS_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Zone walking", ["ZONEWALK", "NSEC3CRACK"]),
     ("Amplification / DoS", ["AMPFACTOR", "RRL", "TCPFALLBACK"]),
     ("Dynamic update (write)", ["DYNUPDATE", "TSIGUPDATE", "GSSTSIG"]),
+    ("Encrypted transport", ["DOT", "DOH", "DOQ"]),
 ]
 
 DNS_TESTS: dict[str, dict] = {
@@ -395,6 +396,40 @@ DNS_TESTS: dict[str, dict] = {
             ["-d", "--domain", "<domain>", "Zone to check"],
             ["-dl", "--domain-file", "<file>", "File with domains"],
         ],
+    },
+    "DOT": {
+        "desc": "DNS over TLS (853): TLS version, cipher, certificate",
+        "long": ["Handshake on 853; report the TLS version/cipher and certificate",
+                 "(issuer, expiry, SAN, validity), then confirm DNS-over-TLS answers.",
+                 "Weak TLS <1.2 → PTV-DNS-WEAKTLS; invalid/expired/mismatched cert →",
+                 "PTV-DNS-TLSCERT.",
+                 "IMPORTANT: to validate the certificate name, pass the full HOSTNAME",
+                 "(-tg dns.example.com), not just an IP — against an IP the cert can",
+                 "only match an IP-SAN."],
+        "requires": ["-tg/--target — use the full HOSTNAME for certificate validation"],
+        "mods": [["-tg", "--target", "<hostname>", "DNS server HOSTNAME[:PORT] (hostname needed for cert validation)"]],
+    },
+    "DOH": {
+        "desc": "DNS over HTTPS (443, /dns-query): TLS, cert, HTTP/2",
+        "long": ["Handshake on 443 (ALPN h2/http1.1); report TLS version/cipher,",
+                 "whether HTTP/2 is negotiated, and the certificate, then confirm DoH",
+                 "answers at /dns-query. Weak TLS → PTV-DNS-WEAKTLS; invalid cert →",
+                 "PTV-DNS-TLSCERT.",
+                 "IMPORTANT: to validate the certificate name, pass the full HOSTNAME",
+                 "(-tg dns.example.com), not just an IP."],
+        "requires": ["-tg/--target — use the full HOSTNAME for certificate validation"],
+        "mods": [["-tg", "--target", "<hostname>", "DNS server HOSTNAME[:PORT] (hostname needed for cert validation)"]],
+    },
+    "DOQ": {
+        "desc": "DNS over QUIC (853/udp, RFC 9250)",
+        "long": ["Attempt a DoQ query over QUIC (mandates TLS 1.3). Availability means a",
+                 "modern encrypted transport is offered. Needs the optional aioquic",
+                 "package; detailed cert extraction over QUIC is limited (DoT/DoH cover",
+                 "cert detail).",
+                 "For certificate-name validation pass the full HOSTNAME (-tg …), not",
+                 "just an IP."],
+        "requires": ["-tg/--target (full hostname preferred)", "aioquic installed"],
+        "mods": [["-tg", "--target", "<hostname>", "DNS server HOSTNAME[:PORT]"]],
     },
 }
 

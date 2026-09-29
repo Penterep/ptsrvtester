@@ -19,6 +19,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from pathlib import Path
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
@@ -38,12 +39,14 @@ except ModuleNotFoundError as exc:  # transitional compatibility before base reb
     from ptsrvtester.modules._base import BaseArgs, BaseModule, Out
 
 from .auth_analysis import (
+    MAX_BRUTE_ATTEMPTS,
     AccountLockoutConfig,
     BruteProtectionConfig,
     BruteProtectionResult,
     UserEnumerationConfig,
     UserEnumerationResult,
     load_user_wordlist,
+    normalize_candidate_login,
     run_brute_protection,
     run_user_enumeration,
 )
@@ -103,6 +106,8 @@ REMOTEFX_CODEC_GUID = "76772f12-bd72-4463-afb3-b73c9c6f7886"
 IMAGE_REMOTEFX_CODEC_GUID = "2744ccd4-9d8a-4e74-803c-0ecbeea19c54"
 _AARDWOLF_SESSION_LOCK = threading.Lock()
 MAX_ACCEPTED_WEAK_CIPHERS = 32
+MAX_PASSWORD_WORDLIST_BYTES = 1_048_576
+MAX_PASSWORD_WORDLIST_CANDIDATES = 10_000
 
 CREDSSP_TSREQUEST_VERSION = 6
 MAX_CREDSSP_MESSAGE_SIZE = 256 * 1024
@@ -565,6 +570,20 @@ class RDPBruteProtectionResult:
 
 
 @dataclass(frozen=True)
+class RDPCredentialGuessResult:
+    status: str
+    reason: str | None = None
+    user_count: int = 0
+    password_count: int = 0
+    pair_count: int = 0
+    attempt_limit: int = 0
+    attempts_performed: int = 0
+    matched_user_index: int | None = None
+    matched_password_index: int | None = None
+    stopped_early: bool = False
+
+
+@dataclass(frozen=True)
 class RDPConnectionLimitResult:
     status: str
     scenarios: tuple[RateScenarioResult, ...] = ()
@@ -660,6 +679,7 @@ class RDPResults:
     auth: RDPAuthResult | None = None
     auth_methods: RDPAuthMethodsResult | None = None
     user_enumeration: UserEnumerationResult | None = None
+    credential_guessing: RDPCredentialGuessResult | None = None
     brute_protection: RDPBruteProtectionResult | None = None
     connection_limit: RDPConnectionLimitResult | None = None
     not_implemented: list[str] = field(default_factory=list)
@@ -687,6 +707,29 @@ def _split_ntlm_login(login: str) -> tuple[str | None, str]:
         return domain, username
 
     return None, login
+
+
+def load_password_wordlist(path: str | Path) -> tuple[str, ...]:
+    """Read a bounded UTF-8 password list without changing candidate bytes."""
+
+    wordlist_path = Path(path)
+    if wordlist_path.stat().st_size > MAX_PASSWORD_WORDLIST_BYTES:
+        raise ValueError("password wordlist exceeds the 1 MiB size limit")
+    with wordlist_path.open("rb") as wordlist:
+        contents = wordlist.read(MAX_PASSWORD_WORDLIST_BYTES + 1)
+    if len(contents) > MAX_PASSWORD_WORDLIST_BYTES:
+        raise ValueError("password wordlist exceeds the 1 MiB size limit")
+
+    passwords: list[str] = []
+    for password in contents.decode("utf-8-sig", errors="strict").splitlines():
+        if not password:
+            continue
+        if "\x00" in password or len(password) > 4096:
+            raise ValueError("password wordlist contains an invalid candidate")
+        passwords.append(password)
+        if len(passwords) > MAX_PASSWORD_WORDLIST_CANDIDATES:
+            raise ValueError("password wordlist contains too many candidates")
+    return tuple(passwords)
 
 
 def _sanitize_auth_error(error: object, *sensitive_values: str | None) -> str:
@@ -2091,6 +2134,8 @@ class RDP(BaseModule):
             self.results.auth_methods = self._run_auth_methods_test()
         elif canonical == "USERENUM":
             self.results.user_enumeration = self._run_user_enumeration_test()
+        elif canonical == "BRUTE":
+            self.results.credential_guessing = self._run_credential_guessing_test()
         elif canonical == "BRUTEPROT":
             self.results.brute_protection = self._run_brute_protection_test()
         elif canonical == "RATELIMIT":
@@ -2111,10 +2156,16 @@ class RDP(BaseModule):
             self.run_test(canonical)
             self.emit_test_output(canonical, ctx)
         except Exception as exc:
-            redacted = _sanitize_auth_error(
-                exc,
-                getattr(self.args, "password", None),
-                getattr(self.args, "login", None),
+            # A wordlist candidate may appear inside a backend exception.
+            # Its plaintext is not retained in the BRUTE report.
+            redacted = (
+                f"{type(exc).__name__} during credential guessing"
+                if canonical == "BRUTE"
+                else _sanitize_auth_error(
+                    exc,
+                    getattr(self.args, "password", None),
+                    getattr(self.args, "login", None),
+                )
             )
             detail = f"{type(exc).__name__}: {redacted}"
             self.results.module_errors[canonical] = detail
@@ -2135,6 +2186,7 @@ class RDP(BaseModule):
             "AUTH": ("RDP authentication test", self.results.auth, self._output_auth_text),
             "AUTHMETHODS": ("RDP authentication methods", self.results.auth_methods, self._output_auth_methods_text),
             "USERENUM": ("RDP user enumeration", self.results.user_enumeration, self._output_user_enumeration_text),
+            "BRUTE": ("RDP credential guessing", self.results.credential_guessing, self._output_credential_guessing_text),
             "BRUTEPROT": ("RDP password-guessing protections", self.results.brute_protection, self._output_brute_protection_text),
             "RATELIMIT": ("RDP connection rate limiting", self.results.connection_limit, self._output_rate_limit_text),
         }
@@ -2238,7 +2290,7 @@ class RDP(BaseModule):
         if self.args.login is None or self.args.password is None:
             self._authenticated_session_result = AuthenticatedSessionResult(
                 status="missing_credentials",
-                error="both --login and --password are required",
+                error="both --user and --password are required",
             )
             return self._authenticated_session_result
 
@@ -2284,7 +2336,7 @@ class RDP(BaseModule):
         if self.args.login is None or self.args.password is None:
             return RDPAuthResult(
                 status="missing_credentials",
-                error="both --login and --password are required",
+                error="both --user and --password are required",
             )
 
         credssp_probe = next(
@@ -2492,7 +2544,7 @@ class RDP(BaseModule):
                             credential_source="not_used",
                             status="prerequisite_error",
                             reason=(
-                                "valid --login and --password are required; random "
+                                "valid --user and --password are required; random "
                                 "credentials would fail at the KDC before testing RDP"
                             ),
                         )
@@ -2673,7 +2725,7 @@ class RDP(BaseModule):
         if self.args.login is None:
             return UserEnumerationResult(
                 status="blocked",
-                reason="USERENUM requires a known valid --login",
+                reason="USERENUM requires a known valid --user",
             )
         if getattr(self.args, "allow_auth_failures", False) is not True:
             return UserEnumerationResult(
@@ -2753,6 +2805,197 @@ class RDP(BaseModule):
         reason = f"{identity_note}; {result.reason}" if result.reason else identity_note
         return replace(result, reason=reason)
 
+    def _run_credential_guessing_test(self) -> RDPCredentialGuessResult:
+        if getattr(self.args, "allow_auth_failures", False) is not True:
+            return RDPCredentialGuessResult(
+                status="blocked",
+                reason="BRUTE requires --allow-auth-failures",
+            )
+
+        try:
+            direct_users = getattr(self.args, "brute_users", ()) or ()
+            if isinstance(direct_users, str):
+                direct_users = (direct_users,)
+            if not isinstance(direct_users, (tuple, list)):
+                raise TypeError("invalid direct usernames")
+            if not direct_users and getattr(self.args, "login", None) is not None:
+                direct_users = (self.args.login,)
+            namespace_login = direct_users[0] if direct_users else "ptsrv-brute-baseline"
+
+            users: list[str] = []
+            seen_users: set[str] = set()
+            file_users = (
+                load_user_wordlist(self.args.users, namespace_login)
+                if getattr(self.args, "users", None)
+                else ()
+            )
+            for candidate in (*direct_users, *file_users):
+                normalized = normalize_candidate_login(candidate, namespace_login)
+                key = normalized.casefold()
+                if key not in seen_users:
+                    seen_users.add(key)
+                    users.append(normalized)
+
+            passwords: list[str] = []
+            seen_passwords: set[str] = set()
+            direct_password = getattr(self.args, "password", None)
+            file_passwords = (
+                load_password_wordlist(self.args.passwords)
+                if getattr(self.args, "passwords", None)
+                else ()
+            )
+            for candidate in (
+                (direct_password,) if direct_password is not None else ()
+            ) + file_passwords:
+                if not isinstance(candidate, str):
+                    raise TypeError("invalid password candidate")
+                if "\x00" in candidate or len(candidate) > 4096:
+                    raise ValueError("invalid password candidate")
+                if candidate not in seen_passwords:
+                    seen_passwords.add(candidate)
+                    passwords.append(candidate)
+
+            limit = getattr(self.args, "guess_attempts", 10)
+            delay_ms = getattr(self.args, "guess_delay_ms", 100)
+            if isinstance(limit, bool) or not isinstance(limit, int):
+                raise TypeError("invalid attempt limit")
+            if not 2 <= limit <= MAX_BRUTE_ATTEMPTS:
+                raise ValueError("attempt limit must be between 2 and 100")
+            if isinstance(delay_ms, bool) or not isinstance(delay_ms, int):
+                raise TypeError("invalid delay")
+            if not 0 <= delay_ms <= 60_000:
+                raise ValueError("delay must be between 0 and 60000 milliseconds")
+        except (OSError, TypeError, UnicodeError, ValueError):
+            # Decode and filesystem exceptions can contain a wordlist candidate.
+            return RDPCredentialGuessResult(
+                status="error",
+                reason="invalid BRUTE input; check wordlists, encoding and limits",
+            )
+
+        if not users or not passwords:
+            missing = "username" if not users else "password"
+            return RDPCredentialGuessResult(
+                status="blocked",
+                reason=f"BRUTE requires at least one {missing} candidate",
+            )
+
+        base = RDPCredentialGuessResult(
+            status="inconclusive",
+            user_count=len(users),
+            password_count=len(passwords),
+            pair_count=len(users) * len(passwords),
+            attempt_limit=limit,
+        )
+        tls_validation = self._get_auth_tls_validation_result()
+        if tls_validation.status == "error":
+            return replace(
+                base,
+                status="blocked",
+                reason="RDP TLS validation failed; no credentials were sent",
+            )
+        ntlm_preflight = self._get_ntlm_info_preflight()
+        if ntlm_preflight.status not in {"ok", "empty"}:
+            return replace(
+                base,
+                status=(
+                    "not_applicable"
+                    if ntlm_preflight.status == "not_supported"
+                    else "inconclusive"
+                ),
+                reason="an NTLM challenge was not available for RDP CredSSP",
+            )
+
+        performed = 0
+        # Password-first ordering distributes each password across the users.
+        for password_index, password in enumerate(passwords, 1):
+            for user_index, user in enumerate(users, 1):
+                if performed == limit:
+                    return replace(
+                        base,
+                        status="partial",
+                        reason="attempt limit reached before all candidate pairs",
+                        attempts_performed=performed,
+                        stopped_early=True,
+                    )
+                if performed and delay_ms:
+                    time.sleep(delay_ms / 1000.0)
+                performed += 1
+                try:
+                    attempt = self._run_fresh_auth_attempt(
+                        user,
+                        password,
+                        mechanism=AuthMechanism.NTLM,
+                        credential_source=CredentialSource.PROVIDED,
+                    )
+                except Exception as exc:
+                    return replace(
+                        base,
+                        status="error",
+                        reason=f"authentication probe raised {type(exc).__name__}",
+                        attempts_performed=performed,
+                        stopped_early=True,
+                    )
+
+                if not isinstance(attempt, FreshAuthAttemptResult):
+                    return replace(
+                        base,
+                        status="error",
+                        reason="authentication probe returned an invalid result",
+                        attempts_performed=performed,
+                        stopped_early=True,
+                    )
+                code = attempt.server_error_code
+                if (
+                    attempt.server_error_from_credssp
+                    and isinstance(code, int)
+                    and code & 0xFFFFFFFF == 0xC0000234
+                ):
+                    return replace(
+                        base,
+                        status="account_locked",
+                        reason="server reported account lockout; attempts stopped",
+                        attempts_performed=performed,
+                        stopped_early=performed < base.pair_count,
+                    )
+                if attempt.outcome is AuthOutcome.AUTHENTICATED:
+                    return replace(
+                        base,
+                        status="authenticated",
+                        reason="CredSSP accepted one candidate pair",
+                        attempts_performed=performed,
+                        matched_user_index=user_index,
+                        matched_password_index=password_index,
+                        stopped_early=performed < base.pair_count,
+                    )
+                if attempt.outcome is AuthOutcome.REJECTED:
+                    continue
+                if attempt.outcome is AuthOutcome.BLOCKED:
+                    status = "blocked"
+                    reason = "server blocked authentication; attempts stopped"
+                elif attempt.outcome is AuthOutcome.NOT_SUPPORTED:
+                    status = "not_applicable"
+                    reason = "server did not support NTLM CredSSP authentication"
+                else:
+                    status = "inconclusive"
+                    reason = (
+                        "authentication probe did not complete reliably; "
+                        "attempts stopped"
+                    )
+                return replace(
+                    base,
+                    status=status,
+                    reason=reason,
+                    attempts_performed=performed,
+                    stopped_early=performed < base.pair_count,
+                )
+
+        return replace(
+            base,
+            status="not_found",
+            reason="no candidate pair was accepted in the tested sample",
+            attempts_performed=performed,
+        )
+
     def _run_brute_protection_test(self) -> RDPBruteProtectionResult:
         allow_failures = getattr(self.args, "allow_auth_failures", False) is True
         lockout_enabled = getattr(self.args, "lockout_test", False) is True
@@ -2770,7 +3013,7 @@ class RDP(BaseModule):
             analysis = BruteProtectionResult(
                 status="blocked",
                 reason=(
-                    "--lockout-test requires valid --login and --password for a "
+                    "--lockout-test requires valid --user and --password for a "
                     "disposable test account"
                 ),
             )
@@ -4335,6 +4578,15 @@ class RDP(BaseModule):
         }.get(result.status, Out.TITLE)
 
     @staticmethod
+    def _credential_guessing_output_category(result: RDPCredentialGuessResult) -> Out:
+        return {
+            "authenticated": Out.VULN,
+            "not_found": Out.NOTVULN,
+            "account_locked": Out.WARNING,
+            "error": Out.ERROR,
+        }.get(result.status, Out.TITLE)
+
+    @staticmethod
     def _rate_limit_output_category(result: RDPConnectionLimitResult) -> Out:
         return {
             "possible_ip_block_or_service_impact": Out.ERROR,
@@ -4552,6 +4804,19 @@ class RDP(BaseModule):
                         getattr(self.args, "password", None),
                         getattr(self.args, "login", None),
                     ),
+                )
+
+        if self.results.credential_guessing is not None:
+            if emit_text:
+                self._output_credential_guessing_text(self.results.credential_guessing)
+            properties["credentialGuessing"] = self._credential_guessing_json(
+                self.results.credential_guessing
+            )
+            if self.results.credential_guessing.status in {"blocked", "error"}:
+                self.results.module_errors.setdefault(
+                    "BRUTE",
+                    self.results.credential_guessing.reason
+                    or "credential-guessing test failed",
                 )
 
         if self.results.brute_protection is not None:
@@ -4972,7 +5237,7 @@ class RDP(BaseModule):
             )
         elif result.status == "missing_credentials":
             self._print_status(
-                "AUTH requires both --login and --password",
+                "AUTH requires both --user and --password",
                 Out.TITLE,
             )
         elif result.status == "not_supported":
@@ -5107,6 +5372,37 @@ class RDP(BaseModule):
                 Out.TITLE,
                 indent=8,
             )
+
+    def _output_credential_guessing_text(
+        self,
+        result: RDPCredentialGuessResult,
+    ) -> None:
+        if self.use_json:
+            return
+
+        self.ptprint("RDP credential guessing", Out.INFO)
+        messages = {
+            "authenticated": (
+                "CredSSP accepted user candidate "
+                f"#{result.matched_user_index} with password candidate "
+                f"#{result.matched_password_index}; RDP authorization was not tested"
+            ),
+            "not_found": "No candidate pair was accepted within the tested sample",
+            "partial": "Attempt limit reached before all candidate pairs were tested",
+            "account_locked": "Server reported account lockout; attempts stopped",
+            "blocked": "Credential-guessing test was not run",
+            "not_applicable": "NTLM-based credential guessing is not applicable",
+            "inconclusive": "Credential-guessing result is inconclusive",
+            "error": "Credential-guessing test failed",
+        }
+        message = messages.get(result.status, f"Credential-guessing status: {result.status}")
+        if result.reason and result.status not in {"authenticated", "not_found"}:
+            message = f"{message} ({result.reason})"
+        self._print_status(message, self._credential_guessing_output_category(result))
+        self.ptdebug(
+            f"Candidate pairs: {result.pair_count}; attempt limit: "
+            f"{result.attempt_limit}; attempts performed: {result.attempts_performed}"
+        )
 
     def _output_brute_protection_text(
         self,
@@ -5539,6 +5835,22 @@ class RDP(BaseModule):
                 for candidate in result.candidates
             ],
             "timingUsedForClassification": False,
+        }
+
+    @staticmethod
+    def _credential_guessing_json(result: RDPCredentialGuessResult) -> dict:
+        return {
+            "status": result.status,
+            "mechanism": "credssp_ntlm",
+            "reason": result.reason,
+            "userCandidateCount": result.user_count,
+            "passwordCandidateCount": result.password_count,
+            "candidatePairCount": result.pair_count,
+            "attemptLimit": result.attempt_limit,
+            "attemptsPerformed": result.attempts_performed,
+            "matchedUserIndex": result.matched_user_index,
+            "matchedPasswordIndex": result.matched_password_index,
+            "stoppedEarly": result.stopped_early,
         }
 
     def _brute_protection_json(self, result: RDPBruteProtectionResult) -> dict:

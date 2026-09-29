@@ -36,6 +36,7 @@ class RDP(BaseMain):
     def __init__(self, args: BaseArgs, ptjsonlib) -> None:
         # BaseMain validates the namespace and calls _prepare_target() first.
         super().__init__(args, ptjsonlib)
+        self._validate_credential_options()
 
         # Import lazily so importing CLI/help metadata does not eagerly load the
         # sizeable RDP protocol implementation and its optional dependencies.
@@ -47,6 +48,28 @@ class RDP(BaseMain):
 
         # Exactly one coordinator/engine is shared by every discovered module.
         self.rdp_engine = RDPEngine(args, ptjsonlib)
+
+    def _validate_credential_options(self) -> None:
+        """Reject credential wordlists that no selected test would consume."""
+        selected = set(self._test_tokens(getattr(self.args, "tests", None)))
+        direct_users = getattr(self.args, "brute_users", None) or ()
+        if getattr(self.args, "passwords", None) is not None and "BRUTE" not in selected:
+            raise argparse.ArgumentError(
+                None, "-P/--passwords requires explicit -ts BRUTE"
+            )
+        if len(direct_users) > 1:
+            if "BRUTE" not in selected:
+                raise argparse.ArgumentError(
+                    None, "multiple -u/--user values require explicit -ts BRUTE"
+                )
+            single_user_tests = {"ALL", "AUTH", "AUTHMETHODS", "USERENUM", "BRUTEPROT"}
+            incompatible = selected & single_user_tests
+            if incompatible:
+                raise argparse.ArgumentError(
+                    None,
+                    "multiple -u/--user values cannot be combined with "
+                    + ", ".join(sorted(incompatible)),
+                )
 
     def _prepare_target(self) -> None:
         """Apply the RDP port and retain both the hostname and resolved IP.

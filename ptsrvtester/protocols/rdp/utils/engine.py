@@ -685,7 +685,6 @@ class RDPResults:
     auth: RDPAuthResult | None = None
     auth_methods: RDPAuthMethodsResult | None = None
     user_enumeration: UserEnumerationResult | None = None
-    credential_guessing: RDPCredentialGuessResult | None = None
     brute_protection: RDPBruteProtectionResult | None = None
     connection_limit: RDPConnectionLimitResult | None = None
     not_implemented: list[str] = field(default_factory=list)
@@ -2141,8 +2140,6 @@ class RDP(BaseModule):
         elif canonical == "USERENUM":
             self.results.user_enumeration = self._run_user_enumeration_test()
         elif canonical == "BRUTE":
-            self.results.credential_guessing = self._run_credential_guessing_test()
-        elif canonical == "BRUTEPROT":
             self.results.brute_protection = self._run_brute_protection_test()
         elif canonical == "RATELIMIT":
             self.results.connection_limit = self._run_rate_limit_test()
@@ -2166,7 +2163,7 @@ class RDP(BaseModule):
             # Do not propagate that text into either guessing report.
             redacted = (
                 f"{type(exc).__name__} during credential guessing"
-                if canonical in {"BRUTE", "BRUTEPROT"}
+                if canonical == "BRUTE"
                 else _sanitize_auth_error(
                     exc,
                     getattr(self.args, "password", None),
@@ -2192,8 +2189,7 @@ class RDP(BaseModule):
             "AUTH": ("RDP authentication test", self.results.auth, self._output_auth_text),
             "AUTHMETHODS": ("RDP authentication methods", self.results.auth_methods, self._output_auth_methods_text),
             "USERENUM": ("RDP user enumeration", self.results.user_enumeration, self._output_user_enumeration_text),
-            "BRUTE": ("RDP credential guessing", self.results.credential_guessing, self._output_credential_guessing_text),
-            "BRUTEPROT": ("RDP password-guessing protections", self.results.brute_protection, self._output_brute_protection_text),
+            "BRUTE": ("RDP password-guessing protections", self.results.brute_protection, self._output_brute_protection_text),
             "RATELIMIT": ("RDP connection rate limiting", self.results.connection_limit, self._output_rate_limit_text),
         }
         entry = outputters.get(canonical)
@@ -2814,15 +2810,8 @@ class RDP(BaseModule):
     def _run_credential_guessing_test(
         self,
         *,
-        require_opt_in: bool = True,
         progress_callback: Callable[[int, int, str, str], None] | None = None,
     ) -> RDPCredentialGuessResult:
-        if require_opt_in and getattr(self.args, "allow_auth_failures", False) is not True:
-            return RDPCredentialGuessResult(
-                status="blocked",
-                reason="BRUTE requires --allow-auth-failures",
-            )
-
         try:
             direct_users = getattr(self.args, "brute_users", ()) or ()
             if isinstance(direct_users, str):
@@ -3039,14 +3028,13 @@ class RDP(BaseModule):
             return
         percent = index * 100 // total
         self._print_status(
-            f"BRUTEPROT {percent}% ({index}/{total}) trying "
+            f"BRUTE {percent}% ({index}/{total}) trying "
             f"{login!r} / {password!r}",
             Out.TITLE,
         )
 
     def _run_brute_protection_candidates(self) -> RDPBruteProtectionResult:
         guess = self._run_credential_guessing_test(
-            require_opt_in=False,
             progress_callback=self._emit_brute_progress,
         )
         recovery: NegotiationProbe | None = None
@@ -3170,7 +3158,7 @@ class RDP(BaseModule):
         except (TypeError, ValueError) as exc:
             analysis = BruteProtectionResult(
                 status="error",
-                reason=f"invalid BRUTEPROT configuration: {exc}",
+                reason=f"invalid BRUTE configuration: {exc}",
             )
             return RDPBruteProtectionResult(analysis=analysis)
 
@@ -4705,15 +4693,6 @@ class RDP(BaseModule):
         }.get(result.status, Out.TITLE)
 
     @staticmethod
-    def _credential_guessing_output_category(result: RDPCredentialGuessResult) -> Out:
-        return {
-            "authenticated": Out.VULN,
-            "not_found": Out.NOTVULN,
-            "account_locked": Out.WARNING,
-            "error": Out.ERROR,
-        }.get(result.status, Out.TITLE)
-
-    @staticmethod
     def _rate_limit_output_category(result: RDPConnectionLimitResult) -> Out:
         return {
             "possible_ip_block_or_service_impact": Out.ERROR,
@@ -4933,28 +4912,21 @@ class RDP(BaseModule):
                     ),
                 )
 
-        if self.results.credential_guessing is not None:
-            if emit_text:
-                self._output_credential_guessing_text(self.results.credential_guessing)
-            properties["credentialGuessing"] = self._credential_guessing_json(
-                self.results.credential_guessing
-            )
-            if self.results.credential_guessing.status in {"blocked", "error"}:
-                self.results.module_errors.setdefault(
-                    "BRUTE",
-                    self.results.credential_guessing.reason
-                    or "credential-guessing test failed",
-                )
-
         if self.results.brute_protection is not None:
             if emit_text:
                 self._output_brute_protection_text(self.results.brute_protection)
             properties["passwordGuessingProtection"] = self._brute_protection_json(
                 self.results.brute_protection
             )
+            # Preserve the earlier BRUTE JSON field for credential-based scans.
+            # Both views describe the same attempts; no second test is run.
+            if self.results.brute_protection.credential_guessing is not None:
+                properties["credentialGuessing"] = self._credential_guessing_json(
+                    self.results.brute_protection.credential_guessing
+                )
             if self.results.brute_protection.overall_status in {"blocked", "error"}:
                 self.results.module_errors.setdefault(
-                    "BRUTEPROT",
+                    "BRUTE",
                     _sanitize_auth_error(
                         self.results.brute_protection.overall_reason
                         or "password-guessing protection test failed",
@@ -5499,37 +5471,6 @@ class RDP(BaseModule):
                 Out.TITLE,
                 indent=8,
             )
-
-    def _output_credential_guessing_text(
-        self,
-        result: RDPCredentialGuessResult,
-    ) -> None:
-        if self.use_json:
-            return
-
-        self.ptprint("RDP credential guessing", Out.INFO)
-        messages = {
-            "authenticated": (
-                "CredSSP accepted user candidate "
-                f"#{result.matched_user_index} with password candidate "
-                f"#{result.matched_password_index}; RDP authorization was not tested"
-            ),
-            "not_found": "No candidate pair was accepted within the tested sample",
-            "partial": "Attempt limit reached before all candidate pairs were tested",
-            "account_locked": "Server reported account lockout; attempts stopped",
-            "blocked": "Credential-guessing test was not run",
-            "not_applicable": "NTLM-based credential guessing is not applicable",
-            "inconclusive": "Credential-guessing result is inconclusive",
-            "error": "Credential-guessing test failed",
-        }
-        message = messages.get(result.status, f"Credential-guessing status: {result.status}")
-        if result.reason and result.status not in {"authenticated", "not_found"}:
-            message = f"{message} ({result.reason})"
-        self._print_status(message, self._credential_guessing_output_category(result))
-        self.ptdebug(
-            f"Candidate pairs: {result.pair_count}; attempt limit: "
-            f"{result.attempt_limit}; attempts performed: {result.attempts_performed}"
-        )
 
     def _output_brute_protection_text(
         self,

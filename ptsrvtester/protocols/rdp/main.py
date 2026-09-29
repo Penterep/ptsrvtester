@@ -56,7 +56,7 @@ class RDP(BaseMain):
         """Validate guessing inputs and the separate disposable lockout mode."""
         selected = set(self._test_tokens(getattr(self.args, "tests", None)))
         direct_users = getattr(self.args, "brute_users", None) or ()
-        guessing_tests = {"BRUTE", "BRUTEPROT"}
+        guessing_tests = {"BRUTE"}
         if getattr(self.args, "lockout_test", False) and (
             getattr(self.args, "users", None) is not None
             or getattr(self.args, "passwords", None) is not None
@@ -73,13 +73,13 @@ class RDP(BaseMain):
             and not selected & guessing_tests
         ):
             raise argparse.ArgumentError(
-                None, "-P/--passwords requires explicit -ts BRUTE or BRUTEPROT"
+                None, "-P/--passwords requires explicit -ts BRUTE"
             )
         if len(direct_users) > 1:
             if not selected & guessing_tests:
                 raise argparse.ArgumentError(
                     None,
-                    "multiple -u/--user values require explicit -ts BRUTE or BRUTEPROT",
+                    "multiple -u/--user values require explicit -ts BRUTE",
                 )
             single_user_tests = {"ALL", "AUTH", "AUTHMETHODS", "USERENUM"}
             incompatible = selected & single_user_tests
@@ -234,8 +234,8 @@ class RDP(BaseMain):
         return 1
 
     def _run_module(self, code, discovered, extras) -> None:
-        """Put the BRUTEPROT heading before its live progress lines."""
-        if code != "BRUTEPROT" or self.use_json:
+        """Put the BRUTE heading before its live progress lines."""
+        if code != "BRUTE" or self.use_json:
             super()._run_module(code, discovered, extras)
             return
 

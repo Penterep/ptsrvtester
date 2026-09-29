@@ -1,8 +1,8 @@
-"""Explicit, bounded RDP credential-guessing adapter."""
+"""Explicit password-guessing protection adapter."""
 
-__MODULELABEL__ = "RDP credential guessing"
+__MODULELABEL__ = "RDP password-guessing protections"
 __MODULECODE__ = "BRUTE"
-__ORDER__ = 115
+__ORDER__ = 120
 
 
 def run(ctx) -> None:

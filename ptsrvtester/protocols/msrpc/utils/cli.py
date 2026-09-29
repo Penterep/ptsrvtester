@@ -114,11 +114,20 @@ def normalize_interface_uuid(value: str) -> str:
     return f"{parsed}:{version}"
 
 
+class _DirectUsers(argparse.Action):
+    """Keep the single-user attribute used by direct SAMR and pipe probes."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        namespace.usernames = values
+        namespace.username = values[0] if len(values) == 1 else None
+
+
 class MSRPCArgs(BaseArgs):
     target: Target
     tests: str | None
     pipes: list[str] | None
     username: str | None
+    usernames: list[str] | None
     password: str | None
     username_file: str | None
     password_file: str | None
@@ -148,13 +157,13 @@ class MSRPCArgs(BaseArgs):
             {"usage_example": [
                 "ptsrvtester msrpc -ts ENUMEPM -tg 192.168.1.1",
                 "ptsrvtester msrpc -ts ALL -tg server.example.test",
-                "ptsrvtester msrpc -ts ENUMPIPES -tg 192.168.1.1 -u auditor -pw secret",
-                "ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.1 -u auditor -pw secret",
-                "ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.1 -u auditor -pw secret",
-                "ptsrvtester msrpc -ts SAMRGROUPS -tg 192.168.1.1 -u auditor -pw secret",
-                "ptsrvtester msrpc -ts SAMRUSERINFO -tg 192.168.1.1 -u auditor -pw secret --samr-user alice",
-                "ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.1 --pipe svcctl -ul users.txt -pl passwords.txt",
-                "ptsrvtester msrpc -ts BRUTETCP -tg 192.168.1.1:49154 --uuid 12345778-1234-abcd-ef00-0123456789ac:1.0 -u auditor -pw secret",
+                "ptsrvtester msrpc -ts ENUMPIPES -tg 192.168.1.1 -u auditor -p secret",
+                "ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.1 -u auditor -p secret",
+                "ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.1 -u auditor -p secret",
+                "ptsrvtester msrpc -ts SAMRGROUPS -tg 192.168.1.1 -u auditor -p secret",
+                "ptsrvtester msrpc -ts SAMRUSERINFO -tg 192.168.1.1 -u auditor -p secret --samr-user alice",
+                "ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.1 --pipe svcctl -U users.txt -P passwords.txt",
+                "ptsrvtester msrpc -ts BRUTETCP -tg 192.168.1.1:49154 --uuid 12345778-1234-abcd-ef00-0123456789ac:1.0 -u auditor -p secret",
             ]},
             {"options": [
                 ["-ts", "--tests", "<test>", f"{tests}; ALL/default safe suite: {safe}"],
@@ -163,10 +172,10 @@ class MSRPCArgs(BaseArgs):
                 ["", "--pipes", "<names>", "ENUMPIPES: names to try opening; not a complete pipe inventory"],
                 ["-d", "--domain", "<domain>", "Authentication domain"],
                 ["", "--uuid", "<uuid[:ver]>", "BRUTETCP: supported EPM/MGMT/SAMR/LSAD interface UUID and version"],
-                ["-u", "--username", "<user>", "One username"],
-                ["-ul", "--username-file", "<file>", "Username wordlist"],
-                ["-pw", "--password", "<password>", "One password"],
-                ["-pl", "--password-file", "<file>", "Password wordlist"],
+                ["-u", "--user", "<name> ...", "Username(s); one for SAMR/ENUMPIPES"],
+                ["-U", "--users", "<wordlist>", "Username wordlist"],
+                ["-p", "--password", "<password>", "Password"],
+                ["-P", "--passwords", "<wordlist>", "Password wordlist"],
                 ["", "--threads", "<1-100>", "Credential-test concurrency across accounts (default 10; one active attempt per account)"],
                 ["", "--max-attempts", "<1-100000>", "Maximum credential product per test (default 1000); confirmed lockout stops further attempts for that account"],
                 ["", "--samr-max-users", "<1-10000>", "SAMRUSERS/SAMRUSERINFO: global user limit (default 1000)"],
@@ -201,12 +210,17 @@ class MSRPCArgs(BaseArgs):
         parser.add_argument("-d", "--domain", default="")
         parser.add_argument("--uuid", type=normalize_interface_uuid, default=None)
 
+        parser.set_defaults(username=None)
         users = parser.add_mutually_exclusive_group()
-        users.add_argument("-u", "--username", default=None)
-        users.add_argument("-ul", "--username-file", "--username_file", dest="username_file", default=None)
+        users.add_argument("-u", "--user", nargs="+", action=_DirectUsers, dest="usernames", metavar="<name>", default=None)
+        users.add_argument("--username", nargs=1, action=_DirectUsers, dest="usernames", help=argparse.SUPPRESS)
+        users.add_argument("-U", "--users", dest="username_file", metavar="<wordlist>", default=None)
+        users.add_argument("-ul", "--username-file", "--username_file", dest="username_file", help=argparse.SUPPRESS)
         passwords = parser.add_mutually_exclusive_group()
-        passwords.add_argument("-pw", "--password", default=None)
-        passwords.add_argument("-pl", "--password-file", "--password_file", dest="password_file", default=None)
+        passwords.add_argument("-p", "--password", default=None)
+        passwords.add_argument("-pw", dest="password", help=argparse.SUPPRESS)
+        passwords.add_argument("-P", "--passwords", dest="password_file", metavar="<wordlist>", default=None)
+        passwords.add_argument("-pl", "--password-file", "--password_file", dest="password_file", help=argparse.SUPPRESS)
 
         parser.add_argument("--threads", type=_bounded_threads, default=10)
         parser.add_argument("--max-attempts", type=_bounded_attempts, default=1000)
@@ -251,25 +265,29 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
 
     brute = tests_with_credential_mode(selected, "product_required")
     if brute:
-        if not (getattr(args, "username", None) or getattr(args, "username_file", None)):
+        if not (
+            any(name.strip() for name in (getattr(args, "usernames", None) or []))
+            or getattr(args, "username", None)
+            or getattr(args, "username_file", None)
+        ):
             raise argparse.ArgumentError(
-                None, f"{', '.join(sorted(brute))} requires -u/--username or -ul/--username-file"
+                None, f"{', '.join(sorted(brute))} requires -u/--user or -U/--users"
             )
         if not (getattr(args, "password", None) or getattr(args, "password_file", None)):
             raise argparse.ArgumentError(
-                None, f"{', '.join(sorted(brute))} requires -pw/--password or -pl/--password-file"
+                None, f"{', '.join(sorted(brute))} requires -p/--password or -P/--passwords"
             )
 
     direct = tests_with_credential_mode(selected, "direct_required")
     if direct:
         direct_names = ", ".join(sorted(direct))
-        if not getattr(args, "username", None):
+        if not getattr(args, "username", None) or not args.username.strip():
             raise argparse.ArgumentError(
-                None, f"{direct_names} requires one direct -u/--username value"
+                None, f"{direct_names} requires one direct -u/--user value"
             )
         if getattr(args, "password", None) is None:
             raise argparse.ArgumentError(
-                None, f"{direct_names} requires one direct -pw/--password value"
+                None, f"{direct_names} requires one direct -p/--password value"
             )
         if getattr(args, "username_file", None) or getattr(args, "password_file", None):
             raise argparse.ArgumentError(
@@ -315,7 +333,6 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
         )
     if (
         "ENUMPIPES" in selected
-        and not brute
         and (
             getattr(args, "username_file", None)
             or getattr(args, "password_file", None)
@@ -323,9 +340,11 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
     ):
         raise argparse.ArgumentError(
             None,
-            "ENUMPIPES accepts only single -u/--username and -pw/--password values; "
+            "ENUMPIPES accepts only single -u/--user and -p/--password values; "
             "wordlists are for explicit brute tests",
         )
+    if "ENUMPIPES" in selected and len(getattr(args, "usernames", None) or []) > 1:
+        raise argparse.ArgumentError(None, "ENUMPIPES accepts only one -u/--user value")
     return selected
 
 

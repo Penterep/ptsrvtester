@@ -39,11 +39,11 @@ ptsrvtester ftp -ts ALL -tg 127.0.0.1
 ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1
 ptsrvtester ftp -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:21
 ptsrvtester msrpc -ts ALL -tg 192.168.1.10
-ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.10 -u auditor -pw secret
-ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.10 -u auditor -pw secret
-ptsrvtester msrpc -ts SAMRGROUPS -tg 192.168.1.10 -u auditor -pw secret
-ptsrvtester msrpc -ts SAMRUSERINFO -tg 192.168.1.10 -u auditor -pw secret --samr-user alice
-ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.10 --pipe svcctl -u auditor -pw secret
+ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.10 -u auditor -p secret
+ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.10 -u auditor -p secret
+ptsrvtester msrpc -ts SAMRGROUPS -tg 192.168.1.10 -u auditor -p secret
+ptsrvtester msrpc -ts SAMRUSERINFO -tg 192.168.1.10 -u auditor -p secret --samr-user alice
+ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.10 --pipe svcctl -u auditor -p secret
 ptsrvtester upnp -ts ALL -tg 192.168.1.1
 ptsrvtester upnp -ts DISCOVER -tg 192.168.1.1 --multicast -i 192.168.1.10
 ptsrvtester upnp -ts SCPD,PORTMAPS -tg 192.168.1.1

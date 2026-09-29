@@ -292,9 +292,17 @@ class MsrpcEngine(_PrintMixin):
             raise argparse.ArgumentError(None, f"Cannot write file '{self.args.output}': {exc}") from exc
 
     def _credential_sources(self) -> tuple[list[str], list[str]]:
-        usernames = text_or_file(
-            getattr(self.args, "username", None), getattr(self.args, "username_file", None)
-        )
+        direct_usernames = getattr(self.args, "usernames", None)
+        if direct_usernames is None:
+            usernames = text_or_file(
+                getattr(self.args, "username", None), getattr(self.args, "username_file", None)
+            )
+        else:
+            usernames = [
+                name
+                for direct_name in direct_usernames
+                for name in text_or_file(direct_name, None)
+            ]
         passwords = text_or_file(
             getattr(self.args, "password", None), getattr(self.args, "password_file", None),
             preserve_whitespace=True,

@@ -82,6 +82,154 @@ RDP_EXPLICIT_ONLY_TESTS = frozenset(
     {"AUTHMETHODS", "USERENUM", "BRUTEPROT", "RATELIMIT"}
 )
 
+_RDP_TEST_HELP = {
+    "NLA": {
+        "description": "Check whether Network Level Authentication is required",
+        "detail": "Compare CredSSP negotiation with TLS and Standard RDP Security without NLA.",
+    },
+    "RDPSEC": {
+        "description": "Check legacy Standard RDP Security",
+        "detail": "Request Standard RDP Security and report whether the server accepts it.",
+    },
+    "CREDSSP": {
+        "description": "Check CredSSP protocol support",
+        "detail": "Negotiate CredSSP/NLA without submitting credentials.",
+    },
+    "RDPENC": {
+        "description": "Enumerate RDP security and encryption",
+        "detail": "Probe supported security protocols and legacy RDP encryption methods.",
+    },
+    "CAPABIL": {
+        "description": "Inspect RDP capabilities",
+        "detail": "Read Basic Settings and channel negotiation; credentials can expose additional session capabilities.",
+        "options": (
+            ["-l", "--login", "<login>", "Login for authenticated capability exchange"],
+            ["-p", "--password", "<password>", "Password for authenticated capability exchange"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "VERSION": {
+        "description": "Read the server's RDP protocol version",
+        "detail": "Use Server Core Data, with an authenticated fallback if credentials are supplied; report the possible OS family.",
+        "options": (
+            ["-l", "--login", "<login>", "Login for the authenticated fallback"],
+            ["-p", "--password", "<password>", "Password for the authenticated fallback"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "SSL": {
+        "description": "Inspect RDP TLS configuration",
+        "detail": "Check TLS negotiation, protocol versions, selected cipher and server certificate.",
+    },
+    "NTLMINFO": {
+        "description": "Read pre-authentication NTLM information",
+        "detail": "Decode the CredSSP NTLM challenge for server and domain information without logging in.",
+    },
+    "AUTH": {
+        "description": "Try one CredSSP/NTLM login",
+        "detail": "Attempt one supplied username and password over CredSSP/NLA.",
+        "requires": ("-l/--login and -p/--password",),
+        "usage_args": " -l <login> -p <password>",
+        "options": (
+            ["-l", "--login", "<login>", "Username to authenticate"],
+            ["-p", "--password", "<password>", "Password to authenticate"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "AUTHMETHODS": {
+        "description": "Check NTLM and Kerberos password authentication",
+        "detail": "Probe CredSSP authentication methods; Kerberos needs valid credentials and domain settings.",
+        "requires": ("Kerberos: -l/--login, -p/--password, --realm, --kdc and --spn-host",),
+        "usage_args": " --auth-methods ntlm",
+        "options": (
+            ["", "--auth-methods", "<method>", "ntlm and/or kerberos (default: both)"],
+            ["-l", "--login", "<login>", "Username for a credentialed attempt"],
+            ["-p", "--password", "<password>", "Password for a credentialed attempt"],
+            ["", "--realm", "<realm>", "Kerberos realm/domain"],
+            ["", "--kdc", "<ip>", "Kerberos KDC IP address"],
+            ["", "--spn-host", "<host>", "Hostname for the RDP service SPN"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "USERENUM": {
+        "description": "Compare RDP responses for candidate usernames",
+        "detail": "Send wrong passwords for a known login and optional candidates; attempts can contribute to lockout.",
+        "requires": ("-l/--login (known valid username)", "--allow-auth-failures"),
+        "usage_args": " -l <known-login> --allow-auth-failures",
+        "options": (
+            ["-l", "--login", "<login>", "Known valid username for the baseline"],
+            ["-p", "--password", "<password>", "Optional valid password to verify the baseline"],
+            ["-U", "--users", "<file>", "UTF-8 file with candidate usernames"],
+            ["", "--allow-auth-failures", "", "Allow intentional failed logins"],
+            ["", "--guess-delay-ms", "<ms>", "Delay between attempts (default: 100)"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "BRUTEPROT": {
+        "description": "Check password-guessing protections",
+        "detail": "Send bounded failed logins with random nonexistent identities; optional account-lockout check may lock a disposable account.",
+        "requires": ("--allow-auth-failures", "--lockout-test: valid -l/--login and -p/--password for a disposable account"),
+        "usage_args": " --allow-auth-failures",
+        "options": (
+            ["", "--allow-auth-failures", "", "Allow intentional failed logins"],
+            ["", "--guess-attempts", "<count>", "Failed attempts (default: 10; range: 2-100)"],
+            ["", "--guess-delay-ms", "<ms>", "Delay between attempts (default: 100)"],
+            ["-l", "--login", "<login>", "Optional valid baseline; required for --lockout-test"],
+            ["-p", "--password", "<password>", "Optional valid baseline; required for --lockout-test"],
+            ["", "--lockout-test", "", "Test lockout of the supplied disposable account"],
+            ["", "--lockout-attempts", "<count>", "Disposable-account attempts (default: 3; range: 1-20)"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "RATELIMIT": {
+        "description": "Check RDP connection limiting",
+        "detail": "Measure completed and/or held connection pressure and post-load recovery.",
+        "requires": ("--allow-load-test",),
+        "usage_args": " --allow-load-test",
+        "options": (
+            ["", "--allow-load-test", "", "Allow active connection load"],
+            ["", "--rate-mode", "<mode>", "completed, held or both (default: both)"],
+            ["", "--rate-count", "<count>", "Connections per scenario (default: 30; range: 5-200)"],
+            ["", "--rate-concurrency", "<count>", "Parallel connections (default: 10; range: 1-50)"],
+            ["", "--rate-hold-seconds", "<seconds>", "Held-connection duration (default: 3; range: 0-30)"],
+            ["", "--rate-cooldown-seconds", "<seconds>", "Recovery delay (default: 2; range: 0-60)"],
+        ),
+    },
+}
+
+
+def _rdp_test_help(codes: list[str]):
+    """Build the shared help printer's short guide for selected RDP tests."""
+    if not codes:
+        return None
+    selected = [code.strip().upper() for code in codes if code.strip().upper() != "ALL"]
+    if not selected:
+        return None
+    unknown = [code for code in selected if code not in RDP_TEST_CHOICES]
+    if unknown:
+        return [
+            {"unknown_test": [f"Unknown test: {', '.join(unknown)}"]},
+            {"available_tests": [f"ALL, {', '.join(RDP_TEST_CHOICES)}"]},
+        ]
+
+    help_data: list[dict] = []
+    seen: set[str] = set()
+    for requested in selected:
+        canonical = RDP_TEST_ALIASES.get(requested, requested)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        spec = _RDP_TEST_HELP[canonical]
+        name = f"{requested} (alias for {canonical})" if requested != canonical else canonical
+        help_data.append({"description": [f"{name}: {spec['description']}", spec["detail"]]})
+        if spec.get("requires"):
+            help_data.append({"requires": list(spec["requires"])})
+        if spec.get("options"):
+            help_data.append({"test_options": list(spec["options"])})
+        usage_args = spec.get("usage_args", "")
+        help_data.append({"usage": [f"ptsrvtester rdp -ts {requested}{usage_args} -tg <host>"]})
+    return help_data
+
 
 def valid_target_rdp(target: str) -> Target:
     """Accept an IP address or hostname with an optional port."""
@@ -192,7 +340,7 @@ class RDPArgs(BaseArgs):
             ]},
             {"options": [
                 ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT] (default port: 3389)"],
-                ["-ts", "--tests", "<test>", "Specify one or more tests to perform"],
+                ["-ts", "--tests", "<test>", "Specify tests; 'rdp -ts <TEST> -h' for test options"],
                 ["", "", "NLA", "Network Level Authentication requirement test"],
                 ["", "", "RDPSEC", "Legacy Standard RDP Security negotiation test"],
                 ["", "", "CREDSSP", "CredSSP protocol support test"],
@@ -228,7 +376,7 @@ class RDPArgs(BaseArgs):
                 ["", "--insecure-auth", "", "Allow credentials with an untrusted RDP TLS certificate"],
                 ["-T", "--timeout", "<milliseconds>", "Network timeout (default 10000)"],
                 ["", "", "", ""],
-                ["-h", "--help", "", "Show this help message and exit"],
+                ["-h", "--help", "", "Show this help; 'rdp -ts <TEST> -h' for test options"],
                 ["-vv", "--verbose", "", "Enable verbose mode"],
             ]},
             {"note": [
@@ -265,6 +413,11 @@ class RDPArgs(BaseArgs):
                 ),
             ]},
         ]
+
+    @staticmethod
+    def get_test_help(codes):
+        """Per-test help object used by ``rdp -ts <TEST> -h``."""
+        return _rdp_test_help(codes)
 
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """example usage:
@@ -305,7 +458,7 @@ class RDPArgs(BaseArgs):
             help=(
                 "tests to run: NLA, RDPSEC, CREDSSP, RDPENC, CAPABIL, "
                 "VERSION, SSL, NTLMINFO, INFO, AUTH, AUTHMETHODS, USERENUM, "
-                "BRUTEPROT, RATELIMIT"
+                "BRUTEPROT, RATELIMIT; use 'rdp -ts <TEST> -h' for details"
             ),
         )
         parser.add_argument("-l", "--login", help="login for account-based tests")

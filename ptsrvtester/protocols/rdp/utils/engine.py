@@ -16,6 +16,7 @@ import struct
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -106,6 +107,7 @@ REMOTEFX_CODEC_GUID = "76772f12-bd72-4463-afb3-b73c9c6f7886"
 IMAGE_REMOTEFX_CODEC_GUID = "2744ccd4-9d8a-4e74-803c-0ecbeea19c54"
 _AARDWOLF_SESSION_LOCK = threading.Lock()
 MAX_ACCEPTED_WEAK_CIPHERS = 32
+MIN_BRUTE_PROTECTION_ATTEMPTS = 6
 MAX_PASSWORD_WORDLIST_BYTES = 1_048_576
 MAX_PASSWORD_WORDLIST_CANDIDATES = 10_000
 
@@ -538,6 +540,7 @@ class RDPBruteProtectionResult:
     service_recovery_probe: NegotiationProbe | None = None
     valid_baseline: FreshAuthAttemptResult | None = None
     valid_final: FreshAuthAttemptResult | None = None
+    credential_guessing: RDPCredentialGuessResult | None = None
 
     @property
     def overall_status(self) -> str:
@@ -580,6 +583,9 @@ class RDPCredentialGuessResult:
     attempts_performed: int = 0
     matched_user_index: int | None = None
     matched_password_index: int | None = None
+    matched_username: str | None = field(default=None, repr=False)
+    matched_password: str | None = field(default=None, repr=False)
+    server_block_observed: bool = False
     stopped_early: bool = False
 
 
@@ -2157,10 +2163,10 @@ class RDP(BaseModule):
             self.emit_test_output(canonical, ctx)
         except Exception as exc:
             # A wordlist candidate may appear inside a backend exception.
-            # Its plaintext is not retained in the BRUTE report.
+            # Do not propagate that text into either guessing report.
             redacted = (
                 f"{type(exc).__name__} during credential guessing"
-                if canonical == "BRUTE"
+                if canonical in {"BRUTE", "BRUTEPROT"}
                 else _sanitize_auth_error(
                     exc,
                     getattr(self.args, "password", None),
@@ -2805,8 +2811,13 @@ class RDP(BaseModule):
         reason = f"{identity_note}; {result.reason}" if result.reason else identity_note
         return replace(result, reason=reason)
 
-    def _run_credential_guessing_test(self) -> RDPCredentialGuessResult:
-        if getattr(self.args, "allow_auth_failures", False) is not True:
+    def _run_credential_guessing_test(
+        self,
+        *,
+        require_opt_in: bool = True,
+        progress_callback: Callable[[int, int, str, str], None] | None = None,
+    ) -> RDPCredentialGuessResult:
+        if require_opt_in and getattr(self.args, "allow_auth_failures", False) is not True:
             return RDPCredentialGuessResult(
                 status="blocked",
                 reason="BRUTE requires --allow-auth-failures",
@@ -2906,6 +2917,7 @@ class RDP(BaseModule):
             )
 
         performed = 0
+        progress_total = min(base.pair_count, limit)
         # Password-first ordering distributes each password across the users.
         for password_index, password in enumerate(passwords, 1):
             for user_index, user in enumerate(users, 1):
@@ -2919,6 +2931,8 @@ class RDP(BaseModule):
                     )
                 if performed and delay_ms:
                     time.sleep(delay_ms / 1000.0)
+                if progress_callback is not None:
+                    progress_callback(performed + 1, progress_total, user, password)
                 performed += 1
                 try:
                     attempt = self._run_fresh_auth_attempt(
@@ -2955,6 +2969,19 @@ class RDP(BaseModule):
                         status="account_locked",
                         reason="server reported account lockout; attempts stopped",
                         attempts_performed=performed,
+                        server_block_observed=True,
+                        stopped_early=performed < base.pair_count,
+                    )
+                if (
+                    attempt.server_error_from_credssp
+                    and isinstance(code, int)
+                    and code & 0xFFFFFFFF == 0xC0000418
+                ):
+                    return replace(
+                        base,
+                        status="not_applicable",
+                        reason="the server disables NTLM authentication",
+                        attempts_performed=performed,
                         stopped_early=performed < base.pair_count,
                     )
                 if attempt.outcome is AuthOutcome.AUTHENTICATED:
@@ -2965,6 +2992,8 @@ class RDP(BaseModule):
                         attempts_performed=performed,
                         matched_user_index=user_index,
                         matched_password_index=password_index,
+                        matched_username=user,
+                        matched_password=password,
                         stopped_early=performed < base.pair_count,
                     )
                 if attempt.outcome is AuthOutcome.REJECTED:
@@ -2986,6 +3015,12 @@ class RDP(BaseModule):
                     status=status,
                     reason=reason,
                     attempts_performed=performed,
+                    server_block_observed=(
+                        status == "blocked"
+                        and attempt.server_error_from_credssp
+                        and isinstance(code, int)
+                        and code & 0xFFFFFFFF == 0xC0000234
+                    ),
                     stopped_early=performed < base.pair_count,
                 )
 
@@ -2996,17 +3031,90 @@ class RDP(BaseModule):
             attempts_performed=performed,
         )
 
+    def _emit_brute_progress(
+        self, index: int, total: int, login: str, password: str
+    ) -> None:
+        """Show each active probe immediately in text mode."""
+        if self.use_json:
+            return
+        percent = index * 100 // total
+        self._print_status(
+            f"BRUTEPROT {percent}% ({index}/{total}) trying "
+            f"{login!r} / {password!r}",
+            Out.TITLE,
+        )
+
+    def _run_brute_protection_candidates(self) -> RDPBruteProtectionResult:
+        guess = self._run_credential_guessing_test(
+            require_opt_in=False,
+            progress_callback=self._emit_brute_progress,
+        )
+        recovery: NegotiationProbe | None = None
+        if guess.server_block_observed:
+            status = "protection_observed"
+            reason = "CredSSP reported account lockout"
+        elif guess.status in {"not_found", "partial"}:
+            if guess.attempts_performed < MIN_BRUTE_PROTECTION_ATTEMPTS:
+                status = "insufficient_samples"
+                reason = (
+                    "fewer than six credential pairs were tested; source-wide "
+                    "blocking cannot be evaluated"
+                )
+            else:
+                recovery = self._negotiate(
+                    "Post-authentication-pressure recovery",
+                    PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX,
+                )
+                if recovery.selected_protocol is None:
+                    status = "inconclusive"
+                    reason = (
+                        "RDP negotiation did not recover after credential attempts; "
+                        "blocking cannot be distinguished from service impact"
+                    )
+                else:
+                    status = "not_observed"
+                    reason = (
+                        "no blocking was observed in the configured sample of "
+                        f"{guess.attempts_performed} supplied credential pairs"
+                    )
+        elif guess.status == "authenticated":
+            status = "inconclusive"
+            reason = "a valid credential pair was found; guessing stopped early"
+        elif guess.status == "not_applicable":
+            status = "not_applicable"
+            reason = guess.reason
+        elif guess.status == "error":
+            status = "error"
+            reason = guess.reason
+        elif guess.status == "blocked" and guess.attempts_performed == 0:
+            status = "blocked"
+            reason = guess.reason
+        else:
+            status = "inconclusive"
+            reason = guess.reason
+
+        analysis = BruteProtectionResult(
+            status=status,
+            reason=reason,
+            attempts_performed=guess.attempts_performed,
+            early_stopped=guess.stopped_early,
+        )
+        return RDPBruteProtectionResult(
+            analysis=analysis,
+            service_recovery_probe=recovery,
+            credential_guessing=guess,
+        )
+
     def _run_brute_protection_test(self) -> RDPBruteProtectionResult:
-        allow_failures = getattr(self.args, "allow_auth_failures", False) is True
         lockout_enabled = getattr(self.args, "lockout_test", False) is True
         namespace_login = self.args.login or "ptsrv-brute-baseline"
 
-        if not allow_failures:
-            analysis = BruteProtectionResult(
-                status="blocked",
-                reason="BRUTEPROT requires --allow-auth-failures",
-            )
-            return RDPBruteProtectionResult(analysis=analysis)
+        supplied_candidates = any(
+            getattr(self.args, name, None) is not None
+            for name in ("brute_users", "login", "users", "password", "passwords")
+        )
+        if supplied_candidates and not lockout_enabled:
+            return self._run_brute_protection_candidates()
         if lockout_enabled and (
             self.args.login is None or self.args.password is None
         ):
@@ -3066,7 +3174,20 @@ class RDP(BaseModule):
             )
             return RDPBruteProtectionResult(analysis=analysis)
 
+        progress_index = 0
+        progress_total = (
+            attempts + 3 + getattr(self.args, "lockout_attempts", 3)
+            if lockout_enabled
+            else attempts
+        )
+
         def fresh(login: str, password: str) -> FreshAuthAttemptResult:
+            nonlocal progress_index
+            if lockout_enabled:
+                progress_index += 1
+                self._emit_brute_progress(
+                    progress_index, progress_total, login, password
+                )
             source = (
                 CredentialSource.PROVIDED
                 if login == self.args.login and password == self.args.password
@@ -3097,7 +3218,13 @@ class RDP(BaseModule):
                     valid_baseline=valid_baseline,
                 )
 
-        analysis = run_brute_protection(config, fresh)
+        analysis = run_brute_protection(
+            config,
+            fresh,
+            progress_callback=(
+                None if lockout_enabled else self._emit_brute_progress
+            ),
+        )
         if analysis.status == "blocked":
             return RDPBruteProtectionResult(
                 analysis=analysis,
@@ -4571,7 +4698,7 @@ class RDP(BaseModule):
     def _brute_protection_output_category(result: BruteProtectionResult) -> Out:
         return {
             "protection_observed": Out.OK,
-            "not_observed": Out.WARNING,
+            "not_observed": Out.ERROR,
             "response_changed": Out.WARNING,
             "slowdown_signal": Out.WARNING,
             "error": Out.ERROR,
@@ -5420,9 +5547,15 @@ class RDP(BaseModule):
                 "failed-login series; its cause cannot be proven from the wire alone"
             ),
             "not_observed": (
-                "No source-wide blocking protection was observed within "
-                f"{analysis.attempts_performed} failed login attempts against "
-                "random nonexistent identities"
+                "Chybějící ochrana před hádáním hesel: no source-wide blocking "
+                "was observed "
+                f"within {analysis.attempts_performed} tested attempts "
+                + (
+                    "using supplied credentials"
+                    if result.credential_guessing is not None
+                    else "against random nonexistent identities; account-specific "
+                    "lockout was not established"
+                )
             ),
             "response_changed": (
                 "Server responses changed during the failed-login series, but the "
@@ -5440,10 +5573,30 @@ class RDP(BaseModule):
             "blocked": "Password-guessing protection test was not run",
             "error": "Password-guessing protection test failed",
         }
+        if result.credential_guessing is not None:
+            messages["protection_observed"] = (
+                "The server blocked authentication during supplied credential attempts"
+            )
+            messages["insufficient_samples"] = (
+                "Too few supplied credential attempts to assess blocking"
+            )
         message = messages.get(analysis.status, analysis.status.replace("_", " "))
         if analysis.reason:
             message = f"{message} ({analysis.reason})"
         self._print_status(message, self._brute_protection_output_category(analysis))
+
+        credential_guessing = result.credential_guessing
+        if (
+            credential_guessing is not None
+            and credential_guessing.matched_username is not None
+            and credential_guessing.matched_password is not None
+        ):
+            self._print_status(
+                "Valid CredSSP credentials: "
+                f"{credential_guessing.matched_username!r} / "
+                f"{credential_guessing.matched_password!r}",
+                Out.VULN,
+            )
 
         if (
             analysis.status != "blocked"
@@ -5850,6 +6003,7 @@ class RDP(BaseModule):
             "attemptsPerformed": result.attempts_performed,
             "matchedUserIndex": result.matched_user_index,
             "matchedPasswordIndex": result.matched_password_index,
+            "serverBlockObserved": result.server_block_observed,
             "stoppedEarly": result.stopped_early,
         }
 
@@ -5857,19 +6011,49 @@ class RDP(BaseModule):
         analysis = result.analysis
         lockout = analysis.account_lockout
         config = result.config
+        credential_guessing = result.credential_guessing
         return {
             "status": result.overall_status,
             "seriesStatus": analysis.status,
             "mechanism": "credssp_ntlm",
             "scope": "RDP CredSSP/NLA username-password authentication",
-            "identityStrategy": "random_nonexistent_identities",
-            "configuredAttempts": config.attempts if config is not None else None,
+            "identityStrategy": (
+                "provided_candidates"
+                if credential_guessing is not None
+                else "random_nonexistent_identities"
+            ),
+            "configuredAttempts": (
+                config.attempts
+                if config is not None
+                else credential_guessing.attempt_limit
+                if credential_guessing is not None
+                else None
+            ),
             "interAttemptDelayMs": (
-                config.inter_attempt_delay_ms if config is not None else None
+                config.inter_attempt_delay_ms
+                if config is not None
+                else getattr(self.args, "guess_delay_ms", 100)
+                if credential_guessing is not None
+                else None
             ),
             "reason": result.overall_reason,
             "seriesReason": analysis.reason,
             "attemptsPerformed": analysis.attempts_performed,
+            "credentialAttemptSummary": (
+                self._credential_guessing_json(credential_guessing)
+                if credential_guessing is not None
+                else None
+            ),
+            "validCredential": (
+                {
+                    "username": credential_guessing.matched_username,
+                    "password": credential_guessing.matched_password,
+                }
+                if credential_guessing is not None
+                and credential_guessing.matched_username is not None
+                and credential_guessing.matched_password is not None
+                else None
+            ),
             "firstMedianMs": analysis.first_median_ms,
             "lastMedianMs": analysis.last_median_ms,
             "medianChangeMs": analysis.median_change_ms,

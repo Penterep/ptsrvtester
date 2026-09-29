@@ -1145,6 +1145,7 @@ def run_brute_protection(
     token_factory: TokenFactory | None = None,
     shuffle: Shuffle | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    progress_callback: Callable[[int, int, str, str], None] | None = None,
 ) -> BruteProtectionResult:
     """Probe semantic blocking with bounded nonexistent-account attempts.
 
@@ -1168,6 +1169,8 @@ def run_brute_protection(
     consecutive_blocking = 0
 
     for index, login in enumerate(logins, 1):
+        if progress_callback is not None:
+            progress_callback(index, len(logins), login, password)
         attempt = _invoke_fresh(fresh_attempt, login, password)
         raw_attempts.append(attempt)
         observations.append(

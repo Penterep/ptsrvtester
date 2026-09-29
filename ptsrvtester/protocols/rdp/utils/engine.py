@@ -190,6 +190,15 @@ SERVER_RDP_VERSION_NAMES = {
     0x00080011: "RDP 10.12",
 }
 
+# MS-RDPBCGR 2.2.1.4.2 assigns SC_CORE version 0x00080004 to RDP 5.0-8.1.
+# These are typical Windows releases for that family, not an OS fingerprint.
+RDP_5_TO_8_TYPICAL_WINDOWS_RELEASES = (
+    "2000", "XP", "Vista", "7", "8", "8.1",
+)
+RDP_5_TO_8_TYPICAL_SERVER_RELEASES = (
+    "2003", "2008", "2008 R2", "2012", "2012 R2",
+)
+
 SC_CORE = 0x0C01
 SC_SECURITY = 0x0C02
 SC_NET = 0x0C03
@@ -4754,21 +4763,6 @@ class RDP(BaseModule):
                     for level in sorted(levels)
                 )
                 self.ptprint(f"        Encryption level: {level_names}", Out.TEXT)
-            server_versions = {
-                probe.server_rdp_version
-                for probe in result.legacy_probes
-                if probe.server_rdp_version is not None
-            }
-            if server_versions:
-                versions = ", ".join(
-                    SERVER_RDP_VERSION_NAMES.get(
-                        version,
-                        f"Unknown (0x{version:08x})",
-                    )
-                    for version in sorted(server_versions)
-                )
-                self.ptprint(f"        Server protocol version: {versions}", Out.TEXT)
-
         for probe in result.protocol_probes:
             self.ptdebug(probe.summary())
 
@@ -4814,20 +4808,28 @@ class RDP(BaseModule):
             return
 
         self.ptprint("RDP protocol version", Out.INFO)
-        if result.status == "ok":
+        if result.status in ("ok", "ambiguous"):
             self._print_status(
-                f"Server reports: {result.version_name}",
-                self._version_output_category(result),
+                f"Server protocol version: {result.version_name}",
+                Out.TITLE,
             )
-        elif result.status == "ambiguous":
-            self._print_status(
-                f"Server reports: {result.version_name}",
-                self._version_output_category(result),
-            )
-            self.ptprint(
-                "        Exact version cannot be distinguished by the RDP handshake",
-                Out.TEXT,
-            )
+            if result.advertised_version == 0x00080004:
+                self._print_status(
+                    "Typical Windows OS candidates: "
+                    f"{', '.join(RDP_5_TO_8_TYPICAL_WINDOWS_RELEASES)}; "
+                    f"Server {', '.join(RDP_5_TO_8_TYPICAL_SERVER_RELEASES)}",
+                    Out.TITLE,
+                )
+            if result.status == "ambiguous":
+                self._print_status(
+                    "Exact RDP and OS versions cannot be determined from this shared value",
+                    Out.TITLE,
+                )
+            else:
+                self._print_status(
+                    "Exact OS cannot be determined from the advertised RDP version alone",
+                    Out.TITLE,
+                )
         elif result.status == "unknown":
             self._print_status(
                 f"Unrecognized server version: {result.version_name}",
@@ -5392,6 +5394,19 @@ class RDP(BaseModule):
                 else None
             ),
             "versionName": result.version_name,
+            "typicalWindowsOs": (
+                [
+                    f"Windows {release}"
+                    for release in RDP_5_TO_8_TYPICAL_WINDOWS_RELEASES
+                ]
+                + [
+                    f"Windows Server {release}"
+                    for release in RDP_5_TO_8_TYPICAL_SERVER_RELEASES
+                ]
+                if result.advertised_version == 0x00080004
+                else []
+            ),
+            "exactOsIdentified": False,
             "transport": result.transport,
             "source": result.source,
             "error": result.error,

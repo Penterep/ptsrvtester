@@ -194,7 +194,7 @@ ptsrvtester <module> -h     for help for module use
 
 **RDP Module**
 - TLS and certificate inspection
-- RDP version detection
+- RDP version detection with approximate Windows OS hints
 - NLA and CredSSP detection
 - Security protocol detection
 - Legacy RDP encryption testing

@@ -35,7 +35,7 @@ class AmpMeasure:
     response_size: int
     factor: float
     answered: bool
-    minimized: bool = False   # ANY minimised per RFC 8482 (small response = good)
+    minimized: bool = False
 
 
 def amplification_factors(servers: list[str], name: str, timeout: float = DEFAULT_TIMEOUT) -> list[AmpMeasure]:
@@ -118,16 +118,15 @@ def rrl_probe(ip: str, name: str, count: int = 100, deadline: float = 3.0) -> Rr
     finally:
         sock.close()
 
-    # RRL if a meaningful fraction went unanswered, or slip (TC) responses appeared.
     rrl = sent > 0 and (received < sent * 0.8 or truncated > 0)
     return RrlResult(sent, received, truncated, rrl)
 
 
 @dataclass
 class TcpFallbackResult:
-    udp_truncated: bool | None = None   # TC set for the large record at bufsize 512
+    udp_truncated: bool | None = None
     udp_size: int | None = None
-    tcp_ok: bool | None = None          # a TCP query returns a valid answer
+    tcp_ok: bool | None = None
     tcp_error: str | None = None
 
 

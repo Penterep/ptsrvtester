@@ -16,7 +16,7 @@ from ptsrvtester.protocols.dns.utils.results import VULNS
 __MODULELABEL__ = "Response Rate Limiting (RRL)"
 __MODULECODE__ = "RRL"
 __ORDER__ = 710
-__RUN_IN_ALL__ = False   # active burst: only when named in -ts
+__RUN_IN_ALL__ = False
 
 
 def run(ctx):

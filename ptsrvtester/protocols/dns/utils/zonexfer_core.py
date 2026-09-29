@@ -25,20 +25,20 @@ SAMPLE_LIMIT = 25
 
 @dataclass
 class NameServer:
-    host: str                       # NS hostname (e.g. ns1.example.com.)
+    host: str
     ips: list[str] = field(default_factory=list)
-    is_primary: bool = False        # matches the SOA MNAME
+    is_primary: bool = False
 
 
 @dataclass
 class XfrResult:
-    server: str                     # "ns1.example.com (192.0.2.1)"
+    server: str
     ip: str
     is_primary: bool
     allowed: bool
     record_count: int | None = None
     sample: list[str] = field(default_factory=list)
-    incremental: bool | None = None  # IXFR only: True if the reply was truly incremental
+    incremental: bool | None = None
     error: str | None = None
 
 
@@ -103,8 +103,6 @@ def try_ixfr(ip: str, zone: str, host: str, is_primary: bool, serial: int,
         if record_count == 0:
             return XfrResult(server=label, ip=ip, is_primary=is_primary, allowed=False,
                              error="no records returned")
-        # An IXFR reply starts and ends with SOA; a truly incremental one contains
-        # more than one SOA (del/add sections), a full-zone fallback has the AXFR shape.
         soa_count = sum(
             1 for m in messages for rr in m.answer if rr.rdtype == dns.rdatatype.SOA
         )

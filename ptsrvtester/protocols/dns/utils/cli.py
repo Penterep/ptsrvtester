@@ -119,7 +119,7 @@ class DNSArgs(BaseArgs):
         )
 
         if not isinstance(parser, argparse.ArgumentParser):
-            raise TypeError  # IDE typing
+            raise TypeError
 
         parser.add_argument(
             "-tg",

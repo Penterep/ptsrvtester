@@ -21,7 +21,6 @@ import dns.rcode
 import dns.rdataclass
 import dns.rdatatype
 
-# CHAOS-class TXT names that leak build/identity information.
 CHAOS_NAMES: tuple[str, ...] = ("version.bind", "hostname.bind", "id.server", "authors.bind")
 
 DEFAULT_TIMEOUT = 5.0
@@ -35,9 +34,6 @@ def server_target(ctx) -> tuple[str, int] | None:
     return (ip, port) if ip else None
 
 
-# --------------------------------------------------------------------------- #
-# CHAOS TXT: version.bind / hostname.bind / id.server / authors.bind
-# --------------------------------------------------------------------------- #
 def _txt_values(response) -> list[str]:
     out: list[str] = []
     for rrset in response.answer:
@@ -65,9 +61,6 @@ def collect_chaos(ip: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> dict[
     return {name: chaos_txt(ip, port, name, timeout) for name in CHAOS_NAMES}
 
 
-# --------------------------------------------------------------------------- #
-# NSID (server-instance identification, EDNS option 3)
-# --------------------------------------------------------------------------- #
 def nsid(ip: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> bytes | None:
     """Ask for the EDNS NSID option and return the raw server NSID bytes, or ``None``."""
     query = dns.message.make_query(".", dns.rdatatype.NS)
@@ -95,9 +88,6 @@ def nsid_display(raw: bytes) -> tuple[str, str]:
     return ascii_val, raw.hex()
 
 
-# --------------------------------------------------------------------------- #
-# EDNS(0): support, advertised UDP payload, DNS cookies (RFC 7873)
-# --------------------------------------------------------------------------- #
 @dataclass
 class EdnsInfo:
     supported: bool = False
@@ -132,10 +122,6 @@ def edns_probe(ip: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> EdnsInfo
     )
 
 
-# --------------------------------------------------------------------------- #
-# Transports: UDP/53, TCP/53, DoT/853, DoH/443, DoQ/853
-# --------------------------------------------------------------------------- #
-# state: True = works, False = not available (refused/timeout), None = not tested
 @dataclass
 class TransportResult:
     state: bool | None
@@ -152,7 +138,7 @@ def _try(fn) -> TransportResult:
         return TransportResult(True, "responded")
     except (ConnectionRefusedError, socket.timeout, TimeoutError, OSError, dns.exception.Timeout) as e:
         return TransportResult(False, type(e).__name__)
-    except Exception as e:  # library/handshake errors -> report but not "supported"
+    except Exception as e:
         return TransportResult(False, f"{type(e).__name__}: {str(e)[:60]}")
 
 
@@ -175,14 +161,11 @@ def transports(host: str | None, ip: str, port: int, timeout: float = TRANSPORT_
     return results
 
 
-# --------------------------------------------------------------------------- #
-# Server role: authoritative / recursive / forwarder
-# --------------------------------------------------------------------------- #
 @dataclass
 class RoleInfo:
-    recursion_available: bool | None = None   # RA flag echoed
-    recursion_answered: bool | None = None     # actually resolved an external name for us
-    authoritative: bool | None = None          # AA flag on the probe
+    recursion_available: bool | None = None
+    recursion_answered: bool | None = None
+    authoritative: bool | None = None
     rcode: str | None = None
     error: str | None = None
 
@@ -209,22 +192,19 @@ def role_probe(ip: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> RoleInfo
     )
 
 
-# --------------------------------------------------------------------------- #
-# Known-CVE matching for the advertised software version
-# --------------------------------------------------------------------------- #
 @dataclass
 class CveEntry:
     cve: str
     summary: str
-    # each range: (introduced_inclusive_or_None, fixed_exclusive_or_None)
     ranges: list[tuple[tuple[int, ...] | None, tuple[int, ...] | None]]
 
 
-# Seed table — INDICATIVE, keyed off the ADVERTISED version (which may be hidden
-# or spoofed). Not exhaustive; every entry cites the fixed version(s) so it can
-# be verified and extended. A range is (introduced_inclusive | None, fixed_exclusive
-# | None): None-introduced means "all earlier versions", None-fixed means "not
-# fixed / open-ended". A version matches an entry if it falls in ANY of its ranges.
+"""Seed table — INDICATIVE, keyed off the ADVERTISED version (which may be hidden
+or spoofed). Not exhaustive; every entry cites the fixed version(s) so it can
+be verified and extended. A range is (introduced_inclusive | None, fixed_exclusive
+| None): None-introduced means "all earlier versions", None-fixed means "not
+fixed / open-ended". A version matches an entry if it falls in ANY of its ranges.
+"""
 KNOWN_CVES: dict[str, list[CveEntry]] = {
     "bind": [
         CveEntry("CVE-2020-8625",

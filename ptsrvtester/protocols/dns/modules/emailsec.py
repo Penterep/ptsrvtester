@@ -59,7 +59,7 @@ def run(ctx):
             else:
                 ctx.out(f"DMARC    policy: p={info.dmarc_policy}", "OK", indent=8)
 
-        # DKIM (informational — selector-dependent, absence is not conclusive)
+        # DKIM
         if info.dkim:
             for selector, record in info.dkim.items():
                 ctx.out(f"DKIM     {selector}._domainkey: {record[:80]}{'…' if len(record) > 80 else ''}", "OK", indent=8)

@@ -15,7 +15,7 @@ from ptsrvtester.protocols.dns.utils.results import VULNS
 __MODULELABEL__ = "Zone walking (NSEC / NSEC3)"
 __MODULECODE__ = "ZONEWALK"
 __ORDER__ = 600
-__RUN_IN_ALL__ = False   # active enumeration (many queries): only when named in -ts
+__RUN_IN_ALL__ = False
 
 SAMPLE = 40
 

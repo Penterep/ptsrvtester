@@ -26,15 +26,17 @@ import dns.rdatatype
 import dns.resolver
 
 DEFAULT_TIMEOUT = 5.0
-RRSIG_WARN_DAYS = 7  # RRSIGs expiring within this many days are flagged "expiring soon"
+RRSIG_WARN_DAYS = 7
 
-# DNSKEY/DS algorithms considered deprecated (RSA/MD5, DSA, SHA-1 based).
+"""DNSKEY/DS algorithms considered deprecated (RSA/MD5, DSA, SHA-1 based)."""
 DEPRECATED_ALGS: dict[int, str] = {
     1: "RSAMD5", 3: "DSA", 5: "RSASHA1", 6: "DSA-NSEC3-SHA1", 7: "RSASHA1-NSEC3-SHA1",
 }
-# Recommended modern algorithms (ECDSA / EdDSA).
+
+"""Recommended modern algorithms (ECDSA / EdDSA)."""
 MODERN_ALGS = {13, 14, 15, 16}
-# DS digest types: 1 = SHA-1 (weak), 2 = SHA-256, 3 = GOST (weak), 4 = SHA-384.
+
+"""DS digest types: 1 = SHA-1 (weak), 2 = SHA-256, 3 = GOST (weak), 4 = SHA-384."""
 DS_DIGEST_NAMES = {1: "SHA-1", 2: "SHA-256", 3: "GOST", 4: "SHA-384"}
 _DS_DIGEST_FOR_MAKE = {1: "SHA1", 2: "SHA256", 4: "SHA384"}
 
@@ -89,9 +91,9 @@ def _rrset(response, rdtype):
 
 @dataclass
 class DnskeySet:
-    dnskey: object | None = None          # DNSKEY rrset
-    rrsig: object | None = None           # RRSIG(DNSKEY) rrset
-    valid: bool | None = None             # self-signature validates
+    dnskey: object | None = None
+    rrsig: object | None = None
+    valid: bool | None = None
     error: str | None = None
 
 
@@ -124,7 +126,7 @@ class AlgInfo:
     key_tag: int
     algorithm: int
     name: str
-    role: str            # KSK / ZSK
+    role: str
     deprecated: bool
     modern: bool
 
@@ -187,8 +189,7 @@ class DsMatch:
     algorithm: int
     digest_type: int
     digest_name: str
-    matched: bool | None   # DS at parent matches a DNSKEY (None = couldn't compute)
-
+    matched: bool | None
 
 def chain_of_trust(servers: list[str], resolver: dns.resolver.Resolver, domain: str, dnskey_rrset) -> tuple[list[DsMatch], bool]:
     """Compare parent DS records against the child DNSKEYs. Returns (matches, ds_present)."""
@@ -224,12 +225,12 @@ def chain_of_trust(servers: list[str], resolver: dns.resolver.Resolver, domain: 
 
 @dataclass
 class DenialInfo:
-    kind: str | None = None          # "NSEC" / "NSEC3" / None
-    nsec_walkable: bool | None = None  # NSEC: classic (walkable) vs minimal-covering "black lies"
+    kind: str | None = None
+    nsec_walkable: bool | None = None
     nsec_owner: str | None = None
     nsec_next: str | None = None
     nsec3_iterations: int | None = None
-    nsec3_salt: str | None = None    # hex, or "-" for empty
+    nsec3_salt: str | None = None
     error: str | None = None
 
 
@@ -249,8 +250,6 @@ def denial_of_existence(servers: list[str], domain: str) -> DenialInfo:
         if rr.rdtype == dns.rdatatype.NSEC:
             owner = rr.name.to_text().lower()
             nxt = rr[0].next.to_text().lower()
-            # Classic NSEC covers a gap between two EXISTING names, so the owner
-            # is not our random query name; black lies synthesises owner == qname.
             walkable = owner != qname
             return DenialInfo(kind="NSEC", nsec_walkable=walkable,
                               nsec_owner=owner.rstrip("."), nsec_next=nxt.rstrip("."))

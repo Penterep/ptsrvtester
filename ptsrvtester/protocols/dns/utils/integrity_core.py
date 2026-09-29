@@ -20,8 +20,6 @@ from . import zonexfer_core as zx
 DEFAULT_TIMEOUT = 5.0
 CNAME_CAP = 12
 
-# Known takeover-prone services: CNAME target substrings + an "unclaimed" HTTP
-# fingerprint string (seed list, extend as needed — cf. "can-i-take-over-xyz").
 TAKEOVER_SIGNATURES: list[dict] = [
     {"service": "GitHub Pages", "cnames": [".github.io"], "fingerprint": "There isn't a GitHub Pages site here"},
     {"service": "AWS S3", "cnames": [".s3.amazonaws.com", "s3-website", ".s3-", ".s3."], "fingerprint": "NoSuchBucket"},
@@ -42,16 +40,13 @@ TAKEOVER_SIGNATURES: list[dict] = [
 ]
 
 
-# --------------------------------------------------------------------------- #
-# Subdomain takeover
-# --------------------------------------------------------------------------- #
 @dataclass
 class TakeoverResult:
     name: str
     cname: str | None = None
     service: str | None = None
-    dangling: bool = False        # CNAME target does not resolve (NXDOMAIN)
-    fingerprint_hit: bool = False  # HTTP body matched the "unclaimed" fingerprint
+    dangling: bool = False
+    fingerprint_hit: bool = False
     vulnerable: bool = False
     detail: str = ""
 
@@ -80,14 +75,13 @@ def takeover_check(resolver, name: str, do_http: bool = True, timeout: float = D
     sig = _match_service(result.cname)
     result.service = sig["service"] if sig else None
 
-    # Dangling CNAME: the target itself does not resolve.
     try:
         resolver.resolve(result.cname, "A")
         target_resolves = True
     except dns.resolver.NXDOMAIN:
         target_resolves = False
     except Exception:
-        target_resolves = True  # some other error — treat as resolvable/unknown
+        target_resolves = True
     result.dangling = not target_resolves
 
     if sig and do_http:
@@ -121,9 +115,6 @@ def _http_fingerprint(name: str, fingerprint: str, timeout: float) -> bool:
     return False
 
 
-# --------------------------------------------------------------------------- #
-# Lame delegation
-# --------------------------------------------------------------------------- #
 def _query(ip: str, qname: str, rdtype, rd: bool, timeout: float):
     q = dns.message.make_query(qname, rdtype)
     if not rd:
@@ -175,9 +166,6 @@ def lame_delegations(resolver, domain: str, timeout: float = DEFAULT_TIMEOUT) ->
     return out
 
 
-# --------------------------------------------------------------------------- #
-# CNAME chain / loops
-# --------------------------------------------------------------------------- #
 @dataclass
 class ChainResult:
     chain: list[str] = field(default_factory=list)
@@ -208,9 +196,6 @@ def cname_chain(resolver, name: str, cap: int = CNAME_CAP, timeout: float = DEFA
     return result
 
 
-# --------------------------------------------------------------------------- #
-# NS / SOA consistency across the zone's name servers
-# --------------------------------------------------------------------------- #
 @dataclass
 class NsView:
     ns: str

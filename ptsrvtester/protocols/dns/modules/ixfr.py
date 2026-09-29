@@ -32,7 +32,6 @@ def run(ctx):
         if not servers:
             ctx.out("No NS records found for the domain (cannot try IXFR).", "WARNING", indent=8)
             continue
-        # Ask for changes since the version just before the current one; fall back to 1.
         since = (serial - 1) if serial and serial > 1 else 1
 
         for ns in servers:

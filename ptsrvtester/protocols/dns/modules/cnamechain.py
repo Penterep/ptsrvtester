@@ -36,7 +36,7 @@ def run(ctx):
             res = ig.cname_chain(resolver, name)
             hops = len(res.chain) - 1
             if hops == 0:
-                continue  # no CNAME — nothing to report
+                continue
             arrow = " → ".join(res.chain)
             if res.loop:
                 ctx.out(f"CNAME LOOP: {arrow}", "VULN", indent=8)

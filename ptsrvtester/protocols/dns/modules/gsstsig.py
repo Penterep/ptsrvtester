@@ -35,7 +35,7 @@ def run(ctx):
             continue
         ip = servers[0]
 
-        rcode = du.prereq_probe(ip, domain)  # prerequisite-only: no changes made
+        rcode = du.prereq_probe(ip, domain)
         rtext = dns.rcode.to_text(rcode) if rcode is not None else "no response"
 
         if rcode is None:

@@ -40,9 +40,6 @@ def resolver_for(ctx, timeout: float = 5.0) -> dns.resolver.Resolver:
     return make_resolver(ip, port, timeout)
 
 
-# --------------------------------------------------------------------------- #
-# Record lookup (A / AAAA / MX / TXT / CNAME / NS / SRV / SOA / ...)
-# --------------------------------------------------------------------------- #
 def lookup_records(resolver, domain: str, rtypes) -> dict[str, list[str]]:
     """Resolve each record type for *domain*. Maps rtype -> value list (``[]`` if none)."""
     out: dict[str, list[str]] = {}
@@ -59,9 +56,6 @@ def lookup_records(resolver, domain: str, rtypes) -> dict[str, list[str]]:
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Reverse DNS / PTR sweep of a range
-# --------------------------------------------------------------------------- #
 def parse_range(spec: str) -> tuple[list[str], str | None]:
     """Expand *spec* into a list of IPv4/IPv6 addresses.
 
@@ -80,7 +74,7 @@ def parse_range(spec: str) -> tuple[list[str], str | None]:
     elif "-" in spec:
         start_s, end_s = (p.strip() for p in spec.split("-", 1))
         start = ipaddress.ip_address(start_s)
-        if end_s.isdigit():  # 192.0.2.1-50 -> replace last octet
+        if end_s.isdigit():
             end = ipaddress.ip_address(".".join(start_s.split(".")[:-1] + [end_s]))
         else:
             end = ipaddress.ip_address(end_s)
@@ -117,9 +111,6 @@ def ptr_sweep(resolver, ips: list[str], threads: int = 10) -> dict[str, list[str
     return results
 
 
-# --------------------------------------------------------------------------- #
-# WHOIS
-# --------------------------------------------------------------------------- #
 def whois_lookup(domain: str) -> str | None:
     """Return the raw WHOIS text for *domain*, or ``None`` on failure."""
     try:
@@ -134,9 +125,6 @@ def whois_lookup(domain: str) -> str | None:
     return text if text else (str(info) if info else None)
 
 
-# --------------------------------------------------------------------------- #
-# Wildcard detection (also used to de-noise BRUTESUB)
-# --------------------------------------------------------------------------- #
 @dataclass
 class WildcardInfo:
     present: bool = False
@@ -165,9 +153,7 @@ def wildcard_detect(resolver, domain: str, probes: int = 3) -> WildcardInfo:
     return info
 
 
-# --------------------------------------------------------------------------- #
-# Subdomain brute force
-# --------------------------------------------------------------------------- #
+
 def _resolve_sub(resolver, fqdn: str) -> dict[str, list[str]]:
     records: dict[str, list[str]] = {}
     for rtype in ("A", "AAAA", "CNAME"):
@@ -225,16 +211,13 @@ def _is_wildcard_noise(recs: dict[str, list[str]], wc: WildcardInfo) -> bool:
     return False
 
 
-# --------------------------------------------------------------------------- #
-# Email security records: SPF / DKIM / DMARC
-# --------------------------------------------------------------------------- #
 @dataclass
 class EmailSecurity:
-    spf: str | None = None            # the SPF record text, if present
-    spf_all: str | None = None        # 'fail' (-all) / 'softfail' (~all) / 'neutral' (?all) / 'pass' (+all) / None
-    dmarc: str | None = None          # the DMARC record text, if present
-    dmarc_policy: str | None = None    # none / quarantine / reject
-    dkim: dict[str, str] = field(default_factory=dict)  # selector -> record
+    spf: str | None = None
+    spf_all: str | None = None
+    dmarc: str | None = None
+    dmarc_policy: str | None = None
+    dkim: dict[str, str] = field(default_factory=dict)
 
 
 def _txt_strings(resolver, name: str) -> list[str]:
@@ -283,9 +266,6 @@ def email_security(resolver, domain: str, selectors=DEFAULT_DKIM_SELECTORS) -> E
     return result
 
 
-# --------------------------------------------------------------------------- #
-# CAA (certificate issuance control)
-# --------------------------------------------------------------------------- #
 def caa_records(resolver, domain: str) -> list[str]:
     """Return the CAA record values for *domain* (empty list if none set)."""
     try:

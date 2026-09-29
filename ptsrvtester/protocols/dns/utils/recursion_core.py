@@ -17,14 +17,11 @@ import dns.rdatatype
 
 DEFAULT_TIMEOUT = 5.0
 
-# External names used to prove the server recurses for zones it is not
-# authoritative for (open recursion) and to probe the cache.
 EXTERNAL_NAMES: tuple[str, ...] = (
     "google.com", "cloudflare.com", "microsoft.com", "amazon.com",
     "facebook.com", "wikipedia.org", "github.com", "apple.com",
 )
 
-# Small queries that elicit large recursive responses (amplification vectors).
 AMP_QUERIES: tuple[tuple[str, str], ...] = (
     ("google.com", "TXT"),
     ("cloudflare.com", "DNSKEY"),
@@ -36,9 +33,9 @@ AMP_QUERIES: tuple[tuple[str, str], ...] = (
 @dataclass
 class RecursionProbe:
     name: str
-    ra: bool | None          # RA flag echoed by the server
-    answered: bool | None     # returned an answer for the external name
-    authoritative: bool | None = None  # AA flag — an authoritative in-zone answer, not recursion
+    ra: bool | None
+    answered: bool | None
+    authoritative: bool | None = None
     rcode: str = ""
 
 
@@ -77,7 +74,7 @@ class AmpResult:
     response_size: int
     factor: float
     answered: bool
-    authoritative: bool = False   # AA=1 → answered from its own zone, not recursion
+    authoritative: bool = False
     truncated: bool = False
 
     @property
@@ -120,8 +117,8 @@ def best_amplification(results: list[AmpResult]) -> AmpResult | None:
 @dataclass
 class SnoopResult:
     name: str
-    cached: bool | None       # answered from cache to a non-recursive query (AA=0)
-    ttl: int | None = None    # remaining TTL (lower than the record max = it aged in cache)
+    cached: bool | None
+    ttl: int | None = None
     rcode: str = ""
 
 
@@ -134,7 +131,7 @@ def cache_snoop(ip: str, port: int, names=EXTERNAL_NAMES, timeout: float = DEFAU
     out: list[SnoopResult] = []
     for name in names:
         query = dns.message.make_query(name, dns.rdatatype.A)
-        query.flags &= ~dns.flags.RD  # explicitly non-recursive
+        query.flags &= ~dns.flags.RD
         try:
             resp = dns.query.udp(query, ip, port=port, timeout=timeout)
         except Exception as e:

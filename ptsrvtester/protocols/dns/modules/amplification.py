@@ -14,7 +14,6 @@ __MODULELABEL__ = "Reflection / amplification potential"
 __MODULECODE__ = "AMPLIFICATION"
 __ORDER__ = 310
 
-# Response must be at least this many times the query to call it amplification.
 AMP_THRESHOLD = 4.0
 
 

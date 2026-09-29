@@ -37,7 +37,6 @@ def run(ctx):
 
     ctx.out("Server discloses software/build information via CHAOS TXT.", "VULN", indent=4)
 
-    # If version.bind is present, try to identify the product/version for the node.
     version_string = (disclosed.get("version.bind") or [None])[0]
     product = version = None
     if version_string:

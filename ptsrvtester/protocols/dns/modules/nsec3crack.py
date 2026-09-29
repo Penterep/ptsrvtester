@@ -15,7 +15,7 @@ from ptsrvtester.protocols.dns.utils.results import VULNS
 __MODULELABEL__ = "NSEC3 offline hash cracking"
 __MODULECODE__ = "NSEC3CRACK"
 __ORDER__ = 610
-__RUN_IN_ALL__ = False   # active collection + offline cracking: only when named in -ts
+__RUN_IN_ALL__ = False
 
 
 def run(ctx):

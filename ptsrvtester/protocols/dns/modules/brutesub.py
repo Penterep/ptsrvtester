@@ -13,7 +13,7 @@ from ptsrvtester.protocols.dns.utils.results import VULNS
 __MODULELABEL__ = "Subdomain brute-force enumeration"
 __MODULECODE__ = "BRUTESUB"
 __ORDER__ = 130
-__RUN_IN_ALL__ = False   # needs -sub and is active enumeration: only when named in -ts
+__RUN_IN_ALL__ = False
 
 
 def run(ctx):

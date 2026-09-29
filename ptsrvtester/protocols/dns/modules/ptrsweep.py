@@ -9,7 +9,7 @@ from ptsrvtester.protocols.dns.utils import enum_core as ec
 __MODULELABEL__ = "Reverse DNS / PTR sweep"
 __MODULECODE__ = "PTRSWEEP"
 __ORDER__ = 110
-__RUN_IN_ALL__ = False   # needs -r and is an active sweep: only when named in -ts
+__RUN_IN_ALL__ = False
 
 
 def run(ctx):

@@ -126,6 +126,6 @@ def verify_present(ip: str, name: str, timeout: float = DEFAULT_TIMEOUT) -> bool
 def prereq_probe(ip: str, zone: str, timeout: float = DEFAULT_TIMEOUT) -> int | None:
     """Send a PREREQUISITE-ONLY update (no changes) to reveal whether auth is enforced."""
     upd = _update_msg(zone)
-    upd.present(zone)  # prerequisite: the zone apex is in use — makes no modification
+    upd.present(zone)
     resp = _send(upd, ip, timeout)
     return resp.rcode() if resp is not None else None

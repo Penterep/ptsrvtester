@@ -16,7 +16,7 @@ import dns.rcode
 __MODULELABEL__ = "Unauthenticated dynamic update (RFC 2136)"
 __MODULECODE__ = "DYNUPDATE"
 __ORDER__ = 800
-__RUN_IN_ALL__ = False   # active WRITE attempt: only when named in -ts
+__RUN_IN_ALL__ = False
 
 
 def run(ctx):
@@ -44,14 +44,12 @@ def run(ctx):
         rtext = dns.rcode.to_text(rcode)
 
         if rcode != dns.rcode.NOERROR:
-            # REFUSED / NOTAUTH = authentication/ACL required (good); NOTIMP = no dynamic update.
             hint = {"NOTAUTH": "authentication required (TSIG/GSS-TSIG)",
                     "REFUSED": "refused by ACL",
                     "NOTIMP": "dynamic update not supported"}.get(rtext, rtext)
             ctx.out(f"Unauthenticated update rejected on {ip} — {rtext} ({hint}).", "OK", indent=8)
             continue
 
-        # Accepted — verify, then always clean up.
         present = du.verify_present(ip, name)
         du.delete_name(ip, domain, name)
         cleaned = not du.verify_present(ip, name)

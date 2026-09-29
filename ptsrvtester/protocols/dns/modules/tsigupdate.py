@@ -17,9 +17,8 @@ import dns.rcode
 __MODULELABEL__ = "TSIG update & ACL scoping"
 __MODULECODE__ = "TSIGUPDATE"
 __ORDER__ = 810
-__RUN_IN_ALL__ = False   # active WRITE attempt, needs a TSIG key: only when named in -ts
+__RUN_IN_ALL__ = False
 
-# Arbitrary/unrelated names a least-privilege key should NOT be able to write.
 PROBE_LABELS = ("ptsrv-arbitrary1", "ptsrv-admin", "ptsrv-_acme-challenge")
 
 

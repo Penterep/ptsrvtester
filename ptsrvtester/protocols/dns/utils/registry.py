@@ -33,6 +33,7 @@ DNS_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Amplification / DoS", ["AMPFACTOR", "RRL", "TCPFALLBACK"]),
     ("Dynamic update (write)", ["DYNUPDATE", "TSIGUPDATE", "GSSTSIG"]),
     ("Encrypted transport", ["DOT", "DOH", "DOQ"]),
+    ("Integrity, delegation, takeover", ["TAKEOVER", "LAME", "CNAMECHAIN", "NSCONSIST"]),
 ]
 
 DNS_TESTS: dict[str, dict] = {
@@ -430,6 +431,53 @@ DNS_TESTS: dict[str, dict] = {
                  "just an IP."],
         "requires": ["-tg/--target (full hostname preferred)", "aioquic installed"],
         "mods": [["-tg", "--target", "<hostname>", "DNS server HOSTNAME[:PORT]"]],
+    },
+    "TAKEOVER": {
+        "desc": "Subdomain takeover (dangling cloud resources)",
+        "long": ["Check the domain (and -sub labels) for CNAMEs pointing at known",
+                 "SaaS/cloud services and whether the target is unclaimed — a dangling",
+                 "CNAME (NXDOMAIN) or a matching 'unclaimed' HTTP fingerprint means it",
+                 "can be taken over (PTV-DNS-TAKEOVER)."],
+        "requires": ["-d/--domain (or -dl)", "optional -sub/--subdomains to check subdomains"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Domain (apex) to check"],
+            ["-sub", "--subdomains", "<wordlist>", "Subdomain labels to also check"],
+        ],
+    },
+    "LAME": {
+        "desc": "Lame delegation (NS not authoritative)",
+        "long": ["Query each delegated NS directly (RD=0) for the zone SOA. A server",
+                 "that does not answer, refuses, lacks an A/AAAA, or answers",
+                 "non-authoritatively is a lame delegation (PTV-DNS-LAMEDELEGATION)."],
+        "requires": ["-d/--domain or -dl/--domain-file"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Zone to check"],
+            ["-dl", "--domain-file", "<file>", "File with domains"],
+        ],
+    },
+    "CNAMECHAIN": {
+        "desc": "Excessive or looping CNAME chains",
+        "long": ["Follow the CNAME chain for the domain (and -sub labels). A loop (a",
+                 "name recurs) or an over-long chain (>8 hops) is reported",
+                 "(PTV-DNS-CNAMECHAIN) — it wastes resolver work and can break",
+                 "resolution."],
+        "requires": ["-d/--domain (or -dl)", "optional -sub/--subdomains"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Domain to follow"],
+            ["-sub", "--subdomains", "<wordlist>", "Subdomain labels to also follow"],
+        ],
+    },
+    "NSCONSIST": {
+        "desc": "NS / SOA consistency across name servers",
+        "long": ["Query each authoritative NS for the zone SOA serial and NS set and",
+                 "compare. Differing serials (stale/unreplicated), differing NS sets, or",
+                 "servers that do not answer mean inconsistent service",
+                 "(PTV-DNS-NSINCONSISTENT)."],
+        "requires": ["-d/--domain or -dl/--domain-file"],
+        "mods": [
+            ["-d", "--domain", "<domain>", "Zone to check"],
+            ["-dl", "--domain-file", "<file>", "File with domains"],
+        ],
     },
 }
 

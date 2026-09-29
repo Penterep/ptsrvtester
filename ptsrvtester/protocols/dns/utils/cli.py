@@ -88,6 +88,8 @@ class DNSArgs(BaseArgs):
                 "ptsrvtester dns -ts DYNUPDATE -d internal.example.com",
                 "ptsrvtester dns -ts TSIGUPDATE -d example.com --tsig-key mykey:hmac-sha256:BASE64SECRET",
                 "ptsrvtester dns -ts DOT,DOH,DOQ -tg dns.google",
+                "ptsrvtester dns -ts LAME,NSCONSIST,CNAMECHAIN -d example.com",
+                "ptsrvtester dns -ts TAKEOVER -d example.com -sub subs.txt",
                 "ptsrvtester dns -ts EMAILSEC -h",
             ]},
             {"options": options},

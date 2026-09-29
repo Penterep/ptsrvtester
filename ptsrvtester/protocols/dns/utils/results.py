@@ -72,3 +72,9 @@ class VULNS(Enum):
     # Encrypted transport (DoT / DoH / DoQ)
     WeakTls = "PTV-DNS-WEAKTLS"                        # encrypted transport negotiates weak TLS (< 1.2)
     TlsCert = "PTV-DNS-TLSCERT"                        # invalid TLS certificate (untrusted / expired / name mismatch)
+
+    # Integrity / delegation / takeover
+    Takeover = "PTV-DNS-TAKEOVER"                      # record points to a dangling/unclaimed cloud resource
+    LameDelegation = "PTV-DNS-LAMEDELEGATION"          # NS not authoritative for the zone
+    CnameChain = "PTV-DNS-CNAMECHAIN"                  # excessive or looping CNAME chain
+    NsInconsistent = "PTV-DNS-NSINCONSISTENT"          # name servers disagree on SOA serial / NS set

@@ -178,6 +178,15 @@ ENCRYPTION_LEVEL_NAMES = {
     0x00000003: "High",
     0x00000004: "FIPS",
 }
+# These levels are assessed only for negotiated Standard RDP Security.
+# High still uses RC4 and FIPS uses 3DES, so neither is a modern-safe verdict.
+ENCRYPTION_LEVEL_ASSESSMENTS = {
+    0x00000000: "error",
+    0x00000001: "error",
+    0x00000002: "error",
+    0x00000003: "warning",
+    0x00000004: "warning",
+}
 
 SERVER_RDP_VERSION_NAMES = {
     0x00080001: "RDP 4.0",
@@ -4703,6 +4712,10 @@ class RDP(BaseModule):
             "not_observed": Out.WARNING,
         }.get(result.status, Out.TITLE)
 
+    @staticmethod
+    def _encryption_level_assessment(level: int) -> str:
+        return ENCRYPTION_LEVEL_ASSESSMENTS.get(level, "unknown")
+
     def _rdp_encryption_vulnerabilities(
         self,
         result: RDPEncryptionResult,
@@ -5114,7 +5127,7 @@ class RDP(BaseModule):
             levels = {
                 probe.encryption_level
                 for probe in result.legacy_probes
-                if probe.accepted and probe.encryption_level is not None
+                if probe.encryption_level is not None
             }
             for legacy_probe in result.legacy_probes:
                 method_name = ENCRYPTION_METHOD_NAMES[legacy_probe.requested_method]
@@ -5132,12 +5145,18 @@ class RDP(BaseModule):
                     status_out,
                     indent=8,
                 )
-            if levels:
-                level_names = ", ".join(
-                    ENCRYPTION_LEVEL_NAMES.get(level, f"Unknown ({level})")
-                    for level in sorted(levels)
+            for level in sorted(levels):
+                assessment = self._encryption_level_assessment(level)
+                self._print_status(
+                    "Encryption level: "
+                    + ENCRYPTION_LEVEL_NAMES.get(level, f"Unknown ({level})"),
+                    {
+                        "error": Out.ERROR,
+                        "warning": Out.WARNING,
+                        "unknown": Out.TITLE,
+                    }[assessment],
+                    indent=8,
                 )
-                self.ptprint(f"        Encryption level: {level_names}", Out.TEXT)
         for probe in result.protocol_probes:
             self.ptdebug(probe.summary())
 
@@ -5765,6 +5784,11 @@ class RDP(BaseModule):
                         "encryptionLevel": probe.encryption_level,
                         "encryptionLevelName": ENCRYPTION_LEVEL_NAMES.get(
                             probe.encryption_level
+                        ),
+                        "encryptionLevelAssessment": (
+                            self._encryption_level_assessment(probe.encryption_level)
+                            if probe.encryption_level is not None
+                            else None
                         ),
                         "serverRdpVersion": probe.server_rdp_version,
                         "error": probe.error,

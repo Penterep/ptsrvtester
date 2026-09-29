@@ -4242,7 +4242,7 @@ class RDP(BaseModule):
             "allowed_not_required": Out.VULN,
             "not_supported": Out.VULN,
             "error": Out.ERROR,
-        }.get(result.status, Out.WARNING)
+        }.get(result.status, Out.TITLE)
 
     @staticmethod
     def _rdp_security_output_category(result: RDPSecurityResult) -> Out:
@@ -4250,7 +4250,7 @@ class RDP(BaseModule):
             "allowed": Out.VULN,
             "not_allowed": Out.NOTVULN,
             "error": Out.ERROR,
-        }.get(result.status, Out.WARNING)
+        }.get(result.status, Out.TITLE)
 
     @staticmethod
     def _credssp_output_category(result: CredSSPResult) -> Out:
@@ -4258,7 +4258,7 @@ class RDP(BaseModule):
             "supported": Out.OK,
             "not_supported": Out.WARNING,
             "error": Out.ERROR,
-        }.get(result.status, Out.WARNING)
+        }.get(result.status, Out.TITLE)
 
     @staticmethod
     def _security_protocol_output_category(probe: NegotiationProbe) -> Out:
@@ -4272,26 +4272,24 @@ class RDP(BaseModule):
             if probe.requested_protocols in security_verdict_protocols:
                 return Out.NOTVULN
             return Out.INFO
-        if probe.error:
-            return Out.ERROR
-        return Out.WARNING
+        return Out.TITLE
 
     @staticmethod
     def _version_output_category(result: RDPVersionResult) -> Out:
         return {
             "ok": Out.OK,
             "error": Out.ERROR,
-        }.get(result.status, Out.WARNING)
+        }.get(result.status, Out.TITLE)
 
     @staticmethod
     def _ntlm_info_output_category(result: NTLMInfoResult) -> Out:
         if result.status == "ok" and result.info is not None:
             return Out.VULN
         return {
-            "empty": Out.WARNING,
+            "empty": Out.TITLE,
             "not_supported": Out.NOTVULN,
             "error": Out.ERROR,
-        }.get(result.status, Out.WARNING)
+        }.get(result.status, Out.TITLE)
 
     @staticmethod
     def _auth_output_category(result: RDPAuthResult) -> Out:
@@ -4299,7 +4297,8 @@ class RDP(BaseModule):
             "authenticated": Out.OK,
             "tls_error": Out.ERROR,
             "error": Out.ERROR,
-        }.get(result.status, Out.WARNING)
+            "failed": Out.WARNING,
+        }.get(result.status, Out.TITLE)
 
     @staticmethod
     def _auth_method_output_category(result: AuthMethodObservation) -> Out:
@@ -4309,7 +4308,12 @@ class RDP(BaseModule):
             "timeout": Out.ERROR,
             "tls_error": Out.ERROR,
             "transport_error": Out.ERROR,
-        }.get(result.status, Out.WARNING)
+            "blocked": Out.WARNING,
+            "not_supported": Out.WARNING,
+            "negotiable": Out.WARNING,
+            "advertised": Out.WARNING,
+            "rejected": Out.WARNING,
+        }.get(result.status, Out.TITLE)
 
     @staticmethod
     def _user_enumeration_output_category(result: UserEnumerationResult) -> Out:
@@ -4318,21 +4322,28 @@ class RDP(BaseModule):
             "enumerable_partial": Out.VULN,
             "not_observed": Out.NOTVULN,
             "error": Out.ERROR,
-        }.get(result.status, Out.WARNING)
+        }.get(result.status, Out.TITLE)
 
     @staticmethod
     def _brute_protection_output_category(result: BruteProtectionResult) -> Out:
         return {
             "protection_observed": Out.OK,
+            "not_observed": Out.WARNING,
+            "response_changed": Out.WARNING,
+            "slowdown_signal": Out.WARNING,
             "error": Out.ERROR,
-        }.get(result.status, Out.WARNING)
+        }.get(result.status, Out.TITLE)
 
     @staticmethod
     def _rate_limit_output_category(result: RDPConnectionLimitResult) -> Out:
         return {
             "possible_ip_block_or_service_impact": Out.ERROR,
             "error": Out.ERROR,
-        }.get(result.status, Out.WARNING)
+            "limiting_observed": Out.WARNING,
+            "slowdown_observed": Out.WARNING,
+            "behavior_observed": Out.WARNING,
+            "not_observed": Out.WARNING,
+        }.get(result.status, Out.TITLE)
 
     def _rdp_encryption_vulnerabilities(
         self,
@@ -4572,7 +4583,7 @@ class RDP(BaseModule):
             if emit_text and not self.use_json:
                 for test in self.results.not_implemented:
                     self.ptprint(f"{test} test", Out.INFO)
-                    self._print_status("Test is not implemented yet", Out.WARNING)
+                    self._print_status("Test is not implemented yet", Out.TITLE)
 
         if self.results.module_errors:
             properties["moduleErrors"] = [
@@ -4732,7 +4743,7 @@ class RDP(BaseModule):
         elif not result.legacy_probes:
             self._print_status(
                 "Encryption methods could not be enumerated",
-                Out.WARNING,
+                Out.TITLE,
                 indent=8,
             )
         else:
@@ -4750,7 +4761,7 @@ class RDP(BaseModule):
                     status_out = Out.NOTVULN
                     state = "not accepted"
                 else:
-                    status_out = Out.WARNING
+                    status_out = Out.TITLE
                     state = f"unknown ({legacy_probe.error})"
                 self._print_status(
                     f"{method_name}: {state}",
@@ -4776,7 +4787,7 @@ class RDP(BaseModule):
                 status_out = Out.OK
                 state = "supported (advertised by server)"
             elif finding.status == "allocated":
-                status_out = Out.WARNING
+                status_out = Out.TITLE
                 state = "channel allocated; feature/policy not verified"
             elif finding.status == "not_advertised":
                 status_out = Out.WARNING
@@ -4785,13 +4796,13 @@ class RDP(BaseModule):
                 status_out = Out.WARNING
                 state = "channel not allocated"
             elif finding.status == "not_tested":
-                status_out = Out.WARNING
+                status_out = Out.TITLE
                 state = f"not tested ({finding.evidence})"
             elif finding.status == "invalid":
                 status_out = Out.WARNING
                 state = f"invalid ({finding.evidence})"
             else:
-                status_out = Out.WARNING
+                status_out = Out.TITLE
                 state = (
                     finding.evidence
                     if finding.evidence.startswith("requires")
@@ -4932,7 +4943,7 @@ class RDP(BaseModule):
                 detail = scan.error or "scan did not complete"
                 self._print_status(
                     f"Weak TLSv1.2 cipher scan {scan.status}: {detail}",
-                    Out.WARNING,
+                    Out.TITLE,
                 )
             self.ptdebug(
                 f"Weak TLSv1.2 cipher candidates: {scan.tested_count}; "
@@ -4962,7 +4973,7 @@ class RDP(BaseModule):
         elif result.status == "missing_credentials":
             self._print_status(
                 "AUTH requires both --login and --password",
-                Out.WARNING,
+                Out.TITLE,
             )
         elif result.status == "not_supported":
             self._print_status(
@@ -4979,7 +4990,7 @@ class RDP(BaseModule):
         else:
             self._print_status(
                 "Authentication or RDP session setup failed",
-                Out.WARNING,
+                self._auth_output_category(result),
             )
             if result.error:
                 self.ptdebug(result.error)
@@ -5001,7 +5012,10 @@ class RDP(BaseModule):
 
         self.ptprint("RDP authentication methods", Out.INFO)
         if result.note:
-            self._print_status(result.note, Out.WARNING)
+            self._print_status(
+                result.note,
+                Out.WARNING if result.status == "error" else Out.TITLE,
+            )
 
         labels = {
             AuthMechanism.NTLM.value: "Username/password via NTLM",
@@ -5090,7 +5104,7 @@ class RDP(BaseModule):
         for login in result.inconclusive_users:
             self._print_status(
                 f"Candidate could not be classified: {login}",
-                Out.WARNING,
+                Out.TITLE,
                 indent=8,
             )
 
@@ -5173,7 +5187,7 @@ class RDP(BaseModule):
             self._print_status(
                 f"Account-lockout test {lockout.status.replace('_', ' ')}"
                 + (f": {lockout.reason}" if lockout.reason else ""),
-                Out.WARNING,
+                Out.WARNING if lockout.status == "blocked" else Out.TITLE,
             )
 
         if result.service_recovery_probe is not None:
@@ -5264,7 +5278,7 @@ class RDP(BaseModule):
             )
             self._print_status(
                 f"{name}: {scenario.verdict.value.replace('_', ' ')}",
-                scenario_categories.get(scenario.verdict.value, Out.WARNING),
+                scenario_categories.get(scenario.verdict.value, Out.TITLE),
                 indent=8,
             )
             self.ptprint(

@@ -191,6 +191,24 @@ class RDP(BaseMain):
         """RDP modules share caches and a possible authenticated session."""
         return 1
 
+    def run(self) -> None:
+        """Stop the scan before dispatching tests when the RDP port is unreachable."""
+        try:
+            with socket.create_connection(
+                self.target,
+                timeout=self.args.timeout / 1000.0,
+            ):
+                pass
+        except OSError as exc:
+            self.ptjsonlib.end_error(
+                f"Cannot connect to RDP service at "
+                f"{self.target_host}:{self.target[1]}: {exc}",
+                self.use_json,
+            )
+            return
+
+        super().run()
+
     def build_context(self) -> dict:
         """Expose immutable target details and the one shared engine."""
         return {

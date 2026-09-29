@@ -65,7 +65,12 @@ class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
 
     def end_error(self, message, condition, details=None):
         full_msg = f"Error: {message}"
-        ptprint(out_ifnot(full_msg, "ERROR", condition))
+        try:
+            ptprint(out_ifnot(full_msg, "ERROR", condition))
+        except UnicodeEncodeError:
+            encoding = sys.stdout.encoding or "utf-8"
+            safe_msg = full_msg.encode(encoding, errors="replace").decode(encoding)
+            ptprint(f"\033[31m[x]\033[0m {safe_msg}")
         if details:
             from ptlibs.ptprinthelper import get_colored_text
             ptprint("    " + out_ifnot(f"{get_colored_text(details, 'ADDITIONS')}", "TEXT", condition))

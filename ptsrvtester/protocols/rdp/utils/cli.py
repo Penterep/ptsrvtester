@@ -180,17 +180,18 @@ class RDPArgs(BaseArgs):
     def get_help():
         return [
             {"description": ["RDP Testing Module"]},
-            {"usage": ["ptsrvtester rdp <target> <options>"]},
+            {"usage": ["ptsrvtester rdp -tg <host> <options>"]},
             {"usage_example": [
-                "ptsrvtester rdp 192.168.1.10 -ts NLA",
-                "ptsrvtester rdp 12.32.43.163 -ts NLA AUTH -l admin -p pass123",
-                "ptsrvtester rdp 192.168.1.10 -ts AUTHMETHODS --auth-methods ntlm",
-                "ptsrvtester rdp 192.168.1.10 -ts USERENUM -l test-user --allow-auth-failures",
-                "ptsrvtester rdp 192.168.1.10 -ts BRUTEPROT --allow-auth-failures --guess-attempts 10",
-                "ptsrvtester rdp 192.168.1.10 -ts BRUTEPROT -l disposable -p test-pass --allow-auth-failures --lockout-test",
-                "ptsrvtester rdp rdp.example.com -ts NLA",
+                "ptsrvtester rdp -tg 192.168.1.182",
+                "ptsrvtester rdp -tg 12.32.43.163 -ts NLA AUTH -l admin -p pass123",
+                "ptsrvtester rdp -tg 192.168.1.10 -ts AUTHMETHODS --auth-methods ntlm",
+                "ptsrvtester rdp -tg 192.168.1.10 -ts USERENUM -l test-user --allow-auth-failures",
+                "ptsrvtester rdp -tg 192.168.1.10 -ts BRUTEPROT --allow-auth-failures --guess-attempts 10",
+                "ptsrvtester rdp -tg 192.168.1.10 -ts BRUTEPROT -l disposable -p test-pass --allow-auth-failures --lockout-test",
+                "ptsrvtester rdp -tg rdp.example.com -ts NLA",
             ]},
             {"options": [
+                ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT] (default port: 3389)"],
                 ["-ts", "--tests", "<test>", "Specify one or more tests to perform"],
                 ["", "", "NLA", "Network Level Authentication requirement test"],
                 ["", "", "RDPSEC", "Legacy Standard RDP Security negotiation test"],
@@ -267,15 +268,15 @@ class RDPArgs(BaseArgs):
 
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """example usage:
-  ptsrvtester rdp 192.168.1.10 -ts NLA
-  ptsrvtester rdp 192.168.1.10 -ts NLA NTLMINFO
-  ptsrvtester rdp 12.32.43.163 -ts NLA AUTH -l admin -p pass123
-  ptsrvtester rdp 192.168.1.10 -ts AUTHMETHODS --auth-methods ntlm
-  ptsrvtester rdp 192.168.1.10 -ts USERENUM -l known-user --allow-auth-failures
-  ptsrvtester rdp 192.168.1.10 -ts BRUTEPROT --allow-auth-failures --guess-attempts 10
-  ptsrvtester rdp 192.168.1.10 -ts BRUTEPROT -l disposable -p test-pass --allow-auth-failures --lockout-test
-  ptsrvtester rdp rdp.example.com -ts NLA
-  ptsrvtester rdp 192.168.1.10 -vv"""
+  ptsrvtester rdp -tg 192.168.1.182
+  ptsrvtester rdp -tg 192.168.1.10 -ts NLA NTLMINFO
+  ptsrvtester rdp -tg 12.32.43.163 -ts NLA AUTH -l admin -p pass123
+  ptsrvtester rdp -tg 192.168.1.10 -ts AUTHMETHODS --auth-methods ntlm
+  ptsrvtester rdp -tg 192.168.1.10 -ts USERENUM -l known-user --allow-auth-failures
+  ptsrvtester rdp -tg 192.168.1.10 -ts BRUTEPROT --allow-auth-failures --guess-attempts 10
+  ptsrvtester rdp -tg 192.168.1.10 -ts BRUTEPROT -l disposable -p test-pass --allow-auth-failures --lockout-test
+  ptsrvtester rdp -tg rdp.example.com -ts NLA
+  ptsrvtester rdp -tg 192.168.1.10 -vv"""
 
         parser = subparsers.add_parser(
             name,
@@ -288,9 +289,12 @@ class RDPArgs(BaseArgs):
             raise TypeError
 
         parser.add_argument(
-            "target",
+            "-tg",
+            "--target",
             type=valid_target_rdp,
-            help="IP[:PORT] or HOST[:PORT] (default port: 3389)",
+            required=True,
+            metavar="<host>",
+            help="Target IP[:PORT] or HOST[:PORT] (default port: 3389)",
         )
         parser.add_argument(
             "-ts",

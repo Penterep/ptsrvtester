@@ -49,5 +49,10 @@ def run(ctx: SMBContext) -> None:
             ctx.successful_dialects.append(sc.dial_str_converter(dialect))
     
     for dialect in ctx.successful_dialects:
-        ctx.out(dialect, category="VULN" if dialect == "SMBv1" else "NOTVULN",
-                condition=True, indent=4)
+        if dialect == "SMBv1":
+            cat = "VULN"
+        elif dialect in ["SMBv2.0", "SMBv2.1"]:
+            cat = "WARNING"
+        else:
+            cat = "NOTVULN"
+        ctx.out(dialect, category=cat, condition=True, indent=4)

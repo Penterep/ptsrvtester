@@ -25,6 +25,7 @@ setuptools.setup(
     python_requires=">=3.12",
     install_requires = [
     "aardwolf==0.2.13",
+    "aioquic>=1.0.0",
     "asyauth==0.0.23",
     "asysocks==0.2.18",
     "cryptography>=42.0.8",

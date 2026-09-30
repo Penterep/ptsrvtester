@@ -33,6 +33,83 @@ from ..smb_utils.server_connection import ServerConnection
 from ..smb_utils.helpers import SMBContext
 
 
+def win_version_translate(ver: str) -> str:
+    output = "Windows "
+    version = ver.split(".")
+    
+    # 5.x = Windows XP
+    if version[0] == "5":
+        output += "XP"
+        if len(version) > 1 and version[1] == "2":
+            output += " Professional 64-bit"
+        return output
+    
+    # 6.x = Windows Vista, 7, 8, 8.1
+    elif version[0] == "6":
+        if version[1] == "0":
+            output += "Vista"
+            if len(version) > 2:
+                if version[2] == "6001":
+                    output += " SP1"
+                elif version[2] == "6002":
+                    output += " SP2"
+        elif version[1] == "1":
+            output += "7"
+            if len(version) > 2 and version[2] == "7601":
+                output += " SP1"
+        elif version[1] == "2":
+            output += "8"
+        elif version[1] == "3":
+            output += "8.1"
+            if len(version) > 2 and version[2] == "9600":
+                output += " (Update 1)"
+        return output
+    
+    # 10.x = Windows 10 or 11
+    elif version[0] == "10":
+        if len(version) > 2:
+            build = int(version[2])
+            # Windows 11 (build >= 22000)
+            if build >= 22000:
+                output += "11"
+                if build == 22000:
+                    output += " (21H2)"
+                elif build == 22621:
+                    output += " (22H2)"
+                elif build == 22631:
+                    output += " (23H2)"
+            # Windows 10
+            else:
+                output += "10"
+                if build == 10240:
+                    pass  # base Windows 10
+                elif build == 10586:
+                    output += " (1511)"
+                elif build == 15063:
+                    output += " (1703)"
+                elif build == 16299:
+                    output += " (1709)"
+                elif build == 17134:
+                    output += " (1803)"
+                elif build == 17763:
+                    output += " (1809)"
+                elif build == 18362:
+                    output += " (1903)"
+                elif build == 18363:
+                    output += " (1909)"
+                elif build == 19041:
+                    output += " (2004)"
+                elif build == 19042:
+                    output += " (20H2)"
+                elif build == 19043:
+                    output += " (21H1)"
+                elif build == 19044:
+                    output += " (21H2)"
+        return output
+    
+    return output
+
+
 def run(ctx: SMBContext) -> None:
     ip, port = ctx.target
     raw_dialects = ctx.mapping.keys()
@@ -62,7 +139,6 @@ def run(ctx: SMBContext) -> None:
     ctx.dns_host_name = output["server_DNS_hostname"]
 
     # OS version parsing
-    os_name = output["server_OS"]
     os_info = [output["server_OS_major"], output["server_OS_minor"], output["server_OS_build"]]
     
     os_version = ""
@@ -73,11 +149,15 @@ def run(ctx: SMBContext) -> None:
             break
     
     if os_version == "":
+        os_ver_name = "unknown"
         os_version = "unknown"
     else:
         os_version = os_version[1:]
+        os_ver_name = win_version_translate(os_version)
+        
+    os_ver_name = output["server_OS"] if output["server_OS"] != "unknown" and os_version == "unknown" else os_ver_name
     
-    ctx.os_version = os_version if os_name == "unknown" else f"{os_name} (build: {os_version})"
+    ctx.os_version = f"{os_ver_name} (build: {os_version})" if os_version != "unknown" else os_ver_name
     
     ctx.ntlmv2_support = output["does_support_NTLMv2"]
     ctx.login_required = output["is_login_required"]
@@ -87,7 +167,7 @@ def run(ctx: SMBContext) -> None:
     # Printing
     # ctx.out("SMB server info:")
     ctx.out(f"Server name:             {ctx.server_name}", "INFO", indent=4)
-    ctx.out(f"Server version:          {os_version}", "INFO", indent=4)
+    ctx.out(f"OS version:              {ctx.os_version}", "INFO", indent=4)
     ctx.out(f"DNS domain name:         {ctx.dns_domain_name}", "INFO", indent=4)
     ctx.out(f"DNS host name:           {ctx.dns_host_name}", "INFO", indent=4,
                 condition=ctx.dns_host_name != ctx.dns_domain_name)

@@ -524,6 +524,7 @@ class RDPAuthResult:
     tls_verification: str | None = None
     certificate_sha256: str | None = None
     error: str | None = None
+    communication_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -2368,7 +2369,11 @@ class RDP(BaseModule):
             PROTOCOL_HYBRID_EX,
         ):
             if credssp_probe.error:
-                return RDPAuthResult(status="error", error=credssp_probe.error)
+                return RDPAuthResult(
+                    status="error",
+                    error=credssp_probe.error,
+                    communication_error=True,
+                )
             reason = (
                 FAILURE_CODES.get(
                     credssp_probe.failure_code,
@@ -4608,7 +4613,7 @@ class RDP(BaseModule):
             "required": Out.NOTVULN,
             "allowed_not_required": Out.VULN,
             "not_supported": Out.VULN,
-            "error": Out.ERROR,
+            "error": Out.TITLE,
         }.get(result.status, Out.TITLE)
 
     @staticmethod
@@ -4616,7 +4621,7 @@ class RDP(BaseModule):
         return {
             "allowed": Out.VULN,
             "not_allowed": Out.NOTVULN,
-            "error": Out.ERROR,
+            "error": Out.TITLE,
         }.get(result.status, Out.TITLE)
 
     @staticmethod
@@ -4624,7 +4629,7 @@ class RDP(BaseModule):
         return {
             "supported": Out.OK,
             "not_supported": Out.WARNING,
-            "error": Out.ERROR,
+            "error": Out.TITLE,
         }.get(result.status, Out.TITLE)
 
     @staticmethod
@@ -4645,7 +4650,7 @@ class RDP(BaseModule):
     def _version_output_category(result: RDPVersionResult) -> Out:
         return {
             "ok": Out.OK,
-            "error": Out.ERROR,
+            "error": Out.TITLE,
         }.get(result.status, Out.TITLE)
 
     @staticmethod
@@ -4655,11 +4660,13 @@ class RDP(BaseModule):
         return {
             "empty": Out.TITLE,
             "not_supported": Out.NOTVULN,
-            "error": Out.ERROR,
+            "error": Out.TITLE,
         }.get(result.status, Out.TITLE)
 
     @staticmethod
     def _auth_output_category(result: RDPAuthResult) -> Out:
+        if result.status == "error" and result.communication_error:
+            return Out.TITLE
         return {
             "authenticated": Out.OK,
             "tls_error": Out.ERROR,
@@ -4672,9 +4679,9 @@ class RDP(BaseModule):
         return {
             "authenticated": Out.OK,
             "error": Out.ERROR,
-            "timeout": Out.ERROR,
+            "timeout": Out.TITLE,
             "tls_error": Out.ERROR,
-            "transport_error": Out.ERROR,
+            "transport_error": Out.TITLE,
             "blocked": Out.WARNING,
             "not_supported": Out.WARNING,
             "negotiable": Out.WARNING,
@@ -5084,7 +5091,7 @@ class RDP(BaseModule):
 
         self.ptprint("RDP security and encryption enumeration", Out.INFO)
         if result.status == "error":
-            self._print_status(str(result.error), Out.ERROR)
+            self._print_status(str(result.error), Out.TITLE)
             return
 
         self.ptprint("    Security protocols", Out.TEXT)
@@ -5297,13 +5304,13 @@ class RDP(BaseModule):
         else:
             self._print_status(
                 f"TLS handshake failed: {result.error}",
-                Out.ERROR,
+                Out.TITLE,
             )
 
         if result.certificate and result.certificate.parse_error:
             self._print_status(
                 f"Certificate parse error: {result.certificate.parse_error}",
-                Out.ERROR,
+                Out.TITLE,
             )
 
         if result.certificate and result.certificate.subject:

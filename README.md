@@ -44,6 +44,12 @@ ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.10 -u auditor -pw secret
 ptsrvtester msrpc -ts SAMRGROUPS -tg 192.168.1.10 -u auditor -pw secret
 ptsrvtester msrpc -ts SAMRUSERINFO -tg 192.168.1.10 -u auditor -pw secret --samr-user alice
 ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.10 --pipe svcctl -u auditor -pw secret
+ptsrvtester upnp -ts ALL -tg 192.168.1.1
+ptsrvtester upnp -ts DISCOVER -tg 192.168.1.1 --multicast -i 192.168.1.10
+ptsrvtester upnp -ts SCPD,PORTMAPS -tg 192.168.1.1
+ptsrvtester upnp -ts NOTIFY -tg 192.168.1.1 -i 192.168.1.10
+ptsrvtester upnp -ts EVENTS -tg 192.168.1.1 -i 192.168.1.10
+ptsrvtester upnp -ts DISCOVER -tg '[fe80::1%Ethernet]:1900'
 ptsrvtester <module> -h     for help for module use
 ```
 
@@ -64,6 +70,7 @@ ptsrvtester <module> -h     for help for module use
                          dhcp   DHCP testing module
                          xrdp   XRDP testing module
                          rdp    RDP testing module
+                         upnp   UPnP/SSDP testing module
 
    -v        --version          Show script version and exit
    -h        --help             Show this help message and exit
@@ -105,6 +112,14 @@ ptsrvtester <module> -h     for help for module use
 - SAM user, group and membership enumeration
 - User account details and logon statistics
 - Named-pipe, SMB, RPC/TCP and RPC-over-HTTP credential testing
+
+**UPnP/SSDP Module**
+- Targeted IPv4/IPv6 SSDP discovery and multicast search
+- UPnP device and service description retrieval
+- Read-only IGD status and external IP inspection
+- Service action and state variable enumeration (`SCPD`)
+- Read-only existing port mapping enumeration (`PORTMAPS`)
+- Passive SSDP notifications and temporary GENA subscriptions
 
 **FTP Module**
 - Banner and Service Identification

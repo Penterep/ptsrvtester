@@ -8,7 +8,13 @@ __ORDER__ = 40
 
 
 def run(ctx):
-    result = auth_ntlm(ctx.args, debug=ctx.debug)
+    try:
+        result = auth_ntlm(ctx.args, debug=ctx.debug)
+    except Exception as e:
+        err = str(e).rstrip(".")
+        ctx.out(f"{err}. NTLM information was not tested.", "WARNING", indent=4)
+        ctx.report.update_properties(ntlmInfoStatus="failed")
+        return
     if not result.success or result.ntlm is None:
         ctx.out("Not available", "NOTVULN", indent=4)
         ctx.report.update_properties(ntlmInfoStatus="failed")

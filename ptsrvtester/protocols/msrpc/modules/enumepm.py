@@ -3,9 +3,8 @@ __MODULELABEL__ = "Enumerate EPM endpoints"
 __MODULECODE__ = "ENUMEPM"
 __ORDER__ = 10
 
-from ._common import eng
+from ._common import run_probe
 
 
 def run(ctx):
-    e = eng(ctx)
-    e.results.EpmapEndpoints = e.enumerate_epm()
+    run_probe(ctx, __MODULECODE__, "EpmapEndpoints", "enumerate_epm")

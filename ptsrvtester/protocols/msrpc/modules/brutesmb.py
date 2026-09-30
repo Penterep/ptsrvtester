@@ -3,9 +3,8 @@ __MODULELABEL__ = "Brute SMB credentials"
 __MODULECODE__ = "BRUTESMB"
 __ORDER__ = 60
 
-from ._common import eng
+from ._common import run_probe
 
 
 def run(ctx):
-    e = eng(ctx)
-    e.results.SMB_Brute = e.smb_brute()
+    run_probe(ctx, __MODULECODE__, "SMB_Brute", "smb_brute")

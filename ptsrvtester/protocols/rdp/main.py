@@ -120,8 +120,8 @@ class RDP(BaseMain):
                 chosen.append("AUTH")
             return self._remember_selection(chosen)
 
-        # ALL retains the legacy single AUTH check but never implies the active
-        # RATELIMIT test. Naming RATELIMIT alongside ALL remains explicit.
+        # ALL retains the legacy single AUTH check but does not imply active
+        # tests. Naming an active test alongside ALL remains explicit.
         if "ALL" in tokens:
             chosen = [
                 code
@@ -137,8 +137,18 @@ class RDP(BaseMain):
                 )
                 if code not in known and code not in RDP_EXPLICIT_ONLY_TESTS
             )
-            if "RATELIMIT" in tokens and "RATELIMIT" in discovered:
-                chosen.append("RATELIMIT")
+            for token in tokens:
+                code = RDP_TEST_ALIASES.get(token, token)
+                if (
+                    code in RDP_EXPLICIT_ONLY_TESTS
+                    and code in discovered
+                    and code not in chosen
+                ):
+                    chosen.append(code)
+            if "RATELIMIT" in chosen:
+                chosen = [code for code in chosen if code != "RATELIMIT"] + [
+                    "RATELIMIT"
+                ]
             return self._remember_selection(chosen)
 
         chosen: list[str] = []

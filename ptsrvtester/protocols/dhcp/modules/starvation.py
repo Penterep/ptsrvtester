@@ -18,8 +18,8 @@ def _run_starvation(ctx):
         max_count = ctx.count if hasattr(ctx, 'count') and ctx.count else None
 
         while max_count is None or count < max_count:
-            src_mac = random_mac()
-            transaction_id = random_xid()
+            src_mac = ctx.mac or random_mac()
+            transaction_id = ctx.xid or random_xid()
             requested_ip = None
 
             # Send DISCOVER
@@ -54,6 +54,7 @@ def _run_starvation(ctx):
         ctx.out(f"[-] Error during starvation: {str(e)}", "ERROR", indent=4)
 
     ctx.out(f"[*] Total IPs obtained: {count}", "INFO", indent=4)
+    ctx.ptjsonlib.add_vulnerabiltiy("PTV-DHCP-STARVATION")
 
 def run(ctx):
     _run_starvation(ctx)

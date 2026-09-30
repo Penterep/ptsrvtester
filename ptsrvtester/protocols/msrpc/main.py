@@ -1,4 +1,4 @@
-"""MSRPC protocol main."""
+"""MSRPC integration with the generic protocol-module framework."""
 from __future__ import annotations
 
 import argparse
@@ -6,11 +6,14 @@ import importlib
 import socket
 
 from .._base import BaseArgs, BaseMain
-from .utils.cli import MSRPCArgs, MSRPC_DEFAULT_SUITE
-from .utils.engine import MSRPCResult, MsrpcEngine
+from .utils.cli import MSRPCArgs, validate_msrpc_selection
+from .utils.engine import MsrpcEngine
+from .utils.registry import expand_msrpc_selection, selection_families
 
 
 class MSRPC(BaseMain):
+    """Run selected MSRPC checks through one serial, shared engine."""
+
     NAME = "msrpc"
     ARGS_CLASS = MSRPCArgs
 
@@ -21,26 +24,23 @@ class MSRPC(BaseMain):
     def __init__(self, args: BaseArgs, ptjsonlib) -> None:
         if not isinstance(args, MSRPCArgs):
             raise argparse.ArgumentError(None, "wrong arguments namespace for msrpc")
-        if not getattr(args, "module_threads", None):
-            args.module_threads = 1
-        self.engine = MsrpcEngine(args, ptjsonlib)
-        self.engine.results = MSRPCResult()
+        self.selected_tests = validate_msrpc_selection(args)
         super().__init__(args, ptjsonlib)
+        self.engine = MsrpcEngine(args, ptjsonlib)
 
     def _import_module_file(self, name: str, path: str):
         return importlib.import_module(f"ptsrvtester.protocols.msrpc.modules.{name}")
 
     def _prepare_target(self) -> None:
         target = self.args.target
-        raw = getattr(self.args, "tests", None) or ""
-        codes = {c.strip().upper() for c in raw.split(",") if c.strip()}
-        if getattr(target, "port", 0) == 0:
-            if codes & {"ANONSMB", "BRUTESMB", "ENUMPIPES"} and not (
-                codes & {"ENUMEPM", "ENUMMGMT", "BRUTETCP"}
-            ):
-                target.port = 445
-            else:
-                target.port = 135
+        requested_port = int(getattr(target, "port", 0) or 0)
+        families = selection_families(self.selected_tests)
+
+        ports = {"rpc": 135, "smb": 445, "http": 443}
+        if requested_port:
+            # validate_msrpc_selection already rejected a mixed-family override.
+            ports[next(iter(families))] = requested_port
+
         host = target.ip
         try:
             socket.inet_aton(host)
@@ -48,22 +48,45 @@ class MSRPC(BaseMain):
         except OSError:
             try:
                 ip = socket.gethostbyname(host)
-            except socket.gaierror as e:
-                raise argparse.ArgumentError(None, f"Cannot resolve domain name '{host}'") from e
-        self.target_host = host
-        self.target = (ip, target.port)
-        self.args.ip = ip
-        self.args.port = target.port
+            except socket.gaierror as exc:
+                raise argparse.ArgumentError(
+                    None, f"Cannot resolve domain name '{host}' to IP address"
+                ) from exc
 
-    def _select_codes(self, discovered):
-        raw = getattr(self.args, "tests", None)
-        codes = [c.strip().upper() for c in raw.split(",")] if raw else []
-        codes = [c for c in codes if c]
-        if not codes or "ALL" in codes:
-            chosen = [c for c in MSRPC_DEFAULT_SUITE if c in discovered]
-            chosen.sort(key=lambda c: (discovered[c].order, c))
-            return chosen
-        return super()._select_codes(discovered)
+        primary_family = next(iter(families)) if len(families) == 1 else "rpc"
+        primary_port = ports[primary_family]
+        target.port = primary_port
+        self.target_host = host
+        self.target = (ip, primary_port)
+        self.transport_ports = ports
+
+        # Compatibility fields used by the ported engine.
+        self.args.ip = ip
+        self.args.host = host
+        self.args.port = primary_port
+        self.args.rpc_port = ports["rpc"]
+        self.args.smb_port = ports["smb"]
+        self.args.http_port = ports["http"]
+
+    def _select_codes(self, discovered) -> list[str]:
+        requested = expand_msrpc_selection(self.args.tests)
+        missing = [code for code in requested if code not in discovered]
+        if missing:
+            message = (
+                "Selected MSRPC adapter(s) could not be loaded: "
+                + ", ".join(missing)
+            )
+            self.engine.record_module_error("DISCOVERY", message)
+            if not self.use_json:
+                self.ptjsonlib.end_error(message, False)
+            return []
+        chosen = list(requested)
+        chosen.sort(key=lambda code: (discovered[code].order, code))
+        return chosen
+
+    def _thread_count(self) -> int:
+        # bind_ctx() and the result accumulator are intentionally shared.
+        return 1
 
     def build_context(self) -> dict:
         return {
@@ -71,9 +94,11 @@ class MSRPC(BaseMain):
             "host": self.target_host,
             "ip": self.target[0],
             "port": self.target[1],
+            "ports": dict(self.transport_ports),
         }
 
     def output(self) -> None:
-        if self.engine.results is None:
-            self.engine.results = MSRPCResult()
         self.engine.output()
+
+
+__all__ = ["MSRPC"]

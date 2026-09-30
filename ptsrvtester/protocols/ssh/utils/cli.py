@@ -37,10 +37,19 @@ class SSHArgs(ArgsWithBruteforce):
     privkeys: str | None
     dheat: str | None
     dheat_duration: float | None
+    lockout_attempts: int
+    lockout_cooldown: float
+    sftp_max_mb: int
+    sftp_max_files: int
+    sftp_bomb_mb: int
+    enum_samples: int
+    enum_baseline: int
+    enum_sigma: float
 
     @staticmethod
     def get_help():
         options: list[list[str]] = [
+            ["-tg", "--target", "<target>", "IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or ssh.example.com:22)"],
             ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,KEX); ALL runs everything:"],
         ]
         for group_title, codes in SSH_TEST_GROUPS:
@@ -68,6 +77,56 @@ class SSHArgs(ArgsWithBruteforce):
             ["", "--dheat", "<N[:kex[:e_len]]>", "DHEat attack params: N concurrent sockets, optional kex + e length (default: 10)"],
             ["", "--dheat-duration", "<seconds>", "How long to run the DHEat attack before stopping (default: 20)"],
             ["", "", "", ""],
+            [get_colored_text("Shell access (SHELL)", "TITLE")],
+            ["-u", "--user", "<username>", "Account to test (required)"],
+            ["-p", "--password", "<password>", "Password to log in"],
+            ["-P", "--passwords", "<wordlist>", "Passwords to log in (first that works is used)"],
+            ["", "--privkeys", "<dir>", "Private keys to log in"],
+            ["", "", "", ""],
+            [get_colored_text("Post-auth privileges (PRIVS)", "TITLE")],
+            ["-u", "--user", "<username>", "Account to test (required)"],
+            ["-p", "--password", "<password>", "Password to log in"],
+            ["-P", "--passwords", "<wordlist>", "Passwords to log in (first that works is used)"],
+            ["", "--privkeys", "<dir>", "Private keys to log in"],
+            ["", "", "", ""],
+            [get_colored_text("SFTP access control (SFTP)", "TITLE")],
+            ["-u", "--user", "<username>", "Account to test (required)"],
+            ["-p", "--password", "<password>", "Password to log in"],
+            ["-P", "--passwords", "<wordlist>", "Passwords to log in (first that works is used)"],
+            ["", "--privkeys", "<dir>", "Private keys to log in"],
+            ["", "", "", ""],
+            [get_colored_text("SFTP content & limits (SFTPDATA, aggressive)", "TITLE")],
+            ["-u", "--user", "<username>", "Account to test (required)"],
+            ["-p", "--password", "<password>", "Password to log in"],
+            ["", "--sftp-max-mb", "<n>", "Max MB written in the quota probe (default: 10; cap 200)"],
+            ["", "--sftp-max-files", "<n>", "Max files created in the count probe (default: 100; cap 2000)"],
+            ["", "--sftp-bomb-mb", "<n>", "Decompressed size of the ZIP-bomb probe (default: 10; cap 200)"],
+            ["", "", "", ""],
+            [get_colored_text("Port forwarding & tunneling (FORWARD)", "TITLE")],
+            ["-u", "--user", "<username>", "Account to test (required)"],
+            ["-p", "--password", "<password>", "Password to log in"],
+            ["-P", "--passwords", "<wordlist>", "Passwords to log in (first that works is used)"],
+            ["", "--privkeys", "<dir>", "Private keys to log in"],
+            ["", "", "", ""],
+            [get_colored_text("Root login policy (ROOTLOGIN)", "TITLE")],
+            ["-u", "--user", "<username>", "Account to test (default: root)"],
+            ["-p", "--password", "<password>", "Password to confirm root login (optional)"],
+            ["-P", "--passwords", "<wordlist>", "Passwords to confirm root login (optional)"],
+            ["", "--privkeys", "<dir>", "Private keys to confirm root login (optional)"],
+            ["", "", "", ""],
+            [get_colored_text("Username enumeration (USERENUM)", "TITLE")],
+            ["-u", "--user", "<username>", "Known-valid login used to calibrate the timing oracle (required)"],
+            ["-U", "--users", "<wordlist>", "Usernames to enumerate once enumeration is confirmed"],
+            ["", "--enum-samples", "<n>", "Timing samples per username (default: 5; range 3-50)"],
+            ["", "--enum-baseline", "<n>", "Random invalid names for the baseline (default: 5; range 2-25)"],
+            ["", "--enum-sigma", "<f>", "Separation threshold in std devs (default: 3.0)"],
+            ["", "", "", ""],
+            [get_colored_text("Password-guessing lockout (LOCKOUT)", "TITLE")],
+            ["-u", "--user", "<username>", "Target account (required for LOCKOUT)"],
+            ["-p", "--password", "<password>", "VALID password of a canary account (enables account-lockout test)"],
+            ["", "--lockout-attempts", "<n>", "Failed logins to attempt (default: 8)"],
+            ["", "--lockout-cooldown", "<seconds>", "Wait & re-probe to see if a lockout/ban clears (default: 0)"],
+            ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
             ["-j", "--json", "", "Output in JSON format"],
             ["-vv", "--verbose", "", "Enable verbose mode"],
@@ -77,14 +136,22 @@ class SSHArgs(ArgsWithBruteforce):
 
         return [
             {"description": ["SSH Testing Module"]},
-            {"usage": ["ptsrvtester ssh -ts <test>[,<test>...] <options> <target>"]},
+            {"usage": ["ptsrvtester ssh -tg <target> -ts <test>[,<test>...] <options>"]},
             {"usage_example": [
-                "ptsrvtester ssh 127.0.0.1",
-                "ptsrvtester ssh -ts BANNER,HOSTKEY,AUTHM 127.0.0.1:22",
-                "ptsrvtester ssh -ts KEX,ENC,MAC 127.0.0.1",
-                "ptsrvtester ssh -ts BADHOSTKEY -H ./hostkeys/ 127.0.0.1",
-                "ptsrvtester ssh -ts BRUTE -u admin -P passwords.txt 127.0.0.1:22",
-                "ptsrvtester ssh -ts DHEAT --dheat 10 --dheat-duration 30 127.0.0.1",
+                "ptsrvtester ssh -tg 127.0.0.1",
+                "ptsrvtester ssh -tg 127.0.0.1:22 -ts BANNER,HOSTKEY,AUTHM",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts KEX,ENC,MAC",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts TERRAPIN,SSHV1",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts BADHOSTKEY -H ./hostkeys/",
+                "ptsrvtester ssh -tg 127.0.0.1:22 -ts BRUTE -u admin -P passwords.txt",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts ROOTLOGIN",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts SHELL -u svc -p secret",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts PRIVS -u svc -p secret",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts FORWARD -u svc -p secret",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts SFTP -u sftpuser -p secret",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts SFTPDATA -u sftpuser -p secret --sftp-max-mb 20",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts USERENUM -u root -U users.txt",
+                "ptsrvtester ssh -tg 127.0.0.1 -ts DHEAT --dheat 10 --dheat-duration 30",
                 "ptsrvtester ssh -ts BRUTE -h",
             ]},
             {"options": options},
@@ -98,11 +165,18 @@ class SSHArgs(ArgsWithBruteforce):
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """example usage:
   ptsrvtester ssh -h
-  ptsrvtester ssh 127.0.0.1
-  ptsrvtester ssh -ts BANNER,HOSTKEY,AUTHM 127.0.0.1:22
-  ptsrvtester ssh -ts KEX,ENC,MAC 127.0.0.1
-  ptsrvtester ssh -ts BADHOSTKEY -H ./hostkeys/ 127.0.0.1
-  ptsrvtester -j ssh -ts BRUTE -u admin -P passwords.txt --brute-threads 20 127.0.0.1:22
+  ptsrvtester ssh -tg 127.0.0.1
+  ptsrvtester ssh -tg 127.0.0.1:22 -ts BANNER,HOSTKEY,AUTHM
+  ptsrvtester ssh -tg 127.0.0.1 -ts KEX,ENC,MAC
+  ptsrvtester ssh -tg 127.0.0.1 -ts BADHOSTKEY -H ./hostkeys/
+  ptsrvtester -j ssh -tg 127.0.0.1:22 -ts BRUTE -u admin -P passwords.txt --brute-threads 20
+  ptsrvtester ssh -tg 127.0.0.1 -ts ROOTLOGIN
+  ptsrvtester ssh -tg 127.0.0.1 -ts SHELL -u svc -p secret
+  ptsrvtester ssh -tg 127.0.0.1 -ts PRIVS -u svc -p secret
+  ptsrvtester ssh -tg 127.0.0.1 -ts FORWARD -u svc -p secret
+  ptsrvtester ssh -tg 127.0.0.1 -ts SFTP -u sftpuser -p secret
+  ptsrvtester ssh -tg 127.0.0.1 -ts SFTPDATA -u sftpuser -p secret
+  ptsrvtester ssh -tg 127.0.0.1 -ts USERENUM -u root -U users.txt
   ptsrvtester ssh -ts BRUTE -h"""
 
         parser = subparsers.add_parser(
@@ -116,8 +190,12 @@ class SSHArgs(ArgsWithBruteforce):
             raise TypeError  # IDE typing
 
         parser.add_argument(
-            "target",
+            "-tg",
+            "--target",
+            required=True,
             type=valid_target_ssh,
+            metavar="<target>",
+            dest="target",
             help="IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or ssh.example.com:22)",
         )
 
@@ -164,7 +242,87 @@ class SSHArgs(ArgsWithBruteforce):
             help="how long to run the DHEat attack before stopping it and reading the verdict (default: 20)",
         )
 
-        add_bruteforce_args(parser)
+        lockout = parser.add_argument_group(
+            "LOCKOUT (aggressive)",
+            "Password-guessing lockout test — only runs with -ts LOCKOUT. Deliberately "
+            "makes failed logins; may lock the target account and/or ban this IP. Uses "
+            "-u/--user (target account); add -p/--password (a VALID password for a canary "
+            "account) to also test account lockout.",
+        )
+        lockout.add_argument(
+            "--lockout-attempts",
+            type=int,
+            default=8,
+            metavar="<n>",
+            dest="lockout_attempts",
+            help="number of failed login attempts to make (default: 8; range 1-100)",
+        )
+        lockout.add_argument(
+            "--lockout-cooldown",
+            type=float,
+            default=0.0,
+            metavar="<seconds>",
+            dest="lockout_cooldown",
+            help="if a lockout/ban is found, wait this long and re-probe to see if it "
+                 "clears (0 = skip recovery probe; default: 0)",
+        )
+
+        userenum = parser.add_argument_group(
+            "USERENUM (aggressive)",
+            "Username enumeration via authentication timing — only runs with -ts USERENUM. "
+            "Calibrates on a KNOWN-VALID login (-u/--user) and, when enumeration is confirmed, "
+            "classifies the names in -U/--users. Makes repeated failed logins.",
+        )
+        userenum.add_argument(
+            "--enum-samples",
+            type=int,
+            default=5,
+            metavar="<n>",
+            dest="enum_samples",
+            help="timing samples per username; more is more reliable but slower "
+                 "(default: 5; range 3-50)",
+        )
+        userenum.add_argument(
+            "--enum-baseline",
+            type=int,
+            default=5,
+            metavar="<n>",
+            dest="enum_baseline",
+            help="number of random (invalid) names used to build the timing baseline "
+                 "(default: 5; range 2-25)",
+        )
+        userenum.add_argument(
+            "--enum-sigma",
+            type=float,
+            default=3.0,
+            metavar="<f>",
+            dest="enum_sigma",
+            help="how many standard deviations the valid login must be separated from the "
+                 "invalid baseline to call enumeration possible (default: 3.0)",
+        )
+
+        sftpdata = parser.add_argument_group(
+            "SFTPDATA (aggressive)",
+            "SFTP content scanning & resource-limit test — only runs with -ts SFTPDATA. "
+            "Uploads BOUNDED, cleaned-up test files (EICAR, a small ZIP-bomb/XXE probe, "
+            "and quota probes). Every default is small and clamped to a safe cap.",
+        )
+        sftpdata.add_argument(
+            "--sftp-max-mb", type=int, default=None, metavar="<n>", dest="sftp_max_mb",
+            help="max MB written in the disk/quota probe (default: 10; capped at 200)",
+        )
+        sftpdata.add_argument(
+            "--sftp-max-files", type=int, default=None, metavar="<n>", dest="sftp_max_files",
+            help="max files created in the count-quota probe (default: 100; capped at 2000)",
+        )
+        sftpdata.add_argument(
+            "--sftp-bomb-mb", type=int, default=None, metavar="<n>", dest="sftp_bomb_mb",
+            help="decompressed size of the ZIP-bomb processing probe (default: 10; capped at 200)",
+        )
+
+        # -u/--user and -U/--users are NOT mutually exclusive here: USERENUM needs
+        # both at once (-u = known-valid calibration login, -U = list to enumerate).
+        add_bruteforce_args(parser, mutually_exclusive_user_and_users=False)
 
         bruteforce = next(g for g in parser._action_groups if "BRUTEFORCE" in g.title)
         bruteforce.description = "user/users + password/passwords/privkeys"

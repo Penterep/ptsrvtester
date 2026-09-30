@@ -81,6 +81,9 @@ class SSH(BaseMain):
         every crypto section test (KEX/KEYALG/ENC/MAC/FINGERPRINT) shares, so the
         external ssh-audit scan happens at most once per invocation.
         """
+        from .._shared.utils.connection import SSHBannerAdapter
+
+        rate_timeout = getattr(self.args, "rate_timeout", 5.0) or 5.0
         return {
             "host": self.target_host,
             "ip": self.target[0],
@@ -89,6 +92,11 @@ class SSH(BaseMain):
             "deferred_vulns": self._deferred_vulns,
             "results_lock": self._results_lock,
             "ssh_audit": SSHAuditShared(self.target[0], self.target[1]),
+            # Sharper RATELIMIT signal: a connection counts only once sshd sends
+            # its SSH-2.0 banner, and holding it (no KEX) exercises LoginGraceTime.
+            "rate_limit_adapter": SSHBannerAdapter(
+                self.target[0], self.target[1], rate_timeout
+            ),
         }
 
     def output(self) -> None:

@@ -116,6 +116,46 @@ class MSRPCResult:
     module_errors: dict[str, str] = field(default_factory=dict)
 
 
+_EPM_BINDING_PRIORITY = {"ncacn_ip_tcp": 0, "ncalrpc": 1, "ncacn_np": 2}
+_EPM_IP_PORT_SCHEMES = frozenset({"ncacn_ip_tcp", "ncacn_http", "ncadg_ip_udp"})
+
+
+def _epm_binding_sort_key(binding: str) -> tuple[int, str]:
+    scheme = binding.partition(":")[0].lower()
+    return _EPM_BINDING_PRIORITY.get(scheme, 3), scheme
+
+
+def _display_epm_binding(binding: str) -> str:
+    scheme, separator, target = binding.partition(":")
+    if separator and scheme.lower() in _EPM_IP_PORT_SCHEMES:
+        host, bracket, port = target.rpartition("[")
+        if bracket and host and port.endswith("]") and port[:-1].isdigit():
+            return f"{scheme}:{host}:{port[:-1]}"
+    return binding
+
+
+def _format_epm_binding(binding: str) -> str:
+    scheme, separator, target = _display_epm_binding(binding).partition(":")
+    if not separator:
+        return f"  {binding}"
+    return f"  {scheme + ':':<15}{target}"
+
+
+def _epm_output_endpoints(endpoints: dict | None) -> dict | None:
+    if endpoints is None:
+        return None
+    return {
+        endpoint: {
+            **item,
+            "Bindings": [
+                _display_epm_binding(binding)
+                for binding in sorted(item["Bindings"], key=_epm_binding_sort_key)
+            ],
+        }
+        for endpoint, item in endpoints.items()
+    }
+
+
 KNOWN_INTERFACE_UUIDS: dict[str, dict[str, str]] = {
     "12345778-1234-abcd-ef00-0123456789ab": {
         "pipe": r"\pipe\lsarpc",
@@ -411,12 +451,18 @@ class MsrpcEngine(_PrintMixin):
 
         lines: list[str] = []
         for endpoint, item in endpoints.items():
+            interface_uuid, version = uuid.string_to_uuidtup(endpoint)
             lines.extend([
-                f"Protocol: {item['Protocol']}",
-                f"Provider: {item['EXE']}",
-                f"UUID: {endpoint} {item['annotation']}".rstrip(),
+                f"{'Protocol:':<17}{item['Protocol']}",
+                f"{'Provider:':<17}{item['EXE']}",
+                f"{'UUID:':<17}{interface_uuid}",
+                f"{'Version:':<17}v{version}",
+                f"{'Name:':<17}{item['annotation']}".rstrip(),
                 "Bindings:",
-                *(f"  {value}" for value in item["Bindings"]),
+                *(
+                    _format_epm_binding(value)
+                    for value in sorted(item["Bindings"], key=_epm_binding_sort_key)
+                ),
                 "",
             ])
         for line in lines:
@@ -1714,7 +1760,7 @@ class MsrpcEngine(_PrintMixin):
             "version": None,
             "vendor": None,
             "description": None,
-            "epmapEndpoints": self.results.EpmapEndpoints,
+            "epmapEndpoints": _epm_output_endpoints(self.results.EpmapEndpoints),
             "epmapEnumeration": self.results.EpmapEnumeration,
             "mgmtEndpoints": self.results.MgmtEndpoints,
             "mgmtInterfaces": self.results.MgmtInterfaces,

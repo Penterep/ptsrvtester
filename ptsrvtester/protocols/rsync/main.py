@@ -12,14 +12,16 @@ Steps to stand up a new protocol ``Rsync``:
   5. Register the protocol in ``ptsrvtester.py`` MODULES: one line
      ``"Rsync": ("ptsrvtester.protocols.Rsync:Rsync", "Rsync testing module")``.
 """
-import argparse
-import socket
+import argparse, socket
 
 from .._base import BaseMain, BaseArgs
 from .utils.cli import RsyncArgs
 from ptsrvtester.protocols.rsync.utils.registry import check_rsync_path
 from ptsrvtester.protocols.rsync.modules.grab_modules import rsync_grab_modules 
 from dataclasses import dataclass
+import sys
+from ptlibs.threads import printlock
+from ptlibs.ptprinthelper import out_if
 
 @dataclass
 class TmpCtx:
@@ -62,6 +64,35 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
         self.target_host = host
         self.target = (ip, target.port)
 
+    
+    def _run_module(self, code: str, discovered, extras: dict) -> None:
+        """Heading now; ``-vv`` live; verdicts when the test finishes."""
+        entry = discovered[code]
+        lock = printlock.PrintLock()
+        ctx = self._make_context(lock, extras)
+        if not self.use_json:
+            def live_debug(string="", *, indent=4):
+                if not ctx.verbose:
+                    return
+                line = out_if(string, "ADDITIONS", True, colortext=True, indent=indent)
+                if line:
+                    sys.stdout.write(line if line.endswith("\n") else line + "\n")
+                    sys.stdout.flush()
+            ctx.debug = live_debug
+        if entry.label.strip() and not self.use_json:
+            sys.stdout.write(out_if(entry.label, "INFO", True, colortext=True) + "\n")
+            sys.stdout.flush()
+        try:
+            entry.module.run(ctx)
+        except Exception as e:
+            ctx.out(f"Error in module {code}: {e}", "ERROR")
+        chunk = lock.get_output_string()
+        if chunk and not self.use_json:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+        with self._lock:
+            self._outputs[code] = "" if not self.use_json else chunk
+    
     def build_context(self) -> dict:
         """Protocol handles injected onto every module's ``ctx`` (besides core fields).
 

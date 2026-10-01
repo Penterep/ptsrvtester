@@ -1,24 +1,5 @@
-import socket, shutil, argparse
-
-
-def receive(sock: socket.socket) -> bytes:
-    data = b""
-
-    while True:
-        try:
-            chunk = sock.recv(8192)
-        except socket.timeout:
-            break
-        if not chunk:
-            break
-        data += chunk
-
-        if b"@RSYNCD: EXIT" in data:
-            break
-        if b"@ERROR" in data:
-            break
-
-    return data
+import shutil
+import subprocess
 
 def check_rsync_path() -> str:
     path = shutil.which("rsync")
@@ -28,36 +9,37 @@ def check_rsync_path() -> str:
 def split_module_list(modules: str) -> list:
     return modules.split(",")
 
-def _sanitize_rsync_data(data: list):
-    if '\n' in data:
-        data.remove('\n')
+def rsync_grab_modules(ctx, printer=True, include_motd=False):
+    rsync_path = check_rsync_path()
+    if rsync_path is None:
+        return []
 
-    for e in data:
-        if "@RSYNCD" in e:
-            data.pop(data.index(e))
+    timeout = getattr(ctx, "timeout", None) or 10
+    port = getattr(ctx, "port", 873)
+    command = [
+        rsync_path,
+        "--list-only",
+        "--no-motd",
+        f"--contimeout={timeout}",
+        f"--timeout={timeout}",
+        f"rsync://{ctx.ip}:{port}/",
+    ]
 
-    return list(filter(None, data))
+    if include_motd:
+        command.remove("--no-motd")
 
-def rsync_grab_modules(ctx, print=True):
     try:
-        with socket.create_connection((ctx.ip, ctx.port), timeout=ctx.timeout) as sock:
-            sock.settimeout(ctx.timeout)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            input="",
+            timeout=timeout + 2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
 
-            data = receive(sock)
-            banner = data.decode(errors="replace")
-
-            if not banner:
-                return
-
-            sock.sendall(b"@RSYNCD: 31.0\n")
-            sock.sendall(b"\n")
-
-            data = receive(sock)
-
-            modules = data.decode(errors="replace")
-
-            modules = _sanitize_rsync_data(modules.split('\n'))
-            return [module.split('\t')[0].strip() for module in modules]
-
-    except Exception as e:
-        return [e]
+    if result.returncode != 0:
+        return []    
+    
+    return [line.strip().split()[0] for line in result.stdout.splitlines() if line.strip()]

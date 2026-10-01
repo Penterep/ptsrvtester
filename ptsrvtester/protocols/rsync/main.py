@@ -99,29 +99,29 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
         Modules read them as ``ctx.<name>``. Return {} if none are needed.
         """
         tests = getattr(self.args, "tests", None)
-        
-        if getattr(self.args, "modules", None) is None:
-            print_module_grab = tests is None or "grab_modules" in tests.lower()
-            
-            if print_module_grab and tests is not None:
-                ts = [t.lower() for t in tests.split(',')]
-                ts.remove("grab_modules")
-                setattr(self.args, "tests", ','.join(ts))
-            
-            modules = rsync_grab_modules(
-                TmpCtx(
-                    self.target[0],
-                    self.target[1],
-                    getattr(self.args, "timeout", None)
-                ),
-                print=print_module_grab
-            )
+        test_codes = {code.strip().upper() for code in tests.split(",")} if tests else set()
+        needs_modules = not test_codes or "ALL" in test_codes or bool(
+            test_codes & {"GRAB_MODULES", "MODULE_AUTH", "WRITE"}
+        )
+        modules = getattr(self.args, "modules", None)
+        if modules is None:
+            modules = []
+            if needs_modules:
+                tmp_ctx = TmpCtx(
+                                        self.target[0],
+                                        self.target[1],
+                                        getattr(self.args, "timeout", None)
+                                    )
+                modules = rsync_grab_modules(
+                    tmp_ctx,
+                    printer=False
+                ) or rsync_grab_modules(tmp_ctx, printer=False, include_motd=True) or []
         
         return {
             "host": self.target_host,
             "ip": self.target[0],
             "port": self.target[1],
             "timeout": getattr(self.args, "timeout", None),
-            "modules": getattr(self.args, "modules", None) or modules,
+            "modules": modules,
             "rsync_path": check_rsync_path()
         }

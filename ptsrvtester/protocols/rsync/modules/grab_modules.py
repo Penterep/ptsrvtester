@@ -1,5 +1,6 @@
 import os
-import socket, subprocess, re
+import subprocess
+import re
 from dataclasses import dataclass
 from ptsrvtester.protocols.rsync.utils.registry import rsync_grab_modules
 
@@ -46,26 +47,6 @@ def _print_modules(modules: list[Module], ctx) -> None:
             ctx.out(f"{entry.permissions} {entry.size:>12} {entry.mtime} {entry.name} {sym}", "TEXT", indent=12, colortext=True)
 
 
-def receive(sock: socket.socket) -> bytes:
-    data = b""
-
-    while True:
-        try:
-            chunk = sock.recv(8192)
-        except socket.timeout:
-            break
-        if not chunk:
-            break
-        data += chunk
-
-        if b"@RSYNCD: EXIT" in data:
-            break
-        if b"@ERROR" in data:
-            break
-
-    return data
-
-
 def list_module_contents(host, module, recursive=False, timeout=15):
     url = f"rsync://{host}/{module}/"
     cmd = ["rsync", "--list-only", "--no-motd"]
@@ -107,23 +88,34 @@ def list_module_contents(host, module, recursive=False, timeout=15):
     return entries 
 
 
+def probe_module_names(ctx, module_names, modules):
+    for module_name in module_names:
+                if ctx.rsync_path is None:
+                    entries = []
+                else:
+                    try:
+                        entries = list_module_contents(
+                            ctx.ip, module_name, timeout=ctx.timeout or 15
+                        )
+                    except subprocess.TimeoutExpired:
+                        ctx.out(f"Timed out listing the '{module_name}' module", "ERROR", indent=8)
+                        entries = []
+                    except RsyncPasswordRequired as e:
+                        ctx.out(str(e), "OK", indent=8)
+                        entries = []
+                modules.append(Module(name=module_name, entries=entries))   
+
+
 def run(ctx):
-    module_names = rsync_grab_modules(ctx)
+    module_names = getattr(ctx, "modules", None)
+    if module_names is None:
+        module_names = rsync_grab_modules(ctx) or rsync_grab_modules(ctx, include_motd=True)
     modules: list[Module] = []
 
     if module_names:
-        for module_name in module_names:
-            if ctx.rsync_path is None:
-                entries = []
-            else:
-                try:
-                    entries = list_module_contents(ctx.ip, module_name)
-                except RsyncPasswordRequired as e:
-                    ctx.out(str(e), "OK", indent=8)
-                    entries = []
-            modules.append(Module(name=module_name, entries=entries))        
+        probe_module_names(ctx, module_names, modules)
     else:
         ctx.out("Could not list modules or server doesn't have any", "OK", indent=4,
-                condition=not ctx.json and print)
+            condition=not ctx.json and print)
     
     _print_modules(modules=modules, ctx=ctx)

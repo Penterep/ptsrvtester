@@ -12,8 +12,9 @@ Steps to stand up a new protocol ``DHCP``:
   5. Register the protocol in ``ptsrvtester.py`` MODULES: one line
      ``"DHCP": ("ptsrvtester.protocols.DHCP:DHCP", "DHCP testing module")``.
 """
-import argparse
-import socket
+import sys
+from ptlibs.threads import printlock
+from ptlibs.ptprinthelper import out_if
 
 from .._base import BaseMain, BaseArgs, BaseModule
 from .utils.cli import DHCPArgs
@@ -44,6 +45,33 @@ class DHCP(BaseMain):
 
         self.interface = self.args.interface
 
+    def _run_module(self, code: str, discovered, extras: dict) -> None:
+        """Heading now; ``-vv`` live; verdicts when the test finishes."""
+        entry = discovered[code]
+        lock = printlock.PrintLock()
+        ctx = self._make_context(lock, extras)
+        if not self.use_json:
+            def live_debug(string="", *, indent=4):
+                if not ctx.verbose:
+                    return
+                line = out_if(string, "ADDITIONS", True, colortext=True, indent=indent)
+                if line:
+                    sys.stdout.write(line if line.endswith("\n") else line + "\n")
+                    sys.stdout.flush()
+            ctx.debug = live_debug
+        if entry.label.strip() and not self.use_json:
+            sys.stdout.write(out_if(entry.label, "INFO", True, colortext=True) + "\n")
+            sys.stdout.flush()
+        try:
+            entry.module.run(ctx)
+        except Exception as e:
+            ctx.out(f"Error in module {code}: {e}", "ERROR")
+        chunk = lock.get_output_string()
+        if chunk and not self.use_json:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+        with self._lock:
+            self._outputs[code] = "" if not self.use_json else chunk
 
     def build_context(self) -> dict:
         """Protocol handles injected onto every module's ``ctx`` (besides core fields).

@@ -14,10 +14,9 @@ __all__ = ['DHCPArgs']
 
 
 DHCP_TEST_GROUPS = [
-    ("Enumeration", ["SERVER_INFO"]),
+    ("Enumeration", ["INFO"]),
     ("Denial-of-Service", ["DENIAL", "STARVATION"]),
-    ("Spoofing", ["ACK", "REQUEST", "ROGUE_DHCP"])
-    
+    ("Spoofing", ["ACK", "REQUEST", "ROGUE"])
 ]
 
 # Per-test definitions:
@@ -27,7 +26,7 @@ DHCP_TEST_GROUPS = [
 #   value     (dest, default) for tests whose flag carries a value (default set if None)
 #   requires  human-readable prerequisite strings (per-test help)
 DHCP_TESTS: dict[str, dict] = {
-    "SERVER_INFO": {
+    "INFO": {
         "desc": "DHCP server enumeration",
         "long": ["Discovers information about a DHCP server"],
         "mods": [
@@ -120,7 +119,7 @@ DHCP_TESTS: dict[str, dict] = {
         ],
         "flags": {"ack": True}
     },
-    "ROGUE_DHCP": {
+    "ROGUE": {
         "desc": "Rogue DHCP server",
         "long": ["Listens for DHCP REQUEST/DISCOVER packets and responds with OFFER/ACK packets and user-defined options"],
         "mods": [

@@ -149,8 +149,11 @@ class MSRPCArgs(BaseArgs):
 
     @staticmethod
     def get_help():
-        tests = ", ".join(MSRPC_TEST_ORDER)
         safe = ", ".join(MSRPC_DEFAULT_SUITE)
+        test_rows = [
+            ["", "", code, str(MSRPC_TESTS[code]["description"])]
+            for code in MSRPC_TEST_ORDER
+        ]
         return [
             {"description": ["MSRPC Testing Module"]},
             {"usage": ["ptsrvtester msrpc -ts <test>[,<test>...] -tg <host> <options>"]},
@@ -166,7 +169,9 @@ class MSRPCArgs(BaseArgs):
                 "ptsrvtester msrpc -ts BRUTETCP -tg 192.168.1.1:49154 --uuid 12345778-1234-abcd-ef00-0123456789ac:1.0 -u auditor -p secret",
             ]},
             {"options": [
-                ["-ts", "--tests", "<test>", f"{tests}; ALL/default safe suite: {safe}"],
+                ["-ts", "--tests", "<test>", "One or more tests, comma-separated; ALL/default runs the safe suite"],
+                ["", "", "ALL", f"Default safe suite: {safe}"],
+                *test_rows,
                 ["-tg", "--target", "<host>", "IPv4 or HOST[:PORT]; defaults: RPC 135, SMB 445, HTTPS RPC Proxy 443"],
                 ["", "--pipe", "<name>", "BRUTEPIPE: pipe to open after SMB login; no RPC bind/call"],
                 ["", "--pipes", "<names>", "ENUMPIPES: names to try opening; not a complete pipe inventory"],

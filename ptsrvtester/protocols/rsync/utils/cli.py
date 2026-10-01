@@ -8,7 +8,8 @@ __all__ = ['RsyncArgs']
 
 
 RSYNC_TEST_GROUPS = [
-    ("General", ["BANNER"])
+    ("Enumeration", ["BANNER", "GRAB_MODULES", "WRITE"]),
+    ("Authentiction & Encryption", ["MODULE_AUTH", "SSH"])
 ]
 
 # Per-test definitions:
@@ -21,8 +22,8 @@ RSYNC_TEST_GROUPS = [
 #   mods      test-specific option rows [short, long, metavar, help] (per-test help)
 RSYNC_TESTS: dict[str, dict] = {
     "BANNER": {
-        "desc": "Grab RSync server banner",
-        "long": "This module grabs the banner of an Rsync server to detect the version of Rsync",
+        "desc": "Grab Rsync server banner",
+        "long": ["This module grabs the banner of an Rsync server to detect the version of Rsync"],
         "flags": {"banner": True},
         "requires": [
           ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
@@ -31,6 +32,53 @@ RSYNC_TESTS: dict[str, dict] = {
             ["-t", "--timeout", "", "Timeout for connections (in seconds)"]
         ],
         "usage": ["-tg 192.168.15.53:387"]
+    },
+    "GRAB_MODULES": {
+        "desc": "Enumerate available Rsync modules",
+        "long": ["Lists available modules and their contents using the rsync client."],
+        "usage": ["-tg 192.168.15.53:387", "-tg 192.168.15.53:387 -m rsync_module"],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "mods": [
+            ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
+            ["-m", "--modules", "", "Specific module to enumerate"]
+        ],
+    },
+    "WRITE": {
+        "desc": "Check module write access",
+        "long": ["Attempts to upload a temporary marker to each module and removes it when possible."],
+        "usage": ["-tg 192.168.15.53:387", "-tg 192.168.15.53:387 -m rsync_module"],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "mods": [
+            ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
+            ["-m", "--modules", "", "Specific module to enumerate"]
+        ],
+    },
+    "MODULE_AUTH": {
+        "desc": "Detect module authentication requirements",
+        "long": ["Checks whether each discovered module can be listed without authentication."],
+        "usage": ["-tg 192.168.15.53:387", "-tg 192.168.15.53:387 -m rsync_module"],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "mods": [
+            ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
+            ["-m", "--modules", "", "Specific module to enumerate"]
+        ],
+    },
+    "SSH": {
+        "desc": "Check for SSH service",
+        "long": ["Checks whether the target accepts SSH connections on TCP port 22."],
+        "usage": ["-tg 192.168.15.53:387"],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "mods": [
+            ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
+        ],
     }
 }
 

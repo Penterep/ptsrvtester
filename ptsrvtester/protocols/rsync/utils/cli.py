@@ -149,7 +149,7 @@ class RsyncArgs(ArgsWithBruteforce):
             "-t",
             "--timeout",
             type=int,
-            default=10,
+            default=3,
             help="Timeout for connections (in seconds)"
         )
 

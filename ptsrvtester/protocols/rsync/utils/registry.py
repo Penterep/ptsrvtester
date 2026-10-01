@@ -14,7 +14,7 @@ def rsync_grab_modules(ctx, printer=True, include_motd=False):
     if rsync_path is None:
         return []
 
-    timeout = getattr(ctx, "timeout", None) or 10
+    timeout = getattr(ctx, "timeout", None) or 3
     port = getattr(ctx, "port", 873)
     command = [
         rsync_path,

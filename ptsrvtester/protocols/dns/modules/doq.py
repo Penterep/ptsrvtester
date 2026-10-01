@@ -38,7 +38,7 @@ def run(ctx):
         ctx.out("DoQ/853 available — DNS over QUIC answers (QUIC mandates TLS 1.3).", "OK", indent=4)
         if tt.is_ip(host):
             ctx.out("Target is an IP address — pass the full hostname (-tg <fqdn>) to validate the "
-                    "certificate name.", "TEXT", indent=4)
+                    "certificate name.", "ADDITIONS", colortext=True, indent=4)
         with ctx.results_lock:
             ctx.properties["doq"] = "available (TLS 1.3 / QUIC)"
     except Exception as e:

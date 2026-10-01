@@ -171,7 +171,7 @@ def report_tls(ctx, proto: str, host: str, probe: TlsProbe) -> None:
 
     if is_ip(host):
         ctx.out("Target is an IP address — pass the full hostname (-tg <fqdn>) to validate the "
-                "certificate name; against an IP it can only match an IP-SAN.", "TEXT", indent=4)
+                "certificate name; against an IP it can only match an IP-SAN.", "ADDITIONS", colortext=True, indent=4)
 
     if weak:
         ctx.out(f"Weak TLS version negotiated: {probe.tls_version}.", "VULN", indent=4)

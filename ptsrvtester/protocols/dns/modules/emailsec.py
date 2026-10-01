@@ -64,7 +64,7 @@ def run(ctx):
             for selector, record in info.dkim.items():
                 ctx.out(f"DKIM     {selector}._domainkey: {record[:80]}{'…' if len(record) > 80 else ''}", "OK", indent=8)
         else:
-            ctx.out(f"DKIM     none found for tried selectors ({len(selectors)}); may use custom selectors", "TEXT", indent=8)
+            ctx.out(f"DKIM     none found for tried selectors ({len(selectors)}); may use custom selectors", "ADDITIONS", colortext=True, indent=8)
 
         summary[domain] = {
             "spf": info.spf, "spf_all": info.spf_all,

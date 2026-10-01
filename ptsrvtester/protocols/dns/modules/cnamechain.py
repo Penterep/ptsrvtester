@@ -32,11 +32,13 @@ def run(ctx):
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
         names = [domain] + [f"{l}.{domain.rstrip('.')}" for l in labels]
+        any_cname = False
         for name in names:
             res = ig.cname_chain(resolver, name)
             hops = len(res.chain) - 1
             if hops == 0:
                 continue
+            any_cname = True
             arrow = " → ".join(res.chain)
             if res.loop:
                 ctx.out(f"CNAME LOOP: {arrow}", "VULN", indent=8)
@@ -46,6 +48,8 @@ def run(ctx):
                 _finding(ctx, name, f"{hops} hops", arrow)
             else:
                 ctx.out(f"CNAME chain ({hops} hop{'s' if hops != 1 else ''}): {arrow}", "TEXT", indent=8)
+        if not any_cname:
+            ctx.out("No CNAME records among the checked names — nothing to follow.", "OK", indent=8)
 
 
 def _finding(ctx, name, kind, arrow):

@@ -34,10 +34,10 @@ def run(ctx):
     if open_resolver:
         role = "Recursive resolver — open to this client"
         ctx.out("Recursive/open resolver (resolves external names for us); "
-                "see the RECURSION and AMPLIFICATION tests for the abuse findings.", "INFO",
-                colortext=True, indent=4)
+                "see the RECURSION and AMPLIFICATION tests for the abuse findings.",
+                "ADDITIONS", colortext=True, indent=4)
         ctx.out("Note: a full recursive resolver and a forwarder cannot be reliably "
-                "distinguished remotely.", "TEXT", indent=4)
+                "distinguished remotely.", "ADDITIONS", colortext=True, indent=4)
     elif info.recursion_available:
         role = "Recursion advertised but not resolving for us (possibly restricted by ACL)"
         ctx.out(role, "TEXT", indent=4)

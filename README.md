@@ -38,7 +38,12 @@ ptsrvtester ftp -ts BANNER,CMD,ANON -tg 127.0.0.1
 ptsrvtester ftp -ts ALL -tg 127.0.0.1
 ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1
 ptsrvtester ftp -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:21
+ptsrvtester rdp -ts VERSION,OSDETECT -tg 192.168.1.10
+ptsrvtester rdp -ts OSDETECT -h
+ptsrvtester rdp -ts AUTH -tg 192.168.1.10 -u auditor -p
 ptsrvtester msrpc -ts ALL -tg 192.168.1.10
+ptsrvtester msrpc -ts BRUTESMB -tg 192.168.1.10 -u auditor -p
+ptsrvtester msrpc -ts BRUTESMB -tg 192.168.1.10 -u auditor -p ""
 ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.10 -u auditor -p secret
 ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.10 -u auditor -p secret
 ptsrvtester msrpc -ts SAMRGROUPS -tg 192.168.1.10 -u auditor -p secret
@@ -112,6 +117,7 @@ ptsrvtester <module> -h     for help for module use
 - SAM user, group and membership enumeration
 - User account details and logon statistics
 - Named-pipe, SMB, RPC/TCP and RPC-over-HTTP credential testing
+- Live credential-test progress with the current username/password, completed attempt count and completion percentage
 
 **UPnP/SSDP Module**
 - Targeted IPv4/IPv6 SSDP discovery and multicast search
@@ -194,10 +200,12 @@ ptsrvtester <module> -h     for help for module use
 
 **RDP Module**
 - TLS and certificate inspection
-- RDP version detection with approximate Windows OS hints
+- RDP protocol version detection
+- Separate OS detection with approximate Windows OS candidates
 - NLA and CredSSP detection
 - Security protocol detection
 - Legacy RDP encryption testing
+- Live BRUTE progress with the current username/password, completed attempt count and completion percentage
 - NTLM information disclosure
 - Server capability enumeration
 - NLA/CredSSP password authentication through NTLM and Kerberos

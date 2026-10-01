@@ -60,14 +60,15 @@ def text_or_file(
 ) -> list[str]:
     """Read direct values or a wordlist, optionally preserving password whitespace.
 
-    Empty values are excluded. Password wordlists remove only CR/LF line
+    Direct passwords preserve an explicitly empty value. Empty usernames and
+    wordlist lines are excluded. Password wordlists remove only CR/LF line
     separators, so a line containing spaces is a password, not a blank line.
     """
     if text is not None:
         value = str(text)
         if not preserve_whitespace:
             value = value.strip()
-        return [value] if value else []
+        return [value] if value or preserve_whitespace else []
     if filepath is None:
         return []
 

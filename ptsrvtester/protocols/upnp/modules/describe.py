@@ -9,7 +9,7 @@ def run(ctx) -> None:
     devices = ctx.engine.describe()
     ctx.out(
         f"Descriptions: {len(devices)} ({ctx.engine.description_status})",
-        "TEXT",
+        "TEXT" if ctx.engine.description_status in ("complete",) else "TITLE",
         indent=4,
     )
     for item in devices:
@@ -26,4 +26,5 @@ def run(ctx) -> None:
             ctx.out(f"LOCATION={location}", "TEXT", indent=12)
         else:
             error = repr((item.get("error") or item["status"])[:160])
-            ctx.out(f"{location}: {item['status']} ({error})", "WARNING", indent=8)
+            ctx.out(f"{location}: {item['status']} ({error})", "TITLE", indent=8)
+        ctx.out()

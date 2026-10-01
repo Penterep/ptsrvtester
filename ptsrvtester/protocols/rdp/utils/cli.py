@@ -67,6 +67,7 @@ RDP_TEST_ORDER = (
     "RDPENC",
     "CAPABIL",
     "VERSION",
+    "OSDETECT",
     "SSL",
     "NTLMINFO",
     "AUTH",
@@ -104,18 +105,28 @@ _RDP_TEST_HELP = {
         "detail": "Read Basic Settings and channel negotiation; credentials can expose additional session capabilities.",
         "options": (
             ["-u", "--user", "<name>", "Login for authenticated capability exchange"],
-            ["-p", "--password", "<password>", "Password for authenticated capability exchange"],
+            ["-p", "--password", "[password]", "Password for authenticated capability exchange"],
             ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
         ),
     },
     "VERSION": {
         "description": "Read the server's RDP protocol version",
-        "detail": "Use Server Core Data, with an authenticated fallback if credentials are supplied; report the possible OS family.",
+        "detail": "Read Server Core Data, with an authenticated fallback if credentials are supplied.",
         "options": (
             ["-u", "--user", "<name>", "Login for the authenticated fallback"],
-            ["-p", "--password", "<password>", "Password for the authenticated fallback"],
+            ["-p", "--password", "[password]", "Password for the authenticated fallback"],
             ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
         ),
+    },
+    "OSDETECT": {
+        "description": "Report typical Windows OS candidates",
+        "detail": "Use the advertised RDP family to report possible Windows releases; this does not uniquely identify the OS.",
+        "options": (
+            ["-u", "--user", "<name>", "Login for the authenticated fallback"],
+            ["-p", "--password", "[password]", "Password for the authenticated fallback"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+        "examples": ("ptsrvtester rdp -tg 192.168.1.10 -ts VERSION,OSDETECT",),
     },
     "SSL": {
         "description": "Inspect RDP TLS configuration",
@@ -132,7 +143,7 @@ _RDP_TEST_HELP = {
         "usage_args": " -u <name> -p <password>",
         "options": (
             ["-u", "--user", "<name>", "Username to authenticate"],
-            ["-p", "--password", "<password>", "Password to authenticate"],
+            ["-p", "--password", "[password]", "Password to authenticate"],
             ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
         ),
     },
@@ -144,7 +155,7 @@ _RDP_TEST_HELP = {
         "options": (
             ["", "--auth-methods", "<method>", "ntlm and/or kerberos (default: both)"],
             ["-u", "--user", "<name>", "Username for a credentialed attempt"],
-            ["-p", "--password", "<password>", "Password for a credentialed attempt"],
+            ["-p", "--password", "[password]", "Password for a credentialed attempt"],
             ["", "--realm", "<realm>", "Kerberos realm/domain"],
             ["", "--kdc", "<ip>", "Kerberos KDC IP address"],
             ["", "--spn-host", "<host>", "Hostname for the RDP service SPN"],
@@ -158,7 +169,7 @@ _RDP_TEST_HELP = {
         "usage_args": " -u <known-user> --allow-auth-failures",
         "options": (
             ["-u", "--user", "<name>", "Known valid username for the baseline"],
-            ["-p", "--password", "<password>", "Optional valid password to verify the baseline"],
+            ["-p", "--password", "[password]", "Optional valid password to verify the baseline"],
             ["-U", "--users", "<wordlist>", "UTF-8 file with candidate usernames"],
             ["", "--allow-auth-failures", "", "Allow intentional failed logins"],
             ["", "--guess-delay-ms", "<ms>", "Delay between attempts (default: 100)"],
@@ -180,7 +191,7 @@ _RDP_TEST_HELP = {
             ["", "--guess-delay-ms", "<ms>", "Delay between attempts (default: 100)"],
             ["-u", "--user", "<name> ...", "Username candidates"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "<password>", "One password candidate"],
+            ["-p", "--password", "[password]", "One password candidate"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--lockout-test", "", "May lock the supplied disposable account; no wordlists"],
             ["", "--lockout-attempts", "<count>", "Disposable-account attempts (default: 3; range: 1-20)"],
@@ -232,6 +243,10 @@ def _rdp_test_help(codes: list[str]):
             help_data.append({"requires": list(spec["requires"])})
         if spec.get("options"):
             help_data.append({"test_options": list(spec["options"])})
+        if any(row[0] == "-p" for row in spec.get("options", ())):
+            help_data.append({"note": [
+                "Use -p/--password without a value to supply an empty password."
+            ]})
         usage_args = spec.get("usage_args", "")
         help_data.append({"usage": [f"ptsrvtester rdp -ts {requested}{usage_args} -tg <host>"]})
         if spec.get("examples"):
@@ -366,6 +381,7 @@ class RDPArgs(BaseArgs):
                 ["", "", "RDPENC", "Security protocols and RDP encryption enumeration"],
                 ["", "", "CAPABIL", "RDP capability negotiation"],
                 ["", "", "VERSION", "RDP protocol version reported by the server"],
+                ["", "", "OSDETECT", "Typical Windows OS candidates from the RDP family"],
                 ["", "", "SSL", "TLS/RDP Security configuration test"],
                 ["", "", "NTLMINFO", "Pre-auth CredSSP/NTLM server information test"],
                 ["", "", "INFO", "Alias for NTLMINFO"],
@@ -376,7 +392,7 @@ class RDPArgs(BaseArgs):
                 ["", "", "RATELIMIT", "RDP connection limiting test"],
                 ["-u", "--user", "<name> …", "Username(s) for account-based tests"],
                 ["-U", "--users", "<wordlist>", "Username wordlist for USERENUM or BRUTE"],
-                ["-p", "--password", "<password>", "Password for account-based tests"],
+                ["-p", "--password", "[password]", "Password; omit value for an empty password"],
                 ["-P", "--passwords", "<wordlist>", "Password wordlist for BRUTE"],
                 ["", "--auth-methods", "<method>", "AUTHMETHODS subset: ntlm kerberos"],
                 ["", "--realm", "<realm>", "Kerberos realm/domain"],
@@ -400,6 +416,7 @@ class RDPArgs(BaseArgs):
                 ["-vv", "--verbose", "", "Enable verbose mode"],
             ]},
             {"note": [
+                "Use -p/--password without a value to supply an empty password.",
                 (
                     "When -ts/--tests is omitted, all safe pre-auth tests are "
                     "executed; AUTH is also executed when both credentials are "
@@ -480,7 +497,7 @@ class RDPArgs(BaseArgs):
             metavar="TEST",
             help=(
                 "tests to run: NLA, RDPSEC, CREDSSP, RDPENC, CAPABIL, "
-                "VERSION, SSL, NTLMINFO, INFO, AUTH, AUTHMETHODS, USERENUM, BRUTE, "
+                "VERSION, OSDETECT, SSL, NTLMINFO, INFO, AUTH, AUTHMETHODS, USERENUM, BRUTE, "
                 "RATELIMIT; use 'rdp -ts <TEST> -h' for details"
             ),
         )
@@ -500,7 +517,13 @@ class RDPArgs(BaseArgs):
             dest="brute_users",
             help=argparse.SUPPRESS,
         )
-        parser.add_argument("-p", "--password", help="password for account-based tests")
+        parser.add_argument(
+            "-p", "--password",
+            nargs="?",
+            const="",
+            default=None,
+            help="password for account-based tests (omit value for an empty password)",
+        )
         parser.add_argument(
             "-U",
             "--users",

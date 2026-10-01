@@ -39,6 +39,8 @@ except ModuleNotFoundError as exc:  # transitional compatibility before base reb
         raise
     from ptsrvtester.modules._base import BaseArgs, BaseModule, Out
 
+from ptsrvtester.protocols._shared.utils.progress import CredentialProgress
+
 from .auth_analysis import (
     MAX_BRUTE_ATTEMPTS,
     AccountLockoutConfig,
@@ -184,8 +186,8 @@ ENCRYPTION_LEVEL_ASSESSMENTS = {
     0x00000000: "error",
     0x00000001: "error",
     0x00000002: "error",
-    0x00000003: "warning",
-    0x00000004: "warning",
+    0x00000003: "error",
+    0x00000004: "error",
 }
 
 SERVER_RDP_VERSION_NAMES = {
@@ -490,11 +492,37 @@ class RDPVersionResult:
     error: str | None = None
 
 
+class RDPAuthCertificateError(RuntimeError):
+    """An authenticated connection failed its pinned certificate check."""
+
+
+class TLSHandshakeError(str):
+    """Retain the failure type without changing the handshake's string API."""
+
+    outcome: AuthOutcome
+
+    def __new__(cls, error: object, outcome: AuthOutcome) -> TLSHandshakeError:
+        instance = super().__new__(cls, str(error))
+        instance.outcome = outcome
+        return instance
+
+
+def _auth_failure_outcome(error: object) -> AuthOutcome:
+    if isinstance(error, (ssl.SSLCertVerificationError, RDPAuthCertificateError)):
+        return AuthOutcome.TLS_ERROR
+    if isinstance(error, TimeoutError):
+        return AuthOutcome.TIMEOUT
+    if isinstance(error, (OSError, EOFError, RDPProtocolError)):
+        return AuthOutcome.TRANSPORT_ERROR
+    return AuthOutcome.ERROR
+
+
 @dataclass(frozen=True)
 class AuthTLSValidationResult:
     status: str
     certificate_sha256: str | None = None
     error: str | None = None
+    failure_outcome: AuthOutcome | None = None
 
 
 @dataclass(frozen=True)
@@ -514,6 +542,7 @@ class AuthenticatedSessionResult:
     tls_verification: str | None = None
     certificate_sha256: str | None = None
     error: str | None = None
+    communication_error: bool = False
 
 
 @dataclass
@@ -690,6 +719,7 @@ class RDPResults:
     rdp_encryption: RDPEncryptionResult | None = None
     capabilities: CapabilityResult | None = None
     version: RDPVersionResult | None = None
+    os_detection: RDPVersionResult | None = None
     ntlm_info: NTLMInfoResult | None = None
     ssl: SSLResult | None = None
     auth: RDPAuthResult | None = None
@@ -927,10 +957,10 @@ def _aardwolf_probe_channel_types(
 def _aardwolf_peer_certificate_sha256(connection) -> str:
     transport = getattr(connection, "_RDPConnection__connection", None)
     if transport is None:
-        raise RuntimeError("aardwolf TLS transport is unavailable")
+        raise RDPAuthCertificateError("aardwolf TLS transport is unavailable")
     fingerprint = _certificate_sha256(transport.get_peer_certificate())
     if fingerprint is None:
-        raise RuntimeError("RDP server did not provide a TLS certificate")
+        raise RDPAuthCertificateError("RDP server did not provide a TLS certificate")
     return fingerprint
 
 
@@ -940,7 +970,7 @@ def _verify_aardwolf_peer_certificate(
 ) -> str:
     actual_fingerprint = _aardwolf_peer_certificate_sha256(connection)
     if not hmac.compare_digest(actual_fingerprint, expected_certificate_sha256):
-        raise RuntimeError(
+        raise RDPAuthCertificateError(
             "RDP TLS certificate changed between validation and authentication"
         )
     return actual_fingerprint
@@ -1048,8 +1078,17 @@ async def _connect_aardwolf_session(
         requested_channels,
     )
     if not connected or connect_error is not None:
+        outcome = _auth_failure_outcome(connect_error)
+        communication_error = outcome in {
+            AuthOutcome.TIMEOUT, AuthOutcome.TRANSPORT_ERROR,
+        }
         return AuthenticatedSessionResult(
-            status="failed",
+            status=(
+                outcome.value
+                if communication_error or outcome is AuthOutcome.TLS_ERROR
+                else "failed"
+            ),
+            communication_error=communication_error,
             selected_protocol=selected_protocol,
             server_core=server_core,
             channel_ids=channel_ids,
@@ -1162,8 +1201,13 @@ def _run_aardwolf_authenticated_session(
             error=_sanitize_auth_error(exc, password, login),
         )
     except Exception as exc:
+        outcome = _auth_failure_outcome(exc)
+        communication_error = outcome in {
+            AuthOutcome.TIMEOUT, AuthOutcome.TRANSPORT_ERROR,
+        }
         return AuthenticatedSessionResult(
-            status="error",
+            status=outcome.value if communication_error else "error",
+            communication_error=communication_error,
             error=_sanitize_auth_error(exc, password, login),
         )
 
@@ -1233,9 +1277,20 @@ def _certificate_is_self_signed(cert: x509.Certificate) -> bool:
     return True
 
 
-def _recvall(sock: socket.socket, length: int) -> bytes:
+def _deadline_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("RDP negotiation timed out")
+    return remaining
+
+
+def _recvall(
+    sock: socket.socket, length: int, *, deadline: float | None = None,
+) -> bytes:
     data = bytearray()
     while len(data) < length:
+        if deadline is not None:
+            sock.settimeout(_deadline_timeout(deadline))
         chunk = sock.recv(length - len(data))
         if not chunk:
             raise RDPProtocolError("connection closed before full response was received")
@@ -1250,14 +1305,14 @@ def _build_negotiation_request(protocols: int) -> bytes:
     return tpkt + x224_cr
 
 
-def _read_tpkt(sock: socket.socket) -> bytes:
-    header = _recvall(sock, 4)
+def _read_tpkt(sock: socket.socket, *, deadline: float | None = None) -> bytes:
+    header = _recvall(sock, 4, deadline=deadline)
     version, _reserved, length = struct.unpack(">BBH", header)
     if version != 3:
         raise RDPProtocolError(f"invalid TPKT version {version}")
     if length < 7:
         raise RDPProtocolError(f"invalid TPKT length {length}")
-    return header + _recvall(sock, length - 4)
+    return header + _recvall(sock, length - 4, deadline=deadline)
 
 
 def _read_der_message(sock: socket.socket) -> bytes:
@@ -2075,10 +2130,12 @@ class RDP(BaseModule):
         self.args.insecure_auth = bool(getattr(args, "insecure_auth", False))
         self.ptjsonlib = ptjsonlib
         self.use_json = getattr(args, "json", False)
+        self._active_brute_progress: CredentialProgress | None = None
         self.results = RDPResults()
         self.timeout_seconds = args.timeout / 1000.0
         self.connect_host = getattr(args, "_rdp_resolved_ip", args.target.ip)
         self._security_probes: list[NegotiationProbe] | None = None
+        self._service_preflight_probe: NegotiationProbe | None = None
         self._basic_settings_result: BasicSettingsResult | None = None
         self._ntlm_info_preflight_result: NTLMInfoResult | None = None
         self._auth_tls_validation_result: AuthTLSValidationResult | None = None
@@ -2138,7 +2195,9 @@ class RDP(BaseModule):
         elif canonical == "CAPABIL":
             self.results.capabilities = self._run_capability_test()
         elif canonical == "VERSION":
-            self.results.version = self._run_version_test()
+            self.results.version = self._get_version_result()
+        elif canonical == "OSDETECT":
+            self.results.os_detection = self._get_version_result()
         elif canonical == "NTLMINFO":
             self.results.ntlm_info = self._get_ntlm_info_preflight()
         elif canonical == "SSL":
@@ -2194,6 +2253,7 @@ class RDP(BaseModule):
             "RDPENC": ("RDP security and encryption enumeration", self.results.rdp_encryption, self._output_rdp_encryption_text),
             "CAPABIL": ("RDP capabilities", self.results.capabilities, self._output_capabilities_text),
             "VERSION": ("RDP protocol version", self.results.version, self._output_version_text),
+            "OSDETECT": ("OS detection", self.results.os_detection, self._output_os_detection_text),
             "SSL": ("TLS / SSL configuration test", self.results.ssl, self._output_ssl_text),
             "NTLMINFO": ("RDP NTLM information", self.results.ntlm_info, self._output_ntlminfo_text),
             "AUTH": ("RDP authentication test", self.results.auth, self._output_auth_text),
@@ -2277,15 +2337,23 @@ class RDP(BaseModule):
         )
         fingerprint = _certificate_sha256(cert_der)
         if error is not None or fingerprint is None:
-            detail = error or "RDP server did not provide a TLS certificate"
-            if not self.args.insecure_auth:
+            detail = str(error or "RDP server did not provide a TLS certificate")
+            outcome = (
+                error.outcome
+                if isinstance(error, TLSHandshakeError)
+                else AuthOutcome.TLS_ERROR
+            )
+            if outcome is AuthOutcome.TLS_ERROR and not self.args.insecure_auth:
                 detail = (
                     f"RDP TLS certificate validation failed: {detail}. "
                     "Use --insecure-auth only for an explicitly trusted test target"
                 )
+            elif outcome in {AuthOutcome.TIMEOUT, AuthOutcome.TRANSPORT_ERROR}:
+                detail = f"RDP TLS handshake failed: {detail}"
             self._auth_tls_validation_result = AuthTLSValidationResult(
                 status="error",
                 error=detail,
+                failure_outcome=outcome,
             )
             return self._auth_tls_validation_result
 
@@ -2311,8 +2379,12 @@ class RDP(BaseModule):
             tls_validation.status == "error"
             or tls_validation.certificate_sha256 is None
         ):
+            outcome = tls_validation.failure_outcome or AuthOutcome.TLS_ERROR
             self._authenticated_session_result = AuthenticatedSessionResult(
-                status="tls_error",
+                status=outcome.value,
+                communication_error=outcome in {
+                    AuthOutcome.TIMEOUT, AuthOutcome.TRANSPORT_ERROR,
+                },
                 error=tls_validation.error,
             )
             return self._authenticated_session_result
@@ -2408,6 +2480,7 @@ class RDP(BaseModule):
             tls_verification=session.tls_verification,
             certificate_sha256=session.certificate_sha256,
             error=session.error,
+            communication_error=session.communication_error,
         )
 
     def _run_fresh_auth_attempt(
@@ -2430,7 +2503,7 @@ class RDP(BaseModule):
                 mechanism=mechanism,
                 credential_kind=CredentialKind.PASSWORD,
                 credential_source=credential_source,
-                outcome=AuthOutcome.TLS_ERROR,
+                outcome=tls_validation.failure_outcome or AuthOutcome.TLS_ERROR,
                 phase=AuthPhase.TLS,
                 duration_ms=max(0.0, (time.perf_counter() - started) * 1000.0),
                 error=tls_validation.error,
@@ -2615,6 +2688,17 @@ class RDP(BaseModule):
                         "the authentication attempt indicated blocking, but the "
                         "reported status was not decoded directly from a CredSSP "
                         "server response"
+                    )
+            elif attempt.outcome in {
+                AuthOutcome.TIMEOUT, AuthOutcome.TRANSPORT_ERROR,
+                AuthOutcome.TLS_ERROR,
+            }:
+                status = attempt.outcome.value
+                reason = self._auth_attempt_status_reason(attempt)
+                if ntlm_negotiable:
+                    reason = (
+                        "the server returned an NTLM Type 2 challenge; "
+                        f"the fresh credential attempt could not complete: {reason}"
                     )
             elif ntlm_negotiable:
                 if attempt.outcome is AuthOutcome.REJECTED:
@@ -2825,6 +2909,7 @@ class RDP(BaseModule):
         self,
         *,
         progress_callback: Callable[[int, int, str, str], None] | None = None,
+        completion_callback: Callable[[int, int, str, str], None] | None = None,
     ) -> RDPCredentialGuessResult:
         try:
             direct_users = getattr(self.args, "brute_users", ()) or ()
@@ -2921,135 +3006,156 @@ class RDP(BaseModule):
 
         performed = 0
         progress_total = min(base.pair_count, limit)
-        # Password-first ordering distributes each password across the users.
-        for password_index, password in enumerate(passwords, 1):
-            for user_index, user in enumerate(users, 1):
-                if performed == limit:
-                    return replace(
-                        base,
-                        status="partial",
-                        reason="attempt limit reached before all candidate pairs",
-                        attempts_performed=performed,
-                        stopped_early=True,
-                    )
-                if performed and delay_ms:
-                    time.sleep(delay_ms / 1000.0)
-                if progress_callback is not None:
-                    progress_callback(performed + 1, progress_total, user, password)
-                performed += 1
-                try:
-                    attempt = self._run_fresh_auth_attempt(
-                        user,
-                        password,
-                        mechanism=AuthMechanism.NTLM,
-                        credential_source=CredentialSource.PROVIDED,
-                    )
-                except Exception as exc:
-                    return replace(
-                        base,
-                        status="error",
-                        reason=f"authentication probe raised {type(exc).__name__}",
-                        attempts_performed=performed,
-                        stopped_early=True,
-                    )
+        with self._brute_progress_session(progress_total):
+            # Password-first ordering distributes each password across the users.
+            for password_index, password in enumerate(passwords, 1):
+                for user_index, user in enumerate(users, 1):
+                    if performed == limit:
+                        return replace(
+                            base,
+                            status="partial",
+                            reason="attempt limit reached before all candidate pairs",
+                            attempts_performed=performed,
+                            stopped_early=True,
+                        )
+                    if performed and delay_ms:
+                        time.sleep(delay_ms / 1000.0)
+                    if progress_callback is not None:
+                        progress_callback(performed + 1, progress_total, user, password)
+                    performed += 1
+                    try:
+                        attempt = self._run_fresh_auth_attempt(
+                            user,
+                            password,
+                            mechanism=AuthMechanism.NTLM,
+                            credential_source=CredentialSource.PROVIDED,
+                        )
+                    except Exception as exc:
+                        return replace(
+                            base,
+                            status="error",
+                            reason=f"authentication probe raised {type(exc).__name__}",
+                            attempts_performed=performed,
+                            stopped_early=True,
+                        )
+                    finally:
+                        if completion_callback is not None:
+                            completion_callback(performed, progress_total, user, password)
 
-                if not isinstance(attempt, FreshAuthAttemptResult):
-                    return replace(
-                        base,
-                        status="error",
-                        reason="authentication probe returned an invalid result",
-                        attempts_performed=performed,
-                        stopped_early=True,
-                    )
-                code = attempt.server_error_code
-                if (
-                    attempt.server_error_from_credssp
-                    and isinstance(code, int)
-                    and code & 0xFFFFFFFF == 0xC0000234
-                ):
-                    return replace(
-                        base,
-                        status="account_locked",
-                        reason="server reported account lockout; attempts stopped",
-                        attempts_performed=performed,
-                        server_block_observed=True,
-                        stopped_early=performed < base.pair_count,
-                    )
-                if (
-                    attempt.server_error_from_credssp
-                    and isinstance(code, int)
-                    and code & 0xFFFFFFFF == 0xC0000418
-                ):
-                    return replace(
-                        base,
-                        status="not_applicable",
-                        reason="the server disables NTLM authentication",
-                        attempts_performed=performed,
-                        stopped_early=performed < base.pair_count,
-                    )
-                if attempt.outcome is AuthOutcome.AUTHENTICATED:
-                    return replace(
-                        base,
-                        status="authenticated",
-                        reason="CredSSP accepted one candidate pair",
-                        attempts_performed=performed,
-                        matched_user_index=user_index,
-                        matched_password_index=password_index,
-                        matched_username=user,
-                        matched_password=password,
-                        stopped_early=performed < base.pair_count,
-                    )
-                if attempt.outcome is AuthOutcome.REJECTED:
-                    continue
-                if attempt.outcome is AuthOutcome.BLOCKED:
-                    status = "blocked"
-                    reason = "server blocked authentication; attempts stopped"
-                elif attempt.outcome is AuthOutcome.NOT_SUPPORTED:
-                    status = "not_applicable"
-                    reason = "server did not support NTLM CredSSP authentication"
-                else:
-                    status = "inconclusive"
-                    reason = (
-                        "authentication probe did not complete reliably; "
-                        "attempts stopped"
-                    )
-                return replace(
-                    base,
-                    status=status,
-                    reason=reason,
-                    attempts_performed=performed,
-                    server_block_observed=(
-                        status == "blocked"
-                        and attempt.server_error_from_credssp
+                    if not isinstance(attempt, FreshAuthAttemptResult):
+                        return replace(
+                            base,
+                            status="error",
+                            reason="authentication probe returned an invalid result",
+                            attempts_performed=performed,
+                            stopped_early=True,
+                        )
+                    code = attempt.server_error_code
+                    if (
+                        attempt.server_error_from_credssp
                         and isinstance(code, int)
                         and code & 0xFFFFFFFF == 0xC0000234
-                    ),
-                    stopped_early=performed < base.pair_count,
-                )
+                    ):
+                        return replace(
+                            base,
+                            status="account_locked",
+                            reason="server reported account lockout; attempts stopped",
+                            attempts_performed=performed,
+                            server_block_observed=True,
+                            stopped_early=performed < base.pair_count,
+                        )
+                    if (
+                        attempt.server_error_from_credssp
+                        and isinstance(code, int)
+                        and code & 0xFFFFFFFF == 0xC0000418
+                    ):
+                        return replace(
+                            base,
+                            status="not_applicable",
+                            reason="the server disables NTLM authentication",
+                            attempts_performed=performed,
+                            stopped_early=performed < base.pair_count,
+                        )
+                    if attempt.outcome is AuthOutcome.AUTHENTICATED:
+                        return replace(
+                            base,
+                            status="authenticated",
+                            reason="CredSSP accepted one candidate pair",
+                            attempts_performed=performed,
+                            matched_user_index=user_index,
+                            matched_password_index=password_index,
+                            matched_username=user,
+                            matched_password=password,
+                            stopped_early=performed < base.pair_count,
+                        )
+                    if attempt.outcome is AuthOutcome.REJECTED:
+                        continue
+                    if attempt.outcome is AuthOutcome.BLOCKED:
+                        status = "blocked"
+                        reason = "server blocked authentication; attempts stopped"
+                    elif attempt.outcome is AuthOutcome.NOT_SUPPORTED:
+                        status = "not_applicable"
+                        reason = "server did not support NTLM CredSSP authentication"
+                    else:
+                        status = "inconclusive"
+                        reason = (
+                            "authentication probe did not complete reliably; "
+                            "attempts stopped"
+                        )
+                    return replace(
+                        base,
+                        status=status,
+                        reason=reason,
+                        attempts_performed=performed,
+                        server_block_observed=(
+                            status == "blocked"
+                            and attempt.server_error_from_credssp
+                            and isinstance(code, int)
+                            and code & 0xFFFFFFFF == 0xC0000234
+                        ),
+                        stopped_early=performed < base.pair_count,
+                    )
 
-        return replace(
-            base,
-            status="not_found",
-            reason="no candidate pair was accepted in the tested sample",
-            attempts_performed=performed,
-        )
+            return replace(
+                base,
+                status="not_found",
+                reason="no candidate pair was accepted in the tested sample",
+                attempts_performed=performed,
+            )
+
+    @contextmanager
+    def _brute_progress_session(self, total: int):
+        progress = CredentialProgress("BRUTE", total, enabled=not self.use_json)
+        self._active_brute_progress = progress
+        try:
+            yield
+        finally:
+            self._active_brute_progress = None
+            progress.finish()
 
     def _emit_brute_progress(
         self, index: int, total: int, login: str, password: str
     ) -> None:
-        """Show each active probe immediately in text mode."""
-        if self.use_json:
-            return
-        percent = index * 100 // total
-        self._print_status(
-            f"BRUTE {percent}% ({index}/{total}) trying "
-            f"{login!r} / {password!r}",
-            Out.TITLE,
-        )
+        """Show the active pair before it counts as completed work."""
+        if self._active_brute_progress is not None:
+            self._active_brute_progress.update(
+                index - 1, username=login, password=password,
+                status="testing",
+            )
+
+    def _complete_brute_progress(
+        self, index: int, total: int, login: str, password: str
+    ) -> None:
+        if self._active_brute_progress is not None:
+            self._active_brute_progress.update(
+                index, username=login, password=password,
+                status="completed",
+            )
 
     def _run_brute_protection_candidates(self) -> RDPBruteProtectionResult:
         guess = self._run_credential_guessing_test(
             progress_callback=self._emit_brute_progress,
+            completion_callback=self._complete_brute_progress,
         )
         recovery: NegotiationProbe | None = None
         if guess.server_block_observed:
@@ -3185,93 +3291,92 @@ class RDP(BaseModule):
 
         def fresh(login: str, password: str) -> FreshAuthAttemptResult:
             nonlocal progress_index
-            if lockout_enabled:
-                progress_index += 1
-                self._emit_brute_progress(
-                    progress_index, progress_total, login, password
-                )
+            progress_index += 1
+            self._emit_brute_progress(
+                progress_index, progress_total, login, password
+            )
             source = (
                 CredentialSource.PROVIDED
                 if login == self.args.login and password == self.args.password
                 else CredentialSource.GENERATED
             )
-            return self._run_fresh_auth_attempt(
-                login,
-                password,
-                mechanism=AuthMechanism.NTLM,
-                credential_source=source,
-            )
-
-        valid_baseline: FreshAuthAttemptResult | None = None
-        valid_final: FreshAuthAttemptResult | None = None
-        if self.args.login is not None and self.args.password is not None:
-            valid_baseline = fresh(self.args.login, self.args.password)
-            if valid_baseline.outcome is not AuthOutcome.AUTHENTICATED:
-                analysis = BruteProtectionResult(
-                    status="blocked",
-                    reason=(
-                        "the supplied valid-credential baseline did not authenticate; "
-                        "no failed-login pressure was sent"
-                    ),
+            try:
+                return self._run_fresh_auth_attempt(
+                    login,
+                    password,
+                    mechanism=AuthMechanism.NTLM,
+                    credential_source=source,
                 )
+            finally:
+                self._complete_brute_progress(
+                    progress_index, progress_total, login, password
+                )
+
+        with self._brute_progress_session(progress_total):
+            valid_baseline: FreshAuthAttemptResult | None = None
+            valid_final: FreshAuthAttemptResult | None = None
+            if self.args.login is not None and self.args.password is not None:
+                valid_baseline = fresh(self.args.login, self.args.password)
+                if valid_baseline.outcome is not AuthOutcome.AUTHENTICATED:
+                    analysis = BruteProtectionResult(
+                        status="blocked",
+                        reason=(
+                            "the supplied valid-credential baseline did not authenticate; "
+                            "no failed-login pressure was sent"
+                        ),
+                    )
+                    return RDPBruteProtectionResult(
+                        analysis=analysis,
+                        config=config,
+                        valid_baseline=valid_baseline,
+                    )
+
+            analysis = run_brute_protection(config, fresh)
+            if analysis.status == "blocked":
                 return RDPBruteProtectionResult(
                     analysis=analysis,
                     config=config,
                     valid_baseline=valid_baseline,
                 )
+            recovery = self._negotiate(
+                "Post-authentication-pressure recovery",
+                PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX,
+            )
 
-        analysis = run_brute_protection(
-            config,
-            fresh,
-            progress_callback=(
-                None if lockout_enabled else self._emit_brute_progress
-            ),
-        )
-        if analysis.status == "blocked":
+            if (
+                not lockout_enabled
+                and self.args.login is not None
+                and self.args.password is not None
+            ):
+                valid_final = fresh(self.args.login, self.args.password)
+
+            inconclusive_reasons: list[str] = []
+            if recovery.selected_protocol is None:
+                inconclusive_reasons.append(
+                    "RDP negotiation did not recover after the authentication series; "
+                    "blocking cannot be distinguished from service/network impact"
+                )
+            if (
+                valid_final is not None
+                and valid_final.outcome is not AuthOutcome.AUTHENTICATED
+            ):
+                inconclusive_reasons.append(
+                    "the final valid-credential probe no longer authenticated; possible "
+                    "source-IP, account-policy, or service impact"
+                )
+            if inconclusive_reasons and analysis.status not in {"blocked", "error"}:
+                analysis = replace(
+                    analysis,
+                    status="inconclusive",
+                    reason="; ".join(inconclusive_reasons),
+                )
             return RDPBruteProtectionResult(
                 analysis=analysis,
                 config=config,
+                service_recovery_probe=recovery,
                 valid_baseline=valid_baseline,
+                valid_final=valid_final,
             )
-        recovery = self._negotiate(
-            "Post-authentication-pressure recovery",
-            PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX,
-        )
-
-        if (
-            not lockout_enabled
-            and self.args.login is not None
-            and self.args.password is not None
-        ):
-            valid_final = fresh(self.args.login, self.args.password)
-
-        inconclusive_reasons: list[str] = []
-        if recovery.selected_protocol is None:
-            inconclusive_reasons.append(
-                "RDP negotiation did not recover after the authentication series; "
-                "blocking cannot be distinguished from service/network impact"
-            )
-        if (
-            valid_final is not None
-            and valid_final.outcome is not AuthOutcome.AUTHENTICATED
-        ):
-            inconclusive_reasons.append(
-                "the final valid-credential probe no longer authenticated; possible "
-                "source-IP, account-policy, or service impact"
-            )
-        if inconclusive_reasons and analysis.status not in {"blocked", "error"}:
-            analysis = replace(
-                analysis,
-                status="inconclusive",
-                reason="; ".join(inconclusive_reasons),
-            )
-        return RDPBruteProtectionResult(
-            analysis=analysis,
-            config=config,
-            service_recovery_probe=recovery,
-            valid_baseline=valid_baseline,
-            valid_final=valid_final,
-        )
 
     @staticmethod
     def _rate_error_result(exc: Exception, duration_ms: float) -> RateProbeResult:
@@ -3293,16 +3398,17 @@ class RDP(BaseModule):
 
     def _rate_probe(self, _request: RateProbeRequest) -> RateProbeResult:
         started = time.perf_counter()
+        deadline = time.monotonic() + self.timeout_seconds
         sock: socket.socket | None = None
         try:
             sock = socket.create_connection(
                 (self.connect_host, self.args.target.port),
-                timeout=self.timeout_seconds,
+                timeout=_deadline_timeout(deadline),
             )
-            sock.settimeout(self.timeout_seconds)
+            sock.settimeout(_deadline_timeout(deadline))
             requested = PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX
             sock.sendall(_build_negotiation_request(requested))
-            reply = _parse_negotiation_reply_details(_read_tpkt(sock))
+            reply = _parse_negotiation_reply_details(_read_tpkt(sock, deadline=deadline))
             duration_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
             if reply.selected_protocol is not None:
                 return RateProbeResult(
@@ -3333,16 +3439,17 @@ class RDP(BaseModule):
 
     def _rate_open_held(self, _request: RateProbeRequest) -> OpenConnectionResult:
         started = time.perf_counter()
+        deadline = time.monotonic() + self.timeout_seconds
         sock: socket.socket | None = None
         try:
             sock = socket.create_connection(
                 (self.connect_host, self.args.target.port),
-                timeout=self.timeout_seconds,
+                timeout=_deadline_timeout(deadline),
             )
-            sock.settimeout(self.timeout_seconds)
+            sock.settimeout(_deadline_timeout(deadline))
             requested = PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX
             sock.sendall(_build_negotiation_request(requested))
-            reply = _parse_negotiation_reply_details(_read_tpkt(sock))
+            reply = _parse_negotiation_reply_details(_read_tpkt(sock, deadline=deadline))
             duration_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
             if reply.selected_protocol is not None:
                 handle = SocketConnectionHandle(sock)
@@ -3469,11 +3576,21 @@ class RDP(BaseModule):
             stopped_after_completed=stopped_after_completed,
         )
 
+    def preflight_service(self) -> NegotiationProbe:
+        """Require a valid X.224 response within one overall timeout budget."""
+        if self._service_preflight_probe is None:
+            self._service_preflight_probe = self._negotiate(
+                "Full negotiation",
+                PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX,
+                deadline=time.monotonic() + self.timeout_seconds,
+            )
+        return self._service_preflight_probe
+
     def _get_security_probes(self) -> list[NegotiationProbe]:
         if self._security_probes is not None:
             return self._security_probes
         self._security_probes = [
-            self._negotiate(
+            self._service_preflight_probe or self._negotiate(
                 "Full negotiation",
                 PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX,
             ),
@@ -3750,6 +3867,13 @@ class RDP(BaseModule):
         return BasicSettingsResult(
             status="error",
             error=detail,
+        )
+
+    def _get_version_result(self) -> RDPVersionResult:
+        return (
+            self.results.version
+            or self.results.os_detection
+            or self._run_version_test()
         )
 
     def _run_version_test(self) -> RDPVersionResult:
@@ -4345,7 +4469,9 @@ class RDP(BaseModule):
                     None,
                 )
         except (OSError, ssl.SSLError, RDPProtocolError, ValueError) as exc:
-            return probe, None, None, None, str(exc)
+            return probe, None, None, None, TLSHandshakeError(
+                exc, _auth_failure_outcome(exc)
+            )
         finally:
             if sock is not None:
                 try:
@@ -4578,15 +4704,26 @@ class RDP(BaseModule):
 
         return sorted(set(findings))
 
-    def _negotiate(self, name: str, requested_protocols: int) -> NegotiationProbe:
+    def _negotiate(
+        self, name: str, requested_protocols: int, *, deadline: float | None = None,
+    ) -> NegotiationProbe:
         try:
             with socket.create_connection(
-                (self.args.target.ip, self.args.target.port),
-                timeout=self.timeout_seconds,
+                (self.connect_host, self.args.target.port),
+                timeout=(
+                    _deadline_timeout(deadline)
+                    if deadline is not None else self.timeout_seconds
+                ),
             ) as sock:
-                sock.settimeout(self.timeout_seconds)
+                sock.settimeout(
+                    _deadline_timeout(deadline)
+                    if deadline is not None else self.timeout_seconds
+                )
                 sock.sendall(_build_negotiation_request(requested_protocols))
-                reply = _parse_negotiation_reply_details(_read_tpkt(sock))
+                reply = _parse_negotiation_reply_details(
+                    _read_tpkt(sock, deadline=deadline)
+                    if deadline is not None else _read_tpkt(sock)
+                )
                 return NegotiationProbe(
                     name=name,
                     requested_protocols=requested_protocols,
@@ -4665,10 +4802,12 @@ class RDP(BaseModule):
 
     @staticmethod
     def _auth_output_category(result: RDPAuthResult) -> Out:
-        if result.status == "error" and result.communication_error:
+        if result.communication_error:
             return Out.TITLE
         return {
             "authenticated": Out.OK,
+            "timeout": Out.TITLE,
+            "transport_error": Out.TITLE,
             "tls_error": Out.ERROR,
             "error": Out.ERROR,
             "failed": Out.WARNING,
@@ -4862,6 +5001,11 @@ class RDP(BaseModule):
             properties["rdpVersion"] = self._version_json(self.results.version)
             if self.results.version.version_name is not None:
                 properties["version"] = self.results.version.version_name
+
+        if self.results.os_detection is not None:
+            if emit_text:
+                self._output_os_detection_text(self.results.os_detection)
+            properties["osDetection"] = self._os_detection_json(self.results.os_detection)
 
         if self.results.ntlm_info is not None:
             if emit_text:
@@ -5214,21 +5358,9 @@ class RDP(BaseModule):
                 f"Server protocol version: {result.version_name}",
                 Out.TITLE,
             )
-            if result.advertised_version == 0x00080004:
-                self._print_status(
-                    "Typical Windows OS candidates: "
-                    f"{', '.join(RDP_5_TO_8_TYPICAL_WINDOWS_RELEASES)}; "
-                    f"Server {', '.join(RDP_5_TO_8_TYPICAL_SERVER_RELEASES)}",
-                    Out.TITLE,
-                )
             if result.status == "ambiguous":
                 self._print_status(
-                    "Exact RDP and OS versions cannot be determined from this shared value",
-                    Out.TITLE,
-                )
-            else:
-                self._print_status(
-                    "Exact OS cannot be determined from the advertised RDP version alone",
+                    "Exact RDP version cannot be determined from this shared value",
                     Out.TITLE,
                 )
         elif result.status == "unknown":
@@ -5252,6 +5384,33 @@ class RDP(BaseModule):
             self.ptdebug(f"Basic Settings Exchange transport: {result.transport}")
         if result.source is not None:
             self.ptdebug(f"Version source: {result.source}")
+
+    def _output_os_detection_text(self, result: RDPVersionResult) -> None:
+        if self.use_json:
+            return
+
+        self.ptprint("OS detection", Out.INFO)
+        if result.status in {"ok", "ambiguous"}:
+            candidates = self._version_json(result)["typicalWindowsOs"]
+            if candidates:
+                self._print_status(
+                    "Typical Windows OS candidates: " + ", ".join(candidates),
+                    Out.TITLE,
+                )
+            self._print_status(
+                "Exact OS cannot be determined from the advertised RDP version alone",
+                Out.TITLE,
+            )
+        elif result.status == "unknown":
+            self._print_status(
+                f"OS cannot be inferred from unrecognized RDP version: {result.version_name}",
+                Out.TITLE,
+            )
+        else:
+            self._print_status(
+                "OS detection is unavailable: " + (result.error or "RDP version unavailable"),
+                Out.TITLE,
+            )
 
     def _output_ntlminfo_text(self, result: NTLMInfoResult) -> None:
         if self.use_json:
@@ -5372,7 +5531,7 @@ class RDP(BaseModule):
             )
             if result.error:
                 self.ptdebug(result.error)
-        elif result.status == "error":
+        elif result.communication_error or result.status == "error":
             self._print_status(
                 f"Authentication test failed: {result.error}",
                 self._auth_output_category(result),
@@ -5846,6 +6005,18 @@ class RDP(BaseModule):
             "source": result.source,
             "error": result.error,
             "isSupportedVersionList": False,
+        }
+
+    def _os_detection_json(self, result: RDPVersionResult) -> dict:
+        version = self._version_json(result)
+        return {
+            "status": "inconclusive" if result.status in {"ok", "ambiguous", "unknown"} else result.status,
+            "typicalWindowsOs": version["typicalWindowsOs"],
+            "exactOsIdentified": False,
+            "advertisedRdpVersion": result.advertised_version,
+            "rdpVersionName": result.version_name,
+            "source": result.source,
+            "error": result.error,
         }
 
     def _auth_json(self, result: RDPAuthResult) -> dict:

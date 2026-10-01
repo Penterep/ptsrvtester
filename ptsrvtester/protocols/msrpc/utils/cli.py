@@ -161,6 +161,8 @@ class MSRPCArgs(BaseArgs):
                 "ptsrvtester msrpc -ts ENUMEPM -tg 192.168.1.1",
                 "ptsrvtester msrpc -ts ALL -tg server.example.test",
                 "ptsrvtester msrpc -ts ENUMPIPES -tg 192.168.1.1 -u auditor -p secret",
+                "ptsrvtester msrpc -ts BRUTESMB -tg 192.168.1.1 -u auditor -p",
+                'ptsrvtester msrpc -ts BRUTESMB -tg 192.168.1.1 -u auditor -p ""',
                 "ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.1 -u auditor -p secret",
                 "ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.1 -u auditor -p secret",
                 "ptsrvtester msrpc -ts SAMRGROUPS -tg 192.168.1.1 -u auditor -p secret",
@@ -179,7 +181,7 @@ class MSRPCArgs(BaseArgs):
                 ["", "--uuid", "<uuid[:ver]>", "BRUTETCP: supported EPM/MGMT/SAMR/LSAD interface UUID and version"],
                 ["-u", "--user", "<name> ...", "Username(s); one for SAMR/ENUMPIPES"],
                 ["-U", "--users", "<wordlist>", "Username wordlist"],
-                ["-p", "--password", "<password>", "Password"],
+                ["-p", "--password", "[<password>]", "Password; omit the value for an empty password"],
                 ["-P", "--passwords", "<wordlist>", "Password wordlist"],
                 ["", "--threads", "<1-100>", "Credential-test concurrency across accounts (default 10; one active attempt per account)"],
                 ["", "--max-attempts", "<1-100000>", "Maximum credential product per test (default 1000); confirmed lockout stops further attempts for that account"],
@@ -195,6 +197,63 @@ class MSRPCArgs(BaseArgs):
                 ["-h", "--help", "", "Show this help"],
             ]},
         ]
+
+    @staticmethod
+    def get_test_help(codes: list[str]):
+        selected = list(dict.fromkeys(code.strip().upper() for code in codes if code.strip()))
+        if not selected or selected == ["ALL"]:
+            return None
+        unknown = [code for code in selected if code != "ALL" and code not in MSRPC_TESTS]
+        if unknown:
+            return [
+                {"unknown_test": [f"Unknown test: {', '.join(unknown)}"]},
+                {"available_tests": [f"ALL, {', '.join(MSRPC_TEST_ORDER)}"]},
+            ]
+
+        common_options = MSRPCArgs.get_help()[-1]["options"]
+        selected_options = {
+            "ENUMPIPES": {"--pipes", "--user", "--password", "--domain"},
+            "SAMRPOLICY": {"--user", "--password", "--domain"},
+            "SAMRUSERS": {"--user", "--password", "--domain", "--samr-max-users"},
+            "SAMRGROUPS": {"--user", "--password", "--domain", "--samr-max-groups", "--samr-max-members"},
+            "SAMRUSERINFO": {"--user", "--password", "--domain", "--samr-max-users", "--samr-user", "--samr-domain"},
+        }
+        brute_options = {"--user", "--users", "--password", "--passwords", "--domain", "--threads", "--max-attempts"}
+        help_data = []
+        for code in selected:
+            if code == "ALL":
+                continue
+            metadata = MSRPC_TESTS[code]
+            family = str(metadata["family"])
+            default_port = {"rpc": 135, "smb": 445, "http": 443}[family]
+            description = [f"{code}: {metadata['description']}", f"Transport: {family.upper()}, default TCP port {default_port}."]
+            if metadata.get("explicit_only"):
+                description.append("Select this test explicitly; ALL does not include it.")
+            help_data.append({"description": description})
+            mode = metadata.get("credential_mode")
+            usage_args = ""
+            if mode == "direct_required":
+                help_data.append({"requires": ["One -u/--user and -p/--password; credential wordlists are not accepted."]})
+                usage_args = " -u auditor -p secret"
+            options = set(selected_options.get(code, ()))
+            if mode == "product_required":
+                options.update(brute_options)
+                help_data.append({"requires": ["Usernames from -u/-U and passwords from -p/-P; each combination is tested within --max-attempts."]})
+                usage_args = " -U users.txt -P passwords.txt"
+            if code == "BRUTEPIPE":
+                options.add("--pipe")
+                usage_args += " --pipe svcctl"
+                help_data.append({"requires": ["--pipe <name>; success confirms SMB identity and pipe opening, without an RPC bind or call."]})
+            if code == "BRUTETCP":
+                options.add("--uuid")
+                usage_args += " --uuid 12345778-1234-abcd-ef00-0123456789ac:1.0"
+                help_data.append({"requires": ["--uuid for a supported EPM/MGMT/SAMR/LSAD interface; success requires a confirmed read-only RPC call."]})
+            if code == "BRUTEHTTP":
+                help_data.append({"requires": ["An HTTPS RPC Proxy with an EPM backend; success requires a confirmed read-only RPC call."]})
+            options.update({"--target", "--timeout-seconds", "--output", "--json", "--verbose", "--help"})
+            help_data.append({"test_options": [row for row in common_options if row[1] in options]})
+            help_data.append({"usage": [f"ptsrvtester msrpc -ts {code} -tg <host>{usage_args}"]})
+        return help_data
 
     def add_subparser(self, name, subparsers):
         parser = subparsers.add_parser(
@@ -222,7 +281,10 @@ class MSRPCArgs(BaseArgs):
         users.add_argument("-U", "--users", dest="username_file", metavar="<wordlist>", default=None)
         users.add_argument("-ul", "--username-file", "--username_file", dest="username_file", help=argparse.SUPPRESS)
         passwords = parser.add_mutually_exclusive_group()
-        passwords.add_argument("-p", "--password", default=None)
+        passwords.add_argument(
+            "-p", "--password", nargs="?", const="", default=None,
+            metavar="<password>", help="Password; omit the value for an empty password",
+        )
         passwords.add_argument("-pw", dest="password", help=argparse.SUPPRESS)
         passwords.add_argument("-P", "--passwords", dest="password_file", metavar="<wordlist>", default=None)
         passwords.add_argument("-pl", "--password-file", "--password_file", dest="password_file", help=argparse.SUPPRESS)
@@ -278,7 +340,10 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
             raise argparse.ArgumentError(
                 None, f"{', '.join(sorted(brute))} requires -u/--user or -U/--users"
             )
-        if not (getattr(args, "password", None) or getattr(args, "password_file", None)):
+        if (
+            getattr(args, "password", None) is None
+            and not getattr(args, "password_file", None)
+        ):
             raise argparse.ArgumentError(
                 None, f"{', '.join(sorted(brute))} requires -p/--password or -P/--passwords"
             )

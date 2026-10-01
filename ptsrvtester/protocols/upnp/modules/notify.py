@@ -9,10 +9,10 @@ def run(ctx) -> None:
     notifications = ctx.engine.notify()
     ctx.out(
         f"Notifications: {len(notifications)} ({ctx.engine.notify_status})",
-        "TEXT", indent=4,
+        "TEXT" if ctx.engine.notify_status in ("complete",) else "TITLE", indent=4,
     )
     for item in notifications[:50]:
-        category = "TEXT" if item["valid"] else "WARNING"
+        category = "TEXT" if item["valid"] else "TITLE"
         nts = repr((item["nts"] or "unknown")[:80])
         nt = repr((item["nt"] or "unknown")[:160])
         usn = repr((item["usn"] or "unknown")[:160])
@@ -21,7 +21,8 @@ def run(ctx) -> None:
         if item["validationErrors"]:
             ctx.out(
                 f"Invalid notification: {', '.join(item['validationErrors'])}",
-                "WARNING", indent=12,
+                "TITLE", indent=12,
             )
+        ctx.out()
     if len(notifications) > 50:
         ctx.out(f"... {len(notifications) - 50} further notifications in JSON", "TEXT", indent=8)

@@ -9,4 +9,6 @@ def run_probe(ctx, code: str, result_field: str, method_name: str) -> None:
         setattr(engine.results, result_field, getattr(engine, method_name)())
     except Exception as exc:
         engine.record_module_error(code, exc)
-        ctx.out(f"{code} failed: {exc}", "ERROR", indent=4)
+        from argparse import ArgumentError
+        category = "ERROR" if isinstance(exc, ArgumentError) else "TITLE"
+        ctx.out(f"{code} failed: {exc}", category, indent=4)

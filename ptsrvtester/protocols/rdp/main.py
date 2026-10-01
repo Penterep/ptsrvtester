@@ -264,18 +264,15 @@ class RDP(BaseMain):
             self._outputs[code] = output_lock.get_output_string()
 
     def run(self) -> None:
-        """Stop the scan before dispatching tests when the RDP port is unreachable."""
-        try:
-            with socket.create_connection(
-                self.target,
-                timeout=self.args.timeout / 1000.0,
-            ):
-                pass
-        except OSError as exc:
+        """Require a valid pre-auth RDP response before dispatching any tests."""
+        probe = self.rdp_engine.preflight_service()
+        if not (probe.successful or probe.failed_by_server):
+            detail = probe.error or "No valid RDP negotiation response"
             self.ptjsonlib.end_error(
                 f"Cannot connect to RDP service at "
-                f"{self.target_host}:{self.target[1]}: {exc}",
+                f"{self.target_host}:{self.target[1]}: {detail}",
                 self.use_json,
+                category="TITLE",
             )
             return
 

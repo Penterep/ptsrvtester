@@ -60,17 +60,21 @@ def load_module(name: str):
 
 
 class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
-    """PtJsonLib subclass with unified error output format for customer reports.
-    On end_error: status=error, message='Error: ...', empty nodes/properties/vulnerabilities."""
+    """Keep fatal errors structured and allow informational communication output.
 
-    def end_error(self, message, condition, details=None):
-        full_msg = f"Error: {message}"
+    Default errors include an 'Error:' prefix. TITLE uses a plain message and an
+    information bullet; both retain JSON status=error and empty result objects.
+    """
+
+    def end_error(self, message, condition, details=None, *, category="ERROR"):
+        full_msg = f"Error: {message}" if category == "ERROR" else str(message)
         try:
-            ptprint(out_ifnot(full_msg, "ERROR", condition))
+            ptprint(out_ifnot(full_msg, category, condition))
         except UnicodeEncodeError:
             encoding = sys.stdout.encoding or "utf-8"
             safe_msg = full_msg.encode(encoding, errors="replace").decode(encoding)
-            ptprint(f"\033[31m[x]\033[0m {safe_msg}")
+            bullet = "\033[93m[*]\033[0m" if category == "TITLE" else "\033[31m[x]\033[0m"
+            ptprint(f"{bullet} {safe_msg}")
         if details:
             from ptlibs.ptprinthelper import get_colored_text
             ptprint("    " + out_ifnot(f"{get_colored_text(details, 'ADDITIONS')}", "TEXT", condition))
@@ -80,7 +84,8 @@ class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
         self.json_object["results"]["properties"] = {}
         self.json_object["results"]["vulnerabilities"] = []
         ptprint(out_if(self.get_result_json(), None, condition))
-        sys.stdout.write("\033[?25h")
+        if not condition:
+            sys.stdout.write("\033[?25h")
         sys.stdout.flush()
         os._exit(1)
 
@@ -128,25 +133,50 @@ def get_help():
 
 
 def _extract_test_help(module_args, argv):
-    """Return per-test help object for `-ts <TEST> -h`, or None to fall back to module help."""
+    """Return test help using the selected module's test-option arity."""
     get_test_help = getattr(module_args, "get_test_help", None)
     if get_test_help is None:
         return None
-    codes = None
-    for i, tok in enumerate(argv):
-        if tok in ("-ts", "--tests"):
-            if i + 1 < len(argv):
-                codes = argv[i + 1]
+
+    # Read parser metadata without parsing targets, credentials or other options.
+    # RDP accepts space-separated tests; other modules use one comma-separated
+    # argument. Help should accept the same selection syntax as a normal run.
+    parser = argparse.ArgumentParser(add_help=False)
+    subparsers = parser.add_subparsers()
+    module_args.add_subparser("test_help", subparsers)
+    test_action = next(
+        (
+            action
+            for action in subparsers.choices["test_help"]._actions
+            if "-ts" in action.option_strings or "--tests" in action.option_strings
+        ),
+        None,
+    )
+    nargs = test_action.nargs if test_action is not None else None
+    value_limit = nargs if isinstance(nargs, int) else 1
+    values = []
+    for i, token in enumerate(argv):
+        if token == "--":
             break
-        if tok.startswith("-ts="):
-            codes = tok[len("-ts="):]
-            break
-        if tok.startswith("--tests="):
-            codes = tok[len("--tests="):]
-            break
-    if not codes:
-        return None
-    parsed = [c.strip().upper() for c in codes.split(",") if c.strip()]
+        if token in ("-ts", "--tests"):
+            selected = []
+            for value in argv[i + 1:]:
+                if value.startswith("-"):
+                    break
+                selected.append(value)
+                if nargs not in ("+", "*") and len(selected) >= value_limit:
+                    break
+            values = selected
+        elif token.startswith(("-ts=", "--tests=")):
+            # argparse consumes only the explicit value for an option with '='.
+            values = [token.partition("=")[2]]
+
+    parsed = [
+        code.strip().upper()
+        for value in values
+        for code in value.split(",")
+        if code.strip()
+    ]
     if not parsed or parsed == ["ALL"]:
         return None
     return get_test_help(parsed)

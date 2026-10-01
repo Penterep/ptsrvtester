@@ -666,21 +666,12 @@ class RateLimitRunner:
         signal_metrics = [load]
         if control is not None:
             signal_metrics.append(control)
-        observed_failures = (
-            sum(metrics.failures for metrics in signal_metrics)
-            + held_closed_count
-        )
+        observed_failures = sum(metrics.failures for metrics in signal_metrics)
         if observed_failures >= self.config.failure_threshold:
-            if held_closed_count:
-                notes.append(
-                    "repeatable negotiation failures or peer-closed held sockets "
-                    "occurred during load and recovery succeeded"
-                )
-            else:
-                notes.append(
-                    "repeatable negotiation failures occurred during load and "
-                    "recovery succeeded"
-                )
+            notes.append(
+                "repeatable negotiation failures occurred during load and "
+                "recovery succeeded"
+            )
             return RateLimitVerdict.LIMITING_OBSERVED, False, None, tuple(notes)
 
         timing_comparison = control if scenario is Scenario.HELD else load
@@ -691,6 +682,13 @@ class RateLimitRunner:
                 "absolute thresholds"
             )
             return RateLimitVerdict.SLOWDOWN_OBSERVED, True, ratio, tuple(notes)
+
+        if held_closed_count:
+            notes.append(
+                "peer-closed held sockets alone do not establish connection "
+                "limiting; an ordinary handshake or idle timeout was not ruled out"
+            )
+            return RateLimitVerdict.INCONCLUSIVE, False, None, tuple(notes)
 
         if early_stopped or any(not metrics.complete for metrics in signal_metrics):
             notes.append("the configured sample was not completed")

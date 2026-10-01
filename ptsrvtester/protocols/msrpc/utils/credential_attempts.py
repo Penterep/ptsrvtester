@@ -28,6 +28,8 @@ def iter_credential_attempts(
     account_key: Callable[[CredentialT], Hashable],
     stop_account: Callable[[OutcomeT], bool],
     stopped_accounts: set[Hashable] | None = None,
+    on_start: Callable[[int, CredentialT], None] | None = None,
+    stop_all: Callable[[], bool] | None = None,
 ) -> Iterator[ResolvedAttempt[CredentialT, OutcomeT]]:
     """Yield completed/skipped attempts with their original zero-based index.
 
@@ -37,6 +39,10 @@ def iter_credential_attempts(
     accounts continue. At most ``2 * workers`` credentials are buffered or
     running, and only ``workers`` futures are submitted at once.
 
+    ``on_start(index, credential)`` runs in the consuming thread before submission,
+    allowing progress output without writes from worker threads.
+    ``stop_all`` stops new submissions and source consumption while preserving
+    results from attempts already running. Unsubmitted work is not yielded.
     Completion order may vary; callers can use ``index`` to order their output.
     Account keys and the positive lockout verdict belong to the caller, which
     knows the authentication domain and the transport's status semantics.
@@ -57,6 +63,9 @@ def iter_credential_attempts(
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         while True:
+            if stop_all is not None and stop_all():
+                exhausted = True
+                waiting.clear()
             while not exhausted and len(waiting) + len(pending) < window:
                 try:
                     index, credential = next(source)
@@ -74,6 +83,8 @@ def iter_credential_attempts(
                 if account in stopped_accounts:
                     yield ResolvedAttempt(index, credential, skipped=True)
                 elif account not in active_accounts and len(pending) < workers:
+                    if on_start is not None:
+                        on_start(index, credential)
                     future = executor.submit(attempt, credential)
                     pending[future] = (index, credential, account)
                     active_accounts.add(account)

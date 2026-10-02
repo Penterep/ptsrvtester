@@ -2,7 +2,7 @@ import socket
 
 
 __MODULELABEL__ = "Rsync SSH detection"
-__MODULECODE__ = "ssh"
+__MODULECODE__ = "encrypt"
 __ORDER__ = 100
 
 

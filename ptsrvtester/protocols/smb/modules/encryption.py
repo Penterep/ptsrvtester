@@ -29,7 +29,7 @@ __MODULELABEL__ = "Encryption status information"
 __MODULECODE__ = "ENCRYPTION"
 __ORDER__ = 12
 
-from ..smb_utils.helpers import SMBContext
+# from ..smb_utils.helpers import SMBContext
 from ..smb_utils.server_connection import ServerConnection
 from impacket.smbconnection import (
     SMB2_DIALECT_30,
@@ -39,7 +39,7 @@ from impacket.smbconnection import (
 
 # TODO: add encryption requirement check
 
-def run(ctx: SMBContext) -> None:
+def run(ctx) -> None:
     ip, port = ctx.target
     # ctx.out(f"Would check {ip}:{port} here.", "TEXT")
     # For JSON mode, add structured findings instead of text, e.g.:

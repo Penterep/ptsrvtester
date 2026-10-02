@@ -30,7 +30,7 @@ __MODULECODE__ = "INFO"
 __ORDER__ = 10
 
 from ..smb_utils.server_connection import ServerConnection
-from ..smb_utils.helpers import SMBContext
+from ..smb_utils.helpers import SMBResults
 
 
 def win_version_translate(ver: str) -> str:
@@ -110,36 +110,17 @@ def win_version_translate(ver: str) -> str:
     return output
 
 
-def run(ctx: SMBContext) -> None:
-    ip, port = ctx.target
-    raw_dialects = ctx.mapping.keys()
-    # ctx.out(f"Would check {ip}:{port} here.", "TEXT")
-    # For JSON mode, add structured findings instead of text, e.g.:
-    #   ctx.ptjsonlib.add_vulnerability("PTV-SMTP-...")
-    
+def run(ctx) -> None:
+    output: SMBResults = ctx.output
     sc = ServerConnection(ctx)
-    output = None
-    dialect = 0
-    for dialect in raw_dialects:
-        output = sc.connect(dialect)
-        ctx.mapping[dialect] = True
-        if output is not None:
-            break
+    sc.connect()
     
-    if output is None:
-        ctx.out("Could not connect to server", "ERROR")
-        ctx.error = True
+    if output.had_error:
+        ctx.out(f"Could not connect to server: {output.error_info}", "ERROR")
         return
-    
-    dialect = sc.dial_str_converter(dialect)
-    
-    ctx.successful_dialects.append(dialect)
-    ctx.server_name = output["server_name"]
-    ctx.dns_domain_name = output["server_DNS_domain_name"]
-    ctx.dns_host_name = output["server_DNS_hostname"]
 
     # OS version parsing
-    os_info = [output["server_OS_major"], output["server_OS_minor"], output["server_OS_build"]]
+    os_info = [output.server_OS_major, output.server_OS_minor, output.server_OS_build]
     
     os_version = ""
     for piece in os_info:
@@ -155,26 +136,21 @@ def run(ctx: SMBContext) -> None:
         os_version = os_version[1:]
         os_ver_name = win_version_translate(os_version)
         
-    os_ver_name = output["server_OS"] if output["server_OS"] != "unknown" and os_version == "unknown" else os_ver_name
+    os_ver_name = output.server_OS if output.server_OS != "unknown" and os_version == "unknown" else os_ver_name
     
     ctx.os_version = f"{os_ver_name} (build: {os_version})" if os_version != "unknown" else os_ver_name
     
-    ctx.ntlmv2_support = output["does_support_NTLMv2"]
-    ctx.login_required = output["is_login_required"]
-    ctx.signing_required = output["is_signing_required"]
-    
-    
     # Printing
     # ctx.out("SMB server info:")
-    ctx.out(f"Server name:             {ctx.server_name}", "INFO", indent=4)
-    ctx.out(f"OS version:              {ctx.os_version}", "INFO", indent=4)
-    ctx.out(f"DNS domain name:         {ctx.dns_domain_name}", "INFO", indent=4)
-    ctx.out(f"DNS host name:           {ctx.dns_host_name}", "INFO", indent=4,
+    ctx.out(f"Server name:             {output.server_name}", "INFO", indent=4)
+    ctx.out(f"OS version:              {output.server_OS}", "INFO", indent=4)
+    ctx.out(f"DNS domain name:         {output.server_DNS_domain_name}", "INFO", indent=4)
+    ctx.out(f"DNS host name:           {output.server_DNS_hostname}", "INFO", indent=4,
                 condition=ctx.dns_host_name != ctx.dns_domain_name)
-    ctx.out(f"Lowest dialect version:  {dialect}",
-                "VULN" if dialect == "SMBv1" else "NOTVULN", indent=4)
-    ctx.out(f"Login required:          {ctx.login_required}",
+    ctx.out(f"Lowest dialect version:  {output.used_dialect}",
+                "VULN" if output.used_dialect == "SMBv1" else "NOTVULN", indent=4)
+    ctx.out(f"Login required:          {output.is_login_required}",
                 "WARNING" if not ctx.login_required else "OK", indent=4)
-    ctx.out(f"Signing required:        {ctx.signing_required}",
+    ctx.out(f"Signing required:        {output.is_signing_required}",
                 "VULN" if not ctx.signing_required else "NOTVULN", indent=4)
-    ctx.out(f"NTLMv2 supported:        {ctx.ntlmv2_support}", "INFO", indent=4)
+    ctx.out(f"NTLMv2 supported:        {output.does_support_NTLMv2}", "INFO", indent=4)

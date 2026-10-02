@@ -7,53 +7,113 @@ from ptlibs.ptjsonlib import PtJsonLib
 if TYPE_CHECKING:
     from .cli import SMBArgs
 
+from impacket.smbconnection import (
+    SMB_DIALECT,
+    SMB2_DIALECT_002,
+    SMB2_DIALECT_21,
+    SMB2_DIALECT_30,
+    SMB2_DIALECT_311,
+)
 
 @dataclass
 class Target:
     ip: str
     port: int
 
-
-class SMBContext(Protocol):
-    """Quality of life structural type for the ``ctx`` a module's ``run(ctx)`` receives.
-
-    Never instantiated - only exists so that ctx has hints
-    """
-
-    # core ModuleContext fields
-    args: "SMBArgs"
-    target: tuple[str, int]
-    ptjsonlib: PtJsonLib
-    json: bool
-    verbose: bool
-
-    def out(
-        self,
-        string: str = "",
-        category: str = "text",
-        *,
-        colortext: bool = False,
-        indent: int = 0,
-        condition: Optional[bool] = True,
-    ) -> None: ...
-
-    def debug(self, string: str = "", *, indent: int = 4) -> None: ...
-
-    host: str
-    ip: str
-    port: int
-    mapping: dict
+@dataclass
+class SMBResults:
+    has_ran: bool
+    had_error: bool
+    error_info: str
+    nmap_status = str
+    used_dialect: str
     server_name: str
-    os_version: str
-    dns_domain_name: str
-    dns_host_name: str
-    ntlmv2_support: bool | None
-    login_required: bool | None
-    signing_required: bool | None
-    successful_dialects: list
+    client_name: str
+    remote_name: str
+    server_domain: str
+    server_DNS_domain_name: str
+    server_DNS_hostname: str
+    server_OS: str
+    server_OS_major: str
+    server_OS_minor: str
+    server_OS_build: str
+    does_support_NTLMv2: bool | None
+    is_login_required: bool | None
+    is_signing_required: bool | None
+    open_dialects: dict
     v30_encryption: str
     v311_encryption: str
-    error: bool | None
+    
+    def __init__(self) -> None:
+        self.has_ran = False
+        self.had_error = False
+        self.error_info = ""
+        self.nmap_status = ""
+        self.used_dialect = ""
+        self.server_name = ""
+        self.client_name = ""
+        self.remote_name = ""
+        self.server_domain = ""
+        self.server_DNS_domain_name = ""
+        self.server_DNS_hostname = ""
+        self.server_OS = ""
+        self.server_OS_major = ""
+        self.server_OS_minor = ""
+        self.server_OS_build = ""
+        self.does_support_NTLMv2 = None
+        self.is_login_required = None
+        self.is_signing_required = None
+        self.open_dialects = {
+            SMB_DIALECT:        False,
+            SMB2_DIALECT_002:   False,
+            SMB2_DIALECT_21:    False,
+            SMB2_DIALECT_30:    False,
+            SMB2_DIALECT_311:   False,
+        }
+        self.v30_encryption = ""
+        self.v311_encryption = ""
+
+
+# class SMBContext(Protocol):
+#     """Quality of life structural type for the ``ctx`` a module's ``run(ctx)`` receives.
+
+#     Never instantiated - only exists so that ctx has hints
+#     """
+
+#     # core ModuleContext fields
+#     args: "SMBArgs"
+#     target: tuple[str, int]
+#     ptjsonlib: PtJsonLib
+#     json: bool
+#     verbose: bool
+
+#     def out(
+#         self,
+#         string: str = "",
+#         category: str = "text",
+#         *,
+#         colortext: bool = False,
+#         indent: int = 0,
+#         condition: Optional[bool] = True,
+#     ) -> None: ...
+
+#     def debug(self, string: str = "", *, indent: int = 4) -> None: ...
+
+#     host: str
+#     ip: str
+#     port: int
+#     mapping: dict
+#     server_name: str
+#     os_version: str
+#     dns_domain_name: str
+#     dns_host_name: str
+#     ntlmv2_support: bool | None
+#     login_required: bool | None
+#     signing_required: bool | None
+#     successful_dialects: list
+#     v30_encryption: str
+#     v311_encryption: str
+#     error: bool | None
 
 
 def get_if_available(getter):

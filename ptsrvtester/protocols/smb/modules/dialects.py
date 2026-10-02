@@ -29,11 +29,11 @@ __MODULELABEL__ = "The dialects used by the target system"
 __MODULECODE__ = "DIALECTS"
 __ORDER__ = 11
 
-from ..smb_utils.helpers import SMBContext
+# from ..smb_utils.helpers import SMBContext
 from ..smb_utils.server_connection import ServerConnection
 
 
-def run(ctx: SMBContext) -> None:
+def run(ctx) -> None:
     ip, port = ctx.target
     # ctx.out(f"Would check {ip}:{port} here.", "TEXT")
     # For JSON mode, add structured findings instead of text, e.g.:

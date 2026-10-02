@@ -24,27 +24,22 @@ class FTPArgs(ArgsWithBruteforce):
     bounce: Target | None
     bounce_file: str | None
     paths_wordlist: str | None
-    enum_threads: int
+    enum_files: str | None
+    enum_depth: int
     base_path: str
     pasv_port_audit_samples: int
     pasv_port_audit_max_span: int
-    conn_limits_parallel: int
-    conn_limits_sequential: int
-    conn_limits_pasv_attempts: int
-    conn_limits_idle_pre_auth: float
-    conn_limits_slow_auth_gap: float
-    conn_limits_idle_post_auth: float
-    chroot_audit_paths: str
+    conn_limit_count: int | None
+    conn_limit_duration: float | None
     active_audit_low_ports: str
     user_enum_wordlist: str | None
     user_enum_password: str
     user_enum_keep_alive: bool
     user_enum_timing: bool
-    user_enum_threads: int
     user_enum_max: int
     eicar_post_stor_delay: float
     ftp_dos_timeout: float
-    ftp_dos_force_large: bool
+    ftp_dos_large: bool
 
     @staticmethod
     def get_help():
@@ -66,12 +61,12 @@ class FTPArgs(ArgsWithBruteforce):
             ["-A", "--anonymous", "", "Use anonymous login for authenticated tests"],
             ["", "", "", ""],
             [get_colored_text("Credentials (BRUTE / authenticated tests)", "TITLE")],
-            ["-u", "--user", "<name>", "Single username"],
+            ["-u", "--user", "<name> …", "Username(s) for BRUTE / USRENUM / authenticated tests"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
-            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            ["-t", "--threads", "<n>", "Threads (BRUTE default: 10, ENUMPATH default: 5, USRENUM default: 1)"],
             *rate_limit_help_rows(get_colored_text),
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
@@ -87,8 +82,8 @@ class FTPArgs(ArgsWithBruteforce):
                 "ptsrvtester ftp -ts ALL -tg 127.0.0.1",
                 "ptsrvtester ftp -ts ENCRYPT -tg 127.0.0.1",
                 "ptsrvtester ftp -ts ANON,ACCESS -l -tg 127.0.0.1",
-                "ptsrvtester ftp -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:21",
-                "ptsrvtester ftp -ts USRENUM --user-enum-wordlist users.txt -tg 127.0.0.1",
+                "ptsrvtester ftp -ts BRUTE -u admin harry -P passwords.txt -tg 127.0.0.1:21",
+                "ptsrvtester ftp -ts USRENUM -u user admin nobody -tg 127.0.0.1",
                 "ptsrvtester ftp -ts ENUMPATH -w paths.txt -u user -p pass -tg 127.0.0.1",
                 "ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1",
                 "ptsrvtester ftp -ts CONNLIM,DOS -u user -p pass -tg 127.0.0.1",
@@ -111,7 +106,7 @@ class FTPArgs(ArgsWithBruteforce):
   ptsrvtester ftp -ts ANON,ACCESS -l -tg 127.0.0.1
   ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1
   ptsrvtester ftp -ts BRUTE -u admin -P passwords.txt -tg 127.0.0.1:21
-  ptsrvtester ftp -ts USRENUM --user-enum-wordlist users.txt -tg 127.0.0.1
+  ptsrvtester ftp -ts USRENUM -u user admin nobody -tg 127.0.0.1
   ptsrvtester ftp -ts USRENUM -h"""
 
         parser = subparsers.add_parser(
@@ -144,29 +139,24 @@ class FTPArgs(ArgsWithBruteforce):
         mods.add_argument("-l", "--access-list", action="store_true", help="ACCESS: display root directory listing")
         mods.add_argument("-B", "--bounce", type=valid_target_bounce, help="ACCESS: FTP bounce to IP:PORT / HOST:PORT")
         mods.add_argument("--bounce-file", type=str, help="ACCESS: file with request for bounce")
-        mods.add_argument("-w", "--paths-wordlist", type=str, dest="paths_wordlist", help="ENUMPATH: paths wordlist")
-        mods.add_argument("--enum-threads", type=int, default=5, dest="enum_threads", help="ENUMPATH: threads (default 5)")
+        mods.add_argument("-w", "--paths-wordlist", type=str, dest="paths_wordlist", help="ENUMPATH: directory names, one per line")
+        mods.add_argument("--files", type=str, dest="enum_files", metavar="<file>", help="ENUMPATH: file names to try inside each directory entered")
+        mods.add_argument("--depth", type=int, default=1, dest="enum_depth", metavar="<n>", help="ENUMPATH: how many directory levels to walk (default: 1)")
         mods.add_argument("--base-path", type=str, default="", dest="base_path", help="ENUMPATH: start directory")
         mods.add_argument("--pasv-port-audit-samples", type=int, default=8, dest="pasv_port_audit_samples", metavar="<n>")
         mods.add_argument("--pasv-port-audit-max-span", type=int, default=8192, dest="pasv_port_audit_max_span", metavar="<n>")
-        mods.add_argument("--conn-limits-parallel", type=int, default=12, dest="conn_limits_parallel", metavar="<n>")
-        mods.add_argument("--conn-limits-sequential", type=int, default=24, dest="conn_limits_sequential", metavar="<n>")
-        mods.add_argument("--conn-limits-pasv-attempts", type=int, default=18, dest="conn_limits_pasv_attempts", metavar="<n>")
-        mods.add_argument("--conn-limits-idle-pre-auth", type=float, default=0.0, dest="conn_limits_idle_pre_auth", metavar="<s>")
-        mods.add_argument("--conn-limits-slow-auth-gap", type=float, default=0.0, dest="conn_limits_slow_auth_gap", metavar="<s>")
-        mods.add_argument("--conn-limits-idle-post-auth", type=float, default=0.0, dest="conn_limits_idle_post_auth", metavar="<s>")
-        mods.add_argument("--chroot-audit-paths", type=str, default="", dest="chroot_audit_paths", metavar="<list>")
+        mods.add_argument("--count", type=int, default=None, dest="conn_limit_count", metavar="<n>", help=argparse.SUPPRESS)
+        mods.add_argument("--duration", type=float, default=None, dest="conn_limit_duration", metavar="<sec>", help=argparse.SUPPRESS)
         mods.add_argument("--active-audit-low-ports", type=str, default="80,443,21", dest="active_audit_low_ports")
         mods.add_argument("--user-enum-wordlist", type=str, dest="user_enum_wordlist", metavar="<file>")
         mods.add_argument("--user-enum-password", type=str, default="PtsrvUEnumWrongPass!77~", dest="user_enum_password", metavar="<str>")
         mods.add_argument("--user-enum-keep-alive", action="store_true", dest="user_enum_keep_alive")
         mods.add_argument("--user-enum-timing", action="store_true", dest="user_enum_timing")
-        mods.add_argument("--user-enum-threads", type=int, default=1, dest="user_enum_threads", metavar="<n>")
         mods.add_argument("--user-enum-max", type=int, default=0, dest="user_enum_max", metavar="<n>")
         mods.add_argument("--eicar-post-stor-delay", type=float, default=0.5, dest="eicar_post_stor_delay", metavar="<sec>")
         mods.add_argument("--ftp-dos-timeout", type=float, default=30.0, dest="ftp_dos_timeout", metavar="<sec>")
-        mods.add_argument("--ftp-dos-force-large", action="store_true", dest="ftp_dos_force_large")
-        add_bruteforce_args(parser)
+        mods.add_argument("--ftp-dos-large", action="store_true", dest="ftp_dos_large")
+        add_bruteforce_args(parser, user_nargs="+")
 
 
 def _codes(args) -> list[str]:
@@ -179,15 +169,26 @@ def _has_creds(args) -> bool:
 
 
 def validate_ftp_selection(args) -> None:
+    th = getattr(args, "threads", None)
+    if th is not None and int(th) < 1:
+        raise argparse.ArgumentError(None, "-t/--threads must be >= 1")
     codes = _codes(args)
     if not codes or "ALL" in codes:
         return
     if "BRUTE" in codes and not check_if_brute(args):
         raise argparse.ArgumentError(None, "BRUTE requires -u/--user or -U/--users; -p/--password or -P/--passwords")
-    if "USRENUM" in codes and not getattr(args, "user_enum_wordlist", None):
-        raise argparse.ArgumentError(None, "--user-enum-wordlist is required with USRENUM")
-    if "ENUMPATH" in codes and not getattr(args, "paths_wordlist", None):
-        raise argparse.ArgumentError(None, "-w/--paths-wordlist is required with ENUMPATH")
+    if "USRENUM" in codes and not (
+        getattr(args, "user", None) or getattr(args, "users", None) or getattr(args, "user_enum_wordlist", None)
+    ):
+        raise argparse.ArgumentError(None, "USRENUM requires -u/--user or -U/--users")
+    if "ENUMPATH" in codes and not getattr(args, "paths_wordlist", None) and not getattr(args, "enum_files", None):
+        raise argparse.ArgumentError(None, "ENUMPATH requires -w/--paths-wordlist or --files")
+    if "ENUMPATH" in codes:
+        depth = getattr(args, "enum_depth", 1)
+        if depth is None:
+            depth = 1
+        if int(depth) < 1:
+            raise argparse.ArgumentError(None, "--depth must be >= 1")
     need_creds = {"ACCESS", "ENUMPATH", "MODES", "PASVPORT", "CMDAUDITACTIVE", "DOS", "CHROOT", "EICAR"} & set(codes)
     # ACCESS/EICAR etc. may rely on -ts ANON in the same run (results.anonymous) — allow ANON+ACCESS
     if need_creds and not _has_creds(args) and "ANON" not in codes:

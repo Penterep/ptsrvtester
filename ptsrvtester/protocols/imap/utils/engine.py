@@ -256,15 +256,14 @@ class ImapEngine:
     ) -> None:
         if not getattr(self.args, "debug", False) or self.use_json:
             return
-        kind = row.probe_kind
         user = row.username
         if row.error:
-            msg = f"USR-ENUM {method} {kind} {user!r}: connect/error {self._snip(row.error)}"
+            msg = f"{method} {user!r}: connect/error {self._snip(row.error)}"
         elif row.unexpected_ok:
-            msg = f"USR-ENUM {method} {kind} {user!r}: unexpected OK"
+            msg = f"{method} {user!r}: unexpected OK"
         else:
             msg = (
-                f"USR-ENUM {method} {kind} {user!r}: {self._snip(row.reply_raw)} "
+                f"{method} {user!r}: {self._snip(row.reply_raw)} "
                 f"(norm={row.reply_normalized!r} t={row.elapsed_ms}ms)"
             )
         if output is not None:
@@ -390,25 +389,6 @@ class ImapEngine:
             return False
         med = statistics.median(invalid_times)
         return elapsed_ms >= max(invalid_times) + 80.0 and elapsed_ms >= med * 2.0
-
-    @staticmethod
-    def _imap_usrenum_delay_note(invalid_times: list[float], wordlist_times: list[float]) -> str | None:
-        """Explain 2s/4s auth_failure_delay when fake users land in both buckets."""
-        inv = [t for t in invalid_times if t is not None]
-        wl = [t for t in wordlist_times if t is not None]
-        all_t = inv + wl
-        if len(all_t) < 4 or len(inv) < 2:
-            return None
-        lo, hi = min(all_t), max(all_t)
-        if hi < 800 or hi < lo * 1.5:
-            return None
-        inv_lo, inv_hi = min(inv), max(inv)
-        if inv_hi < inv_lo * 1.4:
-            return None
-        return (
-            f"Some replies took ~{int(round(lo / 1000))}s and others ~{int(round(hi / 1000))}s. "
-            "That extra wait is a retry delay, not a sign that the account exists."
-        )
 
     def _imap_usrenum_close(self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL | None) -> None:
         if imap is None:
@@ -5142,22 +5122,16 @@ class ImapEngine:
                 )
         else:
             detail_parts.append(
-                "All names failed the same way. The server does not reveal whether a username exists."
+                "User enumeration is not possible. All names failed the same way."
             )
-            delay_note = self._imap_usrenum_delay_note(invalid_times, [
-                r.elapsed_ms for r in rows
-                if r.probe_kind == "wordlist" and r.elapsed_ms is not None
-            ])
-            if delay_note:
-                detail_parts.append(delay_note)
         if not self._imap_usrenum_timing_usable(invalid_times):
             self._dbg(
-                "USR-ENUM: timing oracle disabled "
+                "timing oracle disabled "
                 f"(threads={self._imap_usrenum_threads()} invalid_ms={invalid_times!r})"
             )
         # LOGINDISABLED / AUTH=PLAIN notes are printed once as a warning, not repeated in detail.
         self._dbg(
-            f"USR-ENUM {enumeration_method}: enumerated={enumerated!r} "
+            f"{enumeration_method}: enumerated={enumerated!r} "
             f"vulnerable={vulnerable} indeterminate={indeterminate}"
         )
         return ImapUserEnumResult(
@@ -5198,12 +5172,12 @@ class ImapEngine:
                 imap_chk, banner_chk, merged_chk
             )
             self._dbg(
-                f"USR-ENUM: LOGINDISABLED advertised={login_disabled_advertised} "
+                f"LOGINDISABLED advertised={login_disabled_advertised} "
                 f"starttls={bool(getattr(self.args, 'starttls', False))} "
                 f"tls={bool(getattr(self.args, 'tls', False))}"
             )
         except Exception as e:
-            self._dbg(f"USR-ENUM: capability check failed: {self._snip(str(e))}")
+            self._dbg(f"capability check failed: {self._snip(str(e))}")
         finally:
             if imap_chk is not None:
                 try:
@@ -5221,7 +5195,7 @@ class ImapEngine:
             names=names,
             threads=threads,
             row_method="LOGIN",
-            baseline_dbg="USR-ENUM: LOGIN — synthetic baseline: ",
+            baseline_dbg="LOGIN — synthetic baseline: ",
         )
         return self._analyze_imap_usrenum(
             all_rows,
@@ -5252,9 +5226,9 @@ class ImapEngine:
                 pass
             banner_chk, merged_chk = self._merged_preauth_capabilities(imap_chk)
             auth_plain_advertised = self._capability_advertises_auth_plain(merged_chk, banner_chk)
-            self._dbg(f"USR-ENUM: AUTH=PLAIN advertised={auth_plain_advertised}")
+            self._dbg(f"AUTH=PLAIN advertised={auth_plain_advertised}")
         except Exception as e:
-            self._dbg(f"USR-ENUM PLAIN: capability check failed: {self._snip(str(e))}")
+            self._dbg(f"PLAIN: capability check failed: {self._snip(str(e))}")
         finally:
             if imap_chk is not None:
                 try:
@@ -5272,7 +5246,7 @@ class ImapEngine:
             names=names,
             threads=threads,
             row_method="PLAIN",
-            baseline_dbg="USR-ENUM: PLAIN (RFC 4616) — synthetic baseline: ",
+            baseline_dbg="PLAIN (RFC 4616) — synthetic baseline: ",
         )
         return self._analyze_imap_usrenum(
             all_rows,

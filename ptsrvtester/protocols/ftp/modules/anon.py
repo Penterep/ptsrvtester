@@ -12,7 +12,11 @@ def run(ctx):
         e.results.anonymous = e.anonymous()
     except Exception as ex:
         e.results.anonymous_error = str(ex)
-        ctx.out(f"Anonymous probe failed: {ex}", "ERROR", indent=4)
+        low = str(ex).lower()
+        if "timed out" in low or "timeout" in low:
+            ctx.out("USER anonymous timed out (not confirmed)", "WARNING", indent=4)
+        else:
+            ctx.out(f"Anonymous probe failed: {ex}", "ERROR", indent=4)
         return
     e._stream_anonymous_result()
 

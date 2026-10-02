@@ -56,7 +56,7 @@ class IMAPArgs(ArgsWithBruteforce):
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
-            ["", "--mailbox", "<name>", "IMAP Folder"],
+            ["", "--mailbox", "<name>", "IMAP folder for APPEND (default: INBOX)"],
             ["", "--spray", "", "Try one password against all users"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
             *rate_limit_help_rows(get_colored_text),
@@ -148,7 +148,7 @@ class IMAPArgs(ArgsWithBruteforce):
             default="INBOX",
             metavar="NAME",
             dest="mailbox",
-            help="IMAP Folder",
+            help="IMAP folder for APPEND (default: INBOX)",
         )
 
         mods = parser.add_argument_group("TEST OPTIONS")

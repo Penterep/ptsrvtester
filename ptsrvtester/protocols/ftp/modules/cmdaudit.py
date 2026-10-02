@@ -9,6 +9,7 @@ from ._common import eng, ensure_creds
 def run(ctx):
     e = eng(ctx)
     e.args.cmd_audit = True
+    e._cmd_audit_emit = True
     creds = ensure_creds(ctx)
     try:
         e.results.cmd_audit = e.test_command_audit(creds)

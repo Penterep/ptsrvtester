@@ -25,22 +25,32 @@ from ssl import SSLSocket
 from string import ascii_uppercase
 from typing import Any, Callable, NamedTuple
 
+from ptlibs.ptprinthelper import out_if
+
+from .ptprinthelper import get_colored_text
 from ptlibs.threads import ptthreads
 
+from .progress import ThreadedProgress
 from .helpers import (
     ArgsWithBruteforce,
     Creds,
     Target,
     check_if_brute,
     get_mode,
+    one_cli_user,
     simple_bruteforce,
     text_or_file,
     valid_target,
     vendor_from_cpe,
 )
 from .service_identification import identify_service
-from .decompression_payloads import BILLION_LAUGHS_XML, build_full_zip_bomb, build_minimal_zip_bomb
+from .decompression_payloads import BILLION_LAUGHS_XML, build_full_zip_bomb, build_huge_zip_bomb
 from .ftp_types import *  # noqa: F403
+from .ftp_types import (  # noqa: F401
+    _conn_limits_pasv_post_suspect,
+    _conn_limits_pasv_pre_suspect,
+    _ftp_list_line_directory_rel_name,
+)
 
 
 class Out:
@@ -67,6 +77,7 @@ class FtpEngine:
         self.debug = ctx.debug
         self.report = getattr(ctx, "report", self.report)
         self.use_json = bool(ctx.json)
+        self._ctx = ctx
         return self
 
     @staticmethod
@@ -81,12 +92,50 @@ class FtpEngine:
             return text[: limit - 3] + "..."
         return text
 
+    @staticmethod
+    def _ftp_text_is_unconfirmed(text: str | None) -> bool:
+        """Timeout or no connection: the check did not finish, so it is not a verdict."""
+        t = (text or "").lower()
+        return any(
+            s in t
+            for s in (
+                "timed out",
+                "timeout",
+                "could not connect",
+                "connection refused",
+                "connection reset",
+                "network is unreachable",
+                "no route to host",
+            )
+        )
+
+    @staticmethod
+    def _ftp_server_reply(text: str | None) -> bool:
+        s = (text or "").strip()
+        return len(s) >= 3 and s[:3].isdigit()
+
     def _dbg(self, msg: str, *, indent: int = 4) -> None:
         """Verbose-only (-vv) line via ctx.debug / ADDITIONS."""
         try:
             self.debug(msg, indent=indent)
         except TypeError:
             self.debug(msg)
+
+    def _flush_terminal(self) -> None:
+        """Flush PrintLock so a -vv line appears immediately above its result."""
+        if self.use_json:
+            return
+        ctx = getattr(self, "_ctx", None)
+        if ctx is None:
+            return
+        lock = getattr(ctx, "print_lock", None)
+        if lock is None:
+            return
+        chunk = lock.get_output_string()
+        if chunk:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+            lock.output_string = ""
 
     def _dbg_extra_lines(self, text: str | None, *, max_lines: int = 12) -> None:
         if not text:
@@ -163,7 +212,7 @@ class FtpEngine:
 
     def _ftp_is_single_known_login(self) -> bool:
         """True when CLI supplies one username and one password (no -U/-P wordlists)."""
-        u = getattr(self.args, "user", None)
+        u = one_cli_user(getattr(self.args, "user", None))
         p = getattr(self.args, "password", None)
         uf = getattr(self.args, "users", None)
         pf = getattr(self.args, "passwords", None)
@@ -241,20 +290,21 @@ class FtpEngine:
                     help_response = None
                 if help_response:
                     self._dbg(f"HELP → {self._snip(help_response)}")
-                    self._dbg_extra_lines(help_response)
+                    self._dbg_extra_lines(help_response, max_lines=24)
                 else:
                     self._dbg("HELP: empty / not advertised")
             except Exception as e:
-                self._dbg(f"HELP failed: {self._snip(str(e))}")
+                help_response = str(e).strip() or "HELP failed"
+                self._dbg(f"HELP failed: {self._snip(help_response)}")
             try:
                 syst = self.ftp.sendcmd("SYST")
-                if re.match(r"[0-9]+ UNIX Type: L8", syst):
+                if re.match(r"[0-9]+ UNIX Type: L8", syst or ""):
                     self._dbg(f"SYST → {self._snip(syst)} (generic L8, ignored)")
-                    syst = None
                 else:
                     self._dbg(f"SYST → {self._snip(syst)}")
             except Exception as e:
-                self._dbg(f"SYST failed: {self._snip(str(e))}")
+                syst = str(e).strip() or "SYST failed"
+                self._dbg(f"SYST failed: {self._snip(syst)}")
             try:
                 if not self.results.anonymous and self.results.creds is not None:
                     for creds in self.results.creds:
@@ -264,9 +314,30 @@ class FtpEngine:
                 self._dbg(f"STAT → {self._snip(stat)}")
                 self._dbg_extra_lines(stat)
             except Exception as e:
-                self._dbg(f"STAT failed: {self._snip(str(e))}")
+                stat = str(e).strip() or "STAT failed"
+                self._dbg(f"STAT failed: {self._snip(stat)}")
 
         return InfoResult(banner, help_response, syst, stat)
+
+    def _missing_login_line(self) -> str:
+        """Why a test that needs a session cannot log in."""
+        anon_failed = self.results.anonymous is False
+        tried_user = check_if_brute(self.args)
+        if anon_failed and tried_user:
+            return "Anonymous login failed and the supplied login was rejected."
+        if anon_failed:
+            return "Anonymous login failed. Use -u and -p."
+        if tried_user:
+            return "Login failed. Check -u and -p."
+        return "Use -u and -p, or -A if anonymous login is enabled."
+
+    def _is_login_skip(self, text: str | None) -> bool:
+        t = text or ""
+        return t.startswith((
+            "Anonymous login failed",
+            "Login failed. Check -u and -p.",
+            "Use -u and -p, or -A",
+        ))
 
     def anonymous(self) -> bool:
         """Attempts anonymous authentication
@@ -280,6 +351,8 @@ class FtpEngine:
             self._dbg("PASS → OK (anonymous)")
             return True
         except ftplib.Error as e:
+            if self._ftp_text_is_unconfirmed(str(e)):
+                raise
             self._dbg(f"PASS → failed: {self._snip(str(e))}")
             return False
 
@@ -308,7 +381,7 @@ class FtpEngine:
 
         if len(all_creds) == 0:
             self._dbg("Access check skipped: no valid credentials")
-            return AccessCheckResult(["No valid credentials"], None)
+            return AccessCheckResult([self._missing_login_line()], None)
 
         # Check all credentials
         errors: list[str] = []
@@ -559,8 +632,16 @@ class FtpEngine:
             and not self._eicar_size_unsupported(size_err)
             and self._eicar_reply_suggests_missing(size_err)
         )
-        size_wrong = size_bytes is not None and size_bytes != len(EICAR_STANDARD_TEST_FILE)
         retr_missing = retr_err is not None and self._eicar_reply_suggests_missing(retr_err)
+        retr_unconfirmed = bool(retr_err) and (
+            self._ftp_text_is_unconfirmed(retr_err) or not self._ftp_server_reply(retr_err)
+        )
+        size_wrong = (
+            size_bytes is not None
+            and size_bytes != len(EICAR_STANDARD_TEST_FILE)
+            and (retr_ok or retr_missing)
+            and not retr_unconfirmed
+        )
         retr_bad = bool(retr_ok and retr_match is False)
         vanished = size_vanished or size_wrong or retr_missing or retr_bad
 
@@ -623,14 +704,9 @@ class FtpEngine:
         if self.results.creds is not None:
             all_creds.extend(self.results.creds)
         if not all_creds:
-            self._dbg("EICAR skipped: no credentials")
-            return FtpEicarAuditResult(
-                delay,
-                tuple(),
-                "No credentials for EICAR probe (enable anonymous or provide -u/-p / wordlists).",
-                False,
-                True,
-            )
+            self._dbg("EICAR skipped: no logged-in account")
+            detail = self._missing_login_line()
+            return FtpEicarAuditResult(delay, tuple(), detail, False, False)
         rows = tuple(self._eicar_probe_one_account(c, delay) for c in all_creds)
         risky = any(
             r.stor_ok and r.retr_payload_match is True and not r.vanished_after_stor_suspected
@@ -751,10 +827,6 @@ class FtpEngine:
         payload: bytes,
     ) -> FtpDosProbeRow:
         o = self._ftp_stor_binary_timed(ftp, "STOR " + remote_filename, payload)
-        self._dbg(
-            f"STOR {remote_filename!r} ({probe_label}) → "
-            f"{'OK' if o.ok else 'FAIL'} code={o.reply_code} {self._snip(o.reply_line or o.error)}"
-        )
         stor_line = (o.reply_line or o.error or "").strip() or None
         blocked = False
         if o.ok:
@@ -801,7 +873,7 @@ class FtpEngine:
             if noop_ok is False:
                 suspected = True
 
-        return FtpDosProbeRow(
+        row = FtpDosProbeRow(
             probe_label,
             remote_filename,
             len(payload),
@@ -820,12 +892,97 @@ class FtpEngine:
             delete_ok,
             delete_err,
         )
+        self._ftp_dos_emit_probe(row)
+        return row
+
+    def _ftp_dos_section_title(self, r: FtpDosProbeRow) -> str:
+        label = r.probe_label or ""
+        if "XML" in label:
+            return "XML entity expansion"
+        if "Overlap" in label:
+            return "Large zip bomb"
+        if "Decompression" in label or r.remote_filename.endswith(".zip"):
+            return "Zip bomb"
+        return r.remote_filename
+
+    def _ftp_dos_reply(self, r: FtpDosProbeRow) -> tuple[str, str]:
+        """Indented server reply. Color only when the transfer stalled or was not confirmed."""
+        if r.timed_out:
+            return "VULN", "timed out"
+        snippet = (r.stor_reply_snippet or "").strip()
+        if r.blocked_by_policy:
+            base = snippet or (str(r.reply_code) if r.reply_code is not None else "rejected")
+            if not base.endswith("(rejected)"):
+                base = f"{base} (rejected)"
+            return "TEXT", base
+        if not r.stor_ok:
+            if self._ftp_text_is_unconfirmed(r.stor_error):
+                return "WARNING", "was not confirmed"
+            detail = self._snip(snippet or r.stor_error or "failed")
+            if r.reply_code is not None and not detail.startswith(str(r.reply_code)):
+                detail = f"{r.reply_code} {detail}".strip()
+            return "WARNING", detail
+        base = snippet or (
+            f"{r.reply_code} Transfer complete" if r.reply_code is not None else "226 Transfer complete"
+        )
+        extra: list[str] = []
+        bullet = "TEXT"
+        if r.background_processing_suspected:
+            bullet = "WARNING"
+            delay = r.delta_last_byte_to_226_seconds
+            if delay is not None and delay >= FTP_DOS_DELTA_WARN_SEC:
+                extra.append(f"reply {delay:.1f}s")
+            if r.noop_ok is False:
+                extra.append("control connection failed")
+            elif (
+                r.noop_elapsed_seconds is not None
+                and r.noop_elapsed_seconds >= FTP_DOS_NOOP_WARN_SEC
+            ):
+                extra.append(f"NOOP {r.noop_elapsed_seconds:.1f}s")
+        note = "accepted" if not extra else "accepted, " + ", ".join(extra)
+        return bullet, f"{base} ({note})"
+
+    def _ftp_dos_print_probe(self, r: FtpDosProbeRow, *, debug: bool) -> None:
+        """Section title, file name, then the server reply. -vv trace sits under the file name."""
+        self._flush_terminal()
+        self._tprint(self._ftp_dos_section_title(r), "TITLE")
+        self._tprint(r.remote_filename, "TEXT", indent=8)
+        self._flush_terminal()
+        if debug:
+            if r.timed_out:
+                recv = "timed out"
+            else:
+                recv = self._snip(r.stor_reply_snippet or r.stor_error or "(no reply)")
+            self._dbg(f"STOR {r.remote_filename} → {recv}", indent=12)
+            if r.stor_ok and not r.blocked_by_policy:
+                if r.noop_ok is True:
+                    self._dbg("NOOP → OK", indent=12)
+                elif r.noop_ok is False:
+                    self._dbg(f"NOOP → {self._snip(r.noop_error)}", indent=12)
+            if r.stor_ok:
+                if r.delete_ok:
+                    self._dbg(f"DELE {r.remote_filename} → OK", indent=12)
+                elif r.delete_error:
+                    self._dbg(f"DELE {r.remote_filename} → {self._snip(r.delete_error)}", indent=12)
+            self._flush_terminal()
+        bullet, text = self._ftp_dos_reply(r)
+        self._tprint(text, bullet, indent=12)
+        if r.stor_ok and not r.delete_ok:
+            self._tprint("Cleanup failed", "WARNING", indent=12)
+        self._flush_terminal()
+
+    def _ftp_dos_emit_probe(self, r: FtpDosProbeRow) -> None:
+        if self.use_json:
+            return
+        self._ftp_dos_print_probe(r, debug=True)
+        self._dos_probes_emitted = True
 
     def test_ftp_processing_resilience_probes(self) -> FtpDosAuditResult:
         """PTL-SVC-FTP-PROC-DOS: one login, sequential STOR probes, timing + NOOP stability."""
+        self._dos_probes_emitted = False
         tmo = float(getattr(self.args, "ftp_dos_timeout", 30.0) or 30.0)
-        force_large = bool(getattr(self.args, "ftp_dos_force_large", False))
-        zip_mode = "full" if force_large else "minimal"
+        large = bool(getattr(self.args, "ftp_dos_large", False))
+        zip_mode = "overlap" if large else "deflate"
         creds = self._get_path_enum_creds()
         if creds is None:
             self._dbg("DOS skipped: no credentials")
@@ -834,7 +991,7 @@ class FtpEngine:
                 zip_mode,
                 "",
                 tuple(),
-                "No credentials for processing probes (--anonymous successful login or -u/-p / wordlists required).",
+                self._missing_login_line(),
                 False,
                 False,
             )
@@ -876,12 +1033,12 @@ class FtpEngine:
             self._ftp_dos_probe_row(
                 ftp,
                 probe_label=(
-                    "recursive_zip_bomb.zip (Decompression DoS — "
-                    + ("full" if force_large else "minimal")
-                    + ")"
+                    "zipbomb-overlap.zip (Overlap DoS)"
+                    if large
+                    else "zipbomb.zip (Decompression DoS)"
                 ),
-                remote_filename="recursive_zip_bomb.zip",
-                payload=build_full_zip_bomb() if force_large else build_minimal_zip_bomb(),
+                remote_filename="zipbomb-overlap.zip" if large else "zipbomb.zip",
+                payload=build_huge_zip_bomb() if large else build_full_zip_bomb(),
             )
         )
 
@@ -927,64 +1084,368 @@ class FtpEngine:
                 indent=4,
             )
 
-    def _path_enum_worker(self, chunk: list[str], creds: Creds) -> list[PathEnumResult]:
-        """Worker for path enumeration. Processes a chunk of paths with one FTP connection.
-        Respects FTP sticky state: after each test returns to base_path to avoid false results."""
+    def _enum_expect_pwd(self, base: str, path: str) -> str:
+        raw = path.replace("\\", "/")
+        if raw.startswith("/"):
+            return self._chroot_norm_pwd(raw)
+        return self._chroot_norm_pwd(posixpath.join(self._chroot_norm_pwd(base), raw))
+
+    def _enum_show(self, lines: list[str], row: PathEnumResult | None) -> None:
+        """-vv lines, then the hit. One path stays together across threads."""
+        if self.use_json:
+            return
+        lock = getattr(self, "_enumpath_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._enumpath_lock = lock
+        with lock:
+            for line in lines:
+                self._dbg(line)
+            if row is not None:
+                self._tprint(self._enumpath_text(row), "VULN")
+                if row.cleanup_failed:
+                    self._tprint("Cleanup failed", "WARNING")
+                self._enumpath_streamed = True
+            self._flush_terminal()
+
+    @staticmethod
+    def _enumpath_text(row: PathEnumResult) -> str:
+        if row.login_directory:
+            if row.writable and row.deletable:
+                return f"{row.path} allows write and delete"
+            if row.writable:
+                return f"{row.path} allows write"
+        if row.is_directory:
+            if row.writable and row.deletable:
+                return f"{row.path} is reachable (write and delete allowed)"
+            if row.writable:
+                return f"{row.path} is reachable (write allowed)"
+            return f"{row.path} is reachable"
+        bits: list[str] = []
+        if row.size is not None:
+            bits.append(f"{row.size} B")
+        if row.mtime:
+            bits.append(f"mtime {row.mtime}")
+        if row.readable:
+            bits.append("readable")
+        if not bits:
+            return f"{row.path} exists"
+        return f"{row.path} ({', '.join(bits)})"
+
+    def _enum_claim_dir(self, pwd: str) -> bool:
+        """True the first time this directory is used for the write/delete probe."""
+        key = self._chroot_norm_pwd(pwd)
+        seen = getattr(self, "_enum_write_seen", None)
+        if seen is None:
+            seen = set()
+            self._enum_write_seen = seen
+        lock = getattr(self, "_enumpath_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._enumpath_lock = lock
+        with lock:
+            if key in seen:
+                return False
+            seen.add(key)
+            return True
+
+    def _enum_mark_seen(self, pwd: str) -> bool:
+        """True the first time this directory is entered."""
+        key = self._chroot_norm_pwd(pwd)
+        with self._enumpath_lock:
+            seen = self._enum_visited
+            if key in seen:
+                return False
+            seen.add(key)
+            return True
+
+    def _enum_file_path(self, directory: str, name: str) -> str:
+        base = self._chroot_norm_pwd(directory)
+        leaf = name.replace("\\", "/").lstrip("/")
+        if base == "/":
+            return f"/{leaf}"
+        return f"{base.rstrip('/')}/{leaf}"
+
+    def _enum_try_file(self, ftp: ftplib.FTP, directory: str, name: str) -> PathEnumResult | None:
+        """SIZE only after CWD 550. A CWD that does not fail that way is not a file."""
+        notes: list[str] = []
+        parent = self._chroot_norm_pwd(directory)
+        try:
+            ftp.cwd(name)
+            try:
+                pwd_after = ftp.pwd()
+            except (ftplib.Error, AttributeError):
+                pwd_after = ""
+        except ftplib.error_perm as exc:
+            err = str(exc)
+            notes.append(f"CWD {name!r} → {self._snip(err)}")
+            if "550" not in err:
+                self._enum_show(notes, None)
+                return None
+        except ftplib.Error as exc:
+            notes.append(f"CWD {name!r} → {self._snip(str(exc))}")
+            self._enum_show(notes, None)
+            return None
+        else:
+            expect = self._enum_expect_pwd(parent, name)
+            shown = pwd_after or "unknown"
+            if pwd_after and self._chroot_norm_pwd(pwd_after) == expect:
+                notes.append(f"CWD {name!r} → directory pwd={pwd_after}")
+            else:
+                notes.append(f"CWD {name!r} → pwd={shown} (not {expect})")
+            self._enum_show(notes, None)
+            back: list[str] = []
+            self._enum_leave(ftp, parent, back)
+            self._enum_show(back, None)
+            return None
+        try:
+            size = ftp.size(name)
+        except ftplib.Error as exc:
+            notes.append(f"SIZE {name!r} → {self._snip(str(exc))}")
+            self._enum_show(notes, None)
+            return None
+        notes.append(f"SIZE {name!r} → {size} B")
+        mtime = None
+        try:
+            reply = ftp.sendcmd(f"MDTM {name}")
+            notes.append(f"MDTM {name!r} → {self._snip(reply)}")
+            parts = reply.split()
+            if len(parts) > 1 and parts[0].startswith("213"):
+                mtime = parts[1]
+        except ftplib.Error as exc:
+            notes.append(f"MDTM {name!r} → {self._snip(str(exc))}")
+        readable = self._enum_readable(ftp, name, notes)
+        row = PathEnumResult(
+            path=self._enum_file_path(directory, name),
+            exists=True,
+            is_directory=False,
+            size=size,
+            mtime=mtime,
+            readable=readable,
+        )
+        self._enum_show(notes, row)
+        return row
+
+    def _enum_leave(self, ftp: ftplib.FTP, parent: str, notes: list[str]) -> None:
+        """Return to the parent directory. CDUP first, then the absolute path."""
+        parent_n = self._chroot_norm_pwd(parent)
+        try:
+            now = self._chroot_norm_pwd(ftp.pwd())
+        except (ftplib.Error, AttributeError):
+            now = ""
+        if now == parent_n:
+            return
+        try:
+            ftp.sendcmd("CDUP")
+            after = ftp.pwd()
+            notes.append(f"CDUP → pwd={after}")
+            if self._chroot_norm_pwd(after) == parent_n:
+                return
+        except Exception as exc:
+            notes.append(f"CDUP → {self._snip(str(exc))}")
+        try:
+            ftp.cwd(parent)
+            after = ftp.pwd()
+            notes.append(f"CWD {parent!r} → pwd={after}")
+        except Exception as exc:
+            notes.append(f"CWD {parent!r} → {self._snip(str(exc))}")
+
+    def _enum_login_directory(self, creds: Creds, files: list[str]) -> list[PathEnumResult]:
+        """Write/delete once in the start directory, then the file wordlist there."""
+        ftp = self.connect()
+        notes: list[str] = []
+        rows: list[PathEnumResult] = []
+        try:
+            ftp.login(creds.user, creds.passw)
+            base_path = getattr(self.args, "base_path", "") or ""
+            if base_path:
+                try:
+                    ftp.cwd(base_path)
+                except ftplib.Error as exc:
+                    notes.append(f"CWD {base_path!r} → {self._snip(str(exc))}")
+            try:
+                pwd = ftp.pwd()
+            except (ftplib.Error, AttributeError):
+                pwd = base_path or "/"
+            self._enum_mark_seen(pwd)
+            if self._enum_claim_dir(pwd):
+                probe = ".ptsrvtester_probe_" + secrets.token_hex(4)
+                writable, deletable, cleanup_failed = self._enum_write_delete(ftp, probe, notes)
+                if writable:
+                    row = PathEnumResult(
+                        path=self._chroot_norm_pwd(pwd),
+                        exists=True,
+                        is_directory=True,
+                        size=None,
+                        writable=writable,
+                        deletable=deletable,
+                        cleanup_failed=cleanup_failed,
+                        login_directory=True,
+                    )
+                    self._enum_show(notes, row)
+                    rows.append(row)
+                    notes = []
+                else:
+                    self._enum_show(notes, None)
+                    notes = []
+            for name in files:
+                hit = self._enum_try_file(ftp, pwd, name)
+                if hit is not None:
+                    rows.append(hit)
+            return rows
+        except Exception as exc:
+            notes.append(f"Login directory → {self._snip(str(exc))}")
+            self._enum_show(notes, None)
+            return rows
+        finally:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    def _enum_write_delete(
+        self, ftp: ftplib.FTP, stor_path: str, notes: list[str]
+    ) -> tuple[bool, bool, bool]:
+        """Prove write and delete with our own file. Returns writable, deletable, cleanup_failed."""
+        try:
+            ftp.storbinary(f"STOR {stor_path}", BytesIO(b"ptsrvtester\n"))
+        except Exception as exc:
+            notes.append(f"STOR {stor_path!r} → {self._snip(str(exc))}")
+            return False, False, False
+        notes.append(f"STOR {stor_path!r} → OK")
+        try:
+            ftp.delete(stor_path)
+        except Exception as exc:
+            notes.append(f"DELE {stor_path!r} → {self._snip(str(exc))}")
+            return True, False, True
+        notes.append(f"DELE {stor_path!r} → OK")
+        return True, True, False
+
+    def _enum_readable(self, ftp: ftplib.FTP, path: str, notes: list[str]) -> bool:
+        """RETR a short prefix and discard it. The file body is not logged."""
+        try:
+            ftp.voidcmd("TYPE I")
+        except Exception:
+            pass
+        try:
+            sock = ftp.transfercmd(f"RETR {path}")
+        except Exception as exc:
+            notes.append(f"RETR {path!r} → {self._snip(str(exc))}")
+            return False
+        got = b""
+        try:
+            sock.settimeout(8)
+            try:
+                got = sock.recv(2048) or b""
+            except Exception:
+                pass
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        try:
+            ftp.voidresp()
+            notes.append(f"RETR {path!r} → OK")
+            return True
+        except Exception as exc:
+            if got:
+                notes.append(f"RETR {path!r} → OK")
+                return True
+            notes.append(f"RETR {path!r} → {self._snip(str(exc))}")
+            return False
+
+    def _enum_enter_dirs(
+        self,
+        ftp: ftplib.FTP,
+        here: str,
+        dir_names: list[str],
+        file_names: list[str],
+        depth_left: int,
+        out: list[PathEnumResult],
+    ) -> None:
+        """Try directory names from the current directory, then step back with CDUP."""
+        if depth_left < 1:
+            return
+        here_n = self._chroot_norm_pwd(here)
+        for name in dir_names:
+            notes: list[str] = []
+            try:
+                ftp.cwd(name)
+                try:
+                    pwd_after = ftp.pwd()
+                except (ftplib.Error, AttributeError):
+                    pwd_after = ""
+            except ftplib.error_perm as exc:
+                notes.append(f"CWD {name!r} → {self._snip(str(exc))}")
+                self._enum_show(notes, None)
+                continue
+            except ftplib.Error as exc:
+                notes.append(f"CWD {name!r} → {self._snip(str(exc))}")
+                self._enum_show(notes, None)
+                continue
+            expect = self._enum_expect_pwd(here_n, name)
+            landed = bool(pwd_after) and self._chroot_norm_pwd(pwd_after) == expect
+            if not landed:
+                shown = pwd_after or "unknown"
+                notes.append(f"CWD {name!r} → pwd={shown} (not {expect})")
+                self._enum_show(notes, None)
+                back: list[str] = []
+                self._enum_leave(ftp, here_n, back)
+                self._enum_show(back, None)
+                continue
+            if not self._enum_mark_seen(pwd_after):
+                notes.append(f"CWD {name!r} → pwd={pwd_after} (already visited)")
+                self._enum_show(notes, None)
+                back = []
+                self._enum_leave(ftp, here_n, back)
+                self._enum_show(back, None)
+                continue
+            notes.append(f"CWD {name!r} → directory pwd={pwd_after}")
+            writable = deletable = cleanup_failed = False
+            if self._enum_claim_dir(pwd_after):
+                probe = ".ptsrvtester_probe_" + secrets.token_hex(4)
+                writable, deletable, cleanup_failed = self._enum_write_delete(ftp, probe, notes)
+            row = PathEnumResult(
+                path=self._chroot_norm_pwd(pwd_after),
+                exists=True,
+                is_directory=True,
+                size=None,
+                writable=writable,
+                deletable=deletable,
+                cleanup_failed=cleanup_failed,
+            )
+            self._enum_show(notes, row)
+            out.append(row)
+            for fname in file_names:
+                hit = self._enum_try_file(ftp, pwd_after, fname)
+                if hit is not None:
+                    out.append(hit)
+            if depth_left > 1:
+                self._enum_enter_dirs(ftp, pwd_after, dir_names, file_names, depth_left - 1, out)
+            back = []
+            self._enum_leave(ftp, here_n, back)
+            self._enum_show(back, None)
+
+    def _path_enum_worker(
+        self, chunk: list[str], creds: Creds, files: list[str], depth: int
+    ) -> list[PathEnumResult]:
+        """One connection. Directory names from the start directory, then CDUP back."""
         results: list[PathEnumResult] = []
         ftp = self.connect()
         try:
             ftp.login(creds.user, creds.passw)
             base_path = getattr(self.args, "base_path", "") or ""
-            # Resolve effective base: use pwd() if base_path empty (login home)
             if base_path:
                 try:
                     ftp.cwd(base_path)
                 except ftplib.Error:
-                    pass  # server may not support, continue with current dir
-                effective_base = base_path
-            else:
-                try:
-                    effective_base = ftp.pwd()
-                except (ftplib.Error, AttributeError):
-                    effective_base = "/"
-
-            def _reset_to_base() -> None:
-                """Return to base to avoid sticky state affecting next path test."""
-                try:
-                    ftp.cwd(effective_base)
-                except ftplib.Error:
                     pass
-
-            for path in chunk:
-                path = path.strip().lstrip("/")  # normalize: relative to effective_base
-                if not path or path.startswith("#"):
-                    continue
-                _reset_to_base()
-                # Try CWD first (directory) – 250 = exists
-                try:
-                    ftp.cwd(path)
-                    self._dbg(f"CWD {path!r} → directory")
-                    results.append(
-                        PathEnumResult(path=path, exists=True, is_directory=True, size=None)
-                    )
-                    continue  # _reset_to_base done at loop start
-                except ftplib.error_perm as e:
-                    err_str = str(e)
-                    self._dbg(f"CWD {path!r} → {self._snip(err_str)}")
-                    if "550" not in err_str and "550" not in str(e.args):
-                        continue  # other permission error, skip
-                except ftplib.Error:
-                    continue
-                # CWD failed (550) – try SIZE (file). Note: SIZE is RFC 3659; some older
-                # servers may not support it and return error even when file exists.
-                try:
-                    size = ftp.size(path)
-                    self._dbg(f"SIZE {path!r} → file size={size}")
-                    results.append(
-                        PathEnumResult(path=path, exists=True, is_directory=False, size=size)
-                    )
-                except ftplib.Error:
-                    pass  # path does not exist
+            try:
+                here = ftp.pwd()
+            except (ftplib.Error, AttributeError):
+                here = base_path or "/"
+            self._enum_enter_dirs(ftp, here, chunk, files, depth, results)
         finally:
             try:
                 ftp.close()
@@ -992,31 +1453,39 @@ class FtpEngine:
                 pass
         return results
 
-    def path_enumeration(self, creds: Creds, paths: list[str]) -> list[PathEnumResult]:
-        """Dictionary attack for path discovery. Each thread uses one connection and processes
-        a chunk of paths, resetting to base_path after each test (FTP sticky state)."""
-        if not paths:
+    def path_enumeration(
+        self, creds: Creds, directories: list[str], files: list[str], depth: int
+    ) -> list[PathEnumResult]:
+        """Directory wordlist from the start directory. Files inside each directory entered."""
+        if not directories and not files:
             return []
+        depth = max(1, int(depth))
+        self._enumpath_lock = threading.Lock()
+        self._enum_write_seen = set()
+        self._enum_visited = set()
+        self._enumpath_streamed = False
+        enum_threads = max(1, int(getattr(self.args, "threads", None) or 5))
         self._dbg(
-            f"Path enumeration: {len(paths)} paths, threads={max(1, getattr(self.args, 'enum_threads', 5))}"
+            f"Path enumeration: {len(directories)} directories, {len(files)} files, "
+            f"depth={depth}, threads={enum_threads}"
         )
-        enum_threads = max(1, getattr(self.args, "enum_threads", 5))
-        # Split paths into chunks (one per thread)
-        k, m = divmod(len(paths), enum_threads)
+        self._flush_terminal()
+        flat: list[PathEnumResult] = list(self._enum_login_directory(creds, files))
+        if not directories:
+            return flat
+        k, m = divmod(len(directories), enum_threads)
         chunks = [
-            paths[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)]
+            directories[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)]
             for i in range(enum_threads)
         ]
         chunks = [c for c in chunks if c]
 
         def worker(chunk: list[str]) -> list[PathEnumResult]:
-            return self._path_enum_worker(chunk, creds)
+            return self._path_enum_worker(chunk, creds, files, depth)
 
         pt = ptthreads.PtThreads(print_errors=False)
         raw_returns = pt.threads(chunks, worker, min(len(chunks), enum_threads)) or []
-        # Flatten and deduplicate by path
-        seen: set[str] = set()
-        flat: list[PathEnumResult] = []
+        seen = {row.path for row in flat}
         for r in raw_returns:
             if isinstance(r, list):
                 for p in r:
@@ -1036,14 +1505,22 @@ class FtpEngine:
     _FTP_USER_ENUM_TIMING_WARMUP = 3
 
     @staticmethod
-    def _user_enum_reply_template(line: str) -> str:
-        """Collapse quoted usernames / 'for user' style slots so e.g. User 'admin' vs User 'root' match template."""
-        t = (line or "").strip()
-        t = re.sub(r"\s+", " ", t).lower()
-        t = re.sub(r"'[^'\n]{1,128}'", "'<u>'", t)
-        t = re.sub(r'"[^"\n]{1,128}"', '"<u>"', t)
-        t = re.sub(r"\bfor\s+[a-z0-9][a-z0-9._-]{0,63}\b", "for <u>", t)
-        t = re.sub(r"\buser\s+[a-z0-9][a-z0-9._-]{0,63}\b", "user <u>", t)
+    def _user_enum_reply_template(line: str, username: str | None = None) -> str:
+        """Drop an echoed account name. Do not rewrite phrases such as 'user logged in'."""
+        t = re.sub(r"\s+", " ", (line or "").strip()).lower()
+        if username:
+            u = username.strip().lower()
+            if u:
+                t = re.sub(rf"\bfor\s+{re.escape(u)}\b", "for <u>", t)
+                t = t.replace(f"'{u}'", "'<u>'").replace(f'"{u}"', '"<u>"')
+                if len(u) > 8 and "for <u>" not in t:
+                    for n in range(min(len(u), 180), 8, -1):
+                        if re.search(rf"\bfor\s+{re.escape(u[:n])}\b", t):
+                            t = re.sub(rf"\bfor\s+{re.escape(u[:n])}\b", "for <u>", t)
+                            break
+        t = re.sub(r"'[^'\n]+'", "'<u>'", t)
+        t = re.sub(r'"[^"\n]+"', '"<u>"', t)
+        t = re.sub(r"\bfor\s+\S+", "for <u>", t)
         return t[:240]
 
     @staticmethod
@@ -1067,6 +1544,34 @@ class FtpEngine:
         need = max(2, (len(diffs) + 1) // 2)
         return sum(1 for d in diffs if d > 35.0) >= need
 
+    def _user_enum_dbg_reply(self, code: int | None, line: str) -> str:
+        shown = self._snip(line)
+        if code is None or shown.startswith(str(code)):
+            return shown
+        return f"{code} {shown}".strip()
+
+    def _user_enum_trace(self, msg: str, output) -> None:
+        if not getattr(self.args, "debug", False) or self.use_json:
+            return
+        if output is None:
+            self._dbg(msg)
+            return
+        line = out_if(msg, "ADDITIONS", True, colortext=True, indent=0)
+        if line:
+            output.add_string_to_output(line.rstrip("\n"))
+
+    @staticmethod
+    def _user_enum_progress_label(username: str, kind: str) -> str:
+        if kind != "wordlist":
+            return kind
+        if len(username) > 24:
+            return username[:21] + "..."
+        return username
+
+    def _user_enum_show(self, progress: ThreadedProgress, output, username: str, kind: str) -> None:
+        progress.flush(output, repaint=False)
+        progress.advance(label=self._user_enum_progress_label(username, kind))
+
     def _ftp_parse_reply_line(self, msg: str) -> tuple[int | None, str]:
         s = str(msg).strip()
         if len(s) >= 3 and s[:3].isdigit():
@@ -1080,9 +1585,11 @@ class FtpEngine:
         wrong_pass: str,
         probe_kind: str,
         probe_index: int,
+        output=None,
     ) -> FtpUserEnumProbeRow:
         ucode: int | None = None
         uline = ""
+        shown = username if len(username) <= 32 else username[:29] + "..."
         try:
             uresp = ftp.sendcmd("USER " + username)
             ucode, uline = self._ftp_parse_reply_line(uresp)
@@ -1090,7 +1597,9 @@ class FtpEngine:
             raw = str(e.args[0]) if e.args else str(e)
             ucode, uline = self._ftp_parse_reply_line(raw)
         except Exception as e:
-            self._dbg(f"USR-ENUM {probe_kind} {username!r}: USER failed {self._snip(str(e))}")
+            self._user_enum_trace(
+                f"{shown!r}: USER failed {self._snip(str(e))}", output
+            )
             return FtpUserEnumProbeRow(
                 username, probe_kind, None, "", None, "", None, False, str(e), probe_index
             )
@@ -1109,9 +1618,10 @@ class FtpEngine:
                 pcode, pline = self._ftp_parse_reply_line(raw)
             except Exception as e:
                 pass_ms = (time.perf_counter() - t0) * 1000
-                self._dbg(
-                    f"USR-ENUM {probe_kind} {username!r}: USER {ucode} {self._snip(uline)}; "
-                    f"PASS error {self._snip(str(e))}"
+                self._user_enum_trace(
+                    f"{shown!r}: USER {self._user_enum_dbg_reply(ucode, uline)}; "
+                    f"PASS error {self._snip(str(e))}",
+                    output,
                 )
                 return FtpUserEnumProbeRow(
                     username, probe_kind, ucode, uline, None, "", pass_ms, False, str(e), probe_index
@@ -1127,83 +1637,102 @@ class FtpEngine:
         except Exception:
             conn_ok = False
 
-        self._dbg(
-            f"USR-ENUM {probe_kind} {username!r}: USER {ucode} {self._snip(uline)}; "
-            f"PASS {pcode} {self._snip(pline)}"
+        self._user_enum_trace(
+            f"{shown!r}: USER {self._user_enum_dbg_reply(ucode, uline)}; "
+            f"PASS {self._user_enum_dbg_reply(pcode, pline)}",
+            output,
         )
         return FtpUserEnumProbeRow(
             username, probe_kind, ucode, uline, pcode, pline, pass_ms, conn_ok, None, probe_index
         )
 
-    def _user_enum_sequential_keepalive(
-        self, work: list[tuple[str, str, int]], wrong_pass: str
-    ) -> list[FtpUserEnumProbeRow]:
-        rows: list[FtpUserEnumProbeRow] = []
-        ftp: ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit | None = None
-        for username, kind, pidx in work:
-            if ftp is None:
-                ftp = self.connect()
-            row = self._ftp_user_pass_probe(ftp, username, wrong_pass, kind, pidx)
-            rows.append(row)
-            if row.error or not row.connection_ok_after:
-                try:
-                    ftp.close()
-                except Exception:
-                    pass
-                ftp = None
-        if ftp is not None:
+    def _user_enum_close(self, ftp) -> None:
+        if ftp is None:
+            return
+        try:
+            ftp.quit()
+        except Exception:
             try:
-                ftp.quit()
+                ftp.close()
             except Exception:
-                try:
-                    ftp.close()
-                except Exception:
-                    pass
-        return rows
+                pass
 
-    def _user_enum_worker_chunk(
-        self, chunk: list[tuple[str, str, int]], wrong_pass: str
+    def _user_enum_one(
+        self,
+        ftp,
+        item: tuple[str, str, int],
+        wrong_pass: str,
+        output,
+        *,
+        own_connection: bool,
+    ) -> FtpUserEnumProbeRow:
+        username, kind, pidx = item
+        session = ftp
+        if own_connection or session is None:
+            session = self.connect()
+            own_connection = True
+        try:
+            return self._ftp_user_pass_probe(session, username, wrong_pass, kind, pidx, output)
+        finally:
+            if own_connection:
+                self._user_enum_close(session)
+
+    def _user_enum_run(
+        self,
+        work: list[tuple[str, str, int]],
+        wrong_pass: str,
+        threads: int,
+        *,
+        keep_alive: bool,
     ) -> list[FtpUserEnumProbeRow]:
-        out: list[FtpUserEnumProbeRow] = []
-        for username, kind, pidx in chunk:
-            ftp = self.connect()
-            try:
-                out.append(self._ftp_user_pass_probe(ftp, username, wrong_pass, kind, pidx))
-            finally:
-                try:
-                    ftp.quit()
-                except Exception:
-                    try:
-                        ftp.close()
-                    except Exception:
-                        pass
-        return out
+        progress = ThreadedProgress(
+            len(work),
+            enabled=not self.use_json,
+            indent=4,
+            bar_indent=4,
+        )
+        rows: list[FtpUserEnumProbeRow] = []
+        baseline = [item for item in work if item[1] == "control_invalid_random"]
+        rest = [item for item in work if item[1] != "control_invalid_random"]
+        ftp = None
 
-    def _user_enum_parallel_or_serial(
-        self, work: list[tuple[str, str, int]], wrong_pass: str, threads: int
-    ) -> list[FtpUserEnumProbeRow]:
-        if not work:
-            return []
-        th = max(1, threads)
-        if th <= 1 or len(work) == 1:
-            return self._user_enum_worker_chunk(work, wrong_pass)
-        k, m = divmod(len(work), th)
-        chunks: list[list[tuple[str, str, int]]] = [
-            work[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)] for i in range(th)
-        ]
-        chunks = [c for c in chunks if c]
+        def drain(items: list[tuple[str, str, int]]) -> None:
+            nonlocal ftp
+            for item in items:
+                output = progress.new_output()
+                if keep_alive and ftp is None:
+                    ftp = self.connect()
+                row = self._user_enum_one(
+                    ftp, item, wrong_pass, output, own_connection=not keep_alive
+                )
+                rows.append(row)
+                if keep_alive and (row.error or not row.connection_ok_after):
+                    self._user_enum_close(ftp)
+                    ftp = None
+                self._user_enum_show(progress, output, item[0], item[1])
 
-        def worker(chunk: list[tuple[str, str, int]]) -> list[FtpUserEnumProbeRow]:
-            return self._user_enum_worker_chunk(chunk, wrong_pass)
+        try:
+            drain(baseline)
+            if keep_alive or threads <= 1 or len(rest) <= 1:
+                drain(rest)
+                return rows
 
-        pt = ptthreads.PtThreads(print_errors=False)
-        raw_returns = pt.threads(chunks, worker, min(len(chunks), th)) or []
-        flat: list[FtpUserEnumProbeRow] = []
-        for r in raw_returns:
-            if isinstance(r, list):
-                flat.extend(r)
-        flat.sort(key=lambda row: row.probe_index)
-        return flat
+            rows_lock = threading.Lock()
+
+            def work_item(item, output) -> str:
+                username, kind, _pidx = item
+                row = self._user_enum_one(None, item, wrong_pass, output, own_connection=True)
+                with rows_lock:
+                    rows.append(row)
+                return self._user_enum_progress_label(username, kind)
+
+            progress.run(rest, work_item, threads, finalize=False)
+            rows.sort(key=lambda row: row.probe_index)
+            return rows
+        finally:
+            if keep_alive:
+                self._user_enum_close(ftp)
+            progress.finalize()
 
     def _analyze_user_enum_result(
         self,
@@ -1220,53 +1749,26 @@ class FtpEngine:
         pass_norms: list[str] = []
         for r in ok_rows:
             if r.user_reply_code in (331, 332) and r.pass_reply_line:
-                pass_norms.append(self._norm_ftp_reply_text(r.pass_reply_line))
+                pass_norms.append(self._user_enum_reply_template(r.pass_reply_line, r.username))
         distinct_pass_norms = tuple(sorted(set(pass_norms)))
 
-        user_line_norms = sorted(
-            {self._norm_ftp_reply_text(r.user_reply_line) for r in ok_rows if r.user_reply_line}
-        )
-        user_line_norms = [u for u in user_line_norms if u]
-
-        pass_lines = [
-            r.pass_reply_line
-            for r in ok_rows
-            if r.user_reply_code in (331, 332) and r.pass_reply_line
-        ]
         sim_min: float | None = None
-        if len(pass_lines) >= 2:
-            ratios: list[float] = []
-            for i in range(len(pass_lines)):
-                for j in range(i + 1, len(pass_lines)):
-                    raw_r = SequenceMatcher(None, pass_lines[i], pass_lines[j]).ratio()
-                    tpl_r = SequenceMatcher(
-                        None,
-                        self._user_enum_reply_template(pass_lines[i]),
-                        self._user_enum_reply_template(pass_lines[j]),
-                    ).ratio()
-                    ratios.append(max(raw_r, tpl_r))
-            sim_min = min(ratios) if ratios else None
-
         enumeration_suspected = False
         detail_parts: list[str] = []
 
-        if len(user_codes) >= 2:
+        baseline = next(
+            (self._user_enum_probe_signature(r) for r in ok_rows if r.probe_kind == "control_invalid_random"),
+            None,
+        )
+        wordlist_rows = [r for r in ok_rows if r.probe_kind == "wordlist"]
+        if baseline is not None:
+            odd = [r for r in wordlist_rows if self._user_enum_probe_signature(r) != baseline]
+            if odd:
+                enumeration_suspected = True
+                detail_parts.append("A listed name got a different reply from a name that does not exist.")
+        elif len({self._user_enum_probe_signature(r) for r in wordlist_rows}) >= 2:
             enumeration_suspected = True
-            detail_parts.append("Distinct USER-stage numeric codes across probes (RFC 2577 section 7 misalignment).")
-
-        if len(user_codes) == 1 and len(user_line_norms) >= 2:
-            enumeration_suspected = True
-            detail_parts.append("Same USER-stage code but differing reply text (possible username oracle).")
-
-        if len(distinct_pass_norms) >= 2:
-            enumeration_suspected = True
-            detail_parts.append("Distinct PASS-stage replies after 331/332 (wrong password path).")
-
-        if sim_min is not None and sim_min < 0.92 and len(distinct_pass_norms) < 2 and len(pass_lines) >= 3:
-            enumeration_suspected = True
-            detail_parts.append(
-                f"Low fuzzy similarity between PASS replies (min raw/template SequenceMatcher ratio {sim_min:.2f})."
-            )
+            detail_parts.append("Listed names did not all get the same reply.")
 
         timing_anomaly = False
         tarpit_hint = False
@@ -1339,24 +1841,27 @@ class FtpEngine:
                 if used_keep_alive and not tarpit_hint:
                     tnotes.append("keepAliveMayStillTarpitWithoutMonotonicPattern")
 
-        for r in ok_rows:
-            if (
-                r.user_reply_code in (331, 332)
-                and r.pass_reply_code is not None
-                and 200 <= r.pass_reply_code < 300
-            ):
-                enumeration_suspected = True
-                detail_parts.append(
-                    f"Unexpected 2xx after PASS for probe {r.username!r} (fixed wrong password) — verify manually."
-                )
+        accepted_wrong_pass = [
+            r
+            for r in ok_rows
+            if r.user_reply_code in (331, 332)
+            and r.pass_reply_code is not None
+            and 200 <= r.pass_reply_code < 300
+        ]
+        if accepted_wrong_pass and len(accepted_wrong_pass) == len(ok_rows):
+            detail_parts.append(
+                "Wrong password was accepted for every name, including controls. That is not a username oracle."
+            )
+        elif accepted_wrong_pass:
+            enumeration_suspected = True
+            shown = ", ".join(repr(r.username) for r in accepted_wrong_pass[:6])
+            detail_parts.append(
+                f"Wrong password was accepted for {shown} and refused for other names."
+            )
 
         if not detail_parts:
             detail_parts.append("No strong USER/PASS differentiation observed in this sample (heuristic).")
 
-        self._dbg(
-            f"USR-ENUM: enumerated_suspected={enumeration_suspected} "
-            f"user_codes={tuple(user_codes)!r} probes={len(rows)}"
-        )
         return FtpUserEnumResult(
             probes=tuple(rows),
             fixed_password_marker="(fixed_wrong_password_sent)",
@@ -1374,41 +1879,36 @@ class FtpEngine:
 
     def test_user_enumeration(self) -> FtpUserEnumResult:
         """PTL-SVC-FTP-USRENUM: USER then fixed wrong PASS; control users + optional timing / keep-alive."""
-        wl = getattr(self.args, "user_enum_wordlist", None)
-        if not wl:
-            raise ValueError("user_enum_wordlist is required")
-        raw = text_or_file(None, wl)
+        user = getattr(self.args, "user", None)
+        users_file = getattr(self.args, "users", None) or getattr(self.args, "user_enum_wordlist", None)
+        if user is None and not users_file:
+            raise ValueError("USRENUM requires -u/--user or -U/--users")
+        raw = text_or_file(user, users_file)
         names = [ln.strip() for ln in raw if ln.strip() and not ln.strip().startswith("#")]
+        if not names:
+            raise ValueError("USRENUM requires -u/--user or -U/--users")
         ue_mx = int(getattr(self.args, "user_enum_max", 0) or 0)
         if ue_mx > 0:
             names = names[:ue_mx]
         hex8 = secrets.token_hex(4)
         work: list[tuple[str, str, int]] = []
         pidx = 0
+        # Known-nonexistent name first, so later names are compared to that reply.
+        work.append((f"enumtest_invalid_{hex8}", "control_invalid_random", pidx))
+        pidx += 1
         for n in names:
             work.append((n, "wordlist", pidx))
             pidx += 1
-        work.append((f"enumtest_invalid_{hex8}", "control_invalid_random", pidx))
-        pidx += 1
-        work.append(("a" * 256, "control_long", pidx))
-        pidx += 1
-        work.append(("admin'", "control_special", pidx))
-        pidx += 1
-        work.append(("admin%", "control_special", pidx))
 
-        pwd = getattr(self.args, "user_enum_password", None) or "PtsrvUEnumWrongPass!77~"
-        keep_alive = bool(getattr(self.args, "user_enum_keep_alive", False))
-        threads = max(1, int(getattr(self.args, "user_enum_threads", 1) or 1))
-        do_timing = bool(getattr(self.args, "user_enum_timing", False))
-        self._dbg(
-            f"USR-ENUM: {len(work)} probes (wordlist={len(names)}), keep_alive={keep_alive}, "
-            f"threads={threads}"
+        pwd = (
+            getattr(self.args, "password", None)
+            or getattr(self.args, "user_enum_password", None)
+            or "PtsrvUEnumWrongPass!77~"
         )
-
-        if keep_alive:
-            rows = self._user_enum_sequential_keepalive(work, pwd)
-        else:
-            rows = self._user_enum_parallel_or_serial(work, pwd, threads)
+        keep_alive = bool(getattr(self.args, "user_enum_keep_alive", False))
+        threads = max(1, int(getattr(self.args, "threads", None) or 1))
+        do_timing = bool(getattr(self.args, "user_enum_timing", False))
+        rows = self._user_enum_run(work, pwd, threads, keep_alive=keep_alive)
 
         return self._analyze_user_enum_result(
             rows, do_timing, used_keep_alive=keep_alive, parallel_threads=threads
@@ -1429,6 +1929,33 @@ class FtpEngine:
         except ValueError:
             return False
 
+    def _modes_line(self, text: str, bullet: str) -> None:
+        if self.use_json:
+            return
+        self._tprint(text, bullet)
+        self._modes_streamed = True
+        self._flush_terminal()
+
+    def _modes_report_passive(self, ok: bool, err: str | None) -> None:
+        if ok:
+            self._modes_line("Passive: available", "NOTVULN")
+        elif self._ftp_text_is_unconfirmed(err):
+            self._modes_line("Passive timed out (not confirmed)", "WARNING")
+        else:
+            self._modes_line("Passive: not available", "VULN")
+
+    def _modes_report_active(self, ok: bool, err: str | None) -> None:
+        if ok:
+            self._modes_line("Active: available", "NOTVULN")
+        elif self._ftp_server_reply(err):
+            self._modes_line("Active: not available", "VULN")
+        else:
+            self._modes_line("Active timed out (not confirmed)", "WARNING")
+            self._modes_line(
+                "Active mode was not confirmed. A timeout can also mean the tester is behind NAT or a firewall.",
+                "WARNING",
+            )
+
     def test_modes(self, creds: Creds) -> ModesResult:
         """
         Test passive and active mode availability. Requires data transfer (LIST/NLST).
@@ -1436,6 +1963,8 @@ class FtpEngine:
         """
         passive_ok = False
         active_ok = False
+        passive_error: str | None = None
+        active_error: str | None = None
         pasv_ip_leak: str | None = None
         target_ip = self.args.target.ip
         try:
@@ -1462,6 +1991,10 @@ class FtpEngine:
                 # IP leak: PASV IP differs from target (e.g. internal IP exposed when connecting from outside)
                 if pasv_ip and target_ip and pasv_ip != target_ip:
                     pasv_ip_leak = pasv_ip
+                    self._modes_line(
+                        f"PASV Internal IP Leak: server advertised {pasv_ip_leak}",
+                        "VULN",
+                    )
             except ftplib.Error as e:
                 self._dbg(f"PASV → failed: {self._snip(str(e))}")
             try:
@@ -1469,14 +2002,18 @@ class FtpEngine:
                 ftp.dir(ach.read_callback)
                 passive_ok = True
                 self._dbg("LIST (PASV) → OK")
-            except ftplib.Error as e:
-                self._dbg(f"LIST (PASV) → failed: {self._snip(str(e))}")
-                pass
+            except Exception as e:
+                passive_error = str(e).strip()
+                self._dbg(f"LIST (PASV) → failed: {self._snip(passive_error)}")
+        except Exception as e:
+            passive_error = str(e).strip()
+            self._dbg(f"Passive probe failed: {self._snip(passive_error)}")
         finally:
             try:
                 ftp.close()
             except Exception:
                 pass
+        self._modes_report_passive(passive_ok, passive_error)
 
         # Test active mode (new connection)
         ftp = self.connect()
@@ -1489,16 +2026,26 @@ class FtpEngine:
                 ftp.dir(ach.read_callback)
                 active_ok = True
                 self._dbg("LIST (PORT/active) → OK")
-            except ftplib.Error as e:
-                self._dbg(f"LIST (PORT/active) → failed: {self._snip(str(e))}")
-                pass
+            except Exception as e:
+                active_error = str(e).strip()
+                self._dbg(f"LIST (PORT/active) → failed: {self._snip(active_error)}")
+        except Exception as e:
+            active_error = str(e).strip()
+            self._dbg(f"Active probe failed: {self._snip(active_error)}")
         finally:
             try:
                 ftp.close()
             except Exception:
                 pass
+        self._modes_report_active(active_ok, active_error)
 
-        return ModesResult(passive_ok=passive_ok, active_ok=active_ok, pasv_ip_leak=pasv_ip_leak)
+        return ModesResult(
+            passive_ok=passive_ok,
+            active_ok=active_ok,
+            pasv_ip_leak=pasv_ip_leak,
+            passive_error=passive_error,
+            active_error=active_error,
+        )
 
     def _pasv_list_data_port_once(self, ftp: ftplib.FTP) -> tuple[int | None, str | None]:
         """
@@ -1563,6 +2110,7 @@ class FtpEngine:
         probes: list[PasvPortRangeProbe] = []
         ports_ok: list[int] = []
 
+        self._flush_terminal()
         for i in range(sample_count):
             ftp = self.connect()
             err: str | None = None
@@ -1572,15 +2120,18 @@ class FtpEngine:
                 port, err = self._pasv_list_data_port_once(ftp)
                 if port is not None:
                     ports_ok.append(port)
-                self._dbg(f"PASVPORT sample[{i}] data_port={port} err={self._snip(err)}")
+                    self._dbg(f"PASV sample {i + 1} → {port}")
+                else:
+                    self._dbg(f"PASV sample {i + 1} failed — {self._snip(err) or 'no data port'}")
             except Exception as e:
                 err = str(e).strip() or type(e).__name__
-                self._dbg(f"PASVPORT sample[{i}] failed: {self._snip(err)}")
+                self._dbg(f"PASV sample {i + 1} failed — {self._snip(err)}")
             finally:
                 try:
                     ftp.close()
                 except Exception:
                     pass
+                self._flush_terminal()
             probes.append(PasvPortRangeProbe(sample_index=i, data_port=port, error=err))
 
         ok_t = tuple(ports_ok)
@@ -1589,7 +2140,7 @@ class FtpEngine:
                 f"Only {len(ports_ok)}/{sample_count} passive LIST transfers yielded a data port; "
                 "need at least 4 for a spread estimate. Check connectivity, TLS vs plaintext, or permissions."
             )
-            return PasvPortRangeResult(
+            result = PasvPortRangeResult(
                 probes=tuple(probes),
                 successful_ports=ok_t,
                 min_port=min(ports_ok) if ports_ok else None,
@@ -1601,6 +2152,8 @@ class FtpEngine:
                 inconclusive=True,
                 detail=detail,
             )
+            self._pasvport_report(result)
+            return result
 
         lo, hi = min(ports_ok), max(ports_ok)
         span = hi - lo
@@ -1614,7 +2167,7 @@ class FtpEngine:
                 else "Spread stays within the configured threshold (prefer also documenting the server's configured passive range in policy)."
             )
         )
-        return PasvPortRangeResult(
+        result = PasvPortRangeResult(
             probes=tuple(probes),
             successful_ports=ok_t,
             min_port=lo,
@@ -1625,6 +2178,38 @@ class FtpEngine:
             wide_passive_range=wide,
             inconclusive=False,
             detail=detail,
+        )
+        self._pasvport_report(result)
+        return result
+
+    def _pasvport_line(self, text: str, bullet: str) -> None:
+        if self.use_json:
+            return
+        self._tprint(text, bullet)
+        self._pasvport_streamed = True
+        self._flush_terminal()
+
+    def _pasvport_report(self, ppr: PasvPortRangeResult) -> None:
+        """One verdict. Sample lines are -vv only and already flushed."""
+        n_ok = len(ppr.successful_ports)
+        n_all = len(ppr.probes)
+        if ppr.inconclusive:
+            self._pasvport_line(
+                f"Passive port range was not confirmed ({n_ok}/{n_all} samples)",
+                "WARNING",
+            )
+            return
+        span = ppr.observed_span
+        bound = ppr.max_span_threshold
+        if ppr.wide_passive_range:
+            self._pasvport_line(
+                f"Passive port range {ppr.min_port}-{ppr.max_port} is not limited (span {span} > {bound})",
+                "VULN",
+            )
+            return
+        self._pasvport_line(
+            f"Passive port range {ppr.min_port}-{ppr.max_port} is limited (span {span} ≤ {bound})",
+            "NOTVULN",
         )
 
     def _conn_limits_read220_quit(self, sock: socket.socket) -> tuple[bool, str | None]:
@@ -1673,94 +2258,6 @@ class FtpEngine:
             if not chunk:
                 return "", True
             buf.extend(chunk)
-
-    def _conn_limits_one_handshake(self) -> tuple[bool, str | None]:
-        host = self.args.target.ip
-        port = self.args.target.port
-        try:
-            if self.args.tls:
-                ctx = ssl.create_default_context()
-                raw = socket.create_connection((host, port), timeout=10)
-                try:
-                    ss = ctx.wrap_socket(raw, server_hostname=host)
-                except Exception:
-                    try:
-                        raw.close()
-                    except Exception:
-                        pass
-                    raise
-                ok, err = self._conn_limits_read220_quit(ss)
-                try:
-                    ss.close()
-                except Exception:
-                    pass
-                return ok, err
-            if self.args.starttls:
-                f = ftplib.FTP_TLS()
-                f.connect(host, port, timeout=10)
-                f.sock.settimeout(12.0)
-                f.auth()
-                try:
-                    f.quit()
-                except Exception:
-                    try:
-                        f.close()
-                    except Exception:
-                        pass
-                return True, None
-            raw = socket.create_connection((host, port), timeout=10)
-            ok, err = self._conn_limits_read220_quit(raw)
-            try:
-                raw.close()
-            except Exception:
-                pass
-            return ok, err
-        except Exception as e:
-            return False, f"{type(e).__name__}: {e}"
-
-    def _conn_limits_parallel_phase(self, n: int) -> ConnLimitsParallelOutcome:
-        errs: list[str] = []
-        ok_c = 0
-        fail_c = 0
-
-        def _worker(_i: int) -> tuple[bool, str | None]:
-            return self._conn_limits_one_handshake()
-
-        with ThreadPoolExecutor(max_workers=max(1, n)) as ex:
-            futures = [ex.submit(_worker, i) for i in range(n)]
-            for fut in as_completed(futures):
-                s_ok, err = fut.result()
-                if s_ok:
-                    ok_c += 1
-                else:
-                    fail_c += 1
-                    if err and len(errs) < 5:
-                        errs.append(err)
-        return ConnLimitsParallelOutcome(
-            attempted=n, succeeded=ok_c, failed=fail_c, error_samples=tuple(errs)
-        )
-
-    def _conn_limits_sequential_phase(self, n: int, delay_s: float) -> ConnLimitsSequentialOutcome:
-        errs: list[str] = []
-        ok_c = 0
-        fail_c = 0
-        for _ in range(n):
-            s_ok, err = self._conn_limits_one_handshake()
-            if s_ok:
-                ok_c += 1
-            else:
-                fail_c += 1
-                if err and len(errs) < 5:
-                    errs.append(err)
-            if delay_s > 0:
-                time.sleep(delay_s)
-        return ConnLimitsSequentialOutcome(
-            attempts=n,
-            succeeded=ok_c,
-            failed=fail_c,
-            inter_connect_delay_ms=delay_s * 1000.0,
-            error_samples=tuple(errs),
-        )
 
     def _conn_limits_pasv_pre_auth_session(self, attempts: int) -> ConnLimitsPasvSpam:
         if attempts <= 0:
@@ -1894,187 +2391,122 @@ class FtpEngine:
                 pass
             return ConnLimitsPasvSpam(attempts, n227, n530, nother, last, str(e))
 
-    def _conn_limits_idle_pre_auth(self, wait_sec: float) -> ConnLimitsIdleProbe:
-        if wait_sec <= 0:
-            return ConnLimitsIdleProbe(False, 0.0, False, "skipped")
-        kick = False
-        note = ""
-        ftp: ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit | None = None
-        try:
-            ftp = self.connect()
-            sock = ftp.sock
-            deadline = time.monotonic() + wait_sec
-            while time.monotonic() < deadline:
-                rem = deadline - time.monotonic()
-                if rem <= 0:
-                    break
-                r, _, _ = select.select([sock], [], [], min(1.0, max(0.01, rem)))
-                if r:
-                    try:
-                        d = sock.recv(8192)
-                        if not d:
-                            kick = True
-                            note = "peer closed during idle"
-                            break
-                        if b"421" in d or b"426" in d:
-                            kick = True
-                            note = "421/426 during idle"
-                            break
-                    except OSError as e:
-                        kick = True
-                        note = str(e)
-                        break
-            if not kick:
-                note = "no 421/close within idle window"
-        except Exception as e:
-            return ConnLimitsIdleProbe(True, wait_sec, False, str(e))
-        finally:
-            if ftp:
-                try:
-                    ftp.close()
-                except Exception:
-                    pass
-        return ConnLimitsIdleProbe(True, wait_sec, kick, note)
+    _CONN_COUNT_DEFAULT = 100
+    _CONN_COUNT_THRESHOLD = 50
+    _CONN_DURATION_DEFAULT = 300.0
+    _CONN_DURATION_RECOMMENDED = 180.0
+    _CONN_PREAUTH_IDLE_OK = 60.0
+    _CONN_POST_IDLE_OK = 180.0
+    _CONN_BAN_MIN = 30.0
+    _CONN_AUTH_PARALLEL_MAX = 30
+    _CONN_AUTH_VULN = 10
+    _CONN_PASV_ATTEMPTS = 18
 
-    def _conn_limits_slow_auth(self, gap: float) -> ConnLimitsSlowAuth:
-        if gap <= 0:
-            return ConnLimitsSlowAuth(False, 0.0, None, None, "skipped")
-        marker_user = "ptsrv_conn_slow_probe"
-        marker_pass = "PtsrvWrongPass!9~"
-        host = self.args.target.ip
-        port = self.args.target.port
-        try:
-            if self.args.tls:
-                ctx = ssl.create_default_context()
-                raw = socket.create_connection((host, port), timeout=10)
-                ss = ctx.wrap_socket(raw, server_hostname=host)
-                okb, err = self._conn_limits_drain_banner_raw(ss)
-                if not okb:
-                    try:
-                        ss.close()
-                    except Exception:
-                        pass
-                    return ConnLimitsSlowAuth(True, gap, None, None, err or "no banner")
-                buf = bytearray()
-                ss.sendall(f"USER {marker_user}\r\n".encode())
-                _line_u, eof = self._conn_limits_readline_socket(ss, buf, 15.0)
-                if eof and not _line_u:
-                    try:
-                        ss.close()
-                    except Exception:
-                        pass
-                    return ConnLimitsSlowAuth(True, gap, False, None, "EOF after USER")
-                time.sleep(gap)
-                ss.sendall(f"PASS {marker_pass}\r\n".encode())
-                line_p, eof2 = self._conn_limits_readline_socket(ss, buf, 20.0)
-                still = bool(line_p) or not eof2
-                try:
-                    ss.close()
-                except Exception:
-                    pass
-                return ConnLimitsSlowAuth(True, gap, still, (line_p or "")[:180], "implicit TLS control")
-            if self.args.starttls:
-                f = ftplib.FTP_TLS()
-                f.connect(host, port, timeout=10)
-                f.sock.settimeout(25.0)
-                f.auth()
-                f.putcmd(f"USER {marker_user}")
-                _ = f.getmultiline()
-                time.sleep(gap)
-                f.putcmd(f"PASS {marker_pass}")
-                resp = f.getmultiline()
-                snippet = resp[:180]
-                try:
-                    f.close()
-                except Exception:
-                    pass
-                return ConnLimitsSlowAuth(True, gap, True, snippet, "STARTTLS control")
-            raw = socket.create_connection((host, port), timeout=10)
-            okb, err = self._conn_limits_drain_banner_raw(raw)
-            if not okb:
-                try:
-                    raw.close()
-                except Exception:
-                    pass
-                return ConnLimitsSlowAuth(True, gap, None, None, err or "no banner")
-            buf = bytearray()
-            raw.sendall(f"USER {marker_user}\r\n".encode())
-            _line_u, eof = self._conn_limits_readline_socket(raw, buf, 15.0)
-            if eof and not _line_u:
-                try:
-                    raw.close()
-                except Exception:
-                    pass
-                return ConnLimitsSlowAuth(True, gap, False, None, "EOF after USER")
-            time.sleep(gap)
-            raw.sendall(f"PASS {marker_pass}\r\n".encode())
-            line_p, eof2 = self._conn_limits_readline_socket(raw, buf, 20.0)
-            still = bool(line_p) or not eof2
+    def _connlim_line(self, text: str, bullet: str) -> None:
+        if self.use_json:
+            return
+        self._tprint(text, bullet)
+        self._connlim_streamed = True
+        self._flush_terminal()
+
+    def _connlim_idle_line(self, label: str, measured: float, exceeded: bool, threshold: float, cap: float) -> bool:
+        """Print one idle verdict. Return True when --duration is too short to decide."""
+        if exceeded and cap <= threshold:
+            return True
+        secs = int(round(measured))
+        bound = int(threshold)
+        if measured > threshold:
+            self._connlim_line(f"{label}: {secs}s (> {bound}s)", "VULN")
+        else:
+            self._connlim_line(f"{label}: {secs}s (≤ {bound}s)", "NOTVULN")
+        return False
+
+    def _conn_limits_watch_idle(
+        self,
+        ftp: ftplib.FTP,
+        cap: float,
+        live,
+    ) -> tuple[float, bool]:
+        """Wait until the server closes the control connection or ``cap`` seconds pass."""
+        sock = ftp.sock
+        start = time.perf_counter()
+        buf = b""
+        while True:
+            elapsed = time.perf_counter() - start
+            if elapsed >= cap:
+                return cap, True
+            live(elapsed)
+            wait = min(0.5, cap - elapsed)
             try:
-                raw.close()
+                if isinstance(sock, ssl.SSLSocket) and sock.pending() > 0:
+                    readable = True
+                else:
+                    readable = bool(select.select([sock], [], [], wait)[0])
+            except (OSError, ValueError):
+                return time.perf_counter() - start, False
+            if not readable:
+                continue
+            try:
+                chunk = sock.recv(4096)
+            except (socket.timeout, TimeoutError, ssl.SSLWantReadError):
+                continue
             except Exception:
-                pass
-            return ConnLimitsSlowAuth(True, gap, still, (line_p or "")[:180], "plaintext control")
-        except Exception as e:
-            return ConnLimitsSlowAuth(True, gap, None, None, str(e))
-
-    def _conn_limits_idle_post_auth(self, creds: Creds, wait_sec: float) -> ConnLimitsIdleProbe:
-        if wait_sec <= 0:
-            return ConnLimitsIdleProbe(False, 0.0, False, "skipped")
-        kick = False
-        note = ""
-        ftp: ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit | None = None
-        try:
-            ftp = self.connect()
-            ftp.login(creds.user, creds.passw)
-            sock = ftp.sock
-            deadline = time.monotonic() + wait_sec
-            while time.monotonic() < deadline:
-                rem = deadline - time.monotonic()
-                if rem <= 0:
-                    break
-                r, _, _ = select.select([sock], [], [], min(1.0, max(0.01, rem)))
-                if r:
-                    try:
-                        d = sock.recv(8192)
-                        if not d:
-                            kick = True
-                            note = "peer closed during post-login idle"
-                            break
-                        if b"421" in d or b"426" in d:
-                            kick = True
-                            note = "421/426 during post-login idle"
-                            break
-                    except OSError as e:
-                        kick = True
-                        note = str(e)
-                        break
-            if not kick:
-                try:
-                    ftp.voidcmd("NOOP")
-                    note = "NOOP succeeded after idle window (weak idle kick)"
-                except ftplib.Error as e:
-                    note = f"NOOP after idle: {e}"
-                    if "421" in str(e):
-                        kick = True
-        except Exception as e:
-            return ConnLimitsIdleProbe(True, wait_sec, False, str(e))
-        finally:
-            if ftp:
-                try:
-                    ftp.close()
-                except Exception:
-                    pass
-        return ConnLimitsIdleProbe(True, wait_sec, kick, note)
+                return time.perf_counter() - start, False
+            if not chunk:
+                return time.perf_counter() - start, False
+            buf += chunk
+            if b"421" in buf or b"426" in buf:
+                return time.perf_counter() - start, False
 
     def test_connection_limits_audit(self, creds_post: Creds | None) -> ConnLimitsAuditResult:
-        """PTL-SVC-FTP-CONN: bounded connection / PASV / optional idle & slow-auth probes."""
-        par_n = max(1, int(getattr(self.args, "conn_limits_parallel", 12) or 12))
-        seq_n = max(0, int(getattr(self.args, "conn_limits_sequential", 24) or 24))
-        pasv_n = max(0, int(getattr(self.args, "conn_limits_pasv_attempts", 18) or 18))
-        idle_pre = float(getattr(self.args, "conn_limits_idle_pre_auth", 0) or 0)
-        slow_gap = float(getattr(self.args, "conn_limits_slow_auth_gap", 0) or 0)
-        idle_post = float(getattr(self.args, "conn_limits_idle_post_auth", 0) or 0)
+        """Connection count, refusal backoff, idle time, and FTP PASV allocation."""
+        count = max(1, int(getattr(self.args, "conn_limit_count", None) or self._CONN_COUNT_DEFAULT))
+        cap = float(getattr(self.args, "conn_limit_duration", None) or self._CONN_DURATION_DEFAULT)
+        if cap <= 0:
+            cap = self._CONN_DURATION_DEFAULT
+        threads = max(1, int(getattr(self.args, "threads", None) or 1))
+        show = not self.use_json and sys.stdout.isatty()
+        live_dirty = False
+        print_lock = threading.Lock()
+
+        def _end_live() -> None:
+            nonlocal live_dirty
+            if not live_dirty:
+                return
+            with print_lock:
+                if live_dirty:
+                    sys.stdout.write("\033[2K\r")
+                    sys.stdout.flush()
+                    live_dirty = False
+
+        def _write_live(text: str) -> None:
+            nonlocal live_dirty
+            if not show:
+                return
+            line = get_colored_text(f"    {text}", "ADDITIONS")
+            with print_lock:
+                sys.stdout.write(f"\033[2K\r{line}")
+                sys.stdout.flush()
+                live_dirty = True
+
+        def _vv(msg: str) -> None:
+            nonlocal live_dirty
+            with print_lock:
+                if live_dirty and bool(getattr(self.args, "debug", False)):
+                    sys.stdout.write("\033[2K\r")
+                    sys.stdout.flush()
+                    live_dirty = False
+            self._dbg(msg)
+            if bool(getattr(self.args, "debug", False)):
+                self._flush_terminal()
+
+        def _close_all(rows: list) -> None:
+            for ftp in rows:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+            rows.clear()
 
         if self.args.tls:
             crypto_mode = "implicit_tls"
@@ -2083,87 +2515,303 @@ class FtpEngine:
         else:
             crypto_mode = "plain"
 
-        self._dbg("Connection limits test")
-        self._dbg(
-            f"Target {self.args.target.ip}:{self.args.target.port} crypto={crypto_mode} "
-            f"— parallel={par_n} sequential={seq_n} pasv={pasv_n}"
-        )
+        held: list[ftplib.FTP] = []
+        est_err = est_disc = est_timeout = 0
+        first_err: str | None = None
+        connected = 0
+        pasv_pre = ConnLimitsPasvSpam(0, 0, 0, 0, None, None)
+        pasv_post: ConnLimitsPasvSpam | None = None
+        idle_pre_r = ConnLimitsIdleProbe(False, 0.0, False, "not run")
+        idle_post_r: ConnLimitsIdleProbe | None = None
+        slow_r = ConnLimitsSlowAuth(False, 0.0, None, None, "not used")
+        risk: list[str] = []
+        duration_warned = False
 
-        parallel = self._conn_limits_parallel_phase(par_n)
-        self._dbg(f"Parallel: {parallel.succeeded}/{parallel.attempted} succeeded")
-        sequential = (
-            self._conn_limits_sequential_phase(seq_n, 0.02)
-            if seq_n > 0
-            else ConnLimitsSequentialOutcome(0, 0, 0, 20.0, ())
-        )
-        self._dbg(f"Sequential: {sequential.succeeded}/{sequential.attempts} succeeded")
-        pasv_pre = self._conn_limits_pasv_pre_auth_session(pasv_n)
-        pasv_post = (
-            self._conn_limits_pasv_post_auth_session(creds_post, pasv_n)
-            if creds_post is not None and pasv_n > 0
-            else None
-        )
-        idle_pre_r = self._conn_limits_idle_pre_auth(idle_pre)
-        slow_r = self._conn_limits_slow_auth(slow_gap)
-        idle_post_r = (
-            self._conn_limits_idle_post_auth(creds_post, idle_post)
-            if creds_post is not None and idle_post > 0
-            else None
-        )
+        try:
+            _vv("Connection limits test")
+            _vv(
+                f"Target {self.args.target.ip}:{self.args.target.port} — up to {count} parallel "
+                f"sessions ({threads} thread{'s' if threads != 1 else ''}), idle wait {cap:.0f}s."
+            )
+            _write_live("Connected: 0")
 
-        risk_factors: list[str] = []
-        if _conn_limits_parallel_suspect(parallel):
-            risk_factors.append(
-                f"Parallel burst: all {parallel.attempted} simultaneous control sessions completed (220 + QUIT) with no refusal."
-            )
-        if _conn_limits_sequential_suspect(sequential):
-            risk_factors.append(
-                f"Sequential rapid connect: {sequential.succeeded} back-to-back control sessions succeeded without visible throttle."
-            )
-        if _conn_limits_pasv_pre_suspect(pasv_pre):
-            risk_factors.append(
-                "Pre-auth PASV spam: most PASV replies were 227 (many passive ports offered before login; 530 on some lines may still be login-gating, not flood control)."
-            )
-        if pasv_post is not None and _conn_limits_pasv_post_suspect(pasv_post):
-            risk_factors.append(
-                "Post-auth PASV spam: high rate of 227 replies on one session without error — passive allocations may be unbounded here."
-            )
-        if _conn_limits_idle_pre_suspect(idle_pre_r):
-            risk_factors.append(
-                f"Pre-login idle ~{int(idle_pre_r.wait_seconds)}s: no 421/close observed on control channel."
-            )
-        if _conn_limits_slow_auth_suspect(slow_r):
-            risk_factors.append(
-                "Slow authentication: long pause between USER and PASS did not drop the control connection before PASS reply."
-            )
-        if _conn_limits_idle_post_suspect(idle_post_r):
-            risk_factors.append(
-                "Post-login idle: NOOP still succeeded after long silence — authenticated idle timeout may be weak."
-            )
+            def _open_one(idx: int) -> tuple[int, ftplib.FTP | None, BaseException | None]:
+                try:
+                    return idx, self.connect(), None
+                except Exception as exc:
+                    return idx, None, exc
 
-        suspected = len(risk_factors) > 0
-        detail = (
-            f"cryptoMode={crypto_mode}; parallel {parallel.succeeded}/{parallel.attempted}; "
-            f"sequential {sequential.succeeded}/{sequential.attempts}; "
-            f"PASV pre 227/530/other={pasv_pre.reply227}/{pasv_pre.reply530}/{pasv_pre.reply_other}"
-            + (
-                f"; PASV post 227/530/other={pasv_post.reply227}/{pasv_post.reply530}/{pasv_post.reply_other}"
-                if pasv_post
-                else ""
-            )
-            + ". Heuristic only — tune probes and confirm on spare lab; not a full DoS test."
+            def _fail_kind(exc: BaseException) -> tuple[str, str]:
+                cause = exc.__cause__ or exc
+                # ftplib raises bare EOFError when the peer closes before a full banner line.
+                if isinstance(cause, EOFError):
+                    return "disconnect", "peer closed connection"
+                detail = str(cause).strip() or type(cause).__name__
+                if isinstance(cause, (socket.timeout, TimeoutError)):
+                    return "timeout", detail
+                msg = detail.lower()
+                if "timed out" in msg or "timeout" in msg:
+                    return "timeout", detail
+                if isinstance(cause, (ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+                    return "disconnect", detail
+                if any(k in msg for k in ("refused", "reset", "closed", "broken pipe", "aborted", "421", "too many", "eof")):
+                    return "disconnect", detail
+                return "error", detail
+
+            workers = min(threads, count)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_open_one, i) for i in range(1, count + 1)]
+                for fut in as_completed(futures):
+                    idx, ftp, exc = fut.result()
+                    if ftp is not None:
+                        held.append(ftp)
+                        _write_live(f"Connected: {len(held)}")
+                        continue
+                    kind, detail = _fail_kind(exc or OSError("connect failed"))
+                    if first_err is None:
+                        first_err = detail
+                    if kind == "timeout":
+                        est_timeout += 1
+                    elif kind == "disconnect":
+                        est_disc += 1
+                    else:
+                        est_err += 1
+                    _vv(f"Connection #{idx} failed — {kind} ({detail})")
+            connected = len(held)
+            dropped = 0
+            for ftp in held:
+                sock = getattr(ftp, "sock", None)
+                if sock is None:
+                    dropped += 1
+                    continue
+                try:
+                    sock.setblocking(False)
+                    peeked = sock.recv(1, socket.MSG_PEEK)
+                    sock.setblocking(True)
+                    if peeked == b"":
+                        dropped += 1
+                except BlockingIOError:
+                    try:
+                        sock.setblocking(True)
+                    except Exception:
+                        pass
+                except Exception:
+                    dropped += 1
+            _end_live()
+            _vv(f"Ramp-up: {connected}/{count} connections established.")
+            if not self.use_json:
+                self.out(f"Established {connected} connections", "TITLE", indent=4)
+                self.out(f"Errors {est_err} connections", "TITLE", indent=4)
+                self.out(f"Refused at connect {est_disc} connections", "TITLE", indent=4)
+                self.out(f"Timeouts during connecting {est_timeout}", "TITLE", indent=4)
+                self.out(f"Dropped while idle {dropped} connections", "TITLE", indent=4)
+                self._connlim_streamed = True
+                self._flush_terminal()
+            if connected <= 0:
+                self._connlim_line(
+                    "Could not open any connection. Connection limit was not tested.",
+                    "WARNING",
+                )
+            elif count <= self._CONN_COUNT_THRESHOLD and connected >= count:
+                self._connlim_line(
+                    f"Cannot determine connection limit (count too low, Recommended > {self._CONN_COUNT_THRESHOLD})",
+                    "WARNING",
+                )
+            elif connected > self._CONN_COUNT_THRESHOLD:
+                self._connlim_line(f"Connection limit > {self._CONN_COUNT_THRESHOLD}", "VULN")
+                risk.append(f"Connection limit > {self._CONN_COUNT_THRESHOLD}")
+            else:
+                self._connlim_line(f"Connection limit ≤ {self._CONN_COUNT_THRESHOLD}", "NOTVULN")
+
+            if 0 < connected < count:
+                start_rl = time.perf_counter()
+                banned_for = cap
+                exceeded_ban = True
+                _write_live("Ban / backoff window: 00:00")
+                while True:
+                    elapsed = time.perf_counter() - start_rl
+                    if elapsed >= cap:
+                        break
+                    _write_live(
+                        f"Ban / backoff window: {int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
+                    )
+                    try:
+                        probe = self.connect()
+                        banned_for = time.perf_counter() - start_rl
+                        exceeded_ban = False
+                        try:
+                            probe.quit()
+                        except Exception:
+                            probe.close()
+                        break
+                    except Exception:
+                        time.sleep(0.5)
+                _end_live()
+                if exceeded_ban:
+                    self._connlim_line(f"Reconnect blocked for {int(cap)}s+ after refusal", "NOTVULN")
+                elif banned_for < self._CONN_BAN_MIN:
+                    self._connlim_line("Ban/backoff window shorter than 30s", "VULN")
+                    risk.append("Ban/backoff window shorter than 30s")
+                else:
+                    self._connlim_line("Reconnect allowed after ban", "NOTVULN")
+
+            if connected > 0:
+                pasv_pre = self._conn_limits_pasv_pre_auth_session(self._CONN_PASV_ATTEMPTS)
+                _vv(
+                    f"PASV before login: 227={pasv_pre.reply227} "
+                    f"530={pasv_pre.reply530} other={pasv_pre.reply_other}"
+                )
+                if _conn_limits_pasv_pre_suspect(pasv_pre):
+                    self._connlim_line(
+                        "PASV before login is not limited (allocates data ports)",
+                        "VULN",
+                    )
+                    risk.append("PASV before login is not limited (allocates data ports)")
+
+                idle_ftp = None
+                try:
+                    idle_ftp = self.connect()
+                    elapsed, exceeded = self._conn_limits_watch_idle(
+                        idle_ftp,
+                        cap,
+                        lambda sec: _write_live(
+                            f"Pre-auth idle: {int(sec // 60):02d}:{int(sec % 60):02d}"
+                        ),
+                    )
+                except Exception as exc:
+                    elapsed, exceeded = 0.0, False
+                    _vv(f"Pre-auth idle: connect failed — {exc}")
+                finally:
+                    if idle_ftp is not None:
+                        try:
+                            idle_ftp.close()
+                        except Exception:
+                            pass
+                _end_live()
+                state = "still open" if exceeded else "closed"
+                _vv(f"Pre-auth idle: {state} after {elapsed:.0f}s")
+                idle_pre_r = ConnLimitsIdleProbe(True, elapsed, not exceeded, state)
+                if self._connlim_idle_line(
+                    "Pre-auth idle timeout", elapsed, exceeded, self._CONN_PREAUTH_IDLE_OK, cap
+                ):
+                    self._connlim_line(
+                        f"Duration too low to evaluate idle timeouts (Recommended > {int(self._CONN_DURATION_RECOMMENDED)})",
+                        "WARNING",
+                    )
+                    duration_warned = True
+                if not exceeded and elapsed <= self._CONN_PREAUTH_IDLE_OK:
+                    pass
+                elif exceeded and elapsed > self._CONN_PREAUTH_IDLE_OK:
+                    risk.append(f"Pre-auth idle timeout: {int(round(elapsed))}s")
+
+            if creds_post is not None and connected > 0:
+                accepted = 0
+                stopped = False
+                _write_live("Authenticated sessions: 0")
+                auth_held: list[ftplib.FTP] = []
+                for _ in range(self._CONN_AUTH_PARALLEL_MAX):
+                    time.sleep(0.15)
+                    try:
+                        aim = self.connect()
+                        aim.login(creds_post.user, creds_post.passw)
+                        auth_held.append(aim)
+                        accepted += 1
+                        _write_live(f"Authenticated sessions: {accepted}")
+                    except Exception:
+                        stopped = True
+                        break
+                _end_live()
+                _close_all(auth_held)
+                _vv(f"Authenticated sessions: {accepted}")
+                if accepted >= self._CONN_AUTH_VULN and not stopped:
+                    self._connlim_line(
+                        f"No per-account session limit ({accepted} parallel logins accepted)",
+                        "VULN",
+                    )
+                    risk.append(f"No per-account session limit ({accepted} parallel logins accepted)")
+                elif stopped and accepted == 0:
+                    self._connlim_line("LOGIN failed — check credentials or account lockout", "NOTVULN")
+                elif stopped:
+                    self._connlim_line("Per-account session limit is enforced", "NOTVULN")
+                else:
+                    self._connlim_line("Per-account session count below threshold", "NOTVULN")
+
+                if accepted > 0:
+                    pasv_post = self._conn_limits_pasv_post_auth_session(
+                        creds_post, self._CONN_PASV_ATTEMPTS
+                    )
+                    _vv(
+                        f"PASV after login: 227={pasv_post.reply227} "
+                        f"530={pasv_post.reply530} other={pasv_post.reply_other}"
+                    )
+                    if _conn_limits_pasv_post_suspect(pasv_post):
+                        self._connlim_line("PASV after login is not limited", "VULN")
+                        risk.append("PASV after login is not limited")
+                    elif pasv_post.error and self._ftp_text_is_unconfirmed(pasv_post.error):
+                        self._connlim_line("PASV after login was not confirmed", "WARNING")
+                    else:
+                        self._connlim_line("PASV after login is limited", "NOTVULN")
+
+                    post_ftp = None
+                    try:
+                        post_ftp = self.connect()
+                        post_ftp.login(creds_post.user, creds_post.passw)
+                        elapsed_p, exceeded_p = self._conn_limits_watch_idle(
+                            post_ftp,
+                            cap,
+                            lambda sec: _write_live(
+                                f"Post-login idle: {int(sec // 60):02d}:{int(sec % 60):02d}"
+                            ),
+                        )
+                    except Exception as exc:
+                        elapsed_p, exceeded_p = 0.0, False
+                        _vv(f"Post-login idle: failed — {exc}")
+                    finally:
+                        if post_ftp is not None:
+                            try:
+                                post_ftp.close()
+                            except Exception:
+                                pass
+                    _end_live()
+                    state_p = "still open" if exceeded_p else "closed"
+                    _vv(f"Post-login idle: {state_p} after {elapsed_p:.0f}s")
+                    note = "NOOP succeeded after idle window (weak idle kick)" if exceeded_p else state_p
+                    idle_post_r = ConnLimitsIdleProbe(True, elapsed_p, not exceeded_p, note)
+                    if self._connlim_idle_line(
+                        "Post-login idle timeout",
+                        elapsed_p,
+                        exceeded_p,
+                        self._CONN_POST_IDLE_OK,
+                        cap,
+                    ) and not duration_warned:
+                        self._connlim_line(
+                            f"Duration too low to evaluate idle timeouts (Recommended > {int(self._CONN_DURATION_RECOMMENDED)})",
+                            "WARNING",
+                        )
+                    if exceeded_p and elapsed_p > self._CONN_POST_IDLE_OK:
+                        risk.append(f"Post-login idle timeout: {int(round(elapsed_p))}s")
+        finally:
+            _end_live()
+            _close_all(held)
+
+        parallel = ConnLimitsParallelOutcome(
+            attempted=count,
+            succeeded=connected,
+            failed=max(0, count - connected),
+            error_samples=(first_err[:240],) if first_err else (),
         )
+        detail = "; ".join(risk) if risk else "No insufficient connection limit in this run."
         return ConnLimitsAuditResult(
             crypto_mode=crypto_mode,
             parallel=parallel,
-            sequential=sequential,
+            sequential=ConnLimitsSequentialOutcome(0, 0, 0, 0.0, ()),
             pasv_pre_auth=pasv_pre,
             pasv_post_auth=pasv_post,
             idle_pre_auth=idle_pre_r,
             slow_auth=slow_r,
             idle_post_auth=idle_post_r,
-            limits_insufficient_suspected=suspected,
-            risk_factors=tuple(risk_factors),
+            limits_insufficient_suspected=bool(risk),
+            risk_factors=tuple(risk),
             detail=detail,
         )
 
@@ -2184,6 +2832,7 @@ class FtpEngine:
         }
     )
     _CHROOT_DOTDOT_MAX_STEPS = 32
+    _CHROOT_REL_STEPS = 8
 
     @staticmethod
     def _chroot_norm_pwd(p: str) -> str:
@@ -2194,8 +2843,8 @@ class FtpEngine:
 
     @staticmethod
     def _chroot_strict_ancestor(ancestor: str, descendant: str) -> bool:
-        a = FTP._chroot_norm_pwd(ancestor)
-        d = FTP._chroot_norm_pwd(descendant)
+        a = FtpEngine._chroot_norm_pwd(ancestor)
+        d = FtpEngine._chroot_norm_pwd(descendant)
         if a == d:
             return False
         if a == "/":
@@ -2203,14 +2852,11 @@ class FtpEngine:
         base = a.rstrip("/")
         return d.startswith(base + "/")
 
-    @staticmethod
-    def _parse_chroot_extra_paths(spec: str) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
-        for i, part in enumerate(spec.split(",")):
-            p = part.strip()
-            if p:
-                out.append((f"extra_{i}", p))
-        return out
+    def _chroot_cwd_landed(self, path: str, row: ChrootCwdProbeRow) -> bool:
+        """CWD reached the path only when PWD afterwards is that path."""
+        if not row.success or not row.pwd_after:
+            return False
+        return self._chroot_norm_pwd(row.pwd_after) == self._chroot_norm_pwd(path)
 
     def _chroot_probe_cwd_fresh(self, creds: Creds, path: str, probe_id: str) -> ChrootCwdProbeRow:
         ftp = self.connect()
@@ -2232,24 +2878,121 @@ class FtpEngine:
             except Exception:
                 pass
 
-    def _chroot_probe_size_fresh(self, creds: Creds, remote_path: str) -> tuple[bool, str | None, int | None]:
+    def _chroot_rel_path(self, tail: str) -> str:
+        return ("../" * self._CHROOT_REL_STEPS) + tail.lstrip("/")
+
+    @staticmethod
+    def _chroot_write_outside(login_pwd: str, landed: str, name: str) -> bool:
+        """True when the created directory is above the login directory. A relative reply stays inside it."""
+        landed_n = FtpEngine._chroot_norm_pwd(landed)
+        if posixpath.basename(landed_n) != name or not landed_n.startswith("/"):
+            return False
+        login_n = FtpEngine._chroot_norm_pwd(login_pwd)
+        if login_n == "/" or landed_n == login_n:
+            return False
+        return not landed_n.startswith(login_n.rstrip("/") + "/")
+
+    def _chroot_probe_retr_fresh(self, creds: Creds, path: str) -> tuple[bool, str | None, int]:
+        """RETR the path and discard the body. Success is a completed transfer."""
         ftp = self.connect()
         try:
             ftp.login(creds.user, creds.passw)
-            sz = ftp.size(remote_path)
-            if isinstance(sz, int) and sz >= 0:
-                self._dbg(f"SIZE {remote_path!r} → {sz}")
-                return True, None, sz
-            self._dbg(f"SIZE {remote_path!r} → no size")
-            return False, None, None
+            total = 0
+
+            def _take(chunk: bytes) -> None:
+                nonlocal total
+                total += len(chunk)
+
+            ftp.retrbinary("RETR " + path, _take)
+            self._dbg(f"RETR {path!r} → {total} bytes")
+            return True, None, total
         except Exception as e:
-            self._dbg(f"SIZE {remote_path!r} → {self._snip(str(e))}")
-            return False, str(e).strip()[:240], None
+            self._dbg(f"RETR {path!r} → {self._snip(str(e))}")
+            return False, str(e).strip()[:240], 0
         finally:
             try:
                 ftp.close()
             except Exception:
                 pass
+
+    def _chroot_rmd_probe(self, creds: Creds, paths: list[str], name: str) -> bool:
+        targets: list[str] = []
+        for path in paths:
+            if not path:
+                continue
+            if posixpath.basename(self._chroot_norm_pwd(path)) != name:
+                continue
+            if path not in targets:
+                targets.append(path)
+        if not targets:
+            return False
+        ftp = self.connect()
+        try:
+            ftp.login(creds.user, creds.passw)
+            for path in targets:
+                try:
+                    ftp.rmd(path)
+                    self._dbg(f"RMD {path!r} → OK")
+                    return True
+                except Exception as e:
+                    self._dbg(f"RMD {path!r} → {self._snip(str(e))}")
+            return False
+        finally:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    def _chroot_probe_mkd_escape(self, creds: Creds, login_pwd: str) -> bool:
+        """MKD a throwaway directory via ../. Remove it. A line is printed only when it landed outside."""
+        name = ".ptsrvtester_probe_" + secrets.token_hex(4)
+        rel = self._chroot_rel_path(name)
+        ftp = self.connect()
+        created = False
+        outside = False
+        landed: str | None = None
+        try:
+            ftp.login(creds.user, creds.passw)
+            try:
+                made = ftp.mkd(rel)
+                created = True
+                shown = made.strip() if isinstance(made, str) else "OK"
+                self._dbg(f"MKD {rel!r} → {shown}")
+                if isinstance(made, str) and made.strip():
+                    landed = made.strip().strip('"').strip("'")
+            except Exception as e:
+                self._dbg(f"MKD {rel!r} → {self._snip(str(e))}")
+                if not self.use_json:
+                    self._flush_terminal()
+                return False
+            try:
+                ftp.cwd(rel)
+                pwd_now = ftp.pwd()
+                self._dbg(f"CWD {rel!r} → OK pwd={pwd_now}")
+                if self._chroot_write_outside(login_pwd, pwd_now, name):
+                    outside = True
+                    landed = pwd_now
+            except Exception as e:
+                self._dbg(f"CWD {rel!r} → {self._snip(str(e))}")
+            if landed and self._chroot_write_outside(login_pwd, landed, name):
+                outside = True
+        finally:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+        if outside:
+            self._chroot_line("../" + name, "VULN")
+        elif not self.use_json:
+            self._flush_terminal()
+        if not created:
+            return False
+        removed = self._chroot_rmd_probe(creds, [rel, landed or ""], name)
+        if not removed:
+            self._chroot_line("Cleanup failed", "WARNING")
+        elif not self.use_json:
+            self._flush_terminal()
+        return outside
 
     def _chroot_dotdot_chain(self, creds: Creds, max_steps: int | None = None) -> ChrootDotdotResult:
         """
@@ -2262,7 +3005,7 @@ class FtpEngine:
         try:
             ftp.login(creds.user, creds.passw)
             p0 = ftp.pwd()
-            self._dbg(f"CHROOT PWD initial={p0!r}")
+            self._dbg(f"PWD initial={p0!r}")
             last = p0
             steps = 0
             reason = "max_steps_cap"
@@ -2285,7 +3028,7 @@ class FtpEngine:
                     break
                 last = pn
                 steps += 1
-            self._dbg(f"CHROOT CWD .. chain: steps={steps} reason={reason} pwd_final={last!r}")
+            self._dbg(f"CWD .. chain: steps={steps} reason={reason} pwd_final={last!r}")
             return ChrootDotdotResult(steps, p0, last, reason)
         except Exception as e:
             return ChrootDotdotResult(0, p0 or "?", None, str(e)[:160])
@@ -2295,9 +3038,15 @@ class FtpEngine:
             except Exception:
                 pass
 
+    def _chroot_line(self, text: str, bullet: str) -> None:
+        if self.use_json:
+            return
+        self._tprint(text, bullet)
+        self._chroot_streamed = True
+        self._flush_terminal()
+
     def test_chroot_audit(self, creds: Creds) -> ChrootAuditResult:
-        """PTL-SVC-FTP-CHROOT: CWD to host-like paths, .. chain, SIZE on /etc/passwd."""
-        self._dbg(f"Chroot / isolation audit as {creds.user!r}")
+        """PTL-SVC-FTP-CHROOT: CWD to host-like paths, .. chain, RETR of passwd/shadow, MKD via ../."""
         ftp0 = self.connect()
         pwd_initial: str
         try:
@@ -2321,28 +3070,43 @@ class FtpEngine:
             ("srv", "/srv"),
             ("dev", "/dev"),
             ("bin", "/bin"),
+            ("sbin", "/sbin"),
+            ("usr", "/usr"),
+            ("boot", "/boot"),
             ("tmp", "/tmp"),
         ]
-        extra = self._parse_chroot_extra_paths(getattr(self.args, "chroot_audit_paths", "") or "")
-        seen: set[str] = {p for _, p in base_probes}
-        for eid, pth in extra:
-            if pth not in seen:
-                base_probes.append((eid, pth))
-                seen.add(pth)
 
         rows: list[ChrootCwdProbeRow] = []
+        confirmed = False
         for pid, pth in base_probes:
-            rows.append(self._chroot_probe_cwd_fresh(creds, pth, pid))
+            row = self._chroot_probe_cwd_fresh(creds, pth, pid)
+            rows.append(row)
+            if row.success or not self._ftp_text_is_unconfirmed(row.error_or_reply):
+                confirmed = True
+            if pth in self._CHROOT_STRONG_CWD_PATHS or pth == "/home":
+                if self._chroot_cwd_landed(pth, row):
+                    self._chroot_line(pth, "VULN")
+                elif row.error_or_reply and self._ftp_text_is_unconfirmed(row.error_or_reply):
+                    if not self.use_json:
+                        self._flush_terminal()
+                else:
+                    self._chroot_line(pth, "NOTVULN")
+            elif not self.use_json:
+                self._flush_terminal()
 
         dot = self._chroot_dotdot_chain(creds)
         pwd0n = self._chroot_norm_pwd(pwd_initial)
         pwd_fn = self._chroot_norm_pwd(dot.pwd_final or pwd_initial)
         dotdot_escape = False
-        if dot.pwd_final and pwd0n and pwd_fn:
+        if dot.steps_ok > 0 and dot.pwd_final and pwd0n and pwd_fn:
             if self._chroot_strict_ancestor(pwd_fn, pwd0n) and pwd_fn != "/":
                 dotdot_escape = True
+        if dotdot_escape:
+            self._chroot_line("..", "VULN")
+        elif not self.use_json:
+            self._flush_terminal()
 
-        home_parent_ok = any(r.path == "/home" and r.success for r in rows)
+        home_parent_ok = any(self._chroot_cwd_landed("/home", r) for r in rows if r.path == "/home")
         home_sibling = bool(
             home_parent_ok
             and pwd0n.startswith("/home/")
@@ -2351,29 +3115,73 @@ class FtpEngine:
 
         strong_hits: list[str] = []
         for r in rows:
-            if r.success and r.path in self._CHROOT_STRONG_CWD_PATHS:
+            if self._chroot_cwd_landed(r.path, r) and r.path in self._CHROOT_STRONG_CWD_PATHS:
                 strong_hits.append(r.path)
 
-        passwd_ok, _, passwd_sz = self._chroot_probe_size_fresh(creds, "/etc/passwd")
-        shadow_ok, _, shadow_sz = self._chroot_probe_size_fresh(creds, "/etc/shadow")
+        passwd_ok, passwd_err, passwd_sz = self._chroot_probe_retr_fresh(creds, "/etc/passwd")
+        if passwd_ok or not self._ftp_text_is_unconfirmed(passwd_err):
+            confirmed = True
+        if passwd_ok:
+            self._chroot_line("/etc/passwd", "VULN")
+        elif not self.use_json:
+            self._flush_terminal()
+        passwd_rel_ok, passwd_rel_err, passwd_rel_sz = self._chroot_probe_retr_fresh(
+            creds, self._chroot_rel_path("etc/passwd")
+        )
+        if passwd_rel_ok or not self._ftp_text_is_unconfirmed(passwd_rel_err):
+            confirmed = True
+        if passwd_rel_ok and not passwd_ok:
+            self._chroot_line("../etc/passwd", "VULN")
+        elif not self.use_json:
+            self._flush_terminal()
+        shadow_ok, shadow_err, shadow_sz = self._chroot_probe_retr_fresh(creds, "/etc/shadow")
+        if shadow_ok or not self._ftp_text_is_unconfirmed(shadow_err):
+            confirmed = True
+        if shadow_ok:
+            self._chroot_line("/etc/shadow", "VULN")
+        elif not self.use_json:
+            self._flush_terminal()
+        shadow_rel_ok, shadow_rel_err, shadow_rel_sz = self._chroot_probe_retr_fresh(
+            creds, self._chroot_rel_path("etc/shadow")
+        )
+        if shadow_rel_ok or not self._ftp_text_is_unconfirmed(shadow_rel_err):
+            confirmed = True
+        if shadow_rel_ok and not shadow_ok:
+            self._chroot_line("../etc/shadow", "VULN")
+        elif not self.use_json:
+            self._flush_terminal()
+        write_outside = self._chroot_probe_mkd_escape(creds, pwd_initial)
+        if not confirmed:
+            self._chroot_line("Could not connect. Isolation was not tested.", "WARNING")
+        elif not getattr(self, "_chroot_streamed", False):
+            self._chroot_line("Users are isolated", "NOTVULN")
 
+        passwd_bytes = passwd_sz if passwd_ok else passwd_rel_sz if passwd_rel_ok else None
+        shadow_bytes = shadow_sz if shadow_ok else shadow_rel_sz if shadow_rel_ok else None
         broken = (
             len(strong_hits) > 0
             or passwd_ok
+            or passwd_rel_ok
             or shadow_ok
-            or home_sibling
+            or shadow_rel_ok
+            or home_parent_ok
+            or write_outside
             or dotdot_escape
         )
 
         parts: list[str] = []
         if strong_hits:
             parts.append(f"CWD succeeded to sensitive path(s): {', '.join(sorted(set(strong_hits)))}.")
-        if passwd_ok:
-            parts.append("SIZE /etc/passwd succeeded (file visible to this account).")
-        if shadow_ok:
-            parts.append("SIZE /etc/shadow succeeded (highly anomalous — verify).")
+        if passwd_ok or passwd_rel_ok:
+            parts.append("RETR /etc/passwd returned the file.")
+        if shadow_ok or shadow_rel_ok:
+            parts.append("RETR /etc/shadow returned the file.")
         if home_sibling:
             parts.append("CWD /home succeeded while login PWD was under /home/<user> (possible cross-user directory access).")
+        elif home_parent_ok:
+            parts.append("CWD /home succeeded.")
+        if write_outside:
+            parts.append("MKD via ../ created a directory outside the login directory.")
         if dotdot_escape:
             parts.append(
                 f"Repeated CWD .. reached strict parent of login directory (final PWD ~ {pwd_fn!r}, steps={dot.steps_ok})."
@@ -2390,13 +3198,18 @@ class FtpEngine:
             dotdot=dot,
             home_parent_accessible=home_parent_ok,
             system_paths_accessible=tuple(sorted(set(strong_hits))),
-            passwd_size_ok=passwd_ok,
-            shadow_size_ok=shadow_ok,
+            passwd_size_ok=passwd_ok or passwd_rel_ok,
+            shadow_size_ok=shadow_ok or shadow_rel_ok,
             dotdot_parent_escape_suspected=dotdot_escape,
             isolation_broken_suspected=broken,
             detail=detail,
-            passwd_size_bytes=passwd_sz if passwd_ok else None,
-            shadow_size_bytes=shadow_sz if shadow_ok else None,
+            passwd_size_bytes=passwd_bytes,
+            shadow_size_bytes=shadow_bytes,
+            passwd_retr_ok=passwd_ok,
+            shadow_retr_ok=shadow_ok,
+            passwd_retr_relative_ok=passwd_rel_ok,
+            shadow_retr_relative_ok=shadow_rel_ok,
+            write_escape_ok=write_outside,
         )
 
     @staticmethod
@@ -2569,9 +3382,14 @@ class FtpEngine:
                 if c == 227:
                     return "NOTVULN", "Passive mode available after login"
             if name == "list_active":
-                if "ok" in reply_l:
+                if "data transfer ok" in reply_l:
                     return "NOTVULN", "Active-mode LIST completed (data path OK)"
-                return "WARNING", "Active-mode LIST failed (NAT/firewall on tester side possible)"
+                if c is not None or self._ftp_server_reply(s.reply):
+                    return "VULN", "Server refused the active data transfer"
+                return (
+                    "WARNING",
+                    "Active-mode LIST was not confirmed. A timeout can also mean the tester is behind NAT or a firewall.",
+                )
 
             if name == "port_foreign_list":
                 if c == 200:
@@ -2651,7 +3469,7 @@ class FtpEngine:
 
         if not aa.post_auth_ran:
             self._tprint(
-                "Post-login steps skipped (no credentials); use --anonymous or -u USER -p PASS (or wordlists)",
+                self._missing_login_line(),
                 "WARNING",
             )
 
@@ -2672,10 +3490,12 @@ class FtpEngine:
                 "VULN",
             )
         if aa.list_after_own_port_ok is False:
-            self._tprint(
-                "Active-mode LIST failed; may be NAT/firewall on tester side",
-                "WARNING",
-            )
+            list_step = next((s for s in aa.steps if s.name == "list_active"), None)
+            if list_step is not None and not self._ftp_server_reply(list_step.reply):
+                self._tprint(
+                    "Active-mode LIST was not confirmed. A timeout can also mean the tester is behind NAT or a firewall.",
+                    "WARNING",
+                )
 
         self._ptprint("Summary", Out.INFO)
         passive_ok = any(
@@ -3261,11 +4081,13 @@ class FtpEngine:
                 ftp_l.login(creds.user, creds.passw)
                 ftp_l.set_pasv(False)
                 ach = AccessCheckHelper()
+                list_err = ""
                 try:
                     ftp_l.dir(ach.read_callback)
                     list_after_own_port_ok = True
-                except ftplib.Error:
+                except Exception as e:
                     list_after_own_port_ok = False
+                    list_err = str(e).strip()
             finally:
                 try:
                     ftp_l.close()
@@ -3276,9 +4098,9 @@ class FtpEngine:
                     "postAuth",
                     "list_active",
                     "LIST (dir, client active mode)",
-                    "data transfer ok" if list_after_own_port_ok else "data transfer failed",
+                    "data transfer ok" if list_after_own_port_ok else (list_err or "data transfer failed"),
+                    self._reply_code(list_err) if list_err else None,
                     None,
-                    "If failed: NAT/firewall on tester side is possible; not necessarily server-only",
                 )
             )
         else:
@@ -3534,207 +4356,193 @@ class FtpEngine:
             None,
         )
 
+    @staticmethod
+    def _cmd_audit_label(token: str) -> str:
+        parts = token.split()
+        if len(parts) >= 2 and parts[0].upper() in ("FEAT", "SITE"):
+            return " ".join(parts[1:])
+        return token
+
     def _print_cmd_audit_terminal(self, ca: CommandAuditResult) -> None:
-        """Structured command-surface audit output (HELP/FEAT/SITE), aligned with other FTP sections."""
-        # Same yellow as section headings (Out.INFO); detail lines are informational [i].
-
-        self._ptprint("Command surface audit", Out.INFO)
-        if ca.response_truncated:
-            self._tprint("At least one response was truncated (64 KiB cap)", "WARNING")
-        if ca.site_help_all_pre_error:
-            self._tprint(f"SITE HELP ALL (pre-auth): {ca.site_help_all_pre_error}", "WARNING")
-        if ca.site_help_all_post_error:
-            self._tprint(f"SITE HELP ALL (post-auth): {ca.site_help_all_post_error}", "WARNING")
-
-        if not ca.matched_risks:
-            self._tprint(
-                "No high-risk SITE / EXEC patterns in captured HELP/FEAT/SITE output",
-                "NOTVULN",
-            )
+        if self._ftp_text_is_unconfirmed(ca.help_pre_auth) and self._ftp_text_is_unconfirmed(ca.feat_response):
+            self._tprint("Could not connect. Commands were not tested.", "WARNING")
             return
-
+        if not ca.matched_risks:
+            self._tprint("No dangerous commands", "NOTVULN")
+            return
         for r in ca.matched_risks:
-            col = "VULN" if r.tier in ("critical", "high") else "WARNING"
-            src_label = self._CMD_AUDIT_SOURCE_LABEL.get(r.source, r.source)
-            self._tprint(f"[{r.tier}] {r.token} — {src_label}", col)
+            bullet = "VULN" if r.tier in ("critical", "high") else "WARNING"
+            self._tprint(self._cmd_audit_label(r.token), bullet)
 
-            snippet = self._cmd_audit_snippet_for_risk(ca, r)
-            self._tprint(f"Response: {snippet}", "TITLE", indent=8)
+    def _cmd_active_line(self, p: CmdActiveProbeResult) -> tuple[str, str]:
+        parts = (p.command_sent or "").split()
+        label = " ".join(parts[:2]) if len(parts) >= 2 else (p.command_sent or p.probe_id)
+        if p.error and self._ftp_text_is_unconfirmed(p.error):
+            return "WARNING", f"{label} was not confirmed"
+        if p.reply_code is not None and 200 <= p.reply_code < 300:
+            return "VULN", f"{label} is allowed"
+        if p.reply_code is not None:
+            return "NOTVULN", f"{label} is not allowed"
+        return "WARNING", f"{label} was not confirmed"
 
-            vuln_t, risk_t, info_t = self._cmd_audit_risk_explain(r)
-
-            if vuln_t and r.tier in ("critical", "high"):
-                self._tprint(f"VULNERABLE: {vuln_t}", "TITLE", indent=8)
-            self._tprint(f"RISK: {risk_t}", "TITLE", indent=8)
-            if info_t:
-                self._tprint(f"INFO: {info_t}", "TITLE", indent=8)
-
-    def _inv_payload_terminal(self, p: InvalidCmdProbeResult) -> str:
-        prev = p.line_sent_preview
-        if p.probe_id in ("long_buffer_cwd", "long_buffer_user"):
-            return f"{prev} ({self._INV_AUDIT_LONG_LEN}+ byte line)"
-        return prev
+    def _inv_command_label(self, p: InvalidCmdProbeResult) -> str:
+        if p.probe_id == "long_buffer_cwd":
+            return f"CWD ({self._INV_AUDIT_LONG_LEN} bytes)"
+        if p.probe_id == "long_buffer_user":
+            return f"USER ({self._INV_AUDIT_LONG_LEN} bytes)"
+        if p.probe_id == "unicode_invalid_cwd":
+            return "CWD (invalid bytes)"
+        if p.probe_id == "double_newline_smuggle":
+            return "USER test / PASS test"
+        if p.probe_id == "user_null_byte":
+            return r"USER root\x00admin"
+        return p.line_sent_preview or p.probe_id
 
     @staticmethod
-    def _inv_verdict_label(classification: str) -> str:
-        return {
-            "no_reply_code": "NO_REPLY_CODE",
-            "connection_lost": "CONNECTION_LOST",
-            "reply_timeout": "REPLY_TIMEOUT",
-            "positive_2xx_unexpected": "UNEXPECTED_2XX",
-            "null_byte_possible_login_230": "NULL_BYTE_POSSIBLE_LOGIN",
-        }.get(classification, classification.upper())
+    def _inv_pad_run(text: str | None, run: int = 8) -> str | None:
+        """Character repeated from a long probe, echoed back in a later reply."""
+        match = re.search(r"(.)\1{%d,}" % (run - 1), text or "")
+        return match.group(1) if match else None
 
-    def _inv_probe_detail_lines(self, p: InvalidCmdProbeResult, post_auth: bool) -> None:
-        """Print one probe block for invalid-command audit (aligned with cmd/active terminal style)."""
+    def _inv_reply_body(self, code: int | None, text: str | None) -> str:
+        raw = (text or "").split("---", 1)[0]
+        line = ""
+        for part in raw.splitlines():
+            part = " ".join(part.split())
+            if part:
+                line = part
+                break
+        if code is not None:
+            prefix = str(code)
+            if line.startswith(prefix):
+                line = line[len(prefix):].lstrip(" -")
+        line = re.sub(r"(.)\1{7,}", lambda m: m.group(1) * 4 + "...", line, count=1)
+        return self._snip(line)
 
-        self._ptprint(f"    [{p.probe_id}] {p.intent_label}", Out.TEXT)
-        self._tprint(f"Payload: {self._inv_payload_terminal(p)}", "TITLE", indent=8)
+    def _inv_pad_kind(self, p: InvalidCmdProbeResult) -> str | None:
+        """'source' when this long line was echoed. 'leftover' when a later reply is still that line."""
+        echoed = self._inv_pad_run(p.reply_text)
+        if p.probe_id in ("long_buffer_cwd", "long_buffer_user") and echoed == "A":
+            self._inv_pad_char = "A"
+            return "source"
+        pad = getattr(self, "_inv_pad_char", None)
+        if pad and echoed == pad:
+            return "leftover"
+        return None
 
-        code_s = str(p.reply_code) if p.reply_code is not None else "—"
-        resp_summary = f"{code_s} | {p.classification}"
-        auth_note = "after login" if post_auth else "before login"
-
+    def _inv_probe_verdict(self, p: InvalidCmdProbeResult) -> tuple[str, str, list[str]]:
+        """One result line. Bullet matches SMTP/IMAP: star, warning, or vulnerability."""
+        label = self._inv_command_label(p)
+        if getattr(self, "_inv_show_phase", False):
+            where = "Before login" if p.phase == "preAuth" else "After login"
+            label = f"{where}, {label}"
+        body = self._inv_reply_body(p.reply_code, p.reply_text)
         cls = p.classification
-        if cls in ("no_reply_code", "connection_lost", "reply_timeout"):
-            self._tprint(f"Verdict: {self._inv_verdict_label(cls)}", "VULN", indent=8)
-            if cls == "no_reply_code":
-                self._tprint(
-                    f"RISK: No standard numeric FTP reply; server may have stalled or dropped the line.",
-                    "TITLE",
-                    indent=8,
-                )
-            elif cls == "connection_lost":
-                self._tprint(
-                    f"RISK: Connection closed or reset after probe (service instability).",
-                    "TITLE",
-                    indent=8,
-                )
-                self._tprint(
-                    f"INFO: Possible Denial of Service (DoS) via malformed or oversized input.",
-                    "TITLE",
-                    indent=8,
-                )
-            else:
-                self._tprint(
-                    f"RISK: Reply timed out; control channel may be slow or stuck.",
-                    "TITLE",
-                    indent=8,
-                )
-        elif cls == "positive_2xx_unexpected":
-            self._tprint("Verdict: UNEXPECTED_2XX", "VULN", indent=8)
-            self._tprint(
-                    f"RISK: Server accepted garbage or probe with a success class reply (review manually).",
-                    "TITLE",
-                    indent=8,
-                )
-        elif cls == "null_byte_possible_login_230":
-            self._tprint("Verdict: NULL_BYTE_POSSIBLE_LOGIN", "VULN", indent=8)
-            self._tprint(
-                    f"RISK: USER with null byte may have produced login success (230); verify PWD/session.",
-                    "TITLE",
-                    indent=8,
-                )
+        notes: list[str] = []
+        if cls == "connection_lost":
+            return "VULN", f"{label}: connection closed", notes
+        if cls == "reply_timeout":
+            return "VULN", f"{label}: no reply", notes
+        if cls == "no_reply_code":
+            return "WARNING", f"{label}: no numeric reply", notes
+        if p.reply_code is not None and body:
+            core = f"{label}: {p.reply_code} {body}"
+        elif p.reply_code is not None:
+            core = f"{label}: {p.reply_code}"
         else:
-            self._tprint(f"Response: {resp_summary}", "NOTVULN", indent=8)
-            # Informational "Result" for common benign cases
-            if cls == "server_error_5xx":
-                if p.probe_id == "unknown_hello":
-                    msg = f"Unknown verb rejected with 5xx ({auth_note})."
-                elif p.probe_id == "user_typo":
-                    msg = f"Typo command rejected; no obvious syntax bypass ({auth_note})."
-                elif p.probe_id == "user_null_byte":
-                    msg = "Null-byte USER handled without accepting a full login in this reply."
-                elif p.probe_id in ("long_buffer_cwd", "long_buffer_user"):
-                    msg = f"Large buffer on {p.probe_id.split('_')[-1].upper()} rejected with an error response."
-                elif p.probe_id == "format_string_stat":
-                    msg = "Format-string STAT probe answered without unexpected 2xx success."
-                else:
-                    msg = f"Server returned 5xx for malformed input ({auth_note})."
-            elif cls in ("null_byte_user_truncation_331",):
-                msg = "331 after null-byte USER suggests truncation parsing (review for auth bypass)."
-            elif cls == "double_crlf_probe_reply":
-                msg = "Server replied to double-CRLF smuggle probe; check for response splitting."
-            else:
-                msg = f"Classification: {cls} ({auth_note})."
-            self._tprint(f"Result: {msg}", "TITLE", indent=8)
+            core = f"{label}: {body or 'no reply'}"
+        if cls == "positive_2xx_unexpected":
+            return "VULN", f"{core} (server accepted the command)", notes
+        if cls == "null_byte_possible_login_230":
+            notes.append("Login succeeded after a null byte in the username")
+            if p.follow_up_command:
+                fu_body = self._inv_reply_body(p.follow_up_reply_code, p.follow_up_reply_snippet)
+                if p.follow_up_reply_code is not None and fu_body:
+                    notes.append(f"{p.follow_up_command}: {p.follow_up_reply_code} {fu_body}")
+                elif p.follow_up_reply_code is not None:
+                    notes.append(f"{p.follow_up_command}: {p.follow_up_reply_code}")
+            return "VULN", core, notes
+        if cls == "null_byte_user_truncation_331":
+            notes.append("Null byte in USER was treated as the end of the name")
+            return "WARNING", core, notes
+        if cls == "continuation_3xx":
+            bullet = "VULN" if p.probe_id in self._INV_3XX_CRITICAL_PROBE_IDS else "WARNING"
+            return bullet, core, notes
+        if cls == "double_crlf_probe_reply" and "smuggle_followup" in (p.reply_text or ""):
+            notes.append("Extra reply after a blank line")
+            return "WARNING", core, notes
+        if p.reply_code == 421:
+            return "WARNING", core, notes
+        pad_kind = self._inv_pad_kind(p)
+        if pad_kind == "source":
+            notes.append("Server did not read the long line as one command")
+            return "WARNING", core, notes
+        if pad_kind == "leftover":
+            return "WARNING", f"{label}: reply is still the previous long line", notes
+        return "TITLE", core, notes
 
-        if p.null_byte_outcome:
-            self._tprint(f"nullByteOutcome: {p.null_byte_outcome}", "WARNING", indent=8)
-        if p.error:
-            self._tprint(f"error: {p.error}", "WARNING", indent=8)
+    def _inv_emit_probe(self, p: InvalidCmdProbeResult) -> None:
+        """-vv Send/Receive, then one result line."""
+        if self.use_json:
+            return
+        label = self._inv_command_label(p)
+        cls = p.classification
+        if cls == "connection_lost":
+            recv = "connection closed"
+        elif cls == "reply_timeout":
+            recv = "(no reply)"
+        else:
+            body = self._inv_reply_body(p.reply_code, p.reply_text)
+            if p.reply_code is not None and body:
+                recv = f"{p.reply_code} {body}"
+            elif p.reply_code is not None:
+                recv = str(p.reply_code)
+            else:
+                recv = body or "(no reply)"
+        self._dbg(f"Send: {label}")
+        self._dbg(f"Receive: {recv}")
         if p.follow_up_command:
-            fc = str(p.follow_up_reply_code) if p.follow_up_reply_code is not None else "—"
-            sn = (p.follow_up_reply_snippet or "")[:180]
-            if p.follow_up_reply_snippet and len(p.follow_up_reply_snippet) > 180:
-                sn += "…"
-            self._tprint(
-                    f"follow-up {p.follow_up_command} → {fc}: {sn}",
-                    "TITLE",
-                    indent=8,
-                )
+            fu_body = self._inv_reply_body(p.follow_up_reply_code, p.follow_up_reply_snippet)
+            if p.follow_up_reply_code is not None and fu_body:
+                fu = f"{p.follow_up_reply_code} {fu_body}"
+            elif p.follow_up_reply_code is not None:
+                fu = str(p.follow_up_reply_code)
+            else:
+                fu = fu_body or "(no reply)"
+            self._dbg(f"Send: {p.follow_up_command}")
+            self._dbg(f"Receive: {fu}")
+        self._flush_terminal()
+        bullet, text, notes = self._inv_probe_verdict(p)
+        self._tprint(text, bullet)
+        for note in notes:
+            self._tprint(note, "TEXT", indent=8)
+        self._flush_terminal()
+        self._inv_terminal_emitted = True
 
     def _print_invalid_cmd_audit_terminal(self, inv: InvalidCmdAuditResult) -> None:
-        """Structured invalid-command (INVCOMM) terminal output."""
-
-        self._ptprint("Invalid command resilience (raw socket)", Out.INFO)
-
+        """Setup and login notes. Probe lines are already printed next to their -vv trace."""
         if inv.setup_error:
-            self._tprint(inv.setup_error, "VULN")
-            if inv.tls_handshake_hint:
-                self._tprint(f"tlsHandshakeHint: {inv.tls_handshake_hint}", "WARNING")
+            if self._ftp_text_is_unconfirmed(inv.setup_error):
+                self._tprint("Could not connect. Invalid commands were not tested.", "WARNING")
+            else:
+                self._tprint(self._snip(inv.setup_error), "WARNING")
             if inv.obsolete_tls_suspected:
-                self._tprint(
-                    "Obsolete TLS: server likely requires obsolete TLS (<1.2); "
-                    "see JSON tlsHandshakeHint / setupError.",
-                    "VULN",
-                )
+                self._tprint("Server requires obsolete TLS.", "VULN")
             return
-
-        rating = inv.overall_resilience_rating
-        ru = rating.upper()
-        if rating == "Vulnerable":
-            rb = "Unexpected 2xx, null-byte login suspicion, or no recovery after probe (see JSON)."
-            rb_bullet = "VULN"
-        elif rating == "Degraded":
-            rb = "Server stability issues during fuzzing (timeouts, drops, or suspicious replies)."
-            rb_bullet = "WARNING"
-        else:
-            rb = "Replies largely within expected error handling for this run."
-            rb_bullet = "NOTVULN"
-
-        self._tprint(f"Rating: {ru} — {rb}", rb_bullet)
-        if inv.null_byte_truncation_suspected:
-            self._tprint("nullByteTruncationSuspected=true", "WARNING")
-        if inv.post_auth_login_error:
-            self._tprint(f"post-auth login: {inv.post_auth_login_error}", "WARNING")
-        if inv.tls_handshake_hint:
-            self._tprint(f"tlsHandshakeHint: {inv.tls_handshake_hint}", "WARNING")
+        if not getattr(self, "_inv_terminal_emitted", False):
+            for sess in (inv.pre_auth, inv.post_auth):
+                if sess is None:
+                    continue
+                self._inv_pad_char = None
+                for p in sess.probes:
+                    bullet, text, notes = self._inv_probe_verdict(p)
+                    self._tprint(text, bullet)
+                    for note in notes:
+                        self._tprint(note, "TEXT", indent=8)
+        if inv.post_auth_login_error and not getattr(self, "_inv_login_note_emitted", False):
+            self._tprint("Login failed. Commands after login were not tested.", "WARNING")
         if inv.obsolete_tls_suspected:
-            self._tprint("Obsolete TLS: post-auth TLS suggests obsolete protocol.", "VULN")
-
-        for label, sess, title_fn in (
-            (
-                "preAuth",
-                inv.pre_auth,
-                lambda sr: f"Pre-authentication resilience ({sr.resilience_rating})",
-            ),
-            (
-                "postAuth",
-                inv.post_auth,
-                lambda sr: f"Post-authentication checks ({sr.resilience_rating})",
-            ),
-        ):
-            if sess is None:
-                continue
-            self._ptprint(title_fn(sess), Out.INFO)
-            if sess.null_byte_truncation_suspected:
-                self._tprint(f"nullByteTruncationSuspected in {label}", "WARNING")
-            if sess.had_connection_drop:
-                self._tprint(f"Connection drop observed in {label}", "WARNING")
-            post_auth = label == "postAuth"
-            for p in sess.probes:
-                self._inv_probe_detail_lines(p, post_auth)
+            self._tprint("Server requires obsolete TLS.", "VULN")
 
     def test_command_audit(self, creds: Creds | None) -> CommandAuditResult:
         """
@@ -3803,7 +4611,7 @@ class FtpEngine:
             risks.extend(self._cmd_audit_scan_text(site_all_post, "siteHelpAllPostAuth"))
 
         merged = self._cmd_audit_merge_risks(risks)
-        return CommandAuditResult(
+        result = CommandAuditResult(
             help_r,
             feat_r,
             site_pre,
@@ -3816,6 +4624,11 @@ class FtpEngine:
             site_all_pre_err,
             site_all_post_err,
         )
+        if getattr(self, "_cmd_audit_emit", False) and not self.use_json:
+            self._print_cmd_audit_terminal(result)
+            self._cmd_audit_streamed = True
+            self._flush_terminal()
+        return result
 
     def _cmd_passive_audit_blob(self, ca: CommandAuditResult | None) -> str:
         if ca is None:
@@ -3863,19 +4676,19 @@ class FtpEngine:
             r = ftp.sendcmd(cmd)
             line = r.strip().split("\n")[0][:500]
             code = int(line[:3]) if len(line) >= 3 and line[:3].isdigit() else None
-            self._dbg(f"{cmd} → {code} {self._snip(line)}")
+            self._dbg(f"{cmd} → {self._snip(line if code is None or line.startswith(str(code)) else f'{code} {line}')}")
             return code, line, None
         except ftplib.error_perm as e:
             s = str(e).strip()
             line = s.split("\n")[0][:500]
             code = int(line[:3]) if len(line) >= 3 and line[:3].isdigit() else None
-            self._dbg(f"{cmd} → {code} {self._snip(line)}")
+            self._dbg(f"{cmd} → {self._snip(line if code is None or line.startswith(str(code)) else f'{code} {line}')}")
             return code, line, None
         except ftplib.error_temp as e:
             s = str(e).strip()
             line = s.split("\n")[0][:500]
             code = int(line[:3]) if len(line) >= 3 and line[:3].isdigit() else None
-            self._dbg(f"{cmd} → {code} {self._snip(line)}")
+            self._dbg(f"{cmd} → {self._snip(line if code is None or line.startswith(str(code)) else f'{code} {line}')}")
             return code, line, None
         except (TimeoutError, socket.timeout, OSError, EOFError) as e:
             err = f"{type(e).__name__}: {e}"
@@ -3929,11 +4742,15 @@ class FtpEngine:
             ftp = self._cmd_active_reconnect_if_needed(creds, ftp)
             code, line, err = self._cmd_active_send_probe(ftp, cmd)
             cls = self._cmd_active_classify_code(code, err)
-            probes.append(
-                CmdActiveProbeResult(
-                    pid, cmd, code, line, cls, self._cmd_advertised_in_passive(passive, adv_key), err
-                )
+            row = CmdActiveProbeResult(
+                pid, cmd, code, line, cls, self._cmd_advertised_in_passive(passive, adv_key), err
             )
+            probes.append(row)
+            if not self.use_json:
+                bullet, text = self._cmd_active_line(row)
+                self._tprint(text, bullet)
+                self._cmd_active_streamed = True
+                self._flush_terminal()
 
         try:
             ftp = self.connect()
@@ -3981,6 +4798,10 @@ class FtpEngine:
                         pass
 
         ce = "; ".join(cleanup_errs) if cleanup_errs else None
+        if ce and not self.use_json:
+            self._tprint("Cleanup failed", "WARNING")
+            self._cmd_active_streamed = True
+            self._flush_terminal()
         return CommandAuditActiveResult(
             timeout_s, probe_name, len(cleanup_errs) == 0, ce, tuple(probes), None
         )
@@ -4306,6 +5127,11 @@ class FtpEngine:
             for p in probes
         ):
             return "Degraded"
+        if any(
+            p.probe_id in ("long_buffer_cwd", "long_buffer_user") and self._inv_pad_run(p.reply_text) == "A"
+            for p in probes
+        ):
+            return "Degraded"
         return "Stable"
 
     def _inv_run_invalid_session(
@@ -4315,6 +5141,7 @@ class FtpEngine:
         had_drop = False
         null_suspect = False
         stop = False
+        self._inv_pad_char = None
         for probe_id, intent_label, payload in self._inv_probe_definitions():
             if stop:
                 break
@@ -4382,10 +5209,6 @@ class FtpEngine:
                     if n_drain:
                         text = (text or "") + f"\n--- drained_after_smuggle_bytes={n_drain} ---\n"
             classification = self._inv_classify_probe(probe_id, code, recv_err or err)
-            self._dbg(
-                f"INVCMD {phase} {preview} → {code} {self._snip(text)}"
-                + (f" ({recv_err or err})" if (recv_err or err) else "")
-            )
             if probe_id == "user_null_byte" and code in (331, 230):
                 null_suspect = True
             if probe_id == "user_null_byte" and code == 331:
@@ -4435,6 +5258,7 @@ class FtpEngine:
                     nb_outcome,
                 )
             )
+            self._inv_emit_probe(probes_out[-1])
 
         reconnect_ok = False
         if had_drop:
@@ -4445,6 +5269,15 @@ class FtpEngine:
                 reconnect_ok = True
             except Exception:
                 reconnect_ok = False
+            if not self.use_json:
+                self._dbg("Reconnect: ok" if reconnect_ok else "Reconnect: failed")
+                self._flush_terminal()
+                if not reconnect_ok:
+                    where = ""
+                    if getattr(self, "_inv_show_phase", False):
+                        where = "before login " if phase == "preAuth" else "after login "
+                    self._tprint(f"A new connection {where}was refused after the drop", "VULN")
+                    self._flush_terminal()
 
         rating = self._inv_rate_session(
             tuple(probes_out), had_drop, reconnect_ok, null_suspect
@@ -4472,7 +5305,9 @@ class FtpEngine:
         PTL-SVC-FTP-INVCOMM: invalid / malformed control lines via raw socket (bytes on wire).
         Includes USER root\\x00… null-byte probe; resilienceRating Stable|Degraded|Vulnerable.
         """
-        self._dbg("Invalid command probes")
+        self._inv_terminal_emitted = False
+        self._inv_login_note_emitted = False
+        self._inv_show_phase = creds is not None
         timeout = self._INV_AUDIT_TIMEOUT
         pre: InvalidCmdSessionResult | None = None
         post: InvalidCmdSessionResult | None = None
@@ -4531,6 +5366,12 @@ class FtpEngine:
             (pre and pre.null_byte_truncation_suspected)
             or (post and post.null_byte_truncation_suspected)
         )
+        if post_login_err and not self.use_json:
+            self._dbg(f"After login: {self._snip(post_login_err)}")
+            self._flush_terminal()
+            self._tprint("Login failed. Commands after login were not tested.", "WARNING")
+            self._flush_terminal()
+            self._inv_login_note_emitted = True
         return InvalidCmdAuditResult(
             timeout,
             pre,
@@ -4555,6 +5396,9 @@ class FtpEngine:
         plaintext_ok = False
         auth_tls_ok = False
         tls_ok = False
+        plaintext_incomplete = False
+        auth_tls_incomplete = False
+        tls_incomplete = False
         _ssl_ctx = ssl._create_unverified_context()
         tls_only_port = port == 990
 
@@ -4568,6 +5412,7 @@ class FtpEngine:
                 self._dbg(f"Plaintext welcome: {self._snip(ftp.welcome)}")
                 ftp.close()
             except Exception as e:
+                plaintext_incomplete = self._ftp_text_is_unconfirmed(str(e))
                 self._dbg(f"Plaintext test failed: {e}")
 
             # 2. AUTH TLS (explicit: plain connect, then AUTH TLS + TLS handshake)
@@ -4581,12 +5426,14 @@ class FtpEngine:
                 auth_tls_ok = True
                 ftp.close()
             except Exception as e:
+                auth_tls_incomplete = self._ftp_text_is_unconfirmed(str(e))
                 self._dbg(f"AUTH TLS test failed: {e}")
 
         # 3. Implicit TLS (port 990)
         _connect_timeout = 15.0 if tls_only_port else timeout
 
         def _try_implicit_tls(sni):
+            nonlocal tls_incomplete
             ftp = FTP_TLS_implicit()
             ftp.context = _ssl_ctx
             try:
@@ -4598,6 +5445,8 @@ class FtpEngine:
                 return True
             except Exception as e:
                 self._dbg(f"Implicit TLS test failed (SNI={sni!r}): {e}")
+                if self._ftp_text_is_unconfirmed(str(e)):
+                    tls_incomplete = True
                 return False
             finally:
                 try:
@@ -4623,7 +5472,14 @@ class FtpEngine:
         except Exception:
             pass
 
-        return EncryptionResult(plaintext_ok, auth_tls_ok, tls_ok)
+        return EncryptionResult(
+            plaintext_ok,
+            auth_tls_ok,
+            tls_ok,
+            plaintext_incomplete,
+            auth_tls_incomplete,
+            tls_incomplete,
+        )
 
     def _stream_banner_result(self) -> None:
         """Stream banner + Service Identification immediately (thread-safe)."""
@@ -4651,27 +5507,126 @@ class FtpEngine:
                 )
                 pp(f"CPE:      {sid.cpe}", bullet_type="TEXT", condition=show, indent=4)
 
+    _FTP_HELP_TOKEN = re.compile(r"^[A-Z][A-Z0-9]{0,15}\*?$")
+    # RFC 959 SITE is ordinary. These arguments are not (same set as the command-surface audit).
+    _FTP_SITE_ERROR = (
+        (re.compile(r"\bSITE\s+(?:EXEC|EXECUTE|RUN)\b", re.I), "SITE EXEC"),
+    )
+    _FTP_SITE_WARNING = (
+        (re.compile(r"\bSITE\s+CHMOD\b", re.I), "SITE CHMOD"),
+        (re.compile(r"\bSITE\s+CHOWN\b", re.I), "SITE CHOWN"),
+        (re.compile(r"\bSITE\s+UMASK\b", re.I), "SITE UMASK"),
+        (re.compile(r"\bSITE\s+(?:SYMLINK|LINK|LN)\b", re.I), "SITE SYMLINK"),
+        (re.compile(r"\bSITE\s+CPFR\b", re.I), "SITE CPFR"),
+        (re.compile(r"\bSITE\s+CPTO\b", re.I), "SITE CPTO"),
+        (re.compile(r"\bSITE\s+WHO\b", re.I), "SITE WHO"),
+        (re.compile(r"\bSITE\s+IDLE\b", re.I), "SITE IDLE"),
+    )
+
+    def _ftp_commands_encrypted(self) -> bool:
+        port = getattr(getattr(self.args, "target", None), "port", None)
+        return bool(port == 990 or getattr(self.args, "tls", False) or getattr(self.args, "starttls", False))
+
+    def _ftp_help_command_rows(self, help_text: str) -> list[tuple[str, bool]]:
+        """Implemented command names from a HELP listing. A trailing * means unimplemented."""
+        rows: list[tuple[str, bool]] = []
+        seen: set[str] = set()
+        for raw in (help_text or "").replace("\r", "").splitlines():
+            body = re.sub(r"^\d{3}[ -]", "", raw).strip()
+            toks = body.split()
+            if not toks:
+                continue
+            matched = [t for t in toks if self._FTP_HELP_TOKEN.match(t)]
+            if not matched or len(matched) != len(toks):
+                continue
+            for tok in matched:
+                implemented = not tok.endswith("*")
+                name = tok[:-1] if tok.endswith("*") else tok
+                if name in seen:
+                    continue
+                seen.add(name)
+                if implemented:
+                    rows.append((name, True))
+        return rows
+
+    def _ftp_command_level(self, name: str) -> str:
+        """OK, WARNING, or ERROR. Ordinary RFC commands stay OK."""
+        if name == "CCC":
+            # RFC 2228: CCC drops integrity and confidentiality on the control connection.
+            return "WARNING"
+        return "OK"
+
+    def _ftp_command_rows(self, help_text: str | None, syst: str | None, stat: str | None) -> list[tuple[str, str]]:
+        """One (label, level) row per advertised command, in EHLO/CAPA order."""
+        text = help_text or ""
+        listed = self._ftp_help_command_rows(text)
+        names = {name for name, _ in listed}
+        rows: list[tuple[str, str]] = []
+        syst_body = ""
+        if syst:
+            m = re.match(r"^\s*215[ -](.*)$", syst, re.S)
+            syst_body = (m.group(1) if m else "").strip().splitlines()[0].strip() if m else ""
+        generic_syst = bool(re.match(r"UNIX Type:\s*L8\b", syst_body, re.I))
+        for name, _implemented in listed:
+            label = name
+            level = self._ftp_command_level(name)
+            if name == "SYST" and syst_body:
+                label = f"SYST {syst_body}"
+                if not generic_syst:
+                    level = "WARNING"
+            elif name == "STAT" and stat and re.match(r"^\s*21[123]\b", stat):
+                label = "STAT before login"
+                level = "WARNING"
+            rows.append((label, level))
+        if "SYST" not in names and syst_body:
+            rows.append((f"SYST {syst_body}", "OK" if generic_syst else "WARNING"))
+        for pattern, label in self._FTP_SITE_ERROR:
+            if pattern.search(text):
+                rows.append((label, "ERROR"))
+        for pattern, label in self._FTP_SITE_WARNING:
+            if pattern.search(text):
+                rows.append((label, "WARNING"))
+        if listed and "AUTH" not in names and not self._ftp_commands_encrypted():
+            # RFC 4217: cleartext FTP should offer AUTH TLS, as EHLO should offer STARTTLS.
+            rows.append(("AUTH TLS (is not allowed)", "ERROR"))
+        email = re.search(r"[\w.+-]+@[\w.-]+\.\w+", text)
+        if email:
+            rows.append((f"HELP contact {email.group(0)}", "WARNING"))
+        if help_text and not listed and not rows:
+            rows.append((f"HELP: {self._snip(help_text)}", "WARNING"))
+        return rows
+
+    @staticmethod
+    def _ftp_command_bullet(level: str) -> str:
+        if level == "ERROR":
+            return "VULN"
+        if level == "WARNING":
+            return "WARNING"
+        return "NOTVULN"
+
     def _stream_commands_result(self) -> None:
-        """Stream HELP/SYST/STAT immediately after info (thread-safe)."""
-        pp = self._ptprint_raw
-        show = not self.use_json
-        if not self.results.commands_requested:
+        """HELP/SYST/STAT as one classified list. -vv lines were recorded in info()."""
+        if getattr(self, "_commands_streamed", False):
+            return
+        if not self.results.commands_requested or self.use_json:
             return
         if not (info := self.results.info):
             return
         if info.help_response is None and info.syst is None and info.stat is None:
             return
+        rows = self._ftp_command_rows(info.help_response, info.syst, info.stat)
+        title = "FTP commands (TLS)" if self._ftp_commands_encrypted() else "FTP commands (PLAIN)"
         with self._output_lock:
-            if info.help_response is not None:
-                self._ptprint("HELP command", Out.INFO)
-                for line in info.help_response.splitlines():
-                    pp(line, bullet_type="TEXT", condition=show, indent=4)
-            if info.syst is not None:
-                self._ptprint("SYST command", Out.INFO)
-                pp(info.syst, bullet_type="TEXT", condition=show, indent=4)
-            if info.stat is not None:
-                self._ptprint("STAT command", Out.INFO)
-                pp(info.stat, bullet_type="TEXT", condition=show, indent=4)
+            self._ptprint(title, Out.INFO)
+            for label, level in rows:
+                self._ptprint_raw(
+                    label,
+                    bullet_type=self._ftp_command_bullet(level),
+                    condition=True,
+                    indent=4,
+                )
+        self._commands_streamed = True
+        self._flush_terminal()
 
     def _stream_encryption_result(self) -> None:
         """Stream encryption test result to terminal (thread-safe)."""
@@ -4684,22 +5639,38 @@ class FtpEngine:
             enc = self.results.encryption
             if enc is None:
                 return
-            plaintext_only = enc.plaintext_ok and not enc.auth_tls_ok and not enc.tls_ok
             any_ok = enc.plaintext_ok or enc.auth_tls_ok or enc.tls_ok
-            if plaintext_only:
+            any_inc = enc.plaintext_incomplete or enc.auth_tls_incomplete or enc.tls_incomplete
+            plaintext_only = (
+                enc.plaintext_ok and not enc.auth_tls_ok and not enc.tls_ok and not any_inc
+            )
+            if not any_ok and any_inc:
+                pp(
+                    "Could not connect. Encryption was not tested.",
+                    bullet_type="WARNING",
+                    condition=show,
+                    indent=4,
+                )
+            elif plaintext_only:
                 pp("Plaintext only", bullet_type="VULN", condition=show, indent=4)
-            elif any_ok:
+            elif any_ok or any_inc:
                 if enc.plaintext_ok:
-                    bullet = "WARNING" if (enc.auth_tls_ok or enc.tls_ok) else "NOTVULN"
+                    bullet = "WARNING" if (enc.auth_tls_ok or enc.tls_ok or any_inc) else "NOTVULN"
                     pp("Plaintext", bullet_type=bullet, condition=show, indent=4)
+                elif enc.plaintext_incomplete:
+                    pp("Plaintext timed out (not confirmed)", bullet_type="WARNING", condition=show, indent=4)
                 if enc.auth_tls_ok:
                     pp("AUTH TLS", bullet_type="NOTVULN", condition=show, indent=4)
+                elif enc.auth_tls_incomplete:
+                    pp("AUTH TLS timed out (not confirmed)", bullet_type="WARNING", condition=show, indent=4)
                 if enc.tls_ok:
                     pp("Implicit TLS", bullet_type="NOTVULN", condition=show, indent=4)
+                elif enc.tls_incomplete:
+                    pp("Implicit TLS timed out (not confirmed)", bullet_type="WARNING", condition=show, indent=4)
             else:
                 pp(
-                    "No connection mode available (plaintext, AUTH TLS, implicit TLS failed)",
-                    bullet_type="VULN",
+                    "Could not connect. Encryption was not tested.",
+                    bullet_type="WARNING",
                     condition=show,
                     indent=4,
                 )
@@ -4716,6 +5687,10 @@ class FtpEngine:
             else:
                 pp("Disabled", bullet_type="NOTVULN", condition=show, indent=4)
 
+    @staticmethod
+    def _access_fact(value: str | None) -> str:
+        return value if value else "no"
+
     def _stream_access_check_terminal(self) -> None:
         """Print --access results under [+] Access check."""
         pp = self._ptprint_raw
@@ -4729,12 +5704,34 @@ class FtpEngine:
                     pp(e, bullet_type="WARNING", condition=show, indent=4)
             if access.results:
                 for p in access.results:
-                    cred_str = f"user: {p.creds.user}, password: {p.creds.passw}"
-                    perm_str = (
-                        f" (Directory listing: {p.dirlist is not None}, "
-                        f"Write: {p.write}, Read: {p.read}, Delete: {p.delete})"
+                    pp(
+                        f"user: {p.creds.user}, password: {p.creds.passw}",
+                        bullet_type="TEXT",
+                        condition=show,
+                        indent=4,
                     )
-                    pp(cred_str + perm_str, bullet_type="TEXT", condition=show, indent=4)
+                    if (
+                        p.dirlist is None
+                        and not p.write
+                        and not p.read
+                        and not p.delete
+                        and any(self._ftp_text_is_unconfirmed(err) for err in (access.errors or []))
+                    ):
+                        pp(
+                            "Access was not confirmed. The connection timed out or never completed.",
+                            bullet_type="WARNING",
+                            condition=show,
+                            indent=8,
+                        )
+                        continue
+                    listing = "yes" if p.dirlist is not None else "no"
+                    for line in (
+                        f"Directory listing: {listing}",
+                        f"Write: {self._access_fact(p.write)}",
+                        f"Read: {self._access_fact(p.read)}",
+                        f"Delete: {self._access_fact(p.delete)}",
+                    ):
+                        pp(line, bullet_type="TEXT", condition=show, indent=8)
             if access.errors and self.results.anonymous is not True:
                 pp(
                     "Use --anonymous (-A), or -u USER -p PASS, or wordlists (-U/-P).",
@@ -4749,8 +5746,10 @@ class FtpEngine:
         if creds is None or len(creds) == 0:
             return
         with self._output_lock:
+            n = len(creds)
+            word = "login" if n == 1 else "logins"
             self._ptprint_raw(
-                f"Found {len(creds)} valid credentials",
+                f"Found {n} valid {word}",
                 bullet_type="INFO",
                 condition=not self.use_json,
                 indent=4,
@@ -4772,39 +5771,49 @@ class FtpEngine:
                 self._ptprint("Directory listing failed (no access or empty listing)", Out.INFO)
 
     def _stream_path_enum_result(self) -> None:
-        if self.use_json:
+        if self.use_json or getattr(self, "_enumpath_streamed", False):
             return
-        with self._output_lock:
-            if (err := getattr(self.results, "path_enum_error", None)) is not None:
-                self._tprint(err, "VULN")
-            elif (path_list := getattr(self.results, "path_enum", None)) is not None and len(path_list) > 0:
-                self._tprint(f"Found {len(path_list)} path(s)", "TITLE")
-                for p in path_list:
-                    kind = "dir" if p.is_directory else "file"
-                    size_str = f" ({p.size} B)" if p.size is not None else ""
-                    self._tprint(f"[{kind}] {p.path}{size_str}", "TEXT", indent=8)
+        err = getattr(self.results, "path_enum_error", None)
+        if err is not None:
+            self._tprint(err, "WARNING" if self._is_login_skip(err) else "VULN")
+            return
+        self._tprint("No wordlist path was reachable", "NOTVULN")
 
     def _stream_modes_result(self) -> None:
-        if self.use_json:
+        if self.use_json or getattr(self, "_modes_streamed", False):
             return
         with self._output_lock:
             if (err := getattr(self.results, "modes_error", None)) is not None:
-                self._tprint(err, "VULN")
+                self._tprint(err, "WARNING" if self._is_login_skip(err) else "VULN")
             elif (modes := getattr(self.results, "modes", None)) is not None:
-                self._tprint(
-                    f"Passive: {'available' if modes.passive_ok else 'not available'}",
-                    "NOTVULN" if modes.passive_ok else "VULN",
-                )
-                self._tprint(
-                    f"Active: {'available' if modes.active_ok else 'not available'}",
-                    "NOTVULN" if modes.active_ok else "VULN",
-                )
-                if not modes.active_ok:
+                passive_open = self._ftp_text_is_unconfirmed(modes.passive_error)
+                if (
+                    not modes.passive_ok
+                    and not modes.active_ok
+                    and passive_open
+                    and self._ftp_text_is_unconfirmed(modes.active_error)
+                ):
                     self._tprint(
-                        "If active failed: tester may be behind NAT/firewall, not necessarily server error. "
-                        "For 100% objective result, tester needs public IP and no local firewall.",
+                        "Could not connect. Data modes were not tested.",
                         "WARNING",
                     )
+                else:
+                    if modes.passive_ok:
+                        self._tprint("Passive: available", "NOTVULN")
+                    elif passive_open:
+                        self._tprint("Passive timed out (not confirmed)", "WARNING")
+                    else:
+                        self._tprint("Passive: not available", "VULN")
+                    if modes.active_ok:
+                        self._tprint("Active: available", "NOTVULN")
+                    elif self._ftp_server_reply(modes.active_error):
+                        self._tprint("Active: not available", "VULN")
+                    else:
+                        self._tprint("Active timed out (not confirmed)", "WARNING")
+                        self._tprint(
+                            "Active mode was not confirmed. A timeout can also mean the tester is behind NAT or a firewall.",
+                            "WARNING",
+                        )
                 if modes.pasv_ip_leak:
                     self._tprint(
                         f"PASV Internal IP Leak: server advertised {modes.pasv_ip_leak}",
@@ -4812,34 +5821,29 @@ class FtpEngine:
                     )
 
     def _stream_pasv_port_range_result(self) -> None:
-        if self.use_json:
+        if self.use_json or getattr(self, "_pasvport_streamed", False):
             return
-        with self._output_lock:
-            if (err := getattr(self.results, "pasv_port_range_error", None)) is not None:
-                self._ptprint("Passive port range audit", Out.INFO)
-                self._tprint(err, "VULN")
-            elif (ppr := getattr(self.results, "pasv_port_range", None)) is not None:
-                self._print_pasv_port_range_terminal(ppr)
+        err = getattr(self.results, "pasv_port_range_error", None)
+        if err is not None:
+            bullet = "WARNING" if self._ftp_text_is_unconfirmed(err) or self._is_login_skip(err) else "VULN"
+            self._tprint(err, bullet)
+        elif (ppr := getattr(self.results, "pasv_port_range", None)) is not None:
+            self._pasvport_report(ppr)
 
     def _stream_conn_limits_result(self) -> None:
-        if self.use_json:
+        if self.use_json or getattr(self, "_connlim_streamed", False):
             return
-        with self._output_lock:
-            if (err := getattr(self.results, "conn_limits_error", None)) is not None:
-                self._ptprint("Connection limits audit", Out.INFO)
-                self._tprint(f"Audit failed: {err}", "VULN")
-            elif (cl := getattr(self.results, "conn_limits", None)) is not None:
-                self._print_conn_limits_audit_terminal(cl)
+        err = getattr(self.results, "conn_limits_error", None)
+        if err is not None:
+            self._tprint(f"Connection limits test failed: {err}", "VULN")
 
     def _stream_chroot_audit_result(self) -> None:
-        if self.use_json:
+        if self.use_json or getattr(self, "_chroot_streamed", False):
             return
         with self._output_lock:
             if (err := getattr(self.results, "chroot_audit_error", None)) is not None:
-                self._ptprint("User isolation audit", Out.INFO)
-                self._tprint(err, "VULN")
-            elif (ch := getattr(self.results, "chroot_audit", None)) is not None:
-                self._print_chroot_audit_terminal(ch)
+                bullet = "WARNING" if self._ftp_text_is_unconfirmed(err) or self._is_login_skip(err) else "VULN"
+                self._tprint(err, bullet)
 
     def _stream_active_audit_result(self) -> None:
         if self.use_json:
@@ -4852,58 +5856,39 @@ class FtpEngine:
                 self._print_active_audit_terminal(aa)
 
     def _stream_cmd_audit_result(self) -> None:
-        if self.use_json:
+        if self.use_json or getattr(self, "_cmd_audit_streamed", False):
             return
         with self._output_lock:
             if (err := getattr(self.results, "cmd_audit_error", None)) is not None:
-                self._ptprint("Command surface audit", Out.INFO)
-                self._tprint(err, "VULN")
+                bullet = "WARNING" if self._ftp_text_is_unconfirmed(err) else "VULN"
+                self._tprint("Could not connect. Commands were not tested." if bullet == "WARNING" else err, bullet)
             elif (ca := getattr(self.results, "cmd_audit", None)) is not None:
                 self._print_cmd_audit_terminal(ca)
 
     def _stream_cmd_audit_active_result(self) -> None:
-        if self.use_json:
+        if self.use_json or getattr(self, "_cmd_active_streamed", False):
             return
         with self._output_lock:
             if (err := getattr(self.results, "cmd_audit_active_error", None)) is not None:
-                self._ptprint("Command surface audit (active SITE probes)", Out.INFO)
-                self._tprint(err, "VULN")
+                bullet = "WARNING" if self._ftp_text_is_unconfirmed(err) or self._is_login_skip(err) else "VULN"
+                self._tprint(err, bullet)
             elif (caa := getattr(self.results, "cmd_audit_active", None)) is not None:
-                self._ptprint("Command surface audit (active SITE probes)", Out.INFO)
                 if caa.setup_error:
-                    self._tprint(f"Setup failed: {caa.setup_error}", "VULN")
+                    bullet = "WARNING" if self._ftp_text_is_unconfirmed(caa.setup_error) else "VULN"
+                    self._tprint(caa.setup_error, bullet)
                 else:
-                    if caa.probe_file:
-                        self._tprint(f"Probe file (cleaned up): {caa.probe_file}", "TEXT", indent=4)
-                    self._tprint(
-                        "Cleanup (DELE): " + ("ok" if caa.cleanup_ok else (caa.cleanup_error or "failed")),
-                        "NOTVULN" if caa.cleanup_ok else "WARNING",
-                    )
                     for p in caa.probes:
-                        code_s = str(p.reply_code) if p.reply_code is not None else "—"
-                        self._tprint(
-                            f"[{p.probe_id}] {p.command_sent!r} → {code_s} | {p.classification}"
-                            + (
-                                f" | passive_advertised={p.advertised_in_passive_audit}"
-                                if p.advertised_in_passive_audit
-                                else ""
-                            ),
-                            "TEXT",
-                            indent=4,
-                        )
-                        if p.reply_line and p.error is None:
-                            snippet = p.reply_line[:200] + ("…" if len(p.reply_line) > 200 else "")
-                            self._tprint(snippet, "TEXT", indent=8)
-                        if p.error:
-                            self._tprint(f"error: {p.error}", "WARNING", indent=8)
+                        bullet, text = self._cmd_active_line(p)
+                        self._tprint(text, bullet)
+                    if not caa.cleanup_ok:
+                        self._tprint("Cleanup failed", "WARNING")
 
     def _stream_invalid_cmd_audit_result(self) -> None:
         if self.use_json:
             return
         with self._output_lock:
             if (err := getattr(self.results, "invalid_cmd_audit_error", None)) is not None:
-                self._ptprint("Invalid command resilience (raw socket)", Out.INFO)
-                self._tprint(err, "VULN")
+                self._tprint(f"Invalid commands test failed: {self._snip(err)}", "WARNING")
             elif (inv := getattr(self.results, "invalid_cmd_audit", None)) is not None:
                 self._print_invalid_cmd_audit_terminal(inv)
 
@@ -4932,8 +5917,7 @@ class FtpEngine:
             return
         with self._output_lock:
             if (err := getattr(self.results, "dos_audit_error", None)) is not None:
-                self._ptprint("FTP Processing Resilience (DoS Probes)", Out.INFO)
-                self._tprint(err, "VULN")
+                self._tprint(err, "WARNING" if self._is_login_skip(err) else "VULN")
             elif (dos := getattr(self.results, "dos_audit", None)) is not None:
                 self._print_ftp_dos_audit_terminal(dos)
 
@@ -5129,504 +6113,19 @@ class FtpEngine:
 
         return True
 
-    def _print_conn_limits_audit_terminal(self, cl: ConnLimitsAuditResult) -> None:
-        """Structured terminal report for connection limits audit (aligned with SMTP-style ptprint nesting).
-
-        Icon semantics: [*] = block titles; [i] = neutral facts; [✓] / [✗] = verdicts (RISK lines use [✗]).
-        Audit summary: one primary verdict line + one [i] caveat (heuristic / not DoS).
-        """
-
-        self._ptprint("Connection limits audit", Out.INFO)
-
-        self._tprint("Connectivity & session burst", "TITLE", indent=4)
-        self._tprint(
-            f"Setup: cryptoMode={cl.crypto_mode} | parallel {cl.parallel.succeeded}/{cl.parallel.attempted}"
-            f" | sequential {cl.sequential.succeeded}/{cl.sequential.attempts}",
-            "TITLE",
-            indent=8,
-        )
-        if cl.parallel.error_samples:
-            self._tprint(
-            f"Parallel errors (sample): {cl.parallel.error_samples[0][:120]}",
-            "TITLE",
-            indent=8,
-        )
-        if cl.sequential.error_samples and cl.sequential.failed:
-            self._tprint(
-            f"Sequential errors (sample): {cl.sequential.error_samples[0][:120]}",
-            "TITLE",
-            indent=8,
-        )
-
-        if _conn_limits_parallel_suspect(cl.parallel):
-            self._tprint(
-            f"Parallel burst: All {cl.parallel.attempted} simultaneous control sessions completed "
-            f"(220 + QUIT) with no refusal.",
-            "TITLE",
-            indent=8,
-        )
-            self._tprint(
-            f"RISK: No observed concurrency cap on this probe; many simultaneous clients could stress resources.",
-            "VULN",
-            indent=8,
-        )
-        elif cl.parallel.attempted >= 10 and (cl.parallel.failed > 0 or cl.parallel.succeeded < cl.parallel.attempted):
-            self._tprint(
-            f"Parallel burst: {cl.parallel.succeeded}/{cl.parallel.attempted} sessions completed; "
-            f"{cl.parallel.failed} failed or refused — possible concurrency or policy limits.",
-            "NOTVULN",
-            indent=8,
-        )
-        else:
-            self._tprint(
-            f"Parallel burst: {cl.parallel.succeeded}/{cl.parallel.attempted} sessions completed "
-            f"(probe volume below the N≥10 parallel heuristic threshold).",
-            "TITLE",
-            indent=8,
-        )
-
-        if cl.sequential.attempts <= 0:
-            self._tprint("Sequential rapid connect: skipped (0 attempts)", "TITLE", indent=8)
-        elif _conn_limits_sequential_suspect(cl.sequential):
-            self._tprint(
-            f"Sequential rapid connect: {cl.sequential.succeeded} back-to-back control sessions "
-            f"succeeded without visible throttle.",
-            "TITLE",
-            indent=8,
-        )
-            self._tprint(
-            f"RISK: No visible new-connection throttle in this rapid series.",
-            "VULN",
-            indent=8,
-        )
-        elif cl.sequential.attempts >= 20 and (
-            cl.sequential.failed > 0 or cl.sequential.succeeded < cl.sequential.attempts
-        ):
-            self._tprint(
-            f"Sequential rapid connect: {cl.sequential.succeeded}/{cl.sequential.attempts} succeeded; "
-            f"{cl.sequential.failed} failed — possible rate or policy limiting.",
-            "NOTVULN",
-            indent=8,
-        )
-        else:
-            self._tprint(
-            f"Sequential rapid connect: {cl.sequential.succeeded}/{cl.sequential.attempts} sessions "
-            f"(probe volume below the N≥20 sequential heuristic threshold).",
-            "TITLE",
-            indent=8,
-        )
-
-        self._tprint("Idle & control timing (optional probes)", "TITLE", indent=4)
-        ipr = cl.idle_pre_auth
-        if not ipr.performed:
-            self._tprint(
-            f"Idle pre-login: not probed (set --conn-limits-idle-pre-auth > 0)",
-            "TITLE",
-            indent=8,
-        )
-        elif _conn_limits_idle_pre_suspect(ipr):
-            self._tprint(
-            f"Idle pre-login ~{ipr.wait_seconds:.0f}s: no 421/426/close observed — weak pre-auth idle limit suspected.",
-            "TITLE",
-            indent=8,
-        )
-            self._tprint(
-            f"RISK: Long-lived anonymous control sessions may be possible before login.",
-            "VULN",
-            indent=8,
-        )
-        elif ipr.kick_observed:
-            self._tprint(
-            f"Idle pre-login ~{ipr.wait_seconds:.0f}s: server closed or sent kick — {ipr.note[:120]}",
-            "NOTVULN",
-            indent=8,
-        )
-        else:
-            self._tprint(
-            f"Idle pre-login ~{ipr.wait_seconds:.0f}s: no kick in window — {ipr.note[:120]}",
-            "TITLE",
-            indent=8,
-        )
-
-        sa = cl.slow_auth
-        if not sa.performed:
-            self._tprint(
-            f"Slow USER→PASS gap: not probed (set --conn-limits-slow-auth-gap > 0)",
-            "TITLE",
-            indent=8,
-        )
-        elif _conn_limits_slow_auth_suspect(sa):
-            self._tprint(
-            f"Slow authentication: {sa.gap_seconds:.0f}s gap before PASS did not drop the session before reply.",
-            "TITLE",
-            indent=8,
-        )
-            self._tprint(
-            f"RISK: Slowloris-style pacing on the control channel may be tolerated.",
-            "VULN",
-            indent=8,
-        )
-        elif sa.still_connected_after_pass is False:
-            self._tprint(
-            f"Slow USER→PASS gap {sa.gap_seconds:.0f}s: connection dropped or hard-failed — possible anti-slow-auth policy.",
-            "NOTVULN",
-            indent=8,
-        )
-        else:
-            self._tprint(
-            f"Slow USER→PASS gap {sa.gap_seconds:.0f}s: still_connected_after_pass={sa.still_connected_after_pass}",
-            "TITLE",
-            indent=8,
-        )
-
-        ipo = cl.idle_post_auth
-        if ipo is None:
-            self._tprint(
-            f"Idle post-login: skipped (no credentials or --conn-limits-idle-post-auth=0)",
-            "TITLE",
-            indent=8,
-        )
-        elif not ipo.performed:
-            self._tprint("Idle post-login: not probed", "TITLE", indent=8)
-        elif _conn_limits_idle_post_suspect(ipo):
-            self._tprint(
-            f"Idle post-login ~{ipo.wait_seconds:.0f}s: NOOP still succeeded — weak authenticated idle timeout suspected.",
-            "TITLE",
-            indent=8,
-        )
-            self._tprint(
-            f"RISK: Authenticated sessions may linger without timely disconnect.",
-            "VULN",
-            indent=8,
-        )
-        elif ipo.kick_observed:
-            self._tprint(
-            f"Idle post-login ~{ipo.wait_seconds:.0f}s: kick observed — {ipo.note[:120]}",
-            "NOTVULN",
-            indent=8,
-        )
-        else:
-            self._tprint(
-            f"Idle post-login ~{ipo.wait_seconds:.0f}s: {ipo.note[:120]}",
-            "TITLE",
-            indent=8,
-        )
-
-        self._tprint("Passive port allocation (PASV spam)", "TITLE", indent=4)
-        pp = cl.pasv_pre_auth
-        self._tprint("Phase: Pre-authentication", "TITLE", indent=8)
-        err_bit = f" | err: {pp.error}" if pp.error else ""
-        self._tprint(
-            f"227 (Ready): {pp.reply227} | 530 (Rejected): {pp.reply530} | Other: {pp.reply_other}{err_bit}",
-            "TITLE",
-            indent=12,
-        )
-        if _conn_limits_pasv_pre_suspect(pp):
-            self._tprint(
-            f"Pre-auth PASV: high 227 rate — passive data ports may be allocated before authentication.",
-            "VULN",
-            indent=12,
-        )
-        elif pp.error and pp.reply227 > 0:
-            self._tprint(
-            f"Result: PASV phase ended with an error after some 227 replies — inconclusive for pre-auth spam.",
-            "TITLE",
-            indent=12,
-        )
-        elif pp.error:
-            self._tprint(
-            f"Result: No pre-login 227 flood observed; session ended early ({pp.error[:100]}).",
-            "NOTVULN",
-            indent=12,
-        )
-        elif pp.reply227 == 0:
-            self._tprint(
-            f"Result: Server rejects or gates PASV before login (no 227 Ready flood in this run).",
-            "NOTVULN",
-            indent=12,
-        )
-        else:
-            self._tprint(
-            f"Result: PASV pre-auth replies did not match the high–227 spam heuristic.",
-            "TITLE",
-            indent=12,
-        )
-
-        po = cl.pasv_post_auth
-        if po is None:
-            self._tprint("Phase: Post-authentication — skipped (no credentials)", "TITLE", indent=8)
-        else:
-            self._tprint("Phase: Post-authentication", "TITLE", indent=8)
-            err_po = f" | err: {po.error}" if po.error else ""
-            self._tprint(
-            f"227 (Ready): {po.reply227} | 530 (Rejected): {po.reply530} | Other: {po.reply_other}{err_po}",
-            "TITLE",
-            indent=12,
-        )
-            if _conn_limits_pasv_post_suspect(po):
-                self._tprint(
-            f"Post-auth PASV: high 227 rate on one session — passive allocations may be unbounded "
-            f"or weakly capped.",
-            "VULN",
-            indent=12,
-        )
-            elif po.error:
-                self._tprint(
-            f"Result: PASV phase ended with an error — inconclusive for post-auth spam.",
-            "TITLE",
-            indent=12,
-        )
-            else:
-                self._tprint(
-            f"Result: PASV post-auth replies did not match the unbounded-227 heuristic.",
-            "TITLE",
-            indent=12,
-        )
-
-        self._tprint("Audit summary & heuristics", "TITLE", indent=4)
-        if cl.limits_insufficient_suspected:
-            self._tprint(
-            f"LIMITS_INSUFFICIENT — bounded probes matched patterns associated with weak FTP limits "
-            f"(connections, rate, PASV, and/or idle).",
-            "VULN",
-            indent=8,
-        )
-        else:
-            self._tprint(
-            f"LIMITS_OK — bounded probes did not match insufficient-limit patterns in this run.",
-            "NOTVULN",
-            indent=8,
-        )
-        self._tprint(
-            f"Heuristic-only ({cl.parallel.attempted} parallel / {cl.sequential.attempts} sequential); "
-            f"tune --conn-limits-* on a lab target — not a full DoS test; confirm in a controlled, authorized environment.",
-            "TITLE",
-            indent=8,
-        )
-
-    def _print_pasv_port_range_terminal(self, ppr: PasvPortRangeResult) -> None:
-        """Structured terminal report for passive port spread audit (aligned with connection limits / SMTP-style nesting)."""
-
-        if self.args.tls:
-            crypto_mode = "implicit_tls"
-        elif self.args.starttls:
-            crypto_mode = "starttls"
-        else:
-            crypto_mode = "plain"
-
-        self._ptprint("Passive port range audit", Out.INFO)
-
-        self._tprint("Port sampling & analysis", "TITLE", indent=4)
-        self._tprint(
-            f"Setup: samples {len(ppr.probes)} | threshold {ppr.max_span_threshold} | cryptoMode={crypto_mode}",
-            "TITLE",
-            indent=8,
-        )
-        n_ok = len(ppr.successful_ports)
-        n_all = len(ppr.probes)
-        if n_ok < n_all:
-            self._tprint(f"Successful data channels: {n_ok}/{n_all}", "TITLE", indent=8)
-
-        ports_csv = ", ".join(str(p) for p in ppr.successful_ports) if ppr.successful_ports else "(none)"
-        self._tprint(f"Collected ports: {ports_csv}", "TITLE", indent=8)
-
-        if ppr.min_port is not None and ppr.max_port is not None and ppr.observed_span is not None:
-            self._tprint(
-            f"Observed range: {ppr.min_port} - {ppr.max_port} (span: {ppr.observed_span})",
-            "TITLE",
-            indent=8,
-        )
-        elif ppr.min_port is not None and ppr.max_port is not None:
-            self._tprint(
-            f"Observed range: {ppr.min_port} - {ppr.max_port}",
-            "TITLE",
-            indent=8,
-        )
-        else:
-            self._tprint(
-            f"Observed range: n/a (insufficient data ports for min/max)",
-            "TITLE",
-            indent=8,
-        )
-
-        if ppr.inconclusive:
-            self._tprint(
-            f"Result: Inconclusive (need ≥{ppr.min_samples_for_verdict} successful passive LIST samples).",
-            "WARNING",
-            indent=8,
-        )
-        elif ppr.wide_passive_range:
-            self._tprint(
-            f"Result: Wide passive range detected (span {ppr.observed_span} > {ppr.max_span_threshold}).",
-            "VULN",
-            indent=8,
-        )
-        else:
-            self._tprint(
-            f"Result: Narrow passive range detected (span {ppr.observed_span} <= {ppr.max_span_threshold}).",
-            "NOTVULN",
-            indent=8,
-        )
-
-        self._tprint("Audit summary & heuristics", "TITLE", indent=4)
-        if ppr.inconclusive:
-            self._tprint("Status: PASSIVE_RANGE_INCONCLUSIVE", "TITLE", indent=8)
-            self._tprint(
-            f"Finding: Not enough successful samples to judge passive port spread against threshold.",
-            "TITLE",
-            indent=8,
-        )
-            self._tprint(f"Note: {ppr.detail}", "TITLE", indent=8)
-        elif ppr.wide_passive_range:
-            self._tprint("Status: PASSIVE_RANGE_WIDE", "VULN", indent=8)
-            self._tprint(
-            f"Finding: Wide passive port range detected.",
-            "VULN",
-            indent=8,
-        )
-            self._tprint(
-            f"RISK: Excessive port exposure complicates firewall filtering and increases attack surface.",
-            "VULN",
-            indent=8,
-        )
-            self._tprint(
-            f"Note: Configure 'pasv_min_port' and 'pasv_max_port' to a smaller range (e.g., 100-200 ports).",
-            "TITLE",
-            indent=8,
-        )
-        else:
-            self._tprint("Status: PASSIVE_RANGE_OK", "NOTVULN", indent=8)
-            self._tprint(
-            f"Finding: Server appears to use a restricted passive port range.",
-            "NOTVULN",
-            indent=8,
-        )
-            self._tprint(
-            f"Note: Observed span ({ppr.observed_span}) is well within the security threshold ({ppr.max_span_threshold}).",
-            "TITLE",
-            indent=8,
-        )
-
-    def _print_chroot_audit_terminal(self, ch: ChrootAuditResult) -> None:
-        """Structured user-isolation report (aggregate CWD stats + highlighted breaches; matches pasv/conn-limits style)."""
-
-        dd = ch.dotdot
-        pwd0n = self._chroot_norm_pwd(ch.pwd_initial)
-        home_sibling = bool(
-            ch.home_parent_accessible
-            and pwd0n.startswith("/home/")
-            and pwd0n.rstrip("/") != "/home"
-        )
-
-        self._ptprint("User isolation audit", Out.INFO)
-
-        self._tprint("Path traversal & system access probes", "TITLE", indent=4)
-        self._tprint(f"Login PWD: {ch.pwd_initial!r}", "TITLE", indent=8)
-
-        paths = [r.path for r in ch.cwd_probes]
-        n = len(paths)
-        preview_n = 5
-        paths_preview = ", ".join(paths[:preview_n]) + (", ..." if n > preview_n else "")
-        self._tprint(f"System paths: {n} tested ({paths_preview})", "TITLE", indent=8)
-
-        allowed_rows = [r for r in ch.cwd_probes if r.success]
-        n_ok = len(allowed_rows)
-        n_rej = n - n_ok
-        allowed_q = ", ".join(repr(r.path) for r in allowed_rows) if allowed_rows else "(none)"
-        self._tprint(
-            f"Path results: {n_rej}/{n} rejected, {n_ok}/{n} allowed ({allowed_q})",
-            "TITLE",
-            indent=8,
-        )
-
-        for r in ch.cwd_probes:
-            if r.success and r.path in self._CHROOT_STRONG_CWD_PATHS:
-                pwd_bit = f" (PWD: {r.pwd_after!r})" if r.pwd_after else ""
-                self._tprint(
-            f"Critical path accessible: CWD {r.path!r} succeeded{pwd_bit}",
-            "VULN",
-            indent=8,
-        )
-        if home_sibling:
-            self._tprint(
-                "Cross-user exposure: CWD '/home' succeeded while login PWD is under '/home/<account>' "
-                "(possible sibling home access).",
-                "VULN",
-                indent=8,
-            )
-        if ch.dotdot_parent_escape_suspected:
-            self._tprint(
-            f"Directory traversal: '..' chain suggests escape above the post-login directory root.",
-            "VULN",
-            indent=8,
-        )
-        if ch.passwd_size_ok:
-            sz = ch.passwd_size_bytes
-            sz_bit = f" ({sz} bytes)" if sz is not None else ""
-            self._tprint(f"Sensitive file found: SIZE '/etc/passwd'{sz_bit}", "VULN", indent=8)
-        if ch.shadow_size_ok:
-            sz = ch.shadow_size_bytes
-            sz_bit = f" ({sz} bytes)" if sz is not None else ""
-            self._tprint(f"Sensitive file found: SIZE '/etc/shadow'{sz_bit}", "VULN", indent=8)
-
-        self._tprint(
-            f"Directory traversal: up to {self._CHROOT_DOTDOT_MAX_STEPS} × '..' attempted "
-            f"({dd.steps_ok} successful step(s); final PWD ~ {dd.pwd_final!r}, {dd.stopped_reason})",
-            "TITLE",
-            indent=8,
-        )
-
-        if ch.isolation_broken_suspected:
-            self._tprint(
-            f"Result: Isolation breach suspected; host paths visible.",
-            "VULN",
-            indent=8,
-        )
-        else:
-            self._tprint(
-            f"Result: No host filesystem breakout detected.",
-            "NOTVULN",
-            indent=8,
-        )
-
-        self._tprint("Audit summary & heuristics", "TITLE", indent=4)
-        if ch.isolation_broken_suspected:
-            self._tprint("Status: CHROOT_BROKEN_SUSPECTED", "VULN", indent=8)
-            self._tprint(
-            f"Finding: Insecure configuration; account can access host system paths.",
-            "VULN",
-            indent=8,
-        )
-            self._tprint(
-            f"Note: {ch.detail}",
-            "TITLE",
-            indent=8,
-        )
-        else:
-            self._tprint("Status: CHROOT_OK", "NOTVULN", indent=8)
-            self._tprint(
-            f"Finding: Account appears properly isolated within a chroot/jail.",
-            "NOTVULN",
-            indent=8,
-        )
-            self._tprint(
-            f"Note: No obvious host-level path breakout; chroot may still use a synthetic '/'.",
-            "TITLE",
-            indent=8,
-        )
-            self._tprint(
-            f"Note: Heuristic check only — confirm manually in critical environments.",
-            "TITLE",
-            indent=8,
-        )
-
-    def _user_enum_probe_signature(self, r: FtpUserEnumProbeRow) -> tuple[int | None, str]:
-        """Comparable (code, normalized text) for USER/PASS outcome (wordlist vs control probes)."""
+    def _user_enum_probe_signature(self, r: FtpUserEnumProbeRow) -> tuple[int | None, int | None, str]:
+        """Comparable outcome. The echoed username is removed before the text is compared."""
         if r.error:
-            return (None, "")
+            return (None, None, "")
         if r.user_reply_code in (331, 332):
-            return (r.pass_reply_code, self._norm_ftp_reply_text(r.pass_reply_line or ""))
-        return (r.user_reply_code, self._norm_ftp_reply_text(r.user_reply_line or ""))
+            user_text = self._user_enum_reply_template(r.user_reply_line or "", r.username)
+            pass_text = self._user_enum_reply_template(r.pass_reply_line or "", r.username)
+            return (r.user_reply_code, r.pass_reply_code, f"{user_text}|{pass_text}")
+        return (
+            r.user_reply_code,
+            None,
+            self._user_enum_reply_template(r.user_reply_line or "", r.username),
+        )
 
     @staticmethod
     def _user_enum_format_probe_reply(r: FtpUserEnumProbeRow) -> str:
@@ -5639,452 +6138,112 @@ class FtpEngine:
             c = r.user_reply_code
             line = (r.user_reply_line or "").strip()
         line = re.sub(r"\s+", " ", line)
+        if c is not None and (line == str(c) or line.startswith(f"{c} ")):
+            return line[:160]
         return f"{c} {line}"[:160].strip()
 
     def _print_user_enum_terminal(self, ue: FtpUserEnumResult) -> None:
-        """Structured username enumeration report (aggregate responses + highlighted outliers; RFC 2577)."""
-
-        do_timing = bool(getattr(self.args, "user_enum_timing", False))
-        keep_alive = bool(getattr(self.args, "user_enum_keep_alive", False))
-        threads = max(1, int(getattr(self.args, "user_enum_threads", 1) or 1))
-        n_word = sum(1 for p in ue.probes if p.probe_kind == "wordlist")
-        n_ctrl = sum(1 for p in ue.probes if p.probe_kind.startswith("control"))
+        """One line per wordlist name, then one verdict."""
+        wl = [r for r in ue.probes if r.probe_kind == "wordlist" and r.error is None]
+        ctrl = [r for r in ue.probes if r.probe_kind.startswith("control") and r.error is None]
         n_err = sum(1 for p in ue.probes if p.error)
+        n_all = len(ue.probes)
 
-        if keep_alive:
-            mode = "keep-alive"
-        elif threads > 1:
-            mode = f"multi-session ({threads} threads)"
-        else:
-            mode = "multi-session"
-
-        self._ptprint("Username enumeration audit (-eu / PTL-SVC-FTP-USRENUM)", Out.INFO)
-
-        self._tprint("Probe configuration & heuristics", "TITLE", indent=4)
-        strat = (
-            "USER then wrong PASS (timing-aware, RFC 2577)"
-            if do_timing
-            else "USER then fixed bad PASS (RFC 2577)"
-        )
-        self._tprint(f"Strategy: {strat}", "TITLE", indent=8)
-        self._tprint(
-            f"Wordlist: {n_word} entries + {n_ctrl} controls | threads: {threads} | mode: {mode}",
-            "TITLE",
-            indent=8,
-        )
-        analysis_bits = "Response codes, fuzzy text matching, sequence behavior"
-        if do_timing:
-            analysis_bits += ", PASS-phase latency (--user-enum-timing)"
-        self._tprint(f"Analysis: {analysis_bits}", "TITLE", indent=8)
-        if n_err:
-            self._tprint(f"Probes with errors: {n_err} (see JSON)", "TITLE", indent=8)
-
-        self._tprint("Enumeration findings", "TITLE", indent=4)
-
-        wl_ok = [r for r in ue.probes if r.probe_kind == "wordlist" and r.error is None]
-        ctr = collections.Counter()
-        dominant_sig: tuple[int | None, str] | None = None
-        dom_count = 0
-        dom_row: FtpUserEnumProbeRow | None = None
-        if wl_ok:
-            sigs = [self._user_enum_probe_signature(r) for r in wl_ok]
-            ctr = collections.Counter(sigs)
-            dominant_sig, dom_count = ctr.most_common(1)[0]
-            dom_code, _norm_dom = dominant_sig
-            n_wl = len(wl_ok)
-            if len(ctr) == 1:
-                self._tprint(
-            f"Response consistency: {n_wl}/{n_wl} wordlist probes share code {dom_code} "
-            f"with identical normalized message.",
-            "TITLE",
-            indent=8,
-        )
-            else:
-                n_diff = n_wl - dom_count
-                self._tprint(
-            f"Response consistency: {dom_count}/{n_wl} wordlist probes share the dominant pattern "
-            f"(code {dom_code}); {n_diff} differ.",
-            "TITLE",
-            indent=8,
-        )
-            dom_row = next((r for r in wl_ok if self._user_enum_probe_signature(r) == dominant_sig), None)
-            dominant_phrase = self._user_enum_format_probe_reply(dom_row) if dom_row else "n/a"
-            for r in wl_ok:
-                if self._user_enum_probe_signature(r) != dominant_sig:
-                    self._tprint(
-            f"Differentiation: User {r.username!r} returned "
-            f"{self._user_enum_format_probe_reply(r)!r} instead of {dominant_phrase!r}",
-            "VULN",
-            indent=8,
-        )
-        elif n_word:
+        if n_all and n_err == n_all:
             self._tprint(
-            f"Response consistency: no successful wordlist probes (all had errors).",
-            "TITLE",
-            indent=8,
-        )
+                "Could not connect. Username enumeration was not tested.",
+                "WARNING",
+                indent=4,
+            )
+            return
+        if (
+            n_err
+            and n_err * 2 >= n_all
+            and not ue.enumeration_suspected
+            and not ue.timing_anomaly_suspected
+        ):
+            self._tprint(
+                f"{n_err} of {n_all} probes failed. Could not tell whether usernames exist.",
+                "WARNING",
+                indent=4,
+            )
+            return
 
-        ctrl_ok = [r for r in ue.probes if r.probe_kind.startswith("control") and r.error is None]
-        if ctrl_ok and wl_ok and len(ctr) == 1 and dominant_sig is not None and dom_row is not None:
-            ctrl_match = sum(1 for r in ctrl_ok if self._user_enum_probe_signature(r) == dominant_sig)
+        accepted = [
+            r
+            for r in wl + ctrl
+            if r.user_reply_code in (331, 332)
+            and r.pass_reply_code is not None
+            and 200 <= r.pass_reply_code < 300
+        ]
+        compared = [r for r in wl + ctrl if r.error is None]
+        if accepted and compared and len(accepted) == len(compared):
             self._tprint(
-            f"Control probes: {ctrl_match}/{len(ctrl_ok)} matched the wordlist response pattern.",
-            "TITLE",
-            indent=8,
-        )
-            for r in ctrl_ok:
-                if self._user_enum_probe_signature(r) != dominant_sig:
-                    self._tprint(
-                        f"Differentiation: Control user {r.username!r} returned "
-                        f"{self._user_enum_format_probe_reply(r)!r} instead of "
-                        f"{self._user_enum_format_probe_reply(dom_row)!r}",
-                        "VULN",
-                        indent=8,
-                    )
-
-        if do_timing:
-            if ue.timing_control_median_ms is not None:
-                self._tprint(
-            f"Control baseline: median {ue.timing_control_median_ms:.1f} ms "
-            f"for control usernames (PASS phase, post-warmup cohort where applicable).",
-            "TITLE",
-            indent=8,
-        )
-                if ue.timing_wordlist_median_ms is not None:
-                    self._tprint(
-            f"Wordlist cohort median: {ue.timing_wordlist_median_ms:.1f} ms.",
-            "TITLE",
-            indent=8,
-        )
-            else:
-                self._tprint(
-            f"Timing: insufficient PASS timings for median comparison "
-            f"(need ≥2 wordlist and ≥1 control with 331/332).",
-            "TITLE",
-            indent=8,
-        )
-            if ue.timing_slow_usernames_ms:
-                parts = ", ".join(f"{u!r} ({ms:.1f}ms)" for u, ms in ue.timing_slow_usernames_ms[:12])
-                if len(ue.timing_slow_usernames_ms) > 12:
-                    parts += ", …"
-                self._tprint(
-            f"Timing anomaly (per user vs control threshold): {parts}",
-            "WARNING",
-            indent=8,
-        )
-            if "timingSuppressedSuspectedTarpitting" in ue.timing_notes:
-                self._tprint(
-            f"Timing: cohort comparison suppressed (possible tarpitting / delay policy in keep-alive run).",
-            "TITLE",
-            indent=8,
-        )
-
-        if ue.enumeration_suspected:
-            self._tprint(
-            f"Result: Response differentiation suggests a username enumeration oracle (RFC 2577).",
-            "VULN",
-            indent=8,
-        )
-        elif ue.timing_anomaly_suspected:
-            self._tprint(
-            f"Result: No obvious code/message leakage detected.",
-            "NOTVULN",
-            indent=8,
-        )
-        else:
-            self._tprint(
-            f"Result: No differentiation in server responses detected.",
-            "NOTVULN",
-            indent=8,
-        )
-
-        self._tprint("Audit summary & heuristics", "TITLE", indent=4)
-        if ue.enumeration_suspected and ue.timing_anomaly_suspected:
-            self._tprint("Status: USER_ENUM_SUSPECTED", "VULN", indent=8)
-            self._tprint(
-            f"Finding: Server responses and/or timing differ in ways that may enable username guessing.",
-            "VULN",
-            indent=8,
-        )
-        elif ue.enumeration_suspected:
-            self._tprint("Status: USER_ENUM_SUSPECTED", "VULN", indent=8)
-            self._tprint(
-            f"Finding: Server responses appear to differentiate between tested usernames.",
-            "VULN",
-            indent=8,
-        )
-        elif ue.timing_anomaly_suspected:
-            self._tprint("Status: USER_ENUM_SUSPECTED (via timing)", "WARNING", indent=8)
-            self._tprint(
-            f"Finding: Server timing differs significantly for certain usernames.",
-            "VULN",
-            indent=8,
-        )
-        else:
-            self._tprint("Status: USER_ENUM_OK", "NOTVULN", indent=8)
-            self._tprint(
-            f"Finding: Server responses appear consistent for all tested usernames.",
-            "NOTVULN",
-            indent=8,
-        )
-
-        codes_s = ", ".join(str(c) for c in ue.distinct_user_reply_codes) if ue.distinct_user_reply_codes else "n/a"
-        if not ue.enumeration_suspected and not ue.timing_anomaly_suspected:
-            if wl_ok and len(ctr) == 1 and dominant_sig is not None:
-                dc = dominant_sig[0]
-                self._tprint(
-            f"Note: Response codes ({codes_s}) and messages were uniform across "
-            f"{len(wl_ok)} wordlist probes (terminal code {dc}).",
-            "TITLE",
-            indent=8,
-        )
-            elif wl_ok:
-                self._tprint(
-            f"Note: USER-stage code set: {codes_s}; see differentiation lines and JSON.",
-            "TITLE",
-            indent=8,
-        )
-
-        if not do_timing:
-            self._tprint(
-            f"Note: Timing analysis was skipped (use --user-enum-timing for latency audit).",
-            "TITLE",
-            indent=8,
-        )
-        elif ue.timing_control_median_ms is not None and ue.timing_slow_usernames_ms:
-            slow = ue.timing_slow_usernames_ms[0]
-            self._tprint(
-            f"Note: Control median was {ue.timing_control_median_ms:.1f} ms; "
-            f"example slow candidate {slow[0]!r} took {slow[1]:.1f} ms.",
-            "TITLE",
-            indent=8,
-        )
-        elif do_timing and ue.timing_control_median_ms is not None and not ue.timing_anomaly_suspected:
-            self._tprint(
-            f"Note: PASS-phase medians within expected range for this sample (no timing flag).",
-            "TITLE",
-            indent=8,
-        )
-
-        if ue.enumeration_suspected or ue.timing_anomaly_suspected:
-            self._tprint(f"Note: {ue.detail}", "TITLE", indent=8)
-
-    def _print_ftp_dos_audit_terminal(self, da: FtpDosAuditResult) -> None:
-
-        self._ptprint("FTP Processing Resilience (DoS Probes)", Out.INFO)
-        self._tprint("Methodology & Safety", "TITLE", indent=4)
-        self._tprint(
-            f"Targets: XML Entity Expansion & Decompression Bombs.",
-            "TITLE",
-            indent=8,
-        )
-        self._tprint(
-            f"Goal: Detect if backend processing (AV/Indexer) delays or stalls after file storage.",
-            "TITLE",
-            indent=8,
-        )
-        self._tprint(
-            f"ZIP payload mode: {da.zip_mode} (--ftp-dos-force-large swaps minimal → full bomb).",
-            "TITLE",
-            indent=8,
-        )
-        if da.zip_mode == "full":
-            self._tprint(
-            f"Large zip bomb mode ENABLED — isolate the target; heavy expansion if extracted server-side.",
-            "WARNING",
-            indent=8,
-        )
-
-        for r in da.probes:
-            self._tprint(f"Probe: {r.probe_label}", "TITLE", indent=4)
-            if r.timed_out:
-                self._tprint(
-            f"STOR did not finish within socket timeout "
-            f"({da.timeout_seconds}s) — control or data hung (high risk synchronous scanner).",
-            "VULN",
-            indent=8,
-        )
-                continue
-            if not r.stor_ok:
-                if r.blocked_by_policy:
-                    self._tprint(
-            f"STOR denied / rejected (protection signal): "
-            f"{r.stor_error or r.stor_reply_snippet or 'n/a'}",
-            "NOTVULN",
-            indent=8,
-        )
-                else:
-                    self._tprint(
-            f"STOR failed: {r.stor_error or 'unknown'}",
-            "VULN",
-            indent=8,
-        )
-                continue
-
-            line_m = r.stor_reply_snippet or "226 Transfer complete"
-            self._tprint(
-                f"STOR command accepted ({line_m})",
-                "WARNING" if r.background_processing_suspected else "NOTVULN",
-                indent=8,
+                "Wrong password was accepted for every name, including controls.",
+                "WARNING",
+                indent=4,
             )
 
-            if r.total_transfer_seconds is not None:
-                tot = r.total_transfer_seconds
-                speed = "Normal" if tot < 5.0 else "Slow"
-                self._tprint(
-            f"Transfer time: {tot:.2f}s ({speed})",
-            "TITLE",
-            indent=8,
-        )
-            if r.delta_last_byte_to_226_seconds is not None:
-                d226 = r.delta_last_byte_to_226_seconds
-                self._tprint(
-            f"Control reply delay after last byte: {d226:.2f}s",
-            "TITLE",
-            indent=8,
-        )
-                if d226 >= FTP_DOS_DELTA_WARN_SEC:
+        if ue.enumeration_suspected:
+            self._tprint("User enumeration is possible. Replies are not the same.", "VULN", indent=4)
+            base = next(
+                (
+                    self._user_enum_probe_signature(r)
+                    for r in ctrl
+                    if r.probe_kind == "control_invalid_random"
+                ),
+                None,
+            )
+            for r in wl:
+                if base is None or self._user_enum_probe_signature(r) != base:
                     self._tprint(
-            f"Warning: server response delayed by {d226:.1f}s after upload "
-            f"(possible background parsing / decompression).",
-            "WARNING",
-            indent=8,
-        )
-
-            if r.noop_ok is True:
-                self._tprint(
-            f"Post-transfer stability: Server responding (OK)",
-            "TITLE",
-            indent=8,
-        )
-            elif r.noop_ok is False:
-                self._tprint(
-            f"Post-transfer stability: control channel unhealthy after STOR "
-            f"({r.noop_error or 'NOOP/PWD failed'})",
-            "WARNING",
-            indent=8,
-        )
-
-            if r.delete_ok:
-                self._tprint("DELE cleanup attempted: OK", "NOTVULN", indent=8)
-            elif r.delete_error:
-                self._tprint(f"DELE: {r.delete_error}", "TITLE", indent=8)
-
-        self._tprint("Summary", "TITLE", indent=4)
-        any_accepted = any(p.stor_ok and not p.blocked_by_policy for p in da.probes)
-        if da.all_blocked_by_policy:
-            self._tprint(
-            f"Uploads rejected by policy — positive signal if denials map to content/type inspection.",
-            "NOTVULN",
-            indent=8,
-        )
-        elif da.post_processing_dos_suspected:
-            self._tprint(
-            f"Delay, timeout, or post-STOR instability observed — treat as post-processing DoS risk "
-            f"if AV/EDR or indexers touch uploads asynchronously.",
-            "WARNING",
-            indent=8,
-        )
-        elif any_accepted:
-            self._tprint(
-            f"Files accepted without obvious delay in this black-box view; "
-            f"still monitor CPU/RAM/disk for asynchronous backend work.",
-            "TITLE",
-            indent=8,
-        )
-        self._tprint(f"{da.detail}", "TITLE", indent=8)
-
-    def _print_eicar_audit_terminal(self, ea: FtpEicarAuditResult) -> None:
-
-        self._ptprint("Antivirus probe (EICAR)", Out.INFO)
-        self._tprint("Setup & methodology", "TITLE", indent=4)
-        self._tprint(
-            f"Post-STOR delay before SIZE/RETR: {ea.post_stor_delay_seconds}s "
-            f"(allows on-access scanners to react after transfer complete).",
-            "TITLE",
-            indent=8,
-        )
-        self._tprint(
-            f"Default filename uses .com (classic EICAR); if upload succeeds unchanged, "
-            f"policy may still be extension-driven — interpret with care.",
-            "TITLE",
-            indent=8,
-        )
-
-        for i, r in enumerate(ea.rows, 1):
-            self._tprint(f"Account {i}: {r.creds.user!r}", "TITLE", indent=4)
-            self._tprint(f"Credentials: {r.creds.user!r} / {r.creds.passw!r}", "TITLE", indent=8)
-            if not r.stor_ok:
-                self._tprint(f"STOR failed: {r.stor_error or 'unknown'}", "VULN", indent=8)
-                continue
-            self._tprint(f"STOR completed: {r.remote_path}", "NOTVULN", indent=8)
-            if r.size_error:
-                su = self._eicar_size_unsupported(r.size_error)
-                hint = " (SIZE unsupported — relied on RETR)" if su else ""
-                self._tprint(
-            f"SIZE: "
-            f"{r.size_bytes if r.size_bytes is not None else 'n/a'} — {r.size_error}{hint}",
-            "TITLE",
-            indent=8,
-        )
-            elif r.size_bytes is not None:
-                self._tprint(
-            f"SIZE: {r.size_bytes} bytes (expected {len(EICAR_STANDARD_TEST_FILE)})",
-            "TITLE",
-            indent=8,
-        )
-
-            if r.retr_ok:
-                self._tprint(
-                    f"RETR payload matches EICAR: {r.retr_payload_match}",
-                    "NOTVULN" if r.retr_payload_match else "VULN",
-                    indent=8,
-                )
-            elif r.retr_error:
-                missing = self._eicar_reply_suggests_missing(r.retr_error)
-                tag = " — file likely gone (on-access AV?)" if missing else ""
-                self._tprint(
-                    f"RETR failed: {r.retr_error}{tag}",
-                    "WARNING" if missing else "VULN",
-                    indent=8,
-                )
-
-            if r.vanished_after_stor_suspected:
-                self._tprint(
-            f"Signal: file missing or altered after STOR + delay — "
-            f"hints at on-access scanning or quarantine.",
-            "WARNING",
-            indent=8,
-        )
-
-            if r.delete_ok:
-                self._tprint("DELE cleanup succeeded.", "NOTVULN", indent=8)
-            elif r.delete_note:
-                self._tprint(f"DELE: {r.delete_note}", "TITLE", indent=8)
-            elif r.delete_error:
-                self._tprint(f"DELE failed: {r.delete_error}", "WARNING", indent=8)
-
-        self._tprint("Summary", "TITLE", indent=4)
-        self._tprint(f"{ea.detail}", "TITLE", indent=8)
-        if ea.risky_content_reachable:
-            self._tprint(
-            f"Verdict: EICAR stayed retrievable after the delay — no on-access removal "
-            f"observed on this path (policy / AV gap possible).",
-            "VULN",
-            indent=8,
-        )
-        elif ea.upload_blocked_all:
-            self._tprint(
-            f"Verdict: STOR failed for every tested account.",
-            "NOTVULN",
-            indent=8,
-        )
+                        f"{r.username}: {self._user_enum_format_probe_reply(r)}",
+                        "TEXT",
+                        indent=4,
+                    )
+        elif ue.timing_anomaly_suspected:
+            self._tprint("User enumeration may be possible from response time.", "WARNING", indent=4)
         else:
             self._tprint(
-            f"Verdict: No account left unchanged EICAR downloadable after the window.",
-            "NOTVULN",
-            indent=8,
-        )
+                "User enumeration is not possible. All names got the same reply.",
+                "NOTVULN",
+                indent=4,
+            )
+
+    def _print_ftp_dos_audit_terminal(self, da: FtpDosAuditResult) -> None:
+        """Login or replay only. Probe lines are printed next to their -vv trace."""
+        if getattr(self, "_dos_probes_emitted", False):
+            return
+        if not da.probes:
+            msg = (da.detail or "").strip() or "Processing probes were not run."
+            self._tprint(self._snip(msg), "WARNING")
+            return
+        for r in da.probes:
+            self._ftp_dos_print_probe(r, debug=False)
+
+    def _eicar_lines(self, r: FtpEicarRow) -> list[tuple[str, str]]:
+        who = f"{r.creds.user}: " if r.creds and r.creds.user else ""
+        if not r.stor_ok:
+            if self._ftp_text_is_unconfirmed(r.stor_error):
+                return [("WARNING", f"{who}EICAR was not confirmed")]
+            return [("NOTVULN", f"{who}EICAR upload was refused")]
+        uploaded = ("VULN", f"{who}EICAR was uploaded")
+        if r.vanished_after_stor_suspected:
+            return [uploaded, ("NOTVULN", f"{who}EICAR was deleted")]
+        if r.retr_ok and r.retr_payload_match:
+            return [uploaded, ("VULN", f"{who}EICAR was not deleted")]
+        return [uploaded, ("WARNING", f"{who}Deletion was not confirmed")]
+
+    def _print_eicar_audit_terminal(self, ea: FtpEicarAuditResult) -> None:
+        if not ea.rows:
+            self._tprint(ea.detail, "WARNING")
+            return
+        many = len(ea.rows) > 1
+        for r in ea.rows:
+            for bullet, text in self._eicar_lines(r):
+                if not many:
+                    text = text.split(": ", 1)[-1]
+                self._tprint(text, bullet)
 
     # region output
 
@@ -6219,8 +6378,9 @@ class FtpEngine:
 
                     json_lines.append(cred_str + perm_str)
 
-                if self.args.user is not None:
-                    user_str = f"username: {self.args.user}"
+                names = text_or_file(self.args.user, None)
+                if names:
+                    user_str = "username: " + ", ".join(names)
                 else:
                     user_str = f"usernames: {self.args.users}"
 
@@ -6260,6 +6420,12 @@ class FtpEngine:
                     "exists": p.exists,
                     "isDirectory": p.is_directory,
                     "size": p.size,
+                    "mtime": p.mtime,
+                    "readable": p.readable,
+                    "writable": p.writable,
+                    "deletable": p.deletable,
+                    "cleanupFailed": p.cleanup_failed,
+                    "loginDirectory": p.login_directory,
                 }
                 for p in path_list
             ]
@@ -6378,7 +6544,7 @@ class FtpEngine:
                 deferred_vulns.append(
                     {
                         "vuln_code": VULNS.FtpConnectionLimits.value,
-                        "vuln_request": "Connection / rate / idle / PASV probes (--conn-limits-audit / -L)",
+                        "vuln_request": "Connection / idle / PASV probes (--count / --duration)",
                         "vuln_response": "; ".join(cl.risk_factors) if cl.risk_factors else cl.detail,
                     }
                 )
@@ -6415,13 +6581,18 @@ class FtpEngine:
                 "detail": ch.detail,
                 "passwdSizeBytes": ch.passwd_size_bytes,
                 "shadowSizeBytes": ch.shadow_size_bytes,
+                "passwdRetrOk": ch.passwd_retr_ok,
+                "shadowRetrOk": ch.shadow_retr_ok,
+                "passwdRetrRelativeOk": ch.passwd_retr_relative_ok,
+                "shadowRetrRelativeOk": ch.shadow_retr_relative_ok,
+                "writeEscapeOk": ch.write_escape_ok,
             }
             properties.update({"ftpChrootAudit": ch_json})
             if ch.isolation_broken_suspected:
                 deferred_vulns.append(
                     {
                         "vuln_code": VULNS.FtpChrootIsolation.value,
-                        "vuln_request": "CWD / .. / SIZE probes (--chroot-audit / -J)",
+                        "vuln_request": "CWD / .. / RETR / MKD probes (--chroot-audit / -J)",
                         "vuln_response": ch.detail,
                     }
                 )

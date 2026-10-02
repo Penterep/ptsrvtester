@@ -239,7 +239,7 @@ class FtpDosProbeRow(NamedTuple):
 
 
 class FtpDosAuditResult(NamedTuple):
-    """Single-session XML + ZIP processing stress (default minimal zip; optional full bomb)."""
+    """Single-session XML + ZIP processing stress (default 100 MiB DEFLATE zip; optional overlap bomb)."""
 
     timeout_seconds: float
     zip_mode: str
@@ -262,6 +262,9 @@ class EncryptionResult(NamedTuple):
     plaintext_ok: bool
     auth_tls_ok: bool
     tls_ok: bool
+    plaintext_incomplete: bool = False
+    auth_tls_incomplete: bool = False
+    tls_incomplete: bool = False
 
 
 class ModesResult(NamedTuple):
@@ -269,6 +272,8 @@ class ModesResult(NamedTuple):
     passive_ok: bool
     active_ok: bool
     pasv_ip_leak: str | None = None  # leaked internal IP from 227 if differs from target
+    passive_error: str | None = None
+    active_error: str | None = None
 
 
 class ActiveAuditStep(NamedTuple):
@@ -389,11 +394,17 @@ class InvalidCmdAuditResult(NamedTuple):
 
 @dataclass
 class PathEnumResult:
-    """Result of path enumeration (dictionary attack): found path with type and optional size."""
+    """One wordlist hit. Write/delete refer to a throwaway probe, not the found file."""
     path: str
     exists: bool
-    is_directory: bool | None  # True=CWD ok, False=SIZE ok (file), None=unknown
+    is_directory: bool | None  # True=CWD landed, False=SIZE ok (file), None=unknown
     size: int | None  # for files when SIZE succeeds
+    mtime: str | None = None
+    readable: bool = False
+    writable: bool = False
+    deletable: bool = False
+    cleanup_failed: bool = False
+    login_directory: bool = False
 
 
 @dataclass
@@ -401,7 +412,7 @@ class FtpUserEnumProbeRow:
     """One USER/PASS probe for PTL-SVC-FTP-USRENUM."""
 
     username: str
-    probe_kind: str  # wordlist | control_random | control_long | control_special
+    probe_kind: str  # wordlist | control_invalid_random
     user_reply_code: int | None
     user_reply_line: str
     pass_reply_code: int | None
@@ -593,7 +604,7 @@ class ChrootDotdotResult:
 @dataclass
 class ChrootAuditResult:
     """
-    User isolation / chroot-style checks: absolute CWD targets, .. chain, /etc/passwd SIZE.
+    User isolation / chroot-style checks: absolute CWD targets, .. chain, RETR of passwd/shadow, MKD via ../.
     isolation_broken_suspected: heuristic; chroot with jail root '/' may still false-negative/positive — confirm manually.
     """
 
@@ -609,6 +620,11 @@ class ChrootAuditResult:
     detail: str
     passwd_size_bytes: int | None = None
     shadow_size_bytes: int | None = None
+    passwd_retr_ok: bool = False
+    shadow_retr_ok: bool = False
+    passwd_retr_relative_ok: bool = False
+    shadow_retr_relative_ok: bool = False
+    write_escape_ok: bool = False
 
 
 @dataclass

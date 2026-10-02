@@ -173,12 +173,12 @@ def add_bruteforce_args(
         help="try 1 password/key for all users (instead of trying all passwords/keys for 1 user)",
     )
     bruteforce.add_argument(
-        "--brute-threads",
+        "-t", "--threads", "--brute-threads", "--enum-threads", "--user-enum-threads",
         type=int,
-        default=10,
-        nargs="?",
+        default=None,
         dest="threads",
-        help="number of threads for bruteforce (default: 10)",
+        metavar="<n>",
+        help=argparse.SUPPRESS,
     )
 
 
@@ -390,6 +390,12 @@ def text_or_file(text: str | list[str] | None, filepath: str | None) -> list[str
             result = raw.decode("utf-8", errors="replace").splitlines()
 
     return result
+
+
+def one_cli_user(user: str | list[str] | None) -> str | None:
+    """Single ``-u`` name, or ``None`` when ``-u`` has zero or several names."""
+    names = [x.strip() for x in text_or_file(user, None) if str(x).strip()]
+    return names[0] if len(names) == 1 else None
 
 
 def filepaths(directory: str, ext: str) -> list[str]:

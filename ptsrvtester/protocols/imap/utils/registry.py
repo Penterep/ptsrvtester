@@ -263,8 +263,8 @@ IMAP_TESTS: dict[str, dict] = {
 }
 
 # Tests that SELECT/APPEND via --mailbox (shown in imap -ts <TEST> -h).
-_IMAP_FOLDER_OPT = ["", "--mailbox", "<name>", "IMAP Folder"]
-_IMAP_FOLDER_APPEND_OPT = ["", "--mailbox", "<name>", "IMAP folder for APPEND"]
+_IMAP_FOLDER_OPT = ["", "--mailbox", "<name>", "IMAP folder for APPEND (default: INBOX)"]
+_IMAP_FOLDER_APPEND_OPT = ["", "--mailbox", "<name>", "IMAP folder for APPEND (default: INBOX)"]
 _IMAP_FOLDER_TESTS = frozenset({
     "EICAR", "XXESSRF", "XXEEXP", "ZIPBOMB", "RESLOAD", "MBOXISO",
 })

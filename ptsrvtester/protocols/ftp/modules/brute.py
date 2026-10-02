@@ -17,7 +17,8 @@ def run(ctx):
             sys.stdout.flush()
     creds = simple_bruteforce(
         e._try_login, ctx.args.user, ctx.args.users, ctx.args.password, ctx.args.passwords,
-        ctx.args.spray, ctx.args.threads, on_success=_on_success if not ctx.json else None,
+        ctx.args.spray, ctx.args.threads if ctx.args.threads is not None else 10,
+        on_success=_on_success if not ctx.json else None,
     )
     e.results.creds = set(creds) if creds else set()
     e._stream_brute_result()

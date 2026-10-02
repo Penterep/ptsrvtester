@@ -11,7 +11,7 @@ def run(ctx):
     e.args.ftp_dos_probes = True
     if ensure_creds(ctx) is None:
         e.results.dos_audit_error = (
-            "No credentials for processing probes (-A/--anonymous or -u/-p required)"
+            e._missing_login_line()
         )
         # still call engine which returns structured empty result when no creds
     try:

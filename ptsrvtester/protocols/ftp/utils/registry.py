@@ -25,8 +25,8 @@ FTP_TESTS: dict[str, dict] = {
     },
     "CMD": {
         "desc": "Grab HELP / SYST / STAT",
-        "long": ["Inspect the HELP, SYST and STAT command responses for software",
-                 "and configuration information disclosure."],
+        "long": ["List commands from HELP, plus the SYST and STAT replies.",
+                 "Ordinary commands are ok. Risky or disclosing ones are flagged."],
     },
     "ENCRYPT": {
         "desc": "Test encryption options (plaintext / AUTH TLS / implicit TLS)",
@@ -55,35 +55,44 @@ FTP_TESTS: dict[str, dict] = {
                  "password(s)."],
         "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
         "mods": [
-            ["-u", "--user", "<name>", "Single username"],
+            ["-u", "--user", "<name> …", "Username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "<password>", "Single password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["-t", "--threads", "<n>", "Threads (default: 10)"],
         ],
     },
     "USRENUM": {
         "desc": "Username enumeration (USER + wrong PASS)",
-        "long": ["USER then a fixed wrong password; compare distinct replies / timing",
-                 "against controls (RFC 2577 user enumeration)."],
-        "requires": ["--user-enum-wordlist <file>"],
+        "long": [
+            "Send USER and one wrong password for each name from -u/-U.",
+            "Compare the replies. Put one real username in the list so you",
+            "can see whether the server answers it differently from names",
+            "that do not exist.",
+        ],
+        "requires": ["-u/--user or -U/--users"],
         "mods": [
-            ["", "--user-enum-wordlist", "<file>", "Usernames to test (required)"],
-            ["", "--user-enum-password", "<str>", "Fixed wrong password after 331/332"],
-            ["", "--user-enum-keep-alive", "", "Reuse one TCP session for all probes"],
-            ["", "--user-enum-timing", "", "Compare median PASS-phase latency"],
-            ["", "--user-enum-threads", "<n>", "Parallel connections (default 1)"],
-            ["", "--user-enum-max", "<n>", "Cap wordlist size (0 = no limit)"],
+            ["-u", "--user", "<name> …", "Candidate username(s)"],
+            ["-U", "--users", "<wordlist>", "Username wordlist (required unless -u)"],
+            ["-p", "--password", "<str>", "Wrong password for every name (default: PtsrvUEnumWrongPass!77~)"],
+            ["", "--user-enum-max", "<n>", "Limit how many names are tested (default: 0 = no limit)"],
+            ["-t", "--threads", "<n>", "Threads (default: 1)"],
+            ["", "--user-enum-keep-alive", "", "Reuse one connection for all names"],
+            ["", "--user-enum-timing", "", "Also compare how long PASS takes"],
         ],
     },
     "ENUMPATH": {
         "desc": "Path / directory dictionary enumeration",
-        "long": ["Dictionary attack for discovering files and directories using",
-                 "supplied credentials (anonymous or -u/-p)."],
-        "requires": ["-w/--paths-wordlist <file>", "credentials (-A or -u/-p)"],
+        "long": ["Directory names from -w, file names from --files. Files are tried",
+                 "in the login directory and in each directory actually entered."],
+        "requires": ["-w/--paths-wordlist or --files", "credentials (-A or -u/-p)"],
         "mods": [
-            ["-w", "--paths-wordlist", "<file>", "Paths to test, one per line (required)"],
-            ["", "--enum-threads", "<n>", "Threads for enumeration (default 5)"],
-            ["", "--base-path", "<path>", "Start directory for enumeration"],
+            ["-w", "--paths-wordlist", "<folder>", "Directory names, one per line"],
+            ["", "--files", "<file>", "File names to try inside each directory entered"],
+            ["", "--depth", "<n>", "Directory levels to walk (default: 1)"],
+            ["-t", "--threads", "<n>", "Threads (default: 5)"],
+            ["", "--base-path", "<path>", "Start directory for enumeration (default: login CWD)"],
         ],
     },
     "MODES": {
@@ -98,8 +107,8 @@ FTP_TESTS: dict[str, dict] = {
                  "in a narrow, predictable range."],
         "requires": ["credentials (-A or -u/-p)"],
         "mods": [
-            ["", "--pasv-port-audit-samples", "<n>", "Samples (default 8, min 4)"],
-            ["", "--pasv-port-audit-max-span", "<n>", "Max acceptable port span (default 8192)"],
+            ["", "--pasv-port-audit-samples", "<n>", "Samples (default: 8, min 4)"],
+            ["", "--pasv-port-audit-max-span", "<n>", "Max acceptable port span (default: 8192)"],
         ],
     },
     "ACTIVE": {
@@ -111,7 +120,7 @@ FTP_TESTS: dict[str, dict] = {
         "long": ["Full methodology: isolated sessions, raw LIST (D0), PORT+LIST and",
                  "low-port hints. More thorough but noisier than ACTIVE."],
         "mods": [
-            ["", "--active-audit-low-ports", "<list>", "Data ports <1000 to test (default 80,443,21)"],
+            ["", "--active-audit-low-ports", "<list>", "Data ports <1000 to test (default: 80,443,21)"],
         ],
     },
     "CMDAUDIT": {
@@ -131,16 +140,15 @@ FTP_TESTS: dict[str, dict] = {
                  "the server's resilience."],
     },
     "CONNLIM": {
-        "desc": "Connection / rate / idle / PASV limits",
-        "long": ["Bounded probes for concurrent sessions, rapid sequential connects,",
-                 "PASV spam and optional idle / slow-auth behaviour."],
+        "desc": "Connection limits / idle probes",
+        "long": ["Connection-count and idle-time probes; with -u/-p also probes",
+                 "parallel logins, post-login idle and PASV allocation."],
         "mods": [
-            ["", "--conn-limits-parallel", "<n>", "Simultaneous pre-auth sessions (default 12, max 40)"],
-            ["", "--conn-limits-sequential", "<n>", "Rapid sequential connects (default 24, max 80)"],
-            ["", "--conn-limits-pasv-attempts", "<n>", "PASV spam per session (default 18, max 60)"],
-            ["", "--conn-limits-idle-pre-auth", "<s>", "Pre-login idle seconds (0 = skip)"],
-            ["", "--conn-limits-slow-auth-gap", "<s>", "Seconds between USER and PASS (0 = skip)"],
-            ["", "--conn-limits-idle-post-auth", "<s>", "Post-login idle seconds (0 = skip; needs creds)"],
+            ["", "--count", "<n>", "Max concurrent connections in ramp-up (default: 100)"],
+            ["", "--duration", "<sec>", "How long idle/ban probes wait (default: 300)"],
+            ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
+            ["-u", "--user", "<name>", "Username for authenticated probes (optional)"],
+            ["-p", "--password", "<pass>", "Password for authenticated probes (optional)"],
         ],
     },
     "DOS": {
@@ -149,8 +157,8 @@ FTP_TESTS: dict[str, dict] = {
                  "stress scanners / indexers. Authorized targets only."],
         "requires": ["credentials (-A or -u/-p)"],
         "mods": [
-            ["", "--ftp-dos-timeout", "<sec>", "Per-operation socket timeout (default 30)"],
-            ["", "--ftp-dos-force-large", "", "Use full zip bomb (isolated labs only)"],
+            ["", "--ftp-dos-timeout", "<sec>", "Per-operation socket timeout (default: 30)"],
+            ["", "--ftp-dos-large", "", "Large zip bomb, about 1 TiB expanded (isolated labs only)"],
         ],
     },
     "CHROOT": {
@@ -158,9 +166,7 @@ FTP_TESTS: dict[str, dict] = {
         "long": ["Post-login CWD / .. chain probes to check whether the account can",
                  "reach host-style paths (/etc, /root, /home parent)."],
         "requires": ["credentials (-A or -u/-p)"],
-        "mods": [
-            ["", "--chroot-audit-paths", "<list>", "Extra comma-separated absolute paths"],
-        ],
+        "mods": [],
     },
     "EICAR": {
         "desc": "EICAR antivirus probe (upload + verify)",
@@ -168,7 +174,7 @@ FTP_TESTS: dict[str, dict] = {
                  "DELE cleanup to check on-access antivirus."],
         "requires": ["credentials (-A or -u/-p)"],
         "mods": [
-            ["", "--eicar-post-stor-delay", "<sec>", "Wait after STOR before verify (default 0.5)"],
+            ["", "--eicar-post-stor-delay", "<sec>", "Wait after STOR before verify (default: 0.5)"],
         ],
     },
     "RATELIMIT": rate_limit_test_spec(),
@@ -185,18 +191,15 @@ def ftp_test_help(codes: list[str]):
     blocks = []
     for code in valid:
         spec = FTP_TESTS[code]
-        options: list[list[str]] = []
-        for line in spec.get("long", []) or []:
-            options.append(["", "", "", line])
+        desc = [f"FTP — {code}: {spec['desc']}"]
+        desc.extend(spec.get("long", []) or [])
         if spec.get("requires"):
-            options.append(["", "", "", ""])
-            options.append(["", "", "", "Requires: " + "; ".join(spec["requires"])])
-        for row in spec.get("mods", []) or []:
-            options.append(row)
-        has_opts = bool(spec.get("mods") or spec.get("requires"))
+            desc.append("Requires: " + "; ".join(spec["requires"]))
+        mods = list(spec.get("mods", []) or [])
+        has_opts = bool(mods or spec.get("requires"))
         usage = f"ptsrvtester ftp -ts {code} " + ("<options> -tg <target>" if has_opts else "-tg <target>")
-        blocks.append({"description": [f"FTP — {code}: {spec['desc']}"]})
+        blocks.append({"description": desc})
         blocks.append({"usage": [usage]})
-        if options:
-            blocks.append({"options": options})
+        if mods:
+            blocks.append({"options": mods})
     return blocks

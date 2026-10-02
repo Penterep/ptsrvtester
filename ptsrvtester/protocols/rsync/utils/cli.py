@@ -9,7 +9,8 @@ __all__ = ['RsyncArgs']
 
 RSYNC_TEST_GROUPS = [
     ("Enumeration", ["BANNER", "GRAB_MODULES", "WRITE"]),
-    ("Authentiction & Encryption", ["MODULE_AUTH", "SSH"])
+    ("Authentiction & Encryption", ["MODULE_AUTH", "ENCRYPT"]),
+    ("Explotation", ["PATH_TRAVERSAL"])
 ]
 
 # Per-test definitions:
@@ -69,9 +70,20 @@ RSYNC_TESTS: dict[str, dict] = {
             ["-m", "--modules", "", "Specific module to enumerate"]
         ],
     },
-    "SSH": {
+    "ENCRYPT": {
         "desc": "Check for SSH service",
         "long": ["Checks whether the target accepts SSH connections on TCP port 22."],
+        "usage": ["-tg 192.168.15.53:387"],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "mods": [
+            ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
+        ],
+    },
+    "PATH_TRAVERSAL": {
+        "desc": "Rsync path traversal test",
+        "long": ["Checks if the rsync server is vulnerable to path traversal. Tries to access a '../../../../etc/passwd' module"],
         "usage": ["-tg 192.168.15.53:387"],
         "requires": [
             ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
@@ -203,8 +215,9 @@ class RsyncArgs(ArgsWithBruteforce):
 
         module_auth_parser = rsync_subparsers.add_argument_group(title="module_auth", description="Rsync module authentication enumeration group")
         module_auth_parser.add_argument("-m", "--modules", type=split_module_list, help="Specify modules to enumerate")
-
-
+        
+        module_enumeration_parser = rsync_subparsers.add_argument_group(title="module_auth", description="Rsync module authentication enumeration group")
+        module_enumeration_parser.add_argument("-r", "--recursion", action="store_true", help="List module contents recursively")
 
 
 # endregion

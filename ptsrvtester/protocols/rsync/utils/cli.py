@@ -144,9 +144,9 @@ class RsyncArgs(ArgsWithBruteforce):
             {"description": ["Rsync Testing Module"]},
             {"usage": ["ptsrvtester rsync <command> <options>"]},
             {"usage_example": [
-                "ptsrvtester rsync version -tg 192.168.1.1:161",
-                "ptsrvtester rsync v2brute --community-file communities.txt -tg 192.168.1.1:161",
-                "ptsrvtester rsync v3brute --username-file users.txt --password-file passwords.txt -tg 192.168.1.1:161"
+                "ptsrvtester rsync -ts banner,ssh -tg 192.168.1.1:873",
+                "ptsrvtester rsync -ts write --modules home,tmp -tg 192.168.1.1:873",
+                "ptsrvtester rsync -ts grab_modules -tg 192.168.1.1 -t 20"
             ]},
             {"options": options}
         ]
@@ -159,9 +159,9 @@ class RsyncArgs(ArgsWithBruteforce):
         """Adds a subparser of RSYNC arguments"""
 
         examples = """example usage:
-    ptsrvtester rsync -ts version 
-    ptsrvtester rsync -ts v2brute
-    ptsrvtester rsync -ts """
+    ptsrvtester rsync -ts banner 
+    ptsrvtester rsync -ts grab_modules
+    ptsrvtester rsync -ts module_auth -m rsync_module"""
 
         rsync_subparsers = subparsers.add_parser(
             name,
@@ -190,7 +190,7 @@ class RsyncArgs(ArgsWithBruteforce):
             default=None,
             metavar="<test>",
             dest="tests",
-            help="Comma-separated test codes (e.g. version,v2brute) or ALL; 'smtp -ts <TEST> -h' for test options",
+            help="Comma-separated test codes (e.g. banner,grab_modules) or ALL; 'rsync -ts <TEST> -h' for test options",
         )
 
         rsync_subparsers.add_argument(

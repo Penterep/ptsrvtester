@@ -47,11 +47,12 @@ def _print_modules(modules: list[Module], ctx) -> None:
             ctx.out(f"{entry.permissions} {entry.size:>12} {entry.mtime} {entry.name} {sym}", "TEXT", indent=12, colortext=True)
 
 
-def list_module_contents(host, module, recursive=False, timeout=15):
+def list_module_contents(ctx, host, module, recursive=False, timeout=15):
     url = f"rsync://{host}/{module}/"
     cmd = ["rsync", "--list-only", "--no-motd"]
     if recursive:
         cmd.append("-r")
+        timeout += 10
     cmd.append(url)
 
     env = os.environ.copy()
@@ -70,6 +71,7 @@ def list_module_contents(host, module, recursive=False, timeout=15):
         return []
 
     entries = []
+    ctx.out(f"Entries for module {module}:", "INFO", indent=4)
     for line in result.stdout.splitlines():
         m = _LINE_RE.match(line)
         if not m:
@@ -78,13 +80,15 @@ def list_module_contents(host, module, recursive=False, timeout=15):
         target = None
         if perms.startswith('l') and ' -> ' in name:
             name, target = name.split(' -> ', 1)
-        entries.append(RsyncEntry(
+        entry = RsyncEntry(
             permissions=perms,
             size=int(size_str.replace(',', '')),
             mtime=mtime,
             name=name,
             symlink_target=target,
-        ))
+        )
+        sym = f" -> {entry.symlink_target}" if entry.symlink_target else ""
+        ctx.out(f"{entry.permissions} {entry.size:>12} {entry.mtime} {entry.name} {sym}", "TEXT", indent=8, colortext=True)
     return entries 
 
 
@@ -95,7 +99,7 @@ def probe_module_names(ctx, module_names, modules):
                 else:
                     try:
                         entries = list_module_contents(
-                            ctx.ip, module_name, timeout=ctx.timeout or 15
+                            ctx, ctx.ip, module_name, timeout=ctx.timeout or 15, recursive=ctx.recursion
                         )
                     except subprocess.TimeoutExpired:
                         ctx.out(f"Timed out listing the '{module_name}' module", "ERROR", indent=8)

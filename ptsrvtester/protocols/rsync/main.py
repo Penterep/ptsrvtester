@@ -66,30 +66,45 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
 
     
     def _run_module(self, code: str, discovered, extras: dict) -> None:
-        """Heading now; ``-vv`` live; verdicts when the test finishes."""
+        """Print the heading before running and stream non-JSON output live."""
         entry = discovered[code]
         lock = printlock.PrintLock()
         ctx = self._make_context(lock, extras)
         if not self.use_json:
+            def live_out(
+                string="", category="TEXT", *, colortext=False, indent=0, condition=None
+            ):
+                cond = True if condition is None else condition
+                line = out_if(string, category, cond, colortext=colortext, indent=indent)
+                if line:
+                    with self._lock:
+                        sys.stdout.write(line if line.endswith("\n") else line + "\n")
+                        sys.stdout.flush()
+
+            ctx.out = live_out
+
             def live_debug(string="", *, indent=4):
                 if not ctx.verbose:
                     return
                 line = out_if(string, "ADDITIONS", True, colortext=True, indent=indent)
                 if line:
-                    sys.stdout.write(line if line.endswith("\n") else line + "\n")
-                    sys.stdout.flush()
+                    with self._lock:
+                        sys.stdout.write(line if line.endswith("\n") else line + "\n")
+                        sys.stdout.flush()
             ctx.debug = live_debug
         if entry.label.strip() and not self.use_json:
-            sys.stdout.write(out_if(entry.label, "INFO", True, colortext=True) + "\n")
-            sys.stdout.flush()
+            with self._lock:
+                sys.stdout.write(out_if(entry.label, "INFO", True, colortext=True) + "\n")
+                sys.stdout.flush()
         try:
             entry.module.run(ctx)
         except Exception as e:
             ctx.out(f"Error in module {code}: {e}", "ERROR")
         chunk = lock.get_output_string()
         if chunk and not self.use_json:
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
+            with self._lock:
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
         with self._lock:
             self._outputs[code] = "" if not self.use_json else chunk
     
@@ -123,5 +138,6 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
             "port": self.target[1],
             "timeout": getattr(self.args, "timeout", None),
             "modules": modules,
-            "rsync_path": check_rsync_path()
+            "rsync_path": check_rsync_path(),
+            "recursion": getattr(self.args, "recursion", False)
         }

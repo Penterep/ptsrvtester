@@ -28,6 +28,8 @@ class TmpCtx:
     ip: str
     port: int
     timeout: int
+    user: str | None = None
+    password: str | None = None
 
 class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
     #: Short protocol identity (also namespaces this protocol's tests).
@@ -125,7 +127,9 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
                 tmp_ctx = TmpCtx(
                                         self.target[0],
                                         self.target[1],
-                                        getattr(self.args, "timeout", None)
+                                        getattr(self.args, "timeout", None),
+                                        getattr(self.args, "user", None),
+                                        getattr(self.args, "password", None),
                                     )
                 modules = rsync_grab_modules(
                     tmp_ctx,
@@ -139,5 +143,7 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
             "timeout": getattr(self.args, "timeout", None),
             "modules": modules,
             "rsync_path": check_rsync_path(),
-            "recursion": getattr(self.args, "recursion", False)
+            "recursion": getattr(self.args, "recursion", False),
+            "user": getattr(self.args, "user", None),
+            "password": getattr(self.args, "password", None),
         }

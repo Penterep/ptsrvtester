@@ -1,5 +1,26 @@
 import shutil
 import subprocess
+import os
+from urllib.parse import quote
+
+
+_INVALID_PROBE_PASSWORD = "ptsrvtester-auth-probe-invalid"
+
+
+def rsync_url(ctx, path="", *, host=None, port=None):
+    username = getattr(ctx, "user", None)
+    host = host or ctx.ip
+    port = port if port is not None else getattr(ctx, "port", None)
+    credentials = f"{quote(username, safe='')}@" if username else ""
+    port_part = f":{port}" if port is not None else ""
+    return f"rsync://{credentials}{host}{port_part}/{path.lstrip('/')}"
+
+
+def rsync_env(ctx):
+    env = os.environ.copy()
+    password = getattr(ctx, "password", None)
+    env["RSYNC_PASSWORD"] = password if password is not None else _INVALID_PROBE_PASSWORD
+    return env
 
 def check_rsync_path() -> str:
     path = shutil.which("rsync")
@@ -57,7 +78,7 @@ def rsync_grab_modules(ctx, printer=True, include_motd=False):
         "--no-motd",
         f"--contimeout={timeout}",
         f"--timeout={timeout}",
-        f"rsync://{ctx.ip}:{port}/",
+        rsync_url(ctx, port=port),
     ]
 
     if include_motd:
@@ -69,6 +90,7 @@ def rsync_grab_modules(ctx, printer=True, include_motd=False):
             capture_output=True,
             text=True,
             input="",
+            env=rsync_env(ctx),
             timeout=timeout + 2,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -76,5 +98,8 @@ def rsync_grab_modules(ctx, printer=True, include_motd=False):
 
     if result.returncode != 0:
         return []    
-    
+
+    if include_motd:
+        return _modules_from_motd(result.stdout)
+
     return [line.strip().split()[0] for line in result.stdout.splitlines() if line.strip()]

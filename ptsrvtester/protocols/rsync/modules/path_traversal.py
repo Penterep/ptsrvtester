@@ -1,4 +1,5 @@
 import subprocess
+from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
 
 
 __MODULELABEL__ = "Rsync path traversal detection"
@@ -7,10 +8,10 @@ __ORDER__ = 100
 
 
 def _try_path_traversal(ctx):
-    url = f"rsync://{ctx.ip}/../../../../../../etc/passwd"
+    url = rsync_url(ctx, "../../../../../../etc/passwd")
     cmd = ["rsync", "--no-motd", url, "."]
     result = subprocess.run(
-        cmd, capture_output=True, text=True, input="", timeout=ctx.timeout
+        cmd, capture_output=True, text=True, input="", env=rsync_env(ctx), timeout=ctx.timeout
     )
     
     if result.returncode != 0:

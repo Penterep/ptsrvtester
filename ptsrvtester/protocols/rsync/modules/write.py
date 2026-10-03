@@ -1,6 +1,7 @@
 import socket, tempfile, subprocess, os, re
 from datetime import datetime, timezone
 from ptthreads.ptthreads import ptthreads
+from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
 
 
 __MODULELABEL__ = "Rsync write probe"
@@ -20,15 +21,14 @@ def check_write_access(module_dict: dict):
     )
  
     result = {"module": module, "write_allowed": False}
-    env = os.environ.copy()
-    env["RSYNC_PASSWORD"] = "ptsrvtester-auth-probe-invalid"
+    env = rsync_env(ctx)
  
     with tempfile.TemporaryDirectory() as tmpdir:
         local_path = os.path.join(tmpdir, marker_name)
         with open(local_path, "w") as f:
             f.write(marker_content)
  
-        upload_url = f"rsync://{ctx.ip}:{ctx.port}/{module}/{marker_name}"
+        upload_url = rsync_url(ctx, f"{module}/{marker_name}")
         try:
             upload = subprocess.run(
                 ["rsync", "--contimeout=5", local_path, upload_url],
@@ -51,7 +51,7 @@ def check_write_access(module_dict: dict):
 
                 verify = subprocess.run(
                     ["rsync", "--list-only", "--contimeout=5",
-                     f"rsync://{ctx.ip}:{ctx.port}/{module}/{marker_name}"],
+                     rsync_url(ctx, f"{module}/{marker_name}")],
                     capture_output=True, text=True, input="", env=env, timeout=ctx.timeout,
                 )
                 result["verified_present"] = verify.returncode == 0
@@ -63,7 +63,7 @@ def check_write_access(module_dict: dict):
                         "rsync", "-r", "--contimeout=5", "--delete",
                         "--include", marker_name, "--exclude", "*",
                         f"{empty_dir}/",
-                        f"rsync://{ctx.ip}:{ctx.port}/{module}/",
+                        rsync_url(ctx, f"{module}/"),
                     ]
                     delcheck = subprocess.run(
                         delete_cmd,

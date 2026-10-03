@@ -1,8 +1,8 @@
-import os
 import re
 import subprocess
 from ptthreads.ptthreads import ptthreads
 from ptsrvtester.protocols.rsync.modules.grab_modules import rsync_grab_modules
+from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
 
 __MODULELABEL__ = "Rsync module authentication enumeration"
 __MODULECODE__ = "module_auth"
@@ -13,15 +13,13 @@ def _check_module(module):
     ctx = module["ctx"]
     module_name = module["module"]
     timeout = ctx.timeout or 10
-    env = os.environ.copy()
-    env["RSYNC_PASSWORD"] = "ptsrvtester-auth-probe-invalid"
     command = [
         ctx.rsync_path,
         "--list-only",
         "--no-motd",
         f"--contimeout={timeout}",
         f"--timeout={timeout}",
-        f"rsync://{ctx.ip}:{ctx.port}/{module_name}/",
+        rsync_url(ctx, f"{module_name}/"),
     ]
 
     try:
@@ -30,7 +28,7 @@ def _check_module(module):
             capture_output=True,
             text=True,
             input="",
-            env=env,
+            env=rsync_env(ctx),
             timeout=timeout + 2,
         )
     except subprocess.TimeoutExpired:
@@ -48,7 +46,10 @@ def _check_module(module):
     ):
         ctx.out(f"The '{module_name}' module requires authentication", "OK", indent=4)
     elif result.returncode == 0:
-        ctx.out(f"The '{module_name}' module does not require authentication", "VULN", indent=4)
+        if getattr(ctx, "user", None) or getattr(ctx, "password", None):
+            ctx.out(f"The '{module_name}' module is accessible with the supplied credentials", "INFO", indent=4)
+        else:
+            ctx.out(f"The '{module_name}' module does not require authentication", "VULN", indent=4)
     else:
         detail = result.stderr.strip() or result.stdout.strip() or f"rsync exited with status {result.returncode}"
         ctx.out(f"Error checking '{module_name}' authentication: {detail}", "ERROR", indent=4)

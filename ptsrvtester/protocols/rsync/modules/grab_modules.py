@@ -1,8 +1,7 @@
-import os
 import subprocess
 import re
 from dataclasses import dataclass
-from ptsrvtester.protocols.rsync.utils.registry import rsync_grab_modules
+from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_grab_modules, rsync_url
 
 __MODULELABEL__ = "Rsync module enumeration"
 __MODULECODE__ = "grab_modules"
@@ -48,17 +47,15 @@ def _print_modules(modules: list[Module], ctx) -> None:
 
 
 def list_module_contents(ctx, host, module, recursive=False, timeout=15):
-    url = f"rsync://{host}/{module}/"
+    url = rsync_url(ctx, f"{module}/", host=host)
     cmd = ["rsync", "--list-only", "--no-motd"]
     if recursive:
         cmd.append("-r")
         timeout += 10
     cmd.append(url)
 
-    env = os.environ.copy()
-    env["RSYNC_PASSWORD"] = "ptsrvtester-auth-probe-invalid"
     result = subprocess.run(
-        cmd, capture_output=True, text=True, input="", env=env, timeout=timeout
+        cmd, capture_output=True, text=True, input="", env=rsync_env(ctx), timeout=timeout
     )
     output = f"{result.stdout}\n{result.stderr}"
     if re.search(

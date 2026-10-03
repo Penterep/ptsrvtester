@@ -43,7 +43,9 @@ RSYNC_TESTS: dict[str, dict] = {
         ],
         "mods": [
             ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
-            ["-m", "--modules", "", "Specific module to enumerate"]
+            ["-m", "--modules", "", "Specific module to enumerate"],
+            ["-u", "--user", "<name>", "Rsync module username"],
+            ["-p", "--password", "<password>", "Rsync module password"],
         ],
     },
     "WRITE": {
@@ -55,7 +57,9 @@ RSYNC_TESTS: dict[str, dict] = {
         ],
         "mods": [
             ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
-            ["-m", "--modules", "", "Specific module to enumerate"]
+            ["-m", "--modules", "", "Specific module to enumerate"],
+            ["-u", "--user", "<name>", "Rsync module username"],
+            ["-p", "--password", "<password>", "Rsync module password"],
         ],
     },
     "MODULE_AUTH": {
@@ -67,7 +71,9 @@ RSYNC_TESTS: dict[str, dict] = {
         ],
         "mods": [
             ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
-            ["-m", "--modules", "", "Specific module to enumerate"]
+            ["-m", "--modules", "", "Specific module to enumerate"],
+            ["-u", "--user", "<name>", "Rsync module username"],
+            ["-p", "--password", "<password>", "Rsync module password"],
         ],
     },
     "ENCRYPT": {
@@ -90,6 +96,8 @@ RSYNC_TESTS: dict[str, dict] = {
         ],
         "mods": [
             ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
+            ["-u", "--user", "<name>", "Rsync module username"],
+            ["-p", "--password", "<password>", "Rsync module password"],
         ],
     }
 }
@@ -131,6 +139,8 @@ class RsyncArgs(ArgsWithBruteforce):
     ip: str
     port: int
     command: str
+    user: str | None
+    password: str | None
 
     @staticmethod
     def get_help():
@@ -150,6 +160,8 @@ class RsyncArgs(ArgsWithBruteforce):
             ["-vv", "--verbose", "", "Enable verbose mode"],
             ["-j", "--json", "", "Output in JSON format"],
             ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+            ["-u", "--user", "<name>", "Rsync module username"],
+            ["-p", "--password", "<password>", "Rsync module password"],
             ]
 
         return [
@@ -190,6 +202,9 @@ class RsyncArgs(ArgsWithBruteforce):
                                      help="IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:25)"
                                      )
 
+        rsync_subparsers.add_argument("-u", "--user", type=str, default=None, help="Rsync module username")
+        rsync_subparsers.add_argument("-p", "--password", type=str, default=None, help="Rsync module password")
+
         rsync_subparsers.add_argument("-w", "--write-to-file", help="File to save the output results.",
                                                                           default=None,
                                                                           type=str)
@@ -209,7 +224,7 @@ class RsyncArgs(ArgsWithBruteforce):
             "-t",
             "--timeout",
             type=int,
-            default=3,
+            default=5,
             help="Timeout for connections (in seconds)"
         )
 

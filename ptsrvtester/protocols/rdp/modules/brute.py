@@ -1,7 +1,7 @@
 """Explicit password-guessing protection adapter."""
 
 __MODULELABEL__ = "RDP password-guessing protections"
-__MODULECODE__ = "BRUTEPROT"
+__MODULECODE__ = "BRUTE"
 __ORDER__ = 120
 
 

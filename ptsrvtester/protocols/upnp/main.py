@@ -211,6 +211,17 @@ class UPnP(BaseMain):
             )
         return selected
 
+    def _run_module(self, code, discovered, extras) -> None:
+        # A silent UDP endpoint is inconclusive. Dependent tests need valid
+        # advertisements/descriptions; passive NOTIFY remains independent.
+        if code not in {"DISCOVER", "NOTIFY"} and self.engine.discovery_status != "not_run":
+            if not any(item["valid"] for item in self.engine.discoveries):
+                return
+        if code not in {"DISCOVER", "DESCRIBE", "NOTIFY"} and self.engine.description_status != "not_run":
+            if not any(item["status"] == "described" for item in self.engine.devices):
+                return
+        super()._run_module(code, discovered, extras)
+
     def _thread_count(self) -> int:
         return 1
 

@@ -34,7 +34,7 @@ def run(ctx):
             if not v.reachable:
                 ctx.out(f"{v.ns}: no answer", "WARNING", indent=8)
             else:
-                ctx.out(f"{v.ns}: SOA serial {v.serial}, {len(v.ns_set)} NS records", "TEXT", indent=8)
+                ctx.out(f"{v.ns}: SOA serial {v.serial}, {len(v.ns_set)} NS records", "TITLE", indent=8)
 
         if consistent:
             ctx.out("All name servers agree on SOA serial and NS set.", "OK", indent=8)

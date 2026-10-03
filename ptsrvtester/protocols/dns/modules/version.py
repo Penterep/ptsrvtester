@@ -27,9 +27,9 @@ def run(ctx):
         if vals:
             ctx.out(f"{name:<15} {', '.join(vals)}", "VULN", indent=4)
         elif vals == []:
-            ctx.out(f"{name:<15} refused / not set", "TEXT", indent=4)
+            ctx.out(f"{name:<15} refused / not set", "TITLE", indent=4)
         else:
-            ctx.out(f"{name:<15} no response", "TEXT", indent=4)
+            ctx.out(f"{name:<15} no response", "TITLE", indent=4)
 
     if not disclosed:
         ctx.out("No CHAOS TXT information disclosed.", "OK", indent=4)

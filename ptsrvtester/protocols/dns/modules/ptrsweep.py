@@ -35,7 +35,7 @@ def run(ctx):
         return
 
     for ip in sorted(results, key=lambda x: tuple(int(p) for p in x.split(".")) if x.count(".") == 3 else x):
-        ctx.out(f"{ip:<18} {', '.join(results[ip])}", "TEXT", indent=4)
+        ctx.out(f"{ip:<18} {', '.join(results[ip])}", "TITLE", indent=4)
     ctx.out(f"{len(results)} of {len(addrs)} address(es) have a PTR record.", "INFO", colortext=True, indent=4)
 
     with ctx.results_lock:

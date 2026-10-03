@@ -20,16 +20,18 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
-    results = rc.cache_snoop(ip, port)
+    names = rc.probe_domains(ctx) or list(rc.EXTERNAL_NAMES)
+    rc.resolve_guard(ctx, ip, port, names[0])
+    results = rc.cache_snoop(ip, port, names)
     cached = [r for r in results if r.cached]
 
     for r in results:
         if r.cached:
             ctx.out(f"{r.name:<18} in cache (TTL {r.ttl})", "VULN", indent=4)
         elif r.cached is None:
-            ctx.out(f"{r.name:<18} {r.rcode}", "TEXT", indent=4)
+            ctx.out(f"{r.name:<18} {r.rcode}", "TITLE", indent=4)
         else:
-            ctx.out(f"{r.name:<18} not cached / not disclosed (rcode {r.rcode})", "TEXT", indent=4)
+            ctx.out(f"{r.name:<18} not cached / not disclosed (rcode {r.rcode})", "TITLE", indent=4)
 
     if not cached:
         ctx.out("No cache contents disclosed via RD=0 (cache snooping not possible here).", "OK", indent=4)

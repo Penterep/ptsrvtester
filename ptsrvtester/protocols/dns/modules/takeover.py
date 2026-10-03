@@ -44,7 +44,7 @@ def run(ctx):
             elif res.service:
                 ctx.out(f"{name} → {res.detail}", "WARNING", indent=8)
             else:
-                ctx.out(f"{name} → {res.detail}", "TEXT", indent=8)
+                ctx.out(f"{name} → {res.detail}", "TITLE", indent=8)
         if not any_cname:
             ctx.out("No CNAMEs among the checked names (pass -sub for subdomains).", "OK", indent=8)
 

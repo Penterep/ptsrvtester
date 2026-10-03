@@ -9,9 +9,11 @@ small :meth:`output` override so every module contributes to a single shared
 """
 import argparse
 import socket
+import sys
 import threading
 
 from ptlibs.ptjsonlib import PtJsonLib
+from ptlibs.threads import printlock
 
 from .._base import BaseMain, BaseArgs
 from .utils.cli import DNSArgs
@@ -86,6 +88,32 @@ class DNS(BaseMain):
             "deferred_vulns": self._deferred_vulns,
             "results_lock": self._results_lock,
         }
+
+    def _run_module(self, code: str, discovered: dict, extras: dict) -> None:
+        """Run one module and flush its result to the screen IMMEDIATELY.
+
+        BaseMain buffers every module's output and prints it all at the very end;
+        DNS instead streams each test's result as soon as that module finishes, so
+        the user sees results live and does not wait for the other tests. With the
+        DNS default of one module thread this stays correctly ordered. The chunk is
+        cleared afterwards so BaseMain.run()'s end-of-run flush does not reprint it.
+        Output is written under ``self._lock`` so a module's lines are never
+        interleaved with another's.
+        """
+        entry = discovered[code]
+        lock = printlock.PrintLock()
+        ctx = self._make_context(lock, extras)
+        ctx.out(entry.label, "INFO", colortext=True)
+        try:
+            entry.module.run(ctx)
+        except Exception as e:
+            ctx.out(f"Error in module {code}: {e}", "ERROR")
+        chunk = lock.get_output_string()
+        with self._lock:
+            if chunk:
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+            self._outputs[code] = ""  # already streamed — avoid BaseMain reprinting it
 
     def output(self) -> None:
         """Build the single shared ``software`` node and bind every module's vulns."""

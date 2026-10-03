@@ -24,7 +24,9 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
-    results = rc.amplification(ip, port)
+    domains = rc.probe_domains(ctx)
+    rc.resolve_guard(ctx, ip, port, (domains or ["google.com"])[0])
+    results = rc.amplification(ip, port, domains=domains or None)
     if not results:
         ctx.out("No response to any amplification probe.", "OK", indent=4)
         return
@@ -37,7 +39,7 @@ def run(ctx):
         else:
             state = "not resolved"
         tc = ", truncated (TCP required)" if r.truncated else ""
-        cat = "VULN" if (r.reflectable and r.factor >= AMP_THRESHOLD) else "TEXT"
+        cat = "VULN" if (r.reflectable and r.factor >= AMP_THRESHOLD) else "TITLE"
         ctx.out(f"{r.name} {r.rtype:<6} {r.request_size}→{r.response_size} B  x{r.factor}  ({state}{tc})", cat, indent=4)
 
     best = rc.best_amplification(results)

@@ -15,7 +15,10 @@ import dns.query
 import dns.rcode
 import dns.rdatatype
 
+from .helpers import text_or_file
+
 DEFAULT_TIMEOUT = 5.0
+GUARD_TIMEOUT = 4.0
 
 EXTERNAL_NAMES: tuple[str, ...] = (
     "google.com", "cloudflare.com", "microsoft.com", "amazon.com",
@@ -28,6 +31,55 @@ AMP_QUERIES: tuple[tuple[str, str], ...] = (
     ("org", "DNSKEY"),
     ("isc.org", "ANY"),
 )
+
+
+# --------------------------------------------------------------------------- #
+# Probe-target selection + reachability guard
+#
+# The resolver-probe tests (ROLE / RECURSION / AMPLIFICATION / CACHESNOOP) need a
+# name the target can resolve. Hard-coded external names time out against an
+# internal DNS with no internet; so when -d/-dl is given those domains are used
+# instead, and a pre-flight guard bails with a clear message if nothing resolves.
+# --------------------------------------------------------------------------- #
+def probe_domains(ctx) -> list[str]:
+    """The -d / -dl domains, if any (used instead of the built-in external names)."""
+    return [d.strip() for d in text_or_file(getattr(ctx.args, "domain", None),
+                                            getattr(ctx.args, "domain_file", None)) if d.strip()]
+
+
+def probe_resolves(ip: str, port: int, name: str, timeout: float = GUARD_TIMEOUT) -> bool:
+    """True if the target returns a usable response for *name* (NOERROR/NXDOMAIN/REFUSED).
+
+    False on timeout/unreachable or SERVFAIL — i.e. the resolver could not complete
+    the lookup (typical of an internal DNS with no path to the name).
+    """
+    query = dns.message.make_query(name, dns.rdatatype.A)
+    query.flags |= dns.flags.RD
+    try:
+        resp = dns.query.udp(query, ip, port=port, timeout=timeout)
+    except Exception:
+        return False
+    return resp.rcode() != dns.rcode.SERVFAIL
+
+
+def resolve_guard(ctx, ip: str, port: int, name: str, timeout: float = GUARD_TIMEOUT) -> None:
+    """Pre-flight: if the target cannot resolve *name*, end the run with a clear error.
+
+    No -d given  -> likely an internal DNS without internet: tell the user to pass
+    -d <internal-domain>. -d given but still unresolvable -> service unavailable or
+    the domain is invalid. Returns normally when resolution works.
+    """
+    if probe_resolves(ip, port, name, timeout):
+        return
+    if probe_domains(ctx):
+        ctx.ptjsonlib.end_error(
+            f"The DNS service at {ip} did not resolve '{name}' — the service is unavailable "
+            f"or '{name}' is not a valid / served domain.", ctx.json)
+    else:
+        ctx.ptjsonlib.end_error(
+            f"Could not resolve '{name}' via {ip}. This looks like an internal DNS without "
+            f"internet access — re-run with -d <internal-domain> so the resolver tests use a "
+            f"name it can resolve.", ctx.json)
 
 
 @dataclass
@@ -83,10 +135,20 @@ class AmpResult:
         return self.answered and not self.authoritative
 
 
-def amplification(ip: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> list[AmpResult]:
-    """Measure response-vs-query size for out-of-zone queries (reflection/amplification)."""
+def amplification(ip: str, port: int, domains: list[str] | None = None,
+                  timeout: float = DEFAULT_TIMEOUT) -> list[AmpResult]:
+    """Measure response-vs-query size for ANY/DNSKEY/TXT (reflection/amplification).
+
+    With *domains* (from -d) the record types are queried against those domains so
+    the test works on an internal DNS; otherwise the built-in external AMP_QUERIES
+    are used.
+    """
+    if domains:
+        queries = [(d, rt) for d in domains for rt in ("ANY", "DNSKEY", "TXT")]
+    else:
+        queries = list(AMP_QUERIES)
     results: list[AmpResult] = []
-    for name, rtype in AMP_QUERIES:
+    for name, rtype in queries:
         query = dns.message.make_query(name, rtype, use_edns=0, payload=4096)
         query.flags |= dns.flags.RD
         request_size = len(query.to_wire())

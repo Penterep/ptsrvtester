@@ -37,7 +37,7 @@ def run(ctx):
         if res.udp_truncated is True:
             ctx.out(f"UDP (bufsize 512): TC set — server truncates large responses correctly.", "OK", indent=8)
         elif res.udp_truncated is False:
-            ctx.out(f"UDP (bufsize 512): no TC (response {res.udp_size} B fit, or record small — inconclusive).", "TEXT", indent=8)
+            ctx.out(f"UDP (bufsize 512): no TC (response {res.udp_size} B fit, or record small — inconclusive).", "ADDITIONS", colortext=True, indent=8)
         else:
             ctx.out("UDP truncation probe got no response.", "WARNING", indent=8)
 

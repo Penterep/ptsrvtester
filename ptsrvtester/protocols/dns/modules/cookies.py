@@ -37,7 +37,7 @@ def run(ctx):
         ctx.out(f"Only the client cookie was echoed ({info['length']} bytes) — no server cookie.", "VULN", indent=4)
     else:
         ctx.out("Server did not return a DNS cookie (no client-facing cookie protection).", "VULN", indent=4)
-    ctx.out("Upstream cookie use toward authoritative servers is separate and not observable here.", "TEXT", indent=4)
+    ctx.out("Upstream cookie use toward authoritative servers is separate and not observable here.", "ADDITIONS", colortext=True, indent=8)
 
     with ctx.results_lock:
         ctx.properties["dns_cookies"] = "not supported (client-facing)"

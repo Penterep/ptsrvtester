@@ -39,7 +39,7 @@ def run(ctx):
             ctx.out(f"RRL probe failed: {res.error}", "WARNING", indent=8)
             continue
 
-        ctx.out(f"Sent {res.sent}, received {res.received} (truncated/slip {res.truncated}).", "TEXT", indent=8)
+        ctx.out(f"Sent {res.sent}, received {res.received} (truncated/slip {res.truncated}).", "TITLE", indent=8)
         if res.rrl_detected:
             ctx.out("Response Rate Limiting appears active (drops / TC-slip observed).", "OK", indent=8)
             with ctx.results_lock:

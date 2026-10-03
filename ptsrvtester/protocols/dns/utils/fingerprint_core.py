@@ -170,14 +170,16 @@ class RoleInfo:
     error: str | None = None
 
 
-def role_probe(ip: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> RoleInfo:
-    """Send a recursive query for an external name and read RA/AA/answer to classify the server.
+def role_probe(ip: str, port: int, name: str = "example.com", timeout: float = DEFAULT_TIMEOUT) -> RoleInfo:
+    """Send a recursive query for *name* and read RA/AA/answer to classify the server.
 
+    *name* defaults to an external name (to test recursion); modules pass the -d
+    domain when testing an internal DNS that cannot resolve the internet.
     Distinguishing a full recursive resolver from a forwarder is not reliable
     remotely (both recurse from the client's point of view), so the module
     reports the observable signals and flags open recursion.
     """
-    query = dns.message.make_query("example.com", dns.rdatatype.A)
+    query = dns.message.make_query(name, dns.rdatatype.A)
     query.flags |= dns.flags.RD
     try:
         response = dns.query.udp(query, ip, port=port, timeout=timeout)

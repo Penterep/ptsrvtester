@@ -20,17 +20,19 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
-    is_open, probes = rc.open_recursion(ip, port)
+    names = rc.probe_domains(ctx) or list(rc.EXTERNAL_NAMES)
+    rc.resolve_guard(ctx, ip, port, names[0])
+    is_open, probes = rc.open_recursion(ip, port, names)
     for p in probes:
         ra = "yes" if p.ra else "no"
         if p.answered and not p.authoritative:
             ctx.out(f"{p.name:<18} RA={ra:<3} recursed (rcode {p.rcode})", "VULN", indent=4)
         elif p.answered and p.authoritative:
-            ctx.out(f"{p.name:<18} RA={ra:<3} authoritative in-zone answer (not recursion)", "TEXT", indent=4)
+            ctx.out(f"{p.name:<18} RA={ra:<3} authoritative in-zone answer (not recursion)", "TITLE", indent=4)
         elif p.answered is None:
-            ctx.out(f"{p.name:<18} {p.rcode}", "TEXT", indent=4)
+            ctx.out(f"{p.name:<18} {p.rcode}", "TITLE", indent=4)
         else:
-            ctx.out(f"{p.name:<18} RA={ra:<3} not resolved (rcode {p.rcode})", "TEXT", indent=4)
+            ctx.out(f"{p.name:<18} RA={ra:<3} not resolved (rcode {p.rcode})", "TITLE", indent=4)
 
     if not is_open:
         ctx.out("Recursion is not open to this client (server does not resolve external names).", "OK", indent=4)

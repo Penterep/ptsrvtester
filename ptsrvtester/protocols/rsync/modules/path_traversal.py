@@ -7,7 +7,7 @@ from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
 
 __MODULELABEL__ = "Rsync path traversal detection"
 __MODULECODE__ = "path_traversal"
-__ORDER__ = 100
+__ORDER__ = 80
 
 
 def _try_path_traversal(ctx):

@@ -8,9 +8,9 @@ __all__ = ['RsyncArgs']
 
 
 RSYNC_TEST_GROUPS = [
-    ("Enumeration", ["BANNER", "GRAB_MODULES", "WRITE"]),
+    ("Enumeration", ["BANNER", "GRAB_MODULES", "WRITE", "OWNERSHIP"]),
     ("Authentication & Encryption", ["MODULE_AUTH", "PASS_BRUTE", "ENCRYPT"]),
-    ("Explotation", ["PATH_TRAVERSAL", "SYMLINK"])
+    ("Exploitation", ["PATH_TRAVERSAL", "SYMLINK"])
 ]
 
 # Per-test definitions:
@@ -58,6 +58,23 @@ RSYNC_TESTS: dict[str, dict] = {
         "mods": [
             ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
             ["-m", "--modules", "", "Specific module to enumerate"],
+            ["-u", "--user", "<name>", "Rsync module username"],
+            ["-p", "--password", "<password>", "Rsync module password"],
+        ],
+    },
+    "OWNERSHIP": {
+        "desc": "Get rsync daemon UID and GID",
+        "long": [
+            "Uploads a uniquely named probe without preserving ownership to a writable module.",
+            "Uses a dry run to read the probe's UID/GID, then removes the probe.",
+        ],
+        "usage": ["-tg 192.168.15.53:873", "-tg 192.168.15.53:873 -m rsync_module"],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "mods": [
+            ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
+            ["-m", "--modules", "", "One or more modules to test"],
             ["-u", "--user", "<name>", "Rsync module username"],
             ["-p", "--password", "<password>", "Rsync module password"],
         ],

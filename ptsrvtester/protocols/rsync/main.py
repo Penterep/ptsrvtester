@@ -118,7 +118,7 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
         tests = getattr(self.args, "tests", None)
         test_codes = {code.strip().upper() for code in tests.split(",")} if tests else set()
         needs_modules = not test_codes or "ALL" in test_codes or bool(
-            test_codes & {"GRAB_MODULES", "MODULE_AUTH", "WRITE"}
+            test_codes & {"GRAB_MODULES", "MODULE_AUTH", "WRITE", "OWNERSHIP"}
         )
         modules = getattr(self.args, "modules", None)
         if modules is None:

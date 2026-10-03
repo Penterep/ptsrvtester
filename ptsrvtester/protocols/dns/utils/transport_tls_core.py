@@ -165,13 +165,13 @@ def report_tls(ctx, proto: str, host: str, probe: TlsProbe) -> None:
     weak, cert, invalid = tls_verdict(probe, host)
     if cert and cert.error is None:
         ctx.out(f"Certificate: CN={cert.subject_cn}, issuer={cert.issuer_cn}, "
-                f"expires {cert.not_after:%Y-%m-%d} ({cert.days_left}d)", "TEXT", indent=4)
+                f"expires {cert.not_after:%Y-%m-%d} ({cert.days_left}d)", "TITLE", indent=4)
         if cert.san:
-            ctx.out(f"SAN: {', '.join(cert.san[:6])}" + (" …" if len(cert.san) > 6 else ""), "TEXT", indent=4)
+            ctx.out(f"SAN: {', '.join(cert.san[:6])}" + (" …" if len(cert.san) > 6 else ""), "TITLE", indent=4)
 
     if is_ip(host):
         ctx.out("Target is an IP address — pass the full hostname (-tg <fqdn>) to validate the "
-                "certificate name; against an IP it can only match an IP-SAN.", "ADDITIONS", colortext=True, indent=4)
+                "certificate name; against an IP it can only match an IP-SAN.", "ADDITIONS", colortext=True, indent=8)
 
     if weak:
         ctx.out(f"Weak TLS version negotiated: {probe.tls_version}.", "VULN", indent=4)

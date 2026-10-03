@@ -70,7 +70,7 @@ def run(ctx):
             continue
         ctx.out(f"NSEC3 (alg {params.algorithm}, iterations {params.iterations}, salt {params.salt_hex}) — "
                 f"collected {len(hashes)} distinct hash(es).", "VULN", indent=8)
-        ctx.out("Names are hashed; run NSEC3CRACK to attempt offline recovery.", "ADDITIONS", colortext=True, indent=8)
+        ctx.out("Names are hashed; run NSEC3CRACK to attempt offline recovery.", "ADDITIONS", colortext=True, indent=12)
         summary[domain] = {"method": "NSEC3", "hashes": len(hashes)}
         with ctx.results_lock:
             ctx.deferred_vulns.append({

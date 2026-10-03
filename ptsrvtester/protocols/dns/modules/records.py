@@ -29,9 +29,9 @@ def run(ctx):
             values = records.get(rtype) or []
             if values:
                 any_found = True
-                ctx.out(f"{rtype:<7} {', '.join(values)}", "TEXT", indent=8)
+                ctx.out(f"{rtype:<7} {', '.join(values)}", "TITLE", indent=8)
             else:
-                ctx.out(f"{rtype:<7} —", "TEXT", indent=8)
+                ctx.out(f"{rtype:<7} —", "TITLE", indent=8)
         if not any_found:
             ctx.out("No records resolved (domain may not exist or is empty).", "WARNING", indent=8)
         all_records[domain] = {rt: v for rt, v in records.items() if v}

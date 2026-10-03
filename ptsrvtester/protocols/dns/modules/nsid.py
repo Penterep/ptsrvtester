@@ -26,7 +26,7 @@ def run(ctx):
 
     ascii_val, hex_val = fp.nsid_display(raw)
     ctx.out(f"{'NSID (text)':<15} {ascii_val}", "VULN", indent=4)
-    ctx.out(f"{'NSID (hex)':<15} {hex_val}", "TEXT", indent=4)
+    ctx.out(f"{'NSID (hex)':<15} {hex_val}", "TITLE", indent=4)
     ctx.out("Server reveals its instance identity via NSID.", "VULN", indent=4)
 
     with ctx.results_lock:

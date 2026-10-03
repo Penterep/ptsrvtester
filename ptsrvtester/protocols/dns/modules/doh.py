@@ -25,7 +25,7 @@ def run(ctx):
 
     probe = tt.tls_probe(ip, 443, host, alpn=["h2", "http/1.1"])
     if not probe.connected:
-        ctx.out(f"DoH/443 not available ({probe.error}).", "TEXT", indent=4)
+        ctx.out(f"DoH/443 not available ({probe.error}).", "TITLE", indent=4)
         with ctx.results_lock:
             ctx.properties["doh"] = "unavailable"
         return

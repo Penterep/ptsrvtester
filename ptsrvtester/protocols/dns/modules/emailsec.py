@@ -36,7 +36,7 @@ def run(ctx):
             vulns.append({"vuln_code": VULNS.SpfMissing.value,
                           "vuln_request": f"TXT {domain} (v=spf1)", "vuln_response": "no SPF record"})
         else:
-            ctx.out(f"SPF      {info.spf}", "TEXT", indent=8)
+            ctx.out(f"SPF      {info.spf}", "TITLE", indent=8)
             if info.spf_all in (None, "pass"):
                 detail = "+all (passes everything)" if info.spf_all == "pass" else "no all mechanism"
                 ctx.out(f"SPF      weak: {detail}", "VULN", indent=8)
@@ -51,7 +51,7 @@ def run(ctx):
             vulns.append({"vuln_code": VULNS.DmarcMissing.value,
                           "vuln_request": f"TXT _dmarc.{domain}", "vuln_response": "no DMARC record"})
         else:
-            ctx.out(f"DMARC    {info.dmarc}", "TEXT", indent=8)
+            ctx.out(f"DMARC    {info.dmarc}", "TITLE", indent=8)
             if info.dmarc_policy == "none":
                 ctx.out("DMARC    weak: p=none (monitoring only, does not block spoofing)", "VULN", indent=8)
                 vulns.append({"vuln_code": VULNS.DmarcWeak.value,

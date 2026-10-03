@@ -41,7 +41,7 @@ def run(ctx):
             elif a.modern:
                 ctx.out(f"{a.role} tag {a.key_tag}: {a.name} (alg {a.algorithm}) — modern", "OK", indent=8)
             else:
-                ctx.out(f"{a.role} tag {a.key_tag}: {a.name} (alg {a.algorithm}) — acceptable (ECDSA/EdDSA recommended)", "TEXT", indent=8)
+                ctx.out(f"{a.role} tag {a.key_tag}: {a.name} (alg {a.algorithm}) — acceptable (ECDSA/EdDSA recommended)", "TITLE", indent=8)
         summary[domain] = [f"{a.name}(alg {a.algorithm},{a.role})" for a in algs]
 
         if deprecated:

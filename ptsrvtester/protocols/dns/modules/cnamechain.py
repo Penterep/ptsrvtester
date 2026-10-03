@@ -47,7 +47,7 @@ def run(ctx):
                 ctx.out(f"Excessive CNAME chain ({hops} hops{'+' if res.truncated else ''}): {arrow}", "VULN", indent=8)
                 _finding(ctx, name, f"{hops} hops", arrow)
             else:
-                ctx.out(f"CNAME chain ({hops} hop{'s' if hops != 1 else ''}): {arrow}", "TEXT", indent=8)
+                ctx.out(f"CNAME chain ({hops} hop{'s' if hops != 1 else ''}): {arrow}", "TITLE", indent=8)
         if not any_cname:
             ctx.out("No CNAME records among the checked names — nothing to follow.", "OK", indent=8)
 

@@ -26,7 +26,7 @@ def run(ctx):
 
     probe = tt.tls_probe(ip, 853, host, alpn=["dot"])
     if not probe.connected:
-        ctx.out(f"DoT/853 not available ({probe.error}).", "TEXT", indent=4)
+        ctx.out(f"DoT/853 not available ({probe.error}).", "TITLE", indent=4)
         with ctx.results_lock:
             ctx.properties["dot"] = "unavailable"
         return

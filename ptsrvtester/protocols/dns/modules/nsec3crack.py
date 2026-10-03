@@ -46,7 +46,7 @@ def run(ctx):
             continue
 
         ctx.out(f"NSEC3 alg {params.algorithm}, iterations {params.iterations}, salt {params.salt_hex}; "
-                f"{len(hashes)} hashes collected; trying {wordlist_note}.", "TEXT", indent=8)
+                f"{len(hashes)} hashes collected; trying {wordlist_note}.", "TITLE", indent=8)
         revealed = zw.crack_nsec3(hashes, params, domain, labels)
 
         if not revealed:

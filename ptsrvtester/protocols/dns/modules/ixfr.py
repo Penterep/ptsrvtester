@@ -37,7 +37,7 @@ def run(ctx):
         for ns in servers:
             role = "primary" if ns.is_primary else "secondary"
             if not ns.ips:
-                ctx.out(f"{ns.host.rstrip('.'):<32} [{role}] no A/AAAA — skipped", "TEXT", indent=8)
+                ctx.out(f"{ns.host.rstrip('.'):<32} [{role}] no A/AAAA — skipped", "TITLE", indent=8)
                 continue
             for ip in ns.ips:
                 res = zc.try_ixfr(ip, domain, ns.host, ns.is_primary, since)

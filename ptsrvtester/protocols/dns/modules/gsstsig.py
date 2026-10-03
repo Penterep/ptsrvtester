@@ -50,7 +50,7 @@ def run(ctx):
                     "secure update may not be enforced (see DYNUPDATE).", "WARNING", indent=8)
 
         ctx.out("GSS-TSIG (RFC 3645) is the AD/Kerberos secure-update mechanism. Confirming it, "
-                "and any authenticated update test, needs AD domain credentials — not performed here.", "ADDITIONS", colortext=True, indent=8)
+                "and any authenticated update test, needs AD domain credentials — not performed here.", "ADDITIONS", colortext=True, indent=12)
 
         with ctx.results_lock:
             ctx.properties.setdefault("secure_update", {})[domain] = rtext

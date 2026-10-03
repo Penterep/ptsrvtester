@@ -34,7 +34,7 @@ def run(ctx):
             ctx.out(f"Could not determine denial type: {info.error}", "WARNING", indent=8)
             continue
         if info.kind is None:
-            ctx.out("No NSEC/NSEC3 records seen (zone may be unsigned or uses minimal responses).", "TEXT", indent=8)
+            ctx.out("No NSEC/NSEC3 records seen (zone may be unsigned or uses minimal responses).", "TITLE", indent=8)
             summary[domain] = "none"
             continue
 

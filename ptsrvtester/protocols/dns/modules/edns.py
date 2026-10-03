@@ -25,16 +25,16 @@ def run(ctx):
         ctx.out(f"EDNS probe failed: {info.error}", "WARNING", indent=4)
         return
     if not info.supported:
-        ctx.out("Server does not support EDNS(0).", "TEXT", indent=4)
+        ctx.out("Server does not support EDNS(0).", "TITLE", indent=4)
         with ctx.results_lock:
             ctx.properties["edns"] = "unsupported"
         return
 
     ctx.out(f"{'EDNS version':<18} {info.version}", "OK", indent=4)
-    ctx.out(f"{'UDP payload':<18} {info.udp_payload} bytes", "TEXT", indent=4)
+    ctx.out(f"{'UDP payload':<18} {info.udp_payload} bytes", "TITLE", indent=4)
     ctx.out(
         f"{'DNS cookies':<18} " + ("supported (server cookie echoed)" if info.cookie else "not observed"),
-        "OK" if info.cookie else "TEXT",
+        "OK" if info.cookie else "TITLE",
         indent=4,
     )
 

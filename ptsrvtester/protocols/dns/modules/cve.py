@@ -25,13 +25,13 @@ def run(ctx):
     version_string = values[0] if values else None
     if not version_string:
         ctx.out("No version.bind disclosed — cannot match CVEs from the banner.", "OK", indent=4)
-        ctx.out("(Windows DNS never answers CHAOS TXT; try other fingerprinting.)", "ADDITIONS", colortext=True, indent=4)
+        ctx.out("(Windows DNS never answers CHAOS TXT; try other fingerprinting.)", "ADDITIONS", colortext=True, indent=8)
         return
 
     product, version, note = fp.identify_product(version_string)
-    ctx.out(f"{'Advertised':<12} {version_string}", "TEXT", indent=4)
-    ctx.out(f"{'Product':<12} {product or 'unknown'}" + (f"  ({note})" if note else ""), "TEXT", indent=4)
-    ctx.out(f"{'Version':<12} {'.'.join(str(p) for p in version) if version else 'unparsed'}", "TEXT", indent=4)
+    ctx.out(f"{'Advertised':<12} {version_string}", "TITLE", indent=4)
+    ctx.out(f"{'Product':<12} {product or 'unknown'}" + (f"  ({note})" if note else ""), "TITLE", indent=4)
+    ctx.out(f"{'Version':<12} {'.'.join(str(p) for p in version) if version else 'unparsed'}", "TITLE", indent=4)
 
     if product is None or version is None:
         ctx.out("Could not identify product/version from the banner — no CVE match attempted.", "WARNING", indent=4)

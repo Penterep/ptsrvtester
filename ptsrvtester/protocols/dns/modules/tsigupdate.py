@@ -62,7 +62,7 @@ def run(ctx):
 
         du.verify_present(ip, base)
         du.delete_name(ip, domain, base, tsig=tsig)
-        ctx.out("TSIG key accepted and can add records — now testing name scope.", "TEXT", indent=8)
+        ctx.out("TSIG key accepted and can add records — now testing name scope.", "TITLE", indent=8)
 
         # Now test whether the key can write ARBITRARY/unrelated names (broad ACL).
         writable = []

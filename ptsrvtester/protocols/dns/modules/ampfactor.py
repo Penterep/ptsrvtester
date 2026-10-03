@@ -45,7 +45,7 @@ def run(ctx):
         for m in measures:
             note = " (ANY minimised — RFC 8482)" if m.minimized else ""
             state = "answered" if m.answered else "no data"
-            cat = "VULN" if (m.answered and m.factor >= AMP_THRESHOLD) else "TEXT"
+            cat = "VULN" if (m.answered and m.factor >= AMP_THRESHOLD) else "TITLE"
             ctx.out(f"{m.rtype:<7} {m.request_size}→{m.response_size} B  x{m.factor}  ({state}{note})", cat, indent=8)
 
         best = dos.best_factor(measures)

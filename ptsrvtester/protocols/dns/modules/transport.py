@@ -30,7 +30,7 @@ def run(ctx):
             ctx.out(f"{name:<10} supported", "OK", indent=4)
             supported.append(name)
         elif res.state is False:
-            ctx.out(f"{name:<10} not available ({res.detail})", "TEXT", indent=4)
+            ctx.out(f"{name:<10} not available ({res.detail})", "TITLE", indent=4)
         else:
             ctx.out(f"{name:<10} not tested ({res.detail})", "WARNING", indent=4)
 

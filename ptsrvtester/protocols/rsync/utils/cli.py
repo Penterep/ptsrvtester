@@ -9,7 +9,7 @@ __all__ = ['RsyncArgs']
 
 RSYNC_TEST_GROUPS = [
     ("Enumeration", ["BANNER", "GRAB_MODULES", "WRITE"]),
-    ("Authentiction & Encryption", ["MODULE_AUTH", "ENCRYPT"]),
+    ("Authentication & Encryption", ["MODULE_AUTH", "PASS_BRUTE", "ENCRYPT"]),
     ("Explotation", ["PATH_TRAVERSAL"])
 ]
 
@@ -74,6 +74,23 @@ RSYNC_TESTS: dict[str, dict] = {
             ["-m", "--modules", "", "Specific module to enumerate"],
             ["-u", "--user", "<name>", "Rsync module username"],
             ["-p", "--password", "<password>", "Rsync module password"],
+        ],
+    },
+    "PASS_BRUTE": {
+        "desc": "Bruteforce a module password",
+        "long": ["Tries a password wordlist against one specified rsync module using a username or username file."],
+        "usage": [
+            "-tg 192.168.15.53:873 -m private -u backup -P passwords.txt",
+            "-tg 192.168.15.53:873 -m private -U users.txt -P passwords.txt",
+        ],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+            ["-m", "--modules", "<module>", "Exactly one rsync module to test"],
+            ["-u / -U", "--user / --users", "<name|file>", "Rsync username or file containing usernames"],
+            ["-P", "--passwords", "<file>", "File containing password candidates"],
+        ],
+        "mods": [
+            ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
         ],
     },
     "ENCRYPT": {
@@ -161,7 +178,9 @@ class RsyncArgs(ArgsWithBruteforce):
             ["-j", "--json", "", "Output in JSON format"],
             ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
             ["-u", "--user", "<name>", "Rsync module username"],
+            ["-U", "--users", "<file>", "File containing usernames"],
             ["-p", "--password", "<password>", "Rsync module password"],
+            ["-P", "--passwords", "<file>", "File containing password candidates"],
             ]
 
         return [
@@ -202,8 +221,24 @@ class RsyncArgs(ArgsWithBruteforce):
                                      help="IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:25)"
                                      )
 
-        rsync_subparsers.add_argument("-u", "--user", type=str, default=None, help="Rsync module username")
-        rsync_subparsers.add_argument("-p", "--password", type=str, default=None, help="Rsync module password")
+        user_group = rsync_subparsers.add_mutually_exclusive_group()
+        user_group.add_argument("-u", "--user", type=str, default=None, help="Rsync module username")
+        user_group.add_argument(
+            "-U",
+            "--users",
+            type=str,
+            default=None,
+            help="File containing usernames for PASS_BRUTE",
+        )
+        password_group = rsync_subparsers.add_mutually_exclusive_group()
+        password_group.add_argument("-p", "--password", type=str, default=None, help="Rsync module password")
+        password_group.add_argument(
+            "-P",
+            "--passwords",
+            type=str,
+            default=None,
+            help="File containing password candidates for PASS_BRUTE",
+        )
 
         rsync_subparsers.add_argument("-w", "--write-to-file", help="File to save the output results.",
                                                                           default=None,

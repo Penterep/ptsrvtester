@@ -7,8 +7,9 @@ from urllib.parse import quote
 _INVALID_PROBE_PASSWORD = "ptsrvtester-auth-probe-invalid"
 
 
-def rsync_url(ctx, path="", *, host=None, port=None):
-    username = getattr(ctx, "user", None)
+def rsync_url(ctx, path="", *, host=None, port=None, username=None):
+    if username is None:
+        username = getattr(ctx, "user", None)
     host = host or ctx.ip
     port = port if port is not None else getattr(ctx, "port", None)
     credentials = f"{quote(username, safe='')}@" if username else ""

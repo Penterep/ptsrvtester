@@ -9,6 +9,41 @@ def check_rsync_path() -> str:
 def split_module_list(modules: str) -> list:
     return modules.split(",")
 
+
+def _modules_from_motd(output):
+    modules = []
+    table_started = False
+    saw_content = False
+    blank_after_content = False
+
+    for line in output.splitlines():
+        if not line.strip():
+            if saw_content:
+                blank_after_content = True
+            continue
+
+        module_name, separator, _ = line.partition("\t")
+        module_name = module_name.strip()
+        is_module = bool(
+            separator and module_name and not any(c.isspace() for c in module_name)
+        )
+
+        if not table_started:
+            if is_module and (not saw_content or blank_after_content):
+                table_started = True
+                modules.append(module_name)
+                continue
+            saw_content = True
+            blank_after_content = False
+            continue
+
+        if not is_module:
+            break
+        modules.append(module_name)
+
+    return modules
+
+
 def rsync_grab_modules(ctx, printer=True, include_motd=False):
     rsync_path = check_rsync_path()
     if rsync_path is None:

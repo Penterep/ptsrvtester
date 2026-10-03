@@ -12,20 +12,24 @@ Steps to stand up a new protocol ``Rsync``:
   5. Register the protocol in ``ptsrvtester.py`` MODULES: one line
      ``"Rsync": ("ptsrvtester.protocols.Rsync:Rsync", "Rsync testing module")``.
 """
-import argparse
-import socket
+import argparse, socket
 
 from .._base import BaseMain, BaseArgs
 from .utils.cli import RsyncArgs
 from ptsrvtester.protocols.rsync.utils.registry import check_rsync_path
 from ptsrvtester.protocols.rsync.modules.grab_modules import rsync_grab_modules 
 from dataclasses import dataclass
+import sys
+from ptlibs.threads import printlock
+from ptlibs.ptprinthelper import out_if
 
 @dataclass
 class TmpCtx:
     ip: str
     port: int
     timeout: int
+    user: str | None = None
+    password: str | None = None
 
 class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
     #: Short protocol identity (also namespaces this protocol's tests).
@@ -62,35 +66,90 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
         self.target_host = host
         self.target = (ip, target.port)
 
+    
+    def _run_module(self, code: str, discovered, extras: dict) -> None:
+        """Print the heading before running and stream non-JSON output live."""
+        entry = discovered[code]
+        lock = printlock.PrintLock()
+        ctx = self._make_context(lock, extras)
+        if not self.use_json:
+            def live_out(
+                string="", category="TEXT", *, colortext=False, indent=0, condition=None
+            ):
+                cond = True if condition is None else condition
+                line = out_if(string, category, cond, colortext=colortext, indent=indent)
+                if line:
+                    with self._lock:
+                        sys.stdout.write(line if line.endswith("\n") else line + "\n")
+                        sys.stdout.flush()
+
+            ctx.out = live_out
+
+            def live_debug(string="", *, indent=4):
+                if not ctx.verbose:
+                    return
+                line = out_if(string, "ADDITIONS", True, colortext=True, indent=indent)
+                if line:
+                    with self._lock:
+                        sys.stdout.write(line if line.endswith("\n") else line + "\n")
+                        sys.stdout.flush()
+            ctx.debug = live_debug
+        if entry.label.strip() and not self.use_json:
+            with self._lock:
+                sys.stdout.write(out_if(entry.label, "INFO", True, colortext=True) + "\n")
+                sys.stdout.flush()
+        try:
+            entry.module.run(ctx)
+        except Exception as e:
+            ctx.out(f"Error in module {code}: {e}", "ERROR")
+        chunk = lock.get_output_string()
+        if chunk and not self.use_json:
+            with self._lock:
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+        with self._lock:
+            self._outputs[code] = "" if not self.use_json else chunk
+    
     def build_context(self) -> dict:
         """Protocol handles injected onto every module's ``ctx`` (besides core fields).
 
         Modules read them as ``ctx.<name>``. Return {} if none are needed.
         """
         tests = getattr(self.args, "tests", None)
-        
-        if getattr(self.args, "modules", None) is None:
-            print_module_grab = tests is None or "grab_modules" in tests.lower()
-            
-            if print_module_grab and tests is not None:
-                ts = [t.lower() for t in tests.split(',')]
-                ts.remove("grab_modules")
-                setattr(self.args, "tests", ','.join(ts))
-            
-            modules = rsync_grab_modules(
-                TmpCtx(
-                    self.target[0],
-                    self.target[1],
-                    getattr(self.args, "timeout", None)
-                ),
-                print=print_module_grab
-            )
+        test_codes = {code.strip().upper() for code in tests.split(",")} if tests else set()
+        needs_modules = (
+            not test_codes
+            or "ALL" in test_codes
+            or bool(test_codes & {"GRAB_MODULES", "MODULE_AUTH", "WRITE", "OWNERSHIP"})
+            or ("FILL_SPACE" in test_codes and getattr(self.args, "dos", False))
+        )
+        modules = getattr(self.args, "modules", None)
+        if modules is None:
+            modules = []
+            if needs_modules:
+                tmp_ctx = TmpCtx(
+                                        self.target[0],
+                                        self.target[1],
+                                        getattr(self.args, "timeout", None),
+                                        getattr(self.args, "user", None),
+                                        getattr(self.args, "password", None),
+                                    )
+                modules = rsync_grab_modules(
+                    tmp_ctx,
+                    printer=False
+                ) or rsync_grab_modules(tmp_ctx, printer=False, include_motd=True) or []
         
         return {
             "host": self.target_host,
             "ip": self.target[0],
             "port": self.target[1],
             "timeout": getattr(self.args, "timeout", None),
-            "modules": getattr(self.args, "modules", None) or modules,
-            "rsync_path": check_rsync_path()
+            "modules": modules,
+            "rsync_path": check_rsync_path(),
+            "recursion": getattr(self.args, "recursion", False),
+            "user": getattr(self.args, "user", None),
+            "password": getattr(self.args, "password", None),
+            "dos": getattr(self.args, "dos", False),
+            "dos_limit": getattr(self.args, "dos_limit", 10),
+            "supported_digests": [],
         }

@@ -1,24 +1,27 @@
-import socket, shutil, argparse
+import shutil
+import subprocess
+import os
+from urllib.parse import quote
 
 
-def receive(sock: socket.socket) -> bytes:
-    data = b""
+_INVALID_PROBE_PASSWORD = "ptsrvtester-auth-probe-invalid"
 
-    while True:
-        try:
-            chunk = sock.recv(8192)
-        except socket.timeout:
-            break
-        if not chunk:
-            break
-        data += chunk
 
-        if b"@RSYNCD: EXIT" in data:
-            break
-        if b"@ERROR" in data:
-            break
+def rsync_url(ctx, path="", *, host=None, port=None, username=None):
+    if username is None:
+        username = getattr(ctx, "user", None)
+    host = host or ctx.ip
+    port = port if port is not None else getattr(ctx, "port", None)
+    credentials = f"{quote(username, safe='')}@" if username else ""
+    port_part = f":{port}" if port is not None else ""
+    return f"rsync://{credentials}{host}{port_part}/{path.lstrip('/')}"
 
-    return data
+
+def rsync_env(ctx):
+    env = os.environ.copy()
+    password = getattr(ctx, "password", None)
+    env["RSYNC_PASSWORD"] = password if password is not None else _INVALID_PROBE_PASSWORD
+    return env
 
 def check_rsync_path() -> str:
     path = shutil.which("rsync")
@@ -28,36 +31,76 @@ def check_rsync_path() -> str:
 def split_module_list(modules: str) -> list:
     return modules.split(",")
 
-def _sanitize_rsync_data(data: list):
-    if '\n' in data:
-        data.remove('\n')
 
-    for e in data:
-        if "@RSYNCD" in e:
-            data.pop(data.index(e))
+def _modules_from_motd(output):
+    modules = []
+    table_started = False
+    saw_content = False
+    blank_after_content = False
 
-    return list(filter(None, data))
+    for line in output.splitlines():
+        if not line.strip():
+            if saw_content:
+                blank_after_content = True
+            continue
 
-def rsync_grab_modules(ctx, print=True):
+        module_name, separator, _ = line.partition("\t")
+        module_name = module_name.strip()
+        is_module = bool(
+            separator and module_name and not any(c.isspace() for c in module_name)
+        )
+
+        if not table_started:
+            if is_module and (not saw_content or blank_after_content):
+                table_started = True
+                modules.append(module_name)
+                continue
+            saw_content = True
+            blank_after_content = False
+            continue
+
+        if not is_module:
+            break
+        modules.append(module_name)
+
+    return modules
+
+
+def rsync_grab_modules(ctx, printer=True, include_motd=False):
+    rsync_path = check_rsync_path()
+    if rsync_path is None:
+        return []
+
+    timeout = getattr(ctx, "timeout", None) or 3
+    port = getattr(ctx, "port", 873)
+    command = [
+        rsync_path,
+        "--list-only",
+        "--no-motd",
+        f"--contimeout={timeout}",
+        f"--timeout={timeout}",
+        rsync_url(ctx, port=port),
+    ]
+
+    if include_motd:
+        command.remove("--no-motd")
+
     try:
-        with socket.create_connection((ctx.ip, ctx.port), timeout=ctx.timeout) as sock:
-            sock.settimeout(ctx.timeout)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            input="",
+            env=rsync_env(ctx),
+            timeout=timeout + 2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
 
-            data = receive(sock)
-            banner = data.decode(errors="replace")
+    if result.returncode != 0:
+        return []    
 
-            if not banner:
-                return
+    if include_motd:
+        return _modules_from_motd(result.stdout)
 
-            sock.sendall(b"@RSYNCD: 31.0\n")
-            sock.sendall(b"\n")
-
-            data = receive(sock)
-
-            modules = data.decode(errors="replace")
-
-            modules = _sanitize_rsync_data(modules.split('\n'))
-            return [module.split('\t')[0].strip() for module in modules]
-
-    except Exception as e:
-        return [e]
+    return [line.strip().split()[0] for line in result.stdout.splitlines() if line.strip()]

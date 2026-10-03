@@ -1,5 +1,7 @@
 import socket, tempfile, subprocess, os, re
 from datetime import datetime, timezone
+from ptthreads.ptthreads import ptthreads
+from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
 
 
 __MODULELABEL__ = "Rsync write probe"
@@ -7,7 +9,11 @@ __MODULECODE__ = "write"
 __ORDER__ = 100
 
 
-def check_write_access(ctx, module, cleanup=True):
+def check_write_access(module_dict: dict):
+    ctx = module_dict.get("ctx")
+    module = module_dict.get("module")
+    cleanup = True
+    
     marker_name = f"pentest_write_check_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.txt"
     marker_content = (
         "Authorized rsync write-access test marker. Safe to delete.\n"
@@ -15,15 +21,14 @@ def check_write_access(ctx, module, cleanup=True):
     )
  
     result = {"module": module, "write_allowed": False}
-    env = os.environ.copy()
-    env["RSYNC_PASSWORD"] = "ptsrvtester-auth-probe-invalid"
+    env = rsync_env(ctx)
  
     with tempfile.TemporaryDirectory() as tmpdir:
         local_path = os.path.join(tmpdir, marker_name)
         with open(local_path, "w") as f:
             f.write(marker_content)
  
-        upload_url = f"rsync://{ctx.ip}:{ctx.port}/{module}/{marker_name}"
+        upload_url = rsync_url(ctx, f"{module}/{marker_name}")
         try:
             upload = subprocess.run(
                 ["rsync", "--contimeout=5", local_path, upload_url],
@@ -46,7 +51,7 @@ def check_write_access(ctx, module, cleanup=True):
 
                 verify = subprocess.run(
                     ["rsync", "--list-only", "--contimeout=5",
-                     f"rsync://{ctx.ip}:{ctx.port}/{module}/{marker_name}"],
+                     rsync_url(ctx, f"{module}/{marker_name}")],
                     capture_output=True, text=True, input="", env=env, timeout=ctx.timeout,
                 )
                 result["verified_present"] = verify.returncode == 0
@@ -58,7 +63,7 @@ def check_write_access(ctx, module, cleanup=True):
                         "rsync", "-r", "--contimeout=5", "--delete",
                         "--include", marker_name, "--exclude", "*",
                         f"{empty_dir}/",
-                        f"rsync://{ctx.ip}:{ctx.port}/{module}/",
+                        rsync_url(ctx, f"{module}/"),
                     ]
                     delcheck = subprocess.run(
                         delete_cmd,
@@ -79,11 +84,20 @@ def check_write_access(ctx, module, cleanup=True):
 
 
 def run(ctx):
-    for module in ctx.modules:
-        res = check_write_access(ctx, module)
-        if res["write_allowed"]:
-            ctx.out(f"The module {module} is writable", "VULN", indent=4)
+    threads = ptthreads()
+
+    if not ctx.modules:
+        ctx.out(f"No modules available to probe for write access", "OK", indent=4)
+        return
+
+    modules = [{"module": m, "ctx": ctx} for m in ctx.modules or []]
+
+    res = threads.threads(modules, check_write_access, 10)
+
+    for r in res:
+        if r["write_allowed"]:
+            ctx.out(f"The module {r.get("module")} is writable", "VULN", indent=4)
         else:
-            cleanup_stderr = res.get("cleanup_stderr", res.get("upload_stderr", "")).strip()
-            ctx.out(f"The module {module} is not writable", "OK", indent=4)
+            cleanup_stderr = r.get("cleanup_stderr", r.get("upload_stderr", "")).strip()
+            ctx.out(f"The module {r.get("module")} is not writable", "OK", indent=4)
             ctx.debug(f"{cleanup_stderr}")

@@ -10,7 +10,7 @@ __all__ = ['RsyncArgs']
 RSYNC_TEST_GROUPS = [
     ("Enumeration", ["BANNER", "GRAB_MODULES", "WRITE"]),
     ("Authentication & Encryption", ["MODULE_AUTH", "PASS_BRUTE", "ENCRYPT"]),
-    ("Explotation", ["PATH_TRAVERSAL"])
+    ("Explotation", ["PATH_TRAVERSAL", "SYMLINK"])
 ]
 
 # Per-test definitions:
@@ -116,7 +116,24 @@ RSYNC_TESTS: dict[str, dict] = {
             ["-u", "--user", "<name>", "Rsync module username"],
             ["-p", "--password", "<password>", "Rsync module password"],
         ],
-    }
+    },
+    "SYMLINK": {
+        "desc": "Rsync symlink upload test",
+        "long": [
+            "Uploads a symlink pointing to the remote /etc/passwd file to each module.",
+            "If the link is accessible, attempts to read and display its contents, then removes the probe.",
+        ],
+        "usage": ["-tg 192.168.15.53:873", "-tg 192.168.15.53:873 -m rsync_module"],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "mods": [
+            ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
+            ["-m", "--modules", "", "Specific module to test"],
+            ["-u", "--user", "<name>", "Rsync module username"],
+            ["-p", "--password", "<password>", "Rsync module password"],
+        ],
+    },
 }
 
 def _RSYNC_test_help(codes: list[str]):

@@ -3,7 +3,7 @@ import socket
 
 __MODULELABEL__ = "Rsync version detection module"
 __MODULECODE__ = "banner"
-__ORDER__ = 100
+__ORDER__ = 10
 
 
 def _rsync_grab_banner(ctx):
@@ -11,12 +11,13 @@ def _rsync_grab_banner(ctx):
         with socket.create_connection((ctx.ip, ctx.port), timeout=ctx.timeout) as sock:
             with sock.makefile("rb") as reader:
                 greeting = reader.readline().decode(errors="replace").strip()
-                version_fields = (
-                    greeting.removeprefix("@RSYNCD:").strip().split(maxsplit=1)
+                greeting_fields = (
+                    greeting.removeprefix("@RSYNCD:").strip().split()
                     if greeting.startswith("@RSYNCD:")
                     else []
                 )
-                version = version_fields[0] if version_fields else ""
+                ctx.supported_digests.extend(greeting_fields[1:])
+                version = greeting_fields[0] if greeting_fields else ""
                 if version:
                     ctx.out(f"Grabbed Rsync server version: {version}", "VULN", indent=4)
                 else:

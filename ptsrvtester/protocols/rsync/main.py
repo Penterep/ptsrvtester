@@ -146,4 +146,5 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
             "recursion": getattr(self.args, "recursion", False),
             "user": getattr(self.args, "user", None),
             "password": getattr(self.args, "password", None),
+            "supported_digests": [],
         }

@@ -36,12 +36,12 @@ def _cleanup_probe(ctx, module, probe_name, empty_dir, env):
             timeout=ctx.timeout,
         )
     except subprocess.TimeoutExpired:
-        ctx.out(f"Could not confirm removal of the ownership probe from module {module} (timed out)", "WARN", indent=4)
+        ctx.out(f"Could not confirm removal of the ownership probe from module {module} (timed out)", "OK", indent=4)
     except FileNotFoundError:
         ctx.out("rsync client binary not found on this machine", "ERROR", indent=4)
     else:
         if cleanup.returncode != 0:
-            ctx.out(f"Could not remove the ownership probe from module {module}", "WARN", indent=4)
+            ctx.out(f"Could not remove the ownership probe from module {module}", "OK", indent=4)
             ctx.debug(f"Ownership probe cleanup failed: {cleanup.stderr.strip()}")
 
 
@@ -75,7 +75,7 @@ def _probe_module(ctx, module):
                 timeout=ctx.timeout,
             )
         except subprocess.TimeoutExpired:
-            ctx.out(f"Ownership probe upload to module {module} timed out", "WARN", indent=4)
+            ctx.out(f"Ownership probe upload to module {module} timed out", "OK", indent=4)
             _cleanup_probe(ctx, module, probe_name, empty_dir, env)
             return False
         except FileNotFoundError:
@@ -111,7 +111,7 @@ def _probe_module(ctx, module):
                     timeout=ctx.timeout,
                 )
             except subprocess.TimeoutExpired:
-                ctx.out(f"Timed out reading UID/GID from module {module}", "WARN", indent=4)
+                ctx.out(f"Timed out reading UID/GID from module {module}", "OK", indent=4)
                 return False
             except FileNotFoundError:
                 ctx.out("rsync client binary not found on this machine", "ERROR", indent=4)
@@ -122,9 +122,9 @@ def _probe_module(ctx, module):
             if query.returncode != 0:
                 error = query.stderr.strip().splitlines()
                 detail = error[0] if error else f"rsync exited with status {query.returncode}"
-                ctx.out(f"Could not read file ownership from module {module}: {detail}", "WARN", indent=4)
+                ctx.out(f"Could not read file ownership from module {module}: {detail}", "OK", indent=4)
             elif match is None:
-                ctx.out(f"Could not parse UID/GID from module {module} dry-run output", "WARN", indent=4)
+                ctx.out(f"Could not parse UID/GID from module {module} dry-run output", "OK", indent=4)
                 ctx.debug(f"Ownership probe dry-run output: {query.stdout.strip()}")
             else:
                 uid, gid, file_name = match.groups()

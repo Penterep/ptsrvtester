@@ -117,8 +117,11 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
         """
         tests = getattr(self.args, "tests", None)
         test_codes = {code.strip().upper() for code in tests.split(",")} if tests else set()
-        needs_modules = not test_codes or "ALL" in test_codes or bool(
-            test_codes & {"GRAB_MODULES", "MODULE_AUTH", "WRITE", "OWNERSHIP"}
+        needs_modules = (
+            not test_codes
+            or "ALL" in test_codes
+            or bool(test_codes & {"GRAB_MODULES", "MODULE_AUTH", "WRITE", "OWNERSHIP"})
+            or ("FILL_SPACE" in test_codes and getattr(self.args, "dos", False))
         )
         modules = getattr(self.args, "modules", None)
         if modules is None:
@@ -146,5 +149,7 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
             "recursion": getattr(self.args, "recursion", False),
             "user": getattr(self.args, "user", None),
             "password": getattr(self.args, "password", None),
+            "dos": getattr(self.args, "dos", False),
+            "dos_limit": getattr(self.args, "dos_limit", 10),
             "supported_digests": [],
         }

@@ -10,7 +10,8 @@ __all__ = ['RsyncArgs']
 RSYNC_TEST_GROUPS = [
     ("Enumeration", ["BANNER", "GRAB_MODULES", "WRITE", "OWNERSHIP"]),
     ("Authentication & Encryption", ["MODULE_AUTH", "PASS_BRUTE", "ENCRYPT"]),
-    ("Exploitation", ["PATH_TRAVERSAL", "SYMLINK"])
+    ("Exploitation", ["PATH_TRAVERSAL", "SYMLINK"]),
+    ("Storage stress (explicit opt-in)", ["FILL_SPACE"]),
 ]
 
 # Per-test definitions:
@@ -151,7 +152,40 @@ RSYNC_TESTS: dict[str, dict] = {
             ["-p", "--password", "<password>", "Rsync module password"],
         ],
     },
+    "FILL_SPACE": {
+        "desc": "Bounded rsync storage upload test",
+        "long": [
+            "Requires the explicit --dos flag and uploads uniquely named data files.",
+            "Stops at the configured size cap (10 MiB by default, 100 MiB maximum) and removes its probe files.",
+        ],
+        "usage": [
+            "-tg 192.168.15.53:873 -d",
+            "-tg 192.168.15.53:873 -d --dos-limit 25 -m rsync_module",
+        ],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+            ["-d", "--dos", "", "Required explicit opt-in for the bounded storage probe"],
+        ],
+        "mods": [
+            ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
+            ["-m", "--modules", "", "One or more modules to test"],
+            ["", "--dos-limit", "<MiB>", "Maximum total upload (1-100 MiB; default: 10)"],
+            ["-u", "--user", "<name>", "Rsync module username"],
+            ["-p", "--password", "<password>", "Rsync module password"],
+        ],
+    },
 }
+
+
+def _dos_limit_mib(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("DOS upload limit must be an integer number of MiB") from exc
+    if not 1 <= limit <= 100:
+        raise argparse.ArgumentTypeError("DOS upload limit must be between 1 and 100 MiB")
+    return limit
+
 
 def _RSYNC_test_help(codes: list[str]):
     """Build a help object (for ptprinthelper.help_print) describing given test codes."""
@@ -215,6 +249,8 @@ class RsyncArgs(ArgsWithBruteforce):
             ["-U", "--users", "<file>", "File containing usernames"],
             ["-p", "--password", "<password>", "Rsync module password"],
             ["-P", "--passwords", "<file>", "File containing password candidates"],
+            ["-d", "--dos", "", "Enable the bounded rsync storage upload test"],
+            ["", "--dos-limit", "<MiB>", "Maximum storage-test upload (1-100 MiB; default: 10)"],
             ]
 
         return [
@@ -295,6 +331,20 @@ class RsyncArgs(ArgsWithBruteforce):
             type=int,
             default=5,
             help="Timeout for connections (in seconds)"
+        )
+
+        rsync_subparsers.add_argument(
+            "-d",
+            "--dos",
+            action="store_true",
+            help="Enable the bounded rsync storage upload test (required by FILL_SPACE)",
+        )
+        rsync_subparsers.add_argument(
+            "--dos-limit",
+            type=_dos_limit_mib,
+            default=10,
+            metavar="<MiB>",
+            help="Maximum FILL_SPACE upload in MiB (1-100; default: 10)",
         )
 
         module_auth_parser = rsync_subparsers.add_argument_group(title="module_auth", description="Rsync module authentication enumeration group")

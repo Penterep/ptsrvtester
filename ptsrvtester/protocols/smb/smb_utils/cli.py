@@ -23,6 +23,7 @@ class SMBArgs(BaseArgs):
             ]},
         ]
 
+    # TODO: add password and login options
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """ptsrvtester smb 192.168.1.1 -ts info
 ptsrvtester smb -h"""

@@ -9,7 +9,7 @@ __all__ = ['RsyncArgs']
 
 RSYNC_TEST_GROUPS = [
     ("Enumeration", ["BANNER", "GRAB_MODULES", "WRITE", "OWNERSHIP"]),
-    ("Authentication & Encryption", ["MODULE_AUTH", "PASS_BRUTE", "ENCRYPT"]),
+    ("Authentication & Encryption", ["MODULE_AUTH", "USER_ENUM", "PASS_BRUTE", "ENCRYPT"]),
     ("Exploitation", ["PATH_TRAVERSAL", "SYMLINK"]),
     ("Storage stress (explicit opt-in)", ["FILL_SPACE"]),
 ]
@@ -106,6 +106,24 @@ RSYNC_TESTS: dict[str, dict] = {
             ["-m", "--modules", "<module>", "Exactly one rsync module to test"],
             ["-u / -U", "--user / --users", "<name|file>", "Rsync username or file containing usernames"],
             ["-P", "--passwords", "<file>", "File containing password candidates"],
+        ],
+        "mods": [
+            ["-t", "--timeout", "", "Timeout for connections (in seconds)"],
+        ],
+    },
+    "USER_ENUM": {
+        "desc": "Enumerate usernames for an rsync module",
+        "long": [
+            "Compares authentication responses for candidate usernames against a random, non-existing username."
+        ],
+        "usage": [
+            "-tg 192.168.15.53:873 -m private -u backup",
+            "-tg 192.168.15.53:873 -m private -U users.txt",
+        ],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+            ["-m", "--modules", "<module>", "Exactly one rsync module to test"],
+            ["-u / -U", "--user / --users", "<name|file>", "Rsync username or file containing usernames"],
         ],
         "mods": [
             ["-t", "--timeout", "", "Timeout for connections (in seconds)"],

@@ -113,10 +113,13 @@ def win_version_translate(ver: str) -> str:
 def run(ctx) -> None:
     output: SMBResults = ctx.output
     sc = ServerConnection(ctx)
-    sc.connect()
+
+    if not output.has_ran:
+        # TODO: add login and password check
+        sc.connect()
     
     if output.had_error:
-        ctx.out(f"Could not connect to server: {output.error_info}", "ERROR")
+        ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
         return
 
     # OS version parsing

@@ -45,6 +45,12 @@ def _check_module(module):
         re.IGNORECASE,
     ):
         ctx.out(f"The '{module_name}' module requires authentication", "OK", indent=4)
+    elif re.search(r"@ERROR:\s*access denied to\b", output, re.IGNORECASE):
+        ctx.out(
+            f"The '{module_name}' module denied access (authentication may be required or access may be restricted)",
+            "OK",
+            indent=4,
+        )
     elif result.returncode == 0:
         if getattr(ctx, "user", None) or getattr(ctx, "password", None):
             ctx.out(f"The '{module_name}' module is accessible with the supplied credentials", "INFO", indent=4)

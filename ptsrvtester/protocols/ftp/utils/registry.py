@@ -9,10 +9,9 @@ FTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Enumeration", ["ENUMPATH"]),
     ("Data channel & modes", ["MODES", "PASVPORT", "ACTIVE", "ACTIVEFULL"]),
     ("Command surface & validation", ["CMDAUDIT", "CMDAUDITACTIVE", "INVCMD"]),
-    ("Rate limiting & stress", ["CONNLIM", "DOS"]),
+    ("Rate limiting & stress", ["CONNLIM", "RATELIMIT"]),
     ("Access control", ["CHROOT"]),
-    ("Content security", ["EICAR"]),
-    ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
+    ("Content security", ["EICAR", "DOS"]),
 ]
 
 FTP_DEFAULT_SUITE: tuple[str, ...] = ("BANNER", "CMD", "ANON")
@@ -52,12 +51,13 @@ FTP_TESTS: dict[str, dict] = {
     "BRUTE": {
         "desc": "Login bruteforce (USER/PASS)",
         "long": ["Bruteforce FTP login with the supplied username(s) and",
-                 "password(s)."],
+                 "password(s). Catch-all check first.",
+                 "Error when the server never stops the guessing."],
         "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
         "mods": [
             ["-u", "--user", "<name> …", "Username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "<password>", "Single password"],
+            ["-p", "--password", "[password]", "Single password. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["-t", "--threads", "<n>", "Threads (default: 10)"],

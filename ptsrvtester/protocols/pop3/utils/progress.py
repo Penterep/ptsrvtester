@@ -1,5 +1,5 @@
 """
-Thread-safe live progress bar + per-item output for FTP USRENUM.
+Thread-safe live progress bar + per-item output for POP3 login bruteforce.
 
 Same ptlibs pattern as SMTP enumeration: ``PtThreads`` plus ``PrintLock`` so
 ``-vv`` / hits print above a single live ETA line instead of interleaving it.
@@ -102,11 +102,7 @@ class ThreadedProgress:
                 pass
 
     def kickoff(self, label: str = "") -> None:
-        """Show 0% before the first attempt finishes.
-
-        Bruteforce runs many attempts at once, so a bar that appears only
-        after a completion stays invisible until the whole wave returns.
-        """
+        """Show 0% before the first attempt finishes."""
         with self._lock:
             if label:
                 self._last_label = label

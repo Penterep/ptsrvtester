@@ -70,7 +70,7 @@ class SniffableResult(NamedTuple):
     detail: str
 
 
-CatchAllResult = str  # "configured" | "not_configured" | "indeterminate" | "unreachable"
+CatchAllResult = str  # "configured" | "not_configured" | "indeterminate" | "unreachable" | "disabled"
 
 # Order of AUTHENTICATE probes when multiple mechanisms are advertised (most sensitive first).
 _SNIFFABLE_AUTH_PROBE_PRIORITY = (

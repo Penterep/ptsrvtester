@@ -611,12 +611,11 @@ def _stream_identify_probe_evidence(e, r: ServerIdentifyResult) -> None:
         return
     if e.args.debug and not has_errors:
         return
-    scored_methods = {s.method for s in r.scoring_matrix or []}
     pp('Protocol probe evidence', bullet_type='TITLE', condition=show, indent=4)
     verbose = e.args.debug
     if has_help and not verbose:
         help_snip = _identify_probe_snippet(r.help_response or '')
-        pp(f'HELP: {help_snip}', bullet_type='TITLE' if 'help' in scored_methods else 'TEXT', condition=show, indent=8)
+        pp(f'HELP: {help_snip}', bullet_type='TITLE', condition=show, indent=8)
         if verbose and r.help_response and (len((r.help_response or '').strip()) > len(help_snip)):
             for line in (r.help_response or '').replace('\r', '').splitlines()[:10]:
                 ln = line.strip()
@@ -627,7 +626,7 @@ def _stream_identify_probe_evidence(e, r: ServerIdentifyResult) -> None:
             continue
         label = 'RCPT error' if i == 0 else f'Error sample {i + 1}'
         snip = _identify_probe_snippet(sample)
-        pp(f'{label}: {snip}', bullet_type='TITLE' if 'error_syntax' in scored_methods else 'TEXT', condition=show, indent=8)
+        pp(f'{label}: {snip}', bullet_type='TITLE', condition=show, indent=8)
         if verbose and len(sample.strip()) > len(snip):
             for line in sample.replace('\r', '').splitlines()[:6]:
                 ln = line.strip()
@@ -635,7 +634,7 @@ def _stream_identify_probe_evidence(e, r: ServerIdentifyResult) -> None:
                     pp(ln, bullet_type='TEXT', condition=show, indent=12)
     if has_unk and not verbose:
         snip = _identify_probe_snippet(r.unknown_cmd_response or '')
-        pp(f'Unknown command: {snip}', bullet_type='TITLE' if 'behavioral_unknown_cmd' in scored_methods else 'TEXT', condition=show, indent=8)
+        pp(f'Unknown command: {snip}', bullet_type='TITLE', condition=show, indent=8)
 
 
 def _stream_identify_result(e) -> None:
@@ -753,14 +752,14 @@ def _stream_identify_result(e) -> None:
             pts_fmt = f'{s.points:+d}%'
             pp(f"{s.method}: {pts_fmt} {(f'({s.detail})' if s.detail else '')}", bullet_type='TITLE', condition=show, indent=8)
     pp('Identification Result', bullet_type='TITLE', condition=show, indent=4)
-    pp(f"Product:     {r.product or 'Unknown'}", bullet_type='TEXT', condition=show, indent=8)
+    pp(f"Product:     {r.product or 'Unknown'}", bullet_type='VULN', condition=show, indent=8)
     _bh = getattr(r, 'behavioral_hint', None)
     if _bh and (not str(_bh).rstrip().endswith('(0%)')):
         pp(f'Behavioral hint: {_bh}', bullet_type='TEXT', condition=show, indent=8)
-    pp(f"Version:     {r.version or '—'}", bullet_type='TEXT', condition=show, indent=8)
-    pp(f'Confidence: {r.confidence_pct}% ({r.confidence_label})', bullet_type='TEXT', condition=show, indent=8)
+    pp(f"Version:     {r.version or '—'}", bullet_type='VULN', condition=show, indent=8)
+    pp(f'Confidence: {r.confidence_pct}% ({r.confidence_label})', bullet_type='VULN', condition=show, indent=8)
     if r.cpe:
-        pp(f'CPE:        {r.cpe}', bullet_type='TEXT', condition=show, indent=8)
+        pp(f'CPE:        {r.cpe}', bullet_type='VULN', condition=show, indent=8)
     if getattr(r, 'discrepancy_detected', False) and getattr(r, 'discrepancy_banner_product', None) and getattr(r, 'discrepancy_behavior_product', None):
         pp(f"Discrepancy: Banner claims '{r.discrepancy_banner_product}', behavior matches '{r.discrepancy_behavior_product}'", bullet_type='TITLE', condition=show, indent=8)
     elif r.anomalous_identity:

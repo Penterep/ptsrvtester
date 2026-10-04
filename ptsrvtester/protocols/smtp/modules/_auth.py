@@ -74,7 +74,7 @@ def _get_smtp_for_auth_enum(e) -> tuple[smtplib.SMTP, str]:
             ehlo = ehlo_bytes.decode() if ehlo_bytes else ""
             if e.args.debug and not getattr(e, "_auth_enum_dbg_logged_starttls", False):
                 e.ptdebug(
-                    "AUTH-ENUM: STARTTLS applied (LOGIN/PLAIN/NTLM was not advertised on plain EHLO); subsequent AUTH probes use TLS"
+                    "STARTTLS applied (LOGIN/PLAIN/NTLM was not advertised on plain EHLO); subsequent AUTH probes use TLS"
                 )
                 e._auth_enum_dbg_logged_starttls = True
     return smtp, ehlo

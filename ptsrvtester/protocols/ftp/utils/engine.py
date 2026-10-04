@@ -8,6 +8,7 @@ import ipaddress
 import posixpath
 import random
 import re
+import string
 import secrets
 import select
 import socket
@@ -35,9 +36,11 @@ from .helpers import (
     ArgsWithBruteforce,
     Creds,
     Target,
+    brute_passwords,
     check_if_brute,
     get_mode,
     one_cli_user,
+    shown_password,
     simple_bruteforce,
     text_or_file,
     valid_target,
@@ -1078,7 +1081,7 @@ class FtpEngine:
         Streams login success immediately; permissions come from access_check() in output()."""
         with self._output_lock:
             self._ptprint_raw(
-                f"user: {cred.user}, password: {cred.passw}",
+                f"user: {cred.user}, password: {shown_password(cred.passw)}",
                 bullet_type="TEXT",
                 condition=not self.use_json,
                 indent=4,
@@ -4404,6 +4407,28 @@ class FtpEngine:
         match = re.search(r"(.)\1{%d,}" % (run - 1), text or "")
         return match.group(1) if match else None
 
+    def _inv_smuggle_receives(self, text: str | None) -> list[str]:
+        """Replies read after the blank line, hidden from the first Receive line."""
+        if not text or "--- smuggle_followup ---" not in text:
+            return []
+        out: list[str] = []
+        for block in text.split("--- smuggle_followup ---")[1:]:
+            block = block.split("---", 1)[0].strip()
+            if not block:
+                continue
+            match = re.match(r"\(code=(None|\d+)\)\s*(.*)", block, re.S)
+            if not match:
+                out.append(self._snip(" ".join(block.split())))
+                continue
+            code_s, body = match.group(1), " ".join(match.group(2).split())
+            if code_s == "None":
+                out.append(self._snip(body) or "(no reply)")
+                continue
+            code = int(code_s)
+            shown = self._inv_reply_body(code, body)
+            out.append(f"{code} {shown}".strip() if shown else str(code))
+        return out
+
     def _inv_reply_body(self, code: int | None, text: str | None) -> str:
         raw = (text or "").split("---", 1)[0]
         line = ""
@@ -4501,6 +4526,8 @@ class FtpEngine:
                 recv = body or "(no reply)"
         self._dbg(f"Send: {label}")
         self._dbg(f"Receive: {recv}")
+        for extra in self._inv_smuggle_receives(p.reply_text):
+            self._dbg(f"Receive: {extra}")
         if p.follow_up_command:
             fu_body = self._inv_reply_body(p.follow_up_reply_code, p.follow_up_reply_snippet)
             if p.follow_up_reply_code is not None and fu_body:
@@ -5741,19 +5768,31 @@ class FtpEngine:
                 )
 
     def _stream_brute_result(self) -> None:
-        """Stream brute-force summary (credentials already streamed via on_success) (thread-safe)."""
+        """Found logins, then whether the server stopped password guessing."""
         creds = self.results.creds
-        if creds is None or len(creds) == 0:
+        guessing = getattr(self, "_brute_guessing", None)
+        if (creds is None or len(creds) == 0) and guessing is None:
             return
         with self._output_lock:
-            n = len(creds)
-            word = "login" if n == 1 else "logins"
-            self._ptprint_raw(
-                f"Found {n} valid {word}",
-                bullet_type="INFO",
-                condition=not self.use_json,
-                indent=4,
-            )
+            if creds:
+                n = len(creds)
+                word = "login" if n == 1 else "logins"
+                self._ptprint_raw(
+                    f"Found {n} valid {word}",
+                    bullet_type="INFO",
+                    condition=not self.use_json,
+                    indent=4,
+                )
+            if guessing == "not_limited":
+                self._tprint("No protection against password guessing", "VULN")
+            elif guessing == "stopped":
+                self._tprint("Password guessing was stopped", "NOTVULN")
+            elif guessing == "not_tested":
+                self._tprint(
+                    getattr(self, "_brute_guessing_detail", None)
+                    or "Could not connect. Password guessing was not tested.",
+                    "WARNING",
+                )
 
     def _stream_directory_listing_result(self) -> None:
         if self.use_json or not self.args.access_list:
@@ -5945,6 +5984,200 @@ class FtpEngine:
                 self._tprint(f"Sent to bounce target: {res}", "TEXT", indent=8)
                 res = "Yes" if r.cleaned else "No"
                 self._tprint(f"Cleaned up: {res}", "TEXT", indent=8)
+
+    _FTP_BRUTE_LOCK_RE = re.compile(
+        r"lock(?:ed|out)?|too many|banned|blocked|try again|exceed|throttl",
+        re.I,
+    )
+
+    def _ftp_brute_hit(self, output, cred: Creds) -> None:
+        line = out_if(
+            f"user: {cred.user}, password: {shown_password(cred.passw)}",
+            "VULN",
+            True,
+            colortext=True,
+            indent=0,
+        )
+        if line and output is not None:
+            output.add_string_to_output(line.rstrip("\n"))
+
+    def _ftp_brute_kind(self, raw: str) -> str:
+        code, _line = self._ftp_parse_reply_line(raw)
+        if code == 421 or self._FTP_BRUTE_LOCK_RE.search(raw or ""):
+            return "blocked"
+        if "cannot change directory" in (raw or "").lower():
+            return "ok"
+        return "fail"
+
+    def _ftp_brute_cmd(self, ftp, command: str) -> tuple[int | None, str, str]:
+        """Send one command. Returns code, reply line, and ok|fail|blocked|down."""
+        try:
+            resp = ftp.sendcmd(command)
+        except (ftplib.error_perm, ftplib.error_temp) as e:
+            raw = str(e.args[0]) if e.args else str(e)
+            code, line = self._ftp_parse_reply_line(raw)
+            return code, line, self._ftp_brute_kind(raw)
+        except (OSError, EOFError, ftplib.Error) as e:
+            raw = str(e)
+            kind = "blocked" if self._ftp_brute_kind(raw) == "blocked" else "down"
+            return None, raw, kind
+        code, line = self._ftp_parse_reply_line(resp)
+        if code is not None and 200 <= code < 300:
+            return code, line, "ok"
+        return code, line, self._ftp_brute_kind(line)
+
+    def _ftp_brute_one(self, cred: Creds, output) -> str:
+        """One USER/PASS. ok, fail, blocked, or down."""
+        if self._brute_stop.is_set():
+            return "skip"
+        shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
+        try:
+            ftp = self.connect()
+        except OSError as e:
+            raw = str(e)
+            self._user_enum_trace(f"{shown!r}: connect failed {self._snip(raw)}", output)
+            if self._FTP_BRUTE_LOCK_RE.search(raw) or "421" in raw:
+                return "limited"
+            return "down"
+        try:
+            ucode, uline, ukind = self._ftp_brute_cmd(ftp, "USER " + cred.user)
+            if ukind in ("blocked", "down") or ucode not in (331, 332):
+                self._user_enum_trace(
+                    f"{shown!r}: USER {self._user_enum_dbg_reply(ucode, uline)}",
+                    output,
+                )
+                if ukind == "ok":
+                    self._ftp_brute_hit(output, cred)
+                return ukind
+            pcode, pline, pkind = self._ftp_brute_cmd(ftp, "PASS " + cred.passw)
+            pass_label = 'PASS ""' if cred.passw == "" else "PASS"
+            self._user_enum_trace(
+                f"{shown!r}: USER {self._user_enum_dbg_reply(ucode, uline)}; "
+                f"{pass_label} {self._user_enum_dbg_reply(pcode, pline)}",
+                output,
+            )
+            if pkind == "ok":
+                self._ftp_brute_hit(output, cred)
+            return pkind
+        finally:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    def _ftp_auth_catch_all(self) -> str:
+        """One USER/PASS with a random user and password (RFC 959)."""
+        fake_user = "".join(random.choices(string.ascii_letters + string.digits, k=24))
+        fake_pass = "".join(random.choices(string.ascii_letters + string.digits, k=24))
+        try:
+            ftp = self.connect()
+        except OSError as e:
+            raw = str(e)
+            self._dbg(f"Catch-all: connect failed: {self._snip(raw)}")
+            if self._FTP_BRUTE_LOCK_RE.search(raw) or "421" in raw:
+                return "limited"
+            return "unreachable"
+        try:
+            self._dbg(f"Catch-all USER {fake_user!r}")
+            ucode, uline, ukind = self._ftp_brute_cmd(ftp, "USER " + fake_user)
+            if ukind == "ok":
+                self._dbg("Catch-all USER → accepted (indeterminate)")
+                return "indeterminate"
+            if ukind == "down" or ucode not in (331, 332):
+                self._dbg(f"Catch-all rejected (not configured): {self._user_enum_dbg_reply(ucode, uline)}")
+                return "unreachable" if ukind == "down" else "not_configured"
+            self._dbg("Catch-all USER → accepted, trying PASS")
+            pcode, pline, pkind = self._ftp_brute_cmd(ftp, "PASS " + fake_pass)
+            if pkind == "ok":
+                self._dbg("Catch-all PASS → accepted (indeterminate)")
+                return "indeterminate"
+            if pkind == "down":
+                self._dbg(f"Catch-all: PASS failed {self._snip(pline)}")
+                return "unreachable"
+            self._dbg(f"Catch-all rejected (not configured): {self._user_enum_dbg_reply(pcode, pline)}")
+            return "not_configured"
+        finally:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    def _ftp_brute_label(self, cred: Creds) -> str:
+        name = cred.user
+        if len(name) > 24:
+            return name[:21] + "..."
+        return name
+
+    def login_bruteforce(self) -> set[Creds]:
+        """Try the supplied passwords. Gray progress like user enumeration. -vv is USER/PASS per attempt."""
+        users = text_or_file(self.args.user, self.args.users)
+        passwords = brute_passwords(self.args.password, self.args.passwords)
+        if self.args.spray:
+            creds = [Creds(u, p) for p in passwords for u in users]
+        else:
+            creds = [Creds(u, p) for u in users for p in passwords]
+        threads = self.args.threads if self.args.threads is not None else 10
+        threads = max(1, int(threads))
+        self._brute_stop = threading.Event()
+        self._brute_guessing = None
+        found: set[Creds] = set()
+        if not creds:
+            self._tprint("No usernames or passwords to try.", "WARNING")
+            return found
+
+        progress = ThreadedProgress(
+            len(creds),
+            enabled=not self.use_json,
+            indent=4,
+            bar_indent=4,
+        )
+        progress.kickoff(self._ftp_brute_label(creds[0]))
+        state = {"downs": 0, "saw_reply": False, "blocked": False, "note": None}
+        lock = threading.Lock()
+
+        def work(cred: Creds, output) -> str:
+            kind = self._ftp_brute_one(cred, output)
+            with lock:
+                if kind == "ok":
+                    found.add(cred)
+                    state["saw_reply"] = True
+                    state["downs"] = 0
+                elif kind == "fail":
+                    state["saw_reply"] = True
+                    state["downs"] = 0
+                elif kind == "blocked":
+                    state["blocked"] = True
+                    state["saw_reply"] = True
+                    self._brute_stop.set()
+                elif kind == "limited":
+                    if state["saw_reply"]:
+                        state["blocked"] = True
+                    else:
+                        state["note"] = (
+                            "Connection rate limit. Password guessing was not tested."
+                        )
+                    self._brute_stop.set()
+                elif kind == "down":
+                    state["downs"] += 1
+                    if state["saw_reply"] and state["downs"] >= 3:
+                        state["blocked"] = True
+                        self._brute_stop.set()
+            return self._ftp_brute_label(cred)
+
+        try:
+            progress.run(creds, work, threads)
+        finally:
+            progress.finalize()
+
+        if state["blocked"]:
+            self._brute_guessing = "stopped"
+        elif state["saw_reply"]:
+            self._brute_guessing = "not_limited"
+        else:
+            self._brute_guessing = "not_tested"
+            self._brute_guessing_detail = state["note"]
+        self.results.creds = found
+        return found
 
     def _try_login(self, creds: Creds) -> Creds | None:
         """Login attempt function for bruteforce
@@ -6347,12 +6580,18 @@ class FtpEngine:
         ):
             properties.update({"accessCheckErrors": list(access.errors)})
 
+        guessing = getattr(self, "_brute_guessing", None)
+        if guessing is not None:
+            properties.update({"ftpPasswordGuessing": guessing})
+        if getattr(self, "_auth_catch_all", None) == "indeterminate":
+            properties.update({"catchAll": "indeterminate"})
+
         # Bruteforced credentials and their access permissions (skip terminal if streamed)
         if (creds := self.results.creds) is not None:
             if len(creds) > 0:
                 json_lines: list[str] = []
                 for cred in creds:
-                    cred_str = f"user: {cred.user}, password: {cred.passw}"
+                    cred_str = f"user: {cred.user}, password: {shown_password(cred.passw)}"
 
                     if (access := self.results.access) is not None:
                         if access.errors is None and access.results is not None:
@@ -6385,7 +6624,7 @@ class FtpEngine:
                     user_str = f"usernames: {self.args.users}"
 
                 if self.args.password is not None:
-                    passw_str = f"password: {self.args.password}"
+                    passw_str = f"password: {shown_password(self.args.password)}"
                 else:
                     passw_str = f"passwords: {self.args.passwords}"
 

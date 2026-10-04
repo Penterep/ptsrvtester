@@ -1973,12 +1973,20 @@ class ReportingMixin:
                 }
             })
 
+        guessing = getattr(self, "_brute_guessing", None)
+        if guessing is not None:
+            properties.update({"smtpPasswordGuessing": guessing})
+        if getattr(self, "_auth_catch_all", None) == "indeterminate":
+            properties.update({"smtpAuthCatchAll": "indeterminate"})
+
         # Login bruteforce
         if (creds := self.results.creds) is not None:
             if len(creds) > 0:
                 json_lines: list[str] = []
                 for cred in creds:
-                    json_lines.append(f"user: {cred.user}, password: {cred.passw}")
+                    json_lines.append(
+                        f"user: {cred.user}, password: {shown_password(cred.passw)}"
+                    )
 
                 if self.args.user is not None:
                     if isinstance(self.args.user, list):
@@ -1989,7 +1997,7 @@ class ReportingMixin:
                     user_str = f"usernames: {self.args.users}"
 
                 if self.args.password is not None:
-                    passw_str = f"password: {self.args.password}"
+                    passw_str = f"password: {shown_password(self.args.password)}"
                 else:
                     passw_str = f"passwords: {self.args.passwords}"
 

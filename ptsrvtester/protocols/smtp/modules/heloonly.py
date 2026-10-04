@@ -85,7 +85,7 @@ def test_helo_only(e) -> HeloOnlyResult:
                     ehlo_reply=None,
                     extensions=(),
                     connection_type=conn_type,
-                    detail="Rate limiting (421/451) - indeterminate",
+                    detail="Rate limiting (421/451)",
                 )
             return HeloOnlyResult(
                 vulnerable=False,
@@ -124,7 +124,7 @@ def test_helo_only(e) -> HeloOnlyResult:
                 ehlo_reply=None,
                 extensions=(),
                 connection_type=conn_type,
-                detail="Reconnect failed - indeterminate",
+                detail="Reconnect failed",
             )
 
         ehlo_status, ehlo_reply_bytes = smtp2.ehlo(helo_host)
@@ -161,7 +161,7 @@ def test_helo_only(e) -> HeloOnlyResult:
                 ehlo_reply=ehlo_reply,
                 extensions=(),
                 connection_type=conn_type,
-                detail="Rate limiting on EHLO (421/451) - indeterminate",
+                detail="Rate limiting on EHLO (421/451)",
             )
 
         # At least one extension = NOT vulnerable. No extensions or EHLO rejected = vulnerable.

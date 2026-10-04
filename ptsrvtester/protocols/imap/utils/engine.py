@@ -33,9 +33,11 @@ from .helpers import (
     ArgsWithBruteforce,
     Creds,
     Target,
+    brute_passwords,
     check_if_brute,
     get_mode,
     one_cli_user,
+    shown_password,
     simple_bruteforce,
     text_or_file,
     valid_target,
@@ -1358,29 +1360,50 @@ class ImapEngine:
             _end_live()
 
     def _test_catch_all(self) -> CatchAllResult:
-        """Test if server accepts invalid credentials (LOGIN with random user/pass)."""
+        """Random credentials. AUTHENTICATE PLAIN when LOGIN is disabled."""
         try:
-            fake_user = "".join(random.choices(string.ascii_letters + string.digits, k=24))
-            fake_pass = "".join(random.choices(string.ascii_letters + string.digits, k=24))
-            self._dbg(f"Catch-all LOGIN {fake_user!r}")
+            method = self._imap_brute_pick()
+        except Exception as e:
+            self._dbg(f"Catch-all: connect failed: {e}")
+            return "unreachable"
+        if method == "disabled":
+            return "disabled"
+        fake_user = "".join(random.choices(string.ascii_letters + string.digits, k=24))
+        fake_pass = "".join(random.choices(string.ascii_letters + string.digits, k=24))
+        cmd = "AUTHENTICATE PLAIN" if method == "PLAIN" else "LOGIN"
+        self._dbg(f"Catch-all {cmd} {fake_user!r}")
+        try:
             imap = self.connect()
+        except Exception as e:
+            self._dbg(f"Catch-all: connect failed: {e}")
+            return "unreachable"
+        try:
+            if method == "PLAIN":
+                typ, raw, _ms = self._imap_usrenum_measure_plain(imap, fake_user, fake_pass)
+                if typ == "OK":
+                    self._dbg(f"Catch-all {cmd} → accepted (indeterminate)")
+                    return "indeterminate"
+                self._dbg(f"Catch-all rejected (not configured): {self._snip(raw)}")
+                if self._imap_text_is_timeout(raw):
+                    return "unreachable"
+                return "not_configured"
             try:
                 imap.login(fake_user, fake_pass)
-                self._dbg("Catch-all LOGIN → accepted (indeterminate)")
+                self._dbg(f"Catch-all {cmd} → accepted (indeterminate)")
                 return "indeterminate"
             except Exception as e:
                 self._dbg(f"Catch-all rejected (not configured): {self._snip(str(e))}")
                 if self._imap_text_is_timeout(str(e)):
                     return "unreachable"
                 return "not_configured"
-            finally:
+        finally:
+            try:
+                imap.logout()
+            except Exception:
                 try:
-                    imap.logout()
+                    imap.shutdown()
                 except Exception:
                     pass
-        except Exception as e:
-            self._dbg(f"Catch-all: connect failed: {e}")
-            return "unreachable"
 
     def _do_info(
         self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL, get_commands: bool = True
@@ -5307,6 +5330,195 @@ class ImapEngine:
                 except Exception:
                     pass
 
+    _IMAP_BRUTE_LOCK_RE = re.compile(
+        r"lock(?:ed|out)?|too many|banned|blocked|try again|exceed|throttl",
+        re.I,
+    )
+
+    def _imap_brute_line(self, output, msg: str, category: str = "ADDITIONS") -> None:
+        if output is None or self.use_json:
+            return
+        if category == "ADDITIONS" and not getattr(self.args, "debug", False):
+            return
+        line = out_if(msg, category, True, colortext=True, indent=0)
+        if line:
+            output.add_string_to_output(line.rstrip("\n"))
+
+    def _imap_brute_pick(self) -> str:
+        """LOGIN, or AUTHENTICATE PLAIN when LOGIN is disabled (RFC 3501 / RFC 4616)."""
+        imap = None
+        try:
+            imap = self.connect()
+            try:
+                imap.capability()
+            except Exception:
+                pass
+            banner, merged = self._merged_preauth_capabilities(imap)
+            if self._usrenum_logindisabled_on_session(imap, banner, merged):
+                if self._capability_advertises_auth_plain(merged, banner):
+                    return "PLAIN"
+                return "disabled"
+            return "LOGIN"
+        except Exception:
+            return "LOGIN"
+        finally:
+            if imap is not None:
+                try:
+                    imap.logout()
+                except Exception:
+                    try:
+                        imap.shutdown()
+                    except Exception:
+                        pass
+
+    def _imap_brute_reply(self, typ: str, raw: str) -> str:
+        text = self._snip(raw)
+        parts = text.split(" ", 1)
+        if len(parts) == 2 and parts[0][:1].isalpha() and any(ch.isdigit() for ch in parts[0]):
+            text = parts[1]
+        if typ == "ABORT":
+            return text or "connection closed"
+        if typ and text and not text.upper().startswith(typ):
+            return f"{typ} {text}".strip()
+        return text or typ
+
+    def _imap_brute_kind(self, typ: str, raw: str) -> str:
+        text = raw or ""
+        up = text.upper()
+        if "LOGINDISABLED" in up:
+            return "unsupported"
+        if typ == "OK":
+            return "ok"
+        if typ == "ABORT" or "* BYE" in up:
+            if any(s in text.lower() for s in ("timed out", "timeout", "connection refused", "could not connect")):
+                return "down"
+            return "blocked"
+        if any(f"[{c}]" in up for c in ("UNAVAILABLE", "LIMIT", "CONTACTADMIN")):
+            return "blocked"
+        if self._IMAP_BRUTE_LOCK_RE.search(text):
+            return "blocked"
+        return "fail"
+
+    def _imap_brute_one(self, cred: Creds, output, method: str) -> tuple[str, str | None]:
+        if self._brute_stop.is_set():
+            return "skip", None
+        shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
+        cmd = "AUTHENTICATE PLAIN" if method == "PLAIN" else "LOGIN"
+        try:
+            imap = self.connect()
+        except Exception as e:
+            self._imap_brute_line(output, f"{shown!r}: connect failed {self._snip(str(e))}")
+            return "down", None
+        try:
+            if method == "PLAIN":
+                typ, raw, _ms = self._imap_usrenum_measure_plain(imap, cred.user, cred.passw)
+            else:
+                typ, raw, _ms = self._imap_usrenum_measure_login(imap, cred.user, cred.passw)
+            kind = self._imap_brute_kind(typ, raw)
+            cmd_show = f'{cmd} ""' if cred.passw == "" else cmd
+            self._imap_brute_line(output, f"{shown!r}: {cmd_show} {self._imap_brute_reply(typ, raw)}")
+            if kind == "ok":
+                self._imap_brute_line(
+                    output,
+                    f"user: {cred.user}, password: {shown_password(cred.passw)}",
+                    "VULN",
+                )
+            note = None
+            if kind == "unsupported":
+                note = "LOGIN is disabled. Password guessing was not tested."
+            return kind, note
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                try:
+                    imap.shutdown()
+                except Exception:
+                    pass
+
+    def _imap_brute_label(self, cred: Creds) -> str:
+        name = cred.user
+        return name if len(name) <= 24 else name[:21] + "..."
+
+    def login_bruteforce(self) -> set[Creds]:
+        """LOGIN, or AUTHENTICATE PLAIN when LOGIN is disabled. Gray progress like user enumeration."""
+        users = text_or_file(self.args.user, self.args.users)
+        passwords = brute_passwords(self.args.password, self.args.passwords)
+        if getattr(self.args, "spray", False):
+            creds = [Creds(u, p) for p in passwords for u in users]
+        else:
+            creds = [Creds(u, p) for u in users for p in passwords]
+        threads = self.args.threads if getattr(self.args, "threads", None) is not None else 10
+        threads = max(1, int(threads))
+        self._brute_stop = threading.Event()
+        self._brute_guessing = None
+        self._brute_guessing_detail = None
+        found: set[Creds] = set()
+        if not creds:
+            self._brute_guessing = "not_tested"
+            self._brute_guessing_detail = "No usernames or passwords to try."
+            self.results.creds = found
+            return found
+        method = self._imap_brute_pick()
+        if method == "disabled":
+            self._brute_guessing = "not_tested"
+            self._brute_guessing_detail = (
+                "LOGIN is disabled and AUTH=PLAIN is not offered. Password guessing was not tested."
+            )
+            self.results.creds = found
+            return found
+
+        progress = ThreadedProgress(
+            len(creds), enabled=not self.use_json, indent=4, bar_indent=4,
+        )
+        progress.kickoff(self._imap_brute_label(creds[0]))
+        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None}
+        lock = threading.Lock()
+
+        def work(cred: Creds, output) -> str:
+            kind, note = self._imap_brute_one(cred, output, method)
+            with lock:
+                if kind == "ok":
+                    found.add(cred)
+                    state["saw_reply"] = True
+                    state["tested"] = True
+                    state["downs"] = 0
+                elif kind == "fail":
+                    state["saw_reply"] = True
+                    state["tested"] = True
+                    state["downs"] = 0
+                elif kind == "unsupported":
+                    state["saw_reply"] = True
+                    state["note"] = state["note"] or note
+                    self._brute_stop.set()
+                elif kind == "blocked":
+                    state["blocked"] = True
+                    state["saw_reply"] = True
+                    self._brute_stop.set()
+                elif kind == "down":
+                    state["downs"] += 1
+                    if state["saw_reply"] and state["downs"] >= 3:
+                        state["blocked"] = True
+                        self._brute_stop.set()
+            return self._imap_brute_label(cred)
+
+        try:
+            progress.run(creds, work, threads)
+        finally:
+            progress.finalize()
+
+        if state["blocked"]:
+            self._brute_guessing = "stopped"
+        elif state["tested"]:
+            self._brute_guessing = "not_limited"
+        else:
+            self._brute_guessing = "not_tested"
+            self._brute_guessing_detail = state["note"] or (
+                "Could not connect. Password guessing was not tested."
+            )
+        self.results.creds = found
+        return found
+
     def _try_login(self, creds: Creds) -> Creds | None:
         """Login attempt function for bruteforce
 
@@ -5338,7 +5550,7 @@ class ImapEngine:
         """Callback for real-time streaming of found credentials (thread-safe)."""
         with self._output_lock:
             self._ptprint_raw(
-                f"user: {cred.user}, password: {cred.passw}",
+                f"user: {cred.user}, password: {shown_password(cred.passw)}",
                 bullet_type="TEXT",
                 condition=not self.use_json,
                 indent=4,
@@ -6335,17 +6547,43 @@ class ImapEngine:
                     pp(part, bullet_type="TEXT", condition=show, indent=8)
 
     def _stream_brute_result(self) -> None:
-        """Stream brute-force summary (credentials already streamed via on_success) (thread-safe)."""
+        """Found logins, then whether the server stopped password guessing."""
         creds = self.results.creds
-        if creds is None or len(creds) == 0:
+        guessing = getattr(self, "_brute_guessing", None)
+        if (not creds) and guessing is None:
             return
         with self._output_lock:
-            self._ptprint_raw(
-                f"Found {len(creds)} valid credentials",
-                bullet_type="INFO",
-                condition=not self.use_json,
-                indent=4,
-            )
+            if creds:
+                n = len(creds)
+                word = "login" if n == 1 else "logins"
+                self._ptprint_raw(
+                    f"Found {n} valid {word}",
+                    bullet_type="INFO",
+                    condition=not self.use_json,
+                    indent=4,
+                )
+            if guessing == "not_limited":
+                self._ptprint_raw(
+                    "No protection against password guessing",
+                    bullet_type="VULN",
+                    condition=not self.use_json,
+                    indent=4,
+                )
+            elif guessing == "stopped":
+                self._ptprint_raw(
+                    "Password guessing was stopped",
+                    bullet_type="NOTVULN",
+                    condition=not self.use_json,
+                    indent=4,
+                )
+            elif guessing == "not_tested":
+                self._ptprint_raw(
+                    getattr(self, "_brute_guessing_detail", None)
+                    or "Could not connect. Password guessing was not tested.",
+                    bullet_type="WARNING",
+                    condition=not self.use_json,
+                    indent=4,
+                )
 
     def _stream_conn_limits_result(self) -> None:
         """Inline verdicts are printed during the probe; this handles hard failures only."""
@@ -7072,16 +7310,22 @@ class ImapEngine:
                         "vuln_response": "\n".join(out_lines),
                     }
                 )
+        guessing = getattr(self, "_brute_guessing", None)
+        if guessing is not None:
+            properties.update({"imapPasswordGuessing": guessing})
+
         # Login bruteforce (skip terminal output if streamed; always add to deferred for JSON)
         if (creds := self.results.creds) is not None and len(creds) > 0:
-            json_lines = [f"user: {cred.user}, password: {cred.passw}" for cred in creds]
+            json_lines = [
+                f"user: {cred.user}, password: {shown_password(cred.passw)}" for cred in creds
+            ]
             names = text_or_file(self.args.user, None)
             if names:
                 user_str = "username: " + ", ".join(names)
             else:
                 user_str = f"usernames: {self.args.users}"
             if self.args.password is not None:
-                passw_str = f"password: {self.args.password}"
+                passw_str = f"password: {shown_password(self.args.password)}"
             else:
                 passw_str = f"passwords: {self.args.passwords}"
             deferred_vulns.append(

@@ -63,7 +63,7 @@ class FTPArgs(ArgsWithBruteforce):
             [get_colored_text("Credentials (BRUTE / authenticated tests)", "TITLE")],
             ["-u", "--user", "<name> …", "Username(s) for BRUTE / USRENUM / authenticated tests"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "<password>", "Single password"],
+            ["-p", "--password", "[password]", "Single password. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["-t", "--threads", "<n>", "Threads (BRUTE default: 10, ENUMPATH default: 5, USRENUM default: 1)"],

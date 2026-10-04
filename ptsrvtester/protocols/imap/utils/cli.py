@@ -54,7 +54,7 @@ class IMAPArgs(ArgsWithBruteforce):
             [get_colored_text("Credentials (BRUTE / authenticated tests)", "TITLE")],
             ["-u", "--user", "<name> …", "Username(s) for BRUTE / USRENUM"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "<password>", "Single password"],
+            ["-p", "--password", "[password]", "Single password. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--mailbox", "<name>", "IMAP folder for APPEND (default: INBOX)"],
             ["", "--spray", "", "Try one password against all users"],

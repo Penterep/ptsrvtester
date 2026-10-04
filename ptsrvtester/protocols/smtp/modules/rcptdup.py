@@ -112,6 +112,8 @@ def _stream_rcpt_duplicate_result(e) -> None:
 
 def run(ctx):
     e = eng(ctx)
+    if not ctx.json:
+        e.ptprint("Duplicate RCPT TO", Out.INFO)
     try:
         e.results.rcpt_duplicate = test_rcpt_duplicate(e)
     except Exception as ex:

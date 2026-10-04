@@ -40,7 +40,7 @@ class POP3Args(ArgsWithBruteforce):
             [get_colored_text("Credentials (BRUTE)", "TITLE")],
             ["-u", "--user", "<name> …", "Username(s) for BRUTE"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "<password>", "Single password"],
+            ["-p", "--password", "[password]", "Single password. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],

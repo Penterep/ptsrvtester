@@ -61,14 +61,15 @@ POP3_TESTS: dict[str, dict] = {
     "BRUTE": {
         "desc": "Login bruteforce (USER/PASS)",
         "long": [
-            "Bruteforce POP3 login with the supplied username(s) and",
-            "password(s); runs a catch-all check first.",
+            "Bruteforce POP3 USER/PASS with the supplied username(s) and",
+            "password(s). Catch-all check first. Error when the server",
+            "never stops password guessing.",
         ],
         "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
         "mods": [
             ["-u", "--user", "<name> …", "Username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "<password>", "Single password"],
+            ["-p", "--password", "[password]", "Single password. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],

@@ -62,7 +62,7 @@ def _stream_ehlo_result(e) -> None:
         e.ptprint('EHLO extensions (STARTTLS)', Out.INFO)
         _print_ehlo_parsed(ehlo_starttls, connection_encrypted=True)
     else:
-        connection_encrypted = e.args.target.port == 465 or e.args.tls or e.args.starttls
+        connection_encrypted = e.args.target.port == 465 or bool(e.args.tls)
         section_label = ' (TLS)' if connection_encrypted else ' (PLAIN)'
         e.ptprint(f'EHLO extensions{section_label}', Out.INFO)
         if info.ehlo:
@@ -75,6 +75,8 @@ def _stream_ehlo_result(e) -> None:
             else:
                 msg = 'STARTTLS (is advertised but cannot be used)'
             e._ptprint_raw(msg, bullet_type='WARNING', condition=show, indent=4)
+        elif e.args.starttls and not connection_encrypted and 'STARTTLS' not in (info.ehlo or '').upper():
+            e._ptprint_raw('STARTTLS is not advertised', bullet_type='WARNING', condition=show, indent=4)
 
 
 def run(ctx):

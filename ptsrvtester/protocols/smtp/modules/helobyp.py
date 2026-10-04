@@ -155,7 +155,7 @@ def test_helo_bypass(e) -> HeloBypassResult:
                         ehlo_comparison=ehlo_comparison,
                         tarpitting_detected=tuple(tarpitting_list),
                         rcpt_latencies=rcpt_latencies,
-                        detail="Rate limiting (421/451) - indeterminate",
+                        detail="Rate limiting (421/451)",
                     )
                 continue
         except (socket.timeout, ConnectionRefusedError, OSError) as ex:

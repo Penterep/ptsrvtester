@@ -34,6 +34,8 @@ from typing import Callable, Iterable
 from ptlibs.threads import ptthreads
 from ptlibs.threads.printlock import PrintLock
 
+from .ptprinthelper import get_colored_text
+
 
 class ThreadedProgress:
     """Shared live-progress line plus ``PrintLock``-based per-item output.
@@ -47,11 +49,17 @@ class ThreadedProgress:
         call every method as a no-op.
     indent:
         Leading spaces prepended to each flushed finding line.
+    bar_indent:
+        Leading spaces on the live ETA line. Defaults to 0 so existing
+        enumeration bars stay flush left.
     """
 
-    def __init__(self, total: int, *, enabled: bool = True, indent: int = 4) -> None:
+    def __init__(
+        self, total: int, *, enabled: bool = True, indent: int = 4, bar_indent: int = 0,
+    ) -> None:
         self.total = max(0, int(total))
         self.indent = max(0, int(indent))
+        self.bar_indent = max(0, int(bar_indent))
         self._tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
         self.enabled = bool(enabled)
         self._lock = threading.Lock()
@@ -95,7 +103,11 @@ class ThreadedProgress:
         eta = self._eta_seconds()
         time_part = self._fmt_duration(eta) if eta is not None else "--:--:--"
         label = self._last_label or ""
-        line = f"{time_part} {pct}% {self._done}/{self.total} {label}".rstrip()
+        pad = " " * self.bar_indent
+        line = get_colored_text(
+            f"{pad}{time_part} {pct}% {self._done}/{self.total} {label}".rstrip(),
+            "ADDITIONS",
+        )
         self._write(f"\033[2K\r{line}")
         self._active = True
 
@@ -113,6 +125,13 @@ class ThreadedProgress:
                 pass
 
     # ── public API ─────────────────────────────────────────────────────────
+    def kickoff(self, label: str = "") -> None:
+        """Show 0% before the first attempt finishes."""
+        with self._lock:
+            if label:
+                self._last_label = label
+            self._paint_unlocked()
+
     def advance(self, label: str = "") -> None:
         """Mark one item done and repaint the live line.
 

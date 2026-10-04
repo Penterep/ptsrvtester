@@ -16,6 +16,8 @@ from typing import Callable, Iterable
 from ptlibs.threads import ptthreads
 from ptlibs.threads.printlock import PrintLock
 
+from .ptprinthelper import get_colored_text
+
 
 class ThreadedProgress:
     """Live-progress line plus ``PrintLock``-based per-item output.
@@ -80,7 +82,10 @@ class ThreadedProgress:
         time_part = self._fmt_duration(eta) if eta is not None else "--:--:--"
         label = self._last_label or ""
         pad = " " * self.bar_indent
-        line = f"{pad}{time_part} {pct}% {self._done}/{self.total} {label}".rstrip()
+        line = get_colored_text(
+            f"{pad}{time_part} {pct}% {self._done}/{self.total} {label}".rstrip(),
+            "ADDITIONS",
+        )
         self._write(f"\033[2K\r{line}")
         self._active = True
 
@@ -95,6 +100,13 @@ class ThreadedProgress:
                 sys.stdout.flush()
             except Exception:
                 pass
+
+    def kickoff(self, label: str = "") -> None:
+        """Show 0% before the first attempt finishes."""
+        with self._lock:
+            if label:
+                self._last_label = label
+            self._paint_unlocked()
 
     def advance(self, label: str = "") -> None:
         with self._lock:

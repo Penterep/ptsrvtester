@@ -4,6 +4,7 @@ from __future__ import annotations
 import ipaddress
 import poplib
 import random
+import re
 import select
 import socket
 import ssl
@@ -14,8 +15,11 @@ import time
 from base64 import b64decode, b64encode
 from typing import Callable
 
+from ptlibs.ptprinthelper import out_if
+
 from .capa import bytes_to_text
-from .helpers import get_mode
+from .helpers import Creds, brute_passwords, get_mode, shown_password, text_or_file
+from .progress import ThreadedProgress
 from .ptprinthelper import get_colored_text
 from .results import (
     EncryptionResult,
@@ -441,6 +445,159 @@ def test_catch_all(args, *, debug: DebugFn | None = None) -> str:
             pop3.close()
         except Exception:
             pass
+
+
+_POP3_BRUTE_LOCK_RE = re.compile(
+    r"lock(?:ed|out)?|too many|banned|blocked|try again|exceed|throttl|login-delay|sys/temp",
+    re.I,
+)
+
+
+def _pop3_brute_line(output, msg: str, category: str = "ADDITIONS", *, debug: bool = False, json_mode: bool = False) -> None:
+    if output is None or json_mode:
+        return
+    if category == "ADDITIONS" and not debug:
+        return
+    line = out_if(msg, category, True, colortext=True, indent=0)
+    if line:
+        output.add_string_to_output(line.rstrip("\n"))
+
+
+def _pop3_line(value) -> str:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    return " ".join(str(value or "").split())
+
+
+def _pop3_brute_kind(text: str) -> str:
+    low = (text or "").lower()
+    if _POP3_BRUTE_LOCK_RE.search(text or ""):
+        return "blocked"
+    if any(s in low for s in ("unknown command", "not implemented", "unrecognized")):
+        return "unsupported"
+    return "fail"
+
+
+def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: bool) -> tuple[str, str | None]:
+    """One USER/PASS (RFC 1939). ok, fail, blocked, down, or unsupported."""
+    if stop.is_set():
+        return "skip", None
+    shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
+
+    def trace(msg: str, category: str = "ADDITIONS") -> None:
+        _pop3_brute_line(output, msg, category, debug=debug, json_mode=json_mode)
+
+    try:
+        pop3 = connect_pop3(args)
+    except OSError as e:
+        trace(f"{shown!r}: connect failed {_snip(str(e))}")
+        return "down", None
+    try:
+        try:
+            urep = _pop3_line(pop3.user(cred.user))
+        except poplib.error_proto as e:
+            urep = _pop3_line(e.args[0] if e.args else e)
+            kind = _pop3_brute_kind(urep)
+            trace(f"{shown!r}: USER {urep}")
+            note = "USER/PASS is not offered. Password guessing was not tested." if kind == "unsupported" else None
+            return kind, note
+        except (OSError, TimeoutError) as e:
+            trace(f"{shown!r}: USER failed {_snip(str(e))}")
+            return "down", None
+        try:
+            prep = _pop3_line(pop3.pass_(cred.passw))
+            kind = "ok"
+        except poplib.error_proto as e:
+            prep = _pop3_line(e.args[0] if e.args else e)
+            kind = _pop3_brute_kind(prep)
+        except (OSError, TimeoutError) as e:
+            trace(f"{shown!r}: USER {urep}; PASS failed {_snip(str(e))}")
+            return "down", None
+        pass_label = 'PASS ""' if cred.passw == "" else "PASS"
+        trace(f"{shown!r}: USER {urep}; {pass_label} {prep}")
+        if kind == "ok":
+            trace(f"user: {cred.user}, password: {shown_password(cred.passw)}", "VULN")
+        note = "USER/PASS is not offered. Password guessing was not tested." if kind == "unsupported" else None
+        return kind, note
+    finally:
+        try:
+            pop3.close()
+        except Exception:
+            pass
+
+
+def login_bruteforce(ctx) -> set[Creds]:
+    """USER/PASS for each password. Gray progress. -vv is the reply above that line."""
+    import threading
+
+    args = ctx.args
+    users = text_or_file(args.user, args.users)
+    passwords = brute_passwords(args.password, args.passwords)
+    if getattr(args, "spray", False):
+        creds = [Creds(u, p) for p in passwords for u in users]
+    else:
+        creds = [Creds(u, p) for u in users for p in passwords]
+    threads = args.threads if getattr(args, "threads", None) is not None else 10
+    threads = max(1, int(threads))
+    stop = threading.Event()
+    debug = bool(getattr(args, "debug", False))
+    json_mode = bool(getattr(ctx, "json", False))
+    found: set[Creds] = set()
+    ctx._brute_guessing = None
+    ctx._brute_guessing_detail = None
+    if not creds:
+        ctx._brute_guessing = "not_tested"
+        ctx._brute_guessing_detail = "No usernames or passwords to try."
+        return found
+
+    progress = ThreadedProgress(len(creds), enabled=not json_mode, indent=4, bar_indent=4)
+    first = creds[0].user
+    progress.kickoff(first if len(first) <= 24 else first[:21] + "...")
+    state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None}
+    lock = threading.Lock()
+
+    def work(cred: Creds, output) -> str:
+        kind, note = _pop3_brute_one(args, cred, output, stop, debug=debug, json_mode=json_mode)
+        with lock:
+            if kind == "ok":
+                found.add(cred)
+                state["saw_reply"] = True
+                state["tested"] = True
+                state["downs"] = 0
+            elif kind == "fail":
+                state["saw_reply"] = True
+                state["tested"] = True
+                state["downs"] = 0
+            elif kind == "unsupported":
+                state["saw_reply"] = True
+                state["note"] = state["note"] or note
+            elif kind == "blocked":
+                state["blocked"] = True
+                state["saw_reply"] = True
+                stop.set()
+            elif kind == "down":
+                state["downs"] += 1
+                if state["saw_reply"] and state["downs"] >= 3:
+                    state["blocked"] = True
+                    stop.set()
+        name = cred.user
+        return name if len(name) <= 24 else name[:21] + "..."
+
+    try:
+        progress.run(creds, work, threads)
+    finally:
+        progress.finalize()
+
+    if state["blocked"]:
+        ctx._brute_guessing = "stopped"
+    elif state["tested"]:
+        ctx._brute_guessing = "not_limited"
+    else:
+        ctx._brute_guessing = "not_tested"
+        ctx._brute_guessing_detail = state["note"] or "Could not connect. Password guessing was not tested."
+    if ctx._brute_guessing is not None:
+        ctx.report.update_properties(pop3PasswordGuessing=ctx._brute_guessing)
+    return found
 
 
 def try_login(args, creds, *, debug: DebugFn | None = None) -> object | None:

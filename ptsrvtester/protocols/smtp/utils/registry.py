@@ -89,10 +89,10 @@ SMTP_DEFAULT_SUITE: tuple[str, ...] = (
 # Ordered groups for the main help table
 SMTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "IDENTIFY", "IDAGG", "EHLO", "AUTHLIST", "ROLE", "ENCRYPT", "NTLM"]),
-    ("Authentication", ["AUTHFMT", "AUTHENUM", "AUTHDN"]),
+    ("Authentication", ["AUTHFMT", "AUTHDN"]),
     ("Protocol & validation", ["HELOVAL", "HELOONLY", "HELOBYP", "INVCMD"]),
     ("Relay & addressing", ["OPENREL", "PROBEDOM", "ALIAS", "BCC", "SPOOF", "BOUNCE"]),
-    ("Enumeration & credentials", ["ENUM", "BRUTE"]),
+    ("Enumeration & credentials", ["ENUM", "AUTHENUM", "BRUTE"]),
     ("Rate limiting & stress", ["RATELIM", "RATELIMIT", "RCPTLIM", "RCPTDUP", "NOOP1", "NOOP2", "BOMB", "FLOOD"]),
     ("Content security", ["AV", "SSRF", "ZIPXXE"]),
     ("Indirect (no direct SMTP connection)", ["BLACKLIST", "SPF"]),
@@ -282,13 +282,16 @@ SMTP_TESTS: dict[str, dict] = {
     "BRUTE": {
         "desc": "Bruteforce credentials",
         "long": ["Bruteforce SMTP AUTH using username(s) and password(s).",
-                 "Requires credentials via -u/-p or -U/-P."],
+                 "One AUTH per guess. Catch-all check first.",
+                 "Error when the server never stops it."],
         "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
         "mods": [
             ["-u", "--user", "<name> …", "Username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "<password>", "Single password"],
+            ["-p", "--password", "[password]", "Single password. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
         ],
     },
     "RATELIM": {
@@ -303,9 +306,10 @@ SMTP_TESTS: dict[str, dict] = {
     "RATELIMIT": rate_limit_test_spec(flags={"shared_rate_limit": True}),
     "RCPTLIM": {
         "desc": "Test RCPT TO recipient limit",
-        "long": ["Storm RCPT TO in one message to find the per-message recipient",
-                 "limit. Without -u/-U generates random recipients. With --send it",
-                 "also submits one message (DATA) after the RCPT storm."],
+        "long": ["Storm RCPT TO in one message to find the per-message recipient limit.",
+                 "A closed MTA needs local names in -u/-U. An open relay uses numbered",
+                 "recipients (1@domain, 2@domain, ...). Submission needs -u and -p;",
+                 "those names are the recipients. --send also submits DATA."],
         "value": ("rcpt_limit", RCPT_LIMIT_DEFAULT_ATTEMPTS),
         "mods": [
             ["-rl", "--recipient-limit", "<n>", f"Max RCPT attempts per session (default: {RCPT_LIMIT_DEFAULT_ATTEMPTS})"],
@@ -313,6 +317,9 @@ SMTP_TESTS: dict[str, dict] = {
             ["", "--rl-no-precheck", "", "Skip role/open-relay/AUTH pre-check"],
             ["-d", "--domain", "<domain>", "Recipient domain (default: banner/EHLO)"],
             ["-m", "--mail-from", "<email>", "Envelope MAIL FROM (default <>)"],
+            ["-u", "--user", "<name> …", "Local recipients; on submission also the login"],
+            ["-U", "--users", "<wordlist>", "Local recipient wordlist"],
+            ["-p", "--password", "[password]", "AUTH password (submission only)"],
         ],
     },
     "RCPTDUP": {

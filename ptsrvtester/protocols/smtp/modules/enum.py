@@ -722,9 +722,9 @@ def test_catchall(e, smtp: smtplib.SMTP) -> CatchAllResult:
 
     def _choose_method() -> str | None:
         if e.results.enum_results:
-            for e in e.results.enum_results:
-                if e.vulnerable and e.method in ('expn', 'vrfy', 'rcpt'):
-                    return e.method
+            for row in e.results.enum_results:
+                if row.vulnerable and row.method in ('expn', 'vrfy', 'rcpt'):
+                    return row.method
         try:
             status, _ = smtp.docmd('VRFY', 'catchallprobe')
             if status in (*VRFY_EXPN_ACCEPT, 550):

@@ -165,7 +165,14 @@ def add_bruteforce_args(
     # password / passwords file
     brutepass = bruteforce.add_mutually_exclusive_group()
     brutepass.title = "brutepass"
-    brutepass.add_argument("-p", "--password", type=str, help="password")
+    brutepass.add_argument(
+        "-p",
+        "--password",
+        nargs="?",
+        const="",
+        default=None,
+        help='password; no value or "" tests an empty password',
+    )
     brutepass.add_argument("-P", "--passwords", type=str, help="file containing passwords")
 
     # other configuration
@@ -195,7 +202,8 @@ def check_if_brute(args: ArgsWithBruteforce) -> bool:
     Returns:
         bool: whether to perform bruteforce
     """
-    if (args.user or args.users) and (args.password or args.passwords):
+    has_password = args.password is not None or bool(args.passwords)
+    if (args.user or args.users) and has_password:
         return True
     else:
         return False
@@ -414,7 +422,24 @@ def text_or_file(text: str | list[str] | None, filepath: str | None) -> list[str
         else:
             result = raw.decode("utf-8", errors="replace").splitlines()
 
-    return result
+    cleaned: list[str] = []
+    for item in result:
+        line = str(item).replace("\ufeff", "").strip()
+        if line:
+            cleaned.append(line)
+    return cleaned
+
+
+def brute_passwords(password: str | None, passwords_file: str | None) -> list[str]:
+    """Passwords for BRUTE. An explicit -p keeps an empty string."""
+    if password is not None:
+        return [password]
+    return text_or_file(None, passwords_file)
+
+
+def shown_password(password: str) -> str:
+    """Visible form of a password. An empty password is a quoted empty string."""
+    return '""' if password == "" else password
 
 
 def filepaths(directory: str, ext: str) -> list[str]:

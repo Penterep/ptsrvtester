@@ -138,19 +138,19 @@ def run(ctx) -> None:
         
     os_ver_name = output.server_OS if output.server_OS != "unknown" and os_version == "unknown" else os_ver_name
     
-    ctx.os_version = f"{os_ver_name} (build: {os_version})" if os_version != "unknown" else os_ver_name
+    output.server_OS = f"{os_ver_name} (build: {os_version})" if os_version != "unknown" else os_ver_name
     
     # Printing
     # ctx.out("SMB server info:")
     ctx.out(f"Server name:             {output.server_name}", "INFO", indent=4)
     ctx.out(f"OS version:              {output.server_OS}", "INFO", indent=4)
-    ctx.out(f"DNS domain name:         {output.server_DNS_domain_name}", "INFO", indent=4)
-    ctx.out(f"DNS host name:           {output.server_DNS_hostname}", "INFO", indent=4,
-                condition=ctx.dns_host_name != ctx.dns_domain_name)
+    ctx.out(f"DNS domain name:         {output.dns_domain_name}", "INFO", indent=4)
+    ctx.out(f"DNS host name:           {output.dns_hostname}", "INFO", indent=4,
+                condition=output.dns_domain_name != output.dns_hostname and output.dns_domain_name.lower() != "unknown")
     ctx.out(f"Lowest dialect version:  {output.used_dialect}",
                 "VULN" if output.used_dialect == "SMBv1" else "NOTVULN", indent=4)
     ctx.out(f"Login required:          {output.is_login_required}",
-                "WARNING" if not ctx.login_required else "OK", indent=4)
+                "WARNING" if not output.is_login_required else "OK", indent=4)
     ctx.out(f"Signing required:        {output.is_signing_required}",
-                "VULN" if not ctx.signing_required else "NOTVULN", indent=4)
+                "VULN" if not output.is_signing_required else "NOTVULN", indent=4)
     ctx.out(f"NTLMv2 supported:        {output.does_support_NTLMv2}", "INFO", indent=4)

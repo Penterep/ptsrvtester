@@ -31,8 +31,8 @@ class SMBResults:
     client_name: str
     remote_name: str
     server_domain: str
-    server_DNS_domain_name: str
-    server_DNS_hostname: str
+    dns_domain_name: str
+    dns_hostname: str
     server_OS: str
     server_OS_major: str
     server_OS_minor: str
@@ -54,8 +54,8 @@ class SMBResults:
         self.client_name = ""
         self.remote_name = ""
         self.server_domain = ""
-        self.server_DNS_domain_name = ""
-        self.server_DNS_hostname = ""
+        self.dns_domain_name = ""
+        self.dns_hostname = ""
         self.server_OS = ""
         self.server_OS_major = ""
         self.server_OS_minor = ""
@@ -64,11 +64,12 @@ class SMBResults:
         self.is_login_required = None
         self.is_signing_required = None
         self.open_dialects = {
-            SMB_DIALECT:        False,
-            SMB2_DIALECT_002:   False,
-            SMB2_DIALECT_21:    False,
-            SMB2_DIALECT_30:    False,
-            SMB2_DIALECT_311:   False,
+            "SMBv1":        False,
+            "SMBv2.0":      False,
+            "SMBv2.1":      False,
+            "SMBv3.0":      False,
+            "SMBv3.0.2":    False,
+            "SMBv3.1.1":    False,
         }
         self.v30_encryption = ""
         self.v311_encryption = ""
@@ -120,7 +121,7 @@ def get_if_available(getter):
     try:
         return getter()
     except Exception:
-        return None
+        return "unknown"
 
 def valid_target_smb(target: str) -> Target:
     return valid_target(target, domain_allowed=True)

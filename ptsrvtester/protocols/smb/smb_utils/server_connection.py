@@ -36,6 +36,15 @@ class ServerConnection():
         '3.0.2':                                        SMB2_DIALECT_30,
         '3.1.1':                                        SMB2_DIALECT_311,
     }
+
+    nm_to_std = {
+        'NT LM 0.12 (SMBv1) [dangerous, but default]':  "SMBv1",
+        '2.0.2':                                        "SMBv2.0",
+        '2.1':                                          "SMBv2.1",
+        '3.0':                                          "SMBv3.0",
+        '3.0.2':                                        "SMBv3.0.2",
+        '3.1.1':                                        "SMBv3.1.1",
+    }
     
     def __init__(self, ctx) -> None:
         self.ctx = ctx
@@ -53,16 +62,16 @@ class ServerConnection():
             return self.int_to_dialect[input]
         else:
             return None
-    
 
     def connect(self, username = "", password = "", timeout = 3) -> None:
         output: SMBResults = SMBResults()
         smb_client: SMBConnection
-        nm = nmap.PortScanner()
-        ip, port = self.ctx.target
         output = self.ctx.output
-        nm_dialects = []
+        output.has_ran = True
+        ip, port = self.ctx.target
         
+        nm_dialects = []
+        nm = nmap.PortScanner()
         try:
             nm.scan(str(ip), str(port), "--script smb-protocols")
             output.nmap_status = str(nm[ip]['tcp'][port]['state'])
@@ -74,7 +83,7 @@ class ServerConnection():
             return
 
         for dialect in nm_dialects:
-            output.open_dialects[dialect] = True
+            output.open_dialects[self.nm_to_std[dialect]] = True
         
         try:
             smb_client = SMBConnection(
@@ -83,7 +92,7 @@ class ServerConnection():
                 sess_port=port,
                 # TODO: check if I might have to try more diealects than the first accepted
                 preferredDialect=self.dial_str_converter(nm_dialects[0]), # lowest accepted dialect
-                timeout=3
+                timeout=timeout
             )
             try:
                 # TODO: implement login interaction

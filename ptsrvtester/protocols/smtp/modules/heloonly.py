@@ -16,6 +16,8 @@ __MODULELABEL__ = "HELO-only Test"
 __MODULECODE__ = "HELOONLY"
 __ORDER__ = 51
 
+_NOT_TESTED = "Could not connect. HELO-only was not tested."
+
 
 def test_helo_only(e) -> HeloOnlyResult:
     """
@@ -68,6 +70,10 @@ def test_helo_only(e) -> HeloOnlyResult:
             smtp.does_esmtp = False
         return smtp, 220
 
+    helo_status = None
+    helo_reply = None
+    ehlo_status = None
+    ehlo_reply = None
     try:
         smtp1, conn_status = _connect_helo_only()
         if conn_status != 220:
@@ -185,16 +191,30 @@ def test_helo_only(e) -> HeloOnlyResult:
         )
 
     except (socket.timeout, ConnectionRefusedError, OSError) as ex:
+        if helo_status is None:
+            if getattr(e.args, "debug", False) and not e.use_json:
+                e.ptdebug(f"Connect: {ex}", indent_override=4)
+            return HeloOnlyResult(
+                vulnerable=False,
+                indeterminate=True,
+                helo_status=None,
+                helo_reply=None,
+                ehlo_status=None,
+                ehlo_reply=None,
+                extensions=(),
+                connection_type=conn_type,
+                detail=_NOT_TESTED,
+            )
         return HeloOnlyResult(
             vulnerable=False,
             indeterminate=True,
-            helo_status=None,
-            helo_reply=None,
-            ehlo_status=None,
-            ehlo_reply=None,
+            helo_status=helo_status,
+            helo_reply=helo_reply,
+            ehlo_status=ehlo_status,
+            ehlo_reply=ehlo_reply,
             extensions=(),
             connection_type=conn_type,
-            detail=str(ex),
+            detail="Reconnect failed",
         )
 
 def _stream_helo_only_result(e) -> None:
@@ -218,12 +238,18 @@ def _stream_helo_only_result(e) -> None:
             return r[4:].strip()
         return r
 
+    if ho.detail == _NOT_TESTED:
+        pp(_NOT_TESTED, bullet_type="WARNING", condition=show, indent=4)
+        return
+
     if not e.args.debug:
         pp(f"Connection: {ho.connection_type}", bullet_type="TITLE", condition=show, indent=4)
-        helo_first = (ho.helo_reply or "").replace("\r", "\n").split("\n")[0].strip()
-        pp(f"HELO test.local: {ho.helo_status} {_strip_status_prefix(helo_first)}", bullet_type="TITLE", condition=show, indent=4)
-        ehlo_first = (ho.ehlo_reply or "").replace("\r", "\n").split("\n")[0].strip()
-        pp(f"EHLO test.local: {ho.ehlo_status} {_strip_status_prefix(ehlo_first)}", bullet_type="TITLE", condition=show, indent=4)
+        if ho.helo_status is not None:
+            helo_first = (ho.helo_reply or "").replace("\r", "\n").split("\n")[0].strip()
+            pp(f"HELO test.local: {ho.helo_status} {_strip_status_prefix(helo_first)}", bullet_type="TITLE", condition=show, indent=4)
+        if ho.ehlo_status is not None:
+            ehlo_first = (ho.ehlo_reply or "").replace("\r", "\n").split("\n")[0].strip()
+            pp(f"EHLO test.local: {ho.ehlo_status} {_strip_status_prefix(ehlo_first)}", bullet_type="TITLE", condition=show, indent=4)
         if ho.extensions:
             for ext in ho.extensions:
                 pp(ext, bullet_type="TEXT", condition=show, indent=8)

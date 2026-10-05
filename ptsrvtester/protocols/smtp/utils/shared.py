@@ -235,7 +235,7 @@ class SharedMixin:
         of ``-U/--users`` and ``-P/--passwords`` files when single credentials are absent.
         """
         user = self._rl_pick_first(getattr(self.args, "user", None))
-        passwd = self._rl_pick_first(getattr(self.args, "password", None))
+        passwd = first_cli_password(getattr(self.args, "password", None))
         if user is None and getattr(self.args, "users", None):
             try:
                 lines = [x for x in text_or_file(None, self.args.users) if x.strip()]
@@ -449,7 +449,7 @@ class SharedMixin:
         """Start live clock line for one SMTP check (single-thread only)."""
         if self.use_json:
             return
-        if getattr(self.args, "enum_threads", 1) > 1:
+        if int(getattr(self.args, "enum_threads", None) or 1) > 1:
             return
         with self._enum_progress_print_lock:
             self._enum_clock_state = {"idx": idx, "total": total, "label": label}
@@ -1245,12 +1245,14 @@ class SharedMixin:
         re.I,
     )
 
-    def _smtp_brute_line(self, output, msg: str, category: str = "ADDITIONS") -> None:
+    def _smtp_brute_line(
+        self, output, msg: str, category: str = "ADDITIONS", *, colortext: bool = True, indent: int = 0,
+    ) -> None:
         if output is None or (category == "ADDITIONS" and not getattr(self.args, "debug", False)):
             return
         if self.use_json:
             return
-        line = out_if(msg, category, True, colortext=True, indent=0)
+        line = out_if(msg, category, True, colortext=colortext, indent=indent)
         if line:
             output.add_string_to_output(line.rstrip("\n"))
 
@@ -1269,6 +1271,23 @@ class SharedMixin:
         if code in (534, 538, 504) or (code == 530 and ("starttls" in low or "encrypt" in low)):
             return "unsupported"
         return "fail"
+
+    def _smtp_brute_block_paren(self, code: int | None, text: str) -> str | None:
+        """Short block reason for the verdict, e.g. ``421 rate limiting``."""
+        low = (text or "").lower()
+        if code == 421 or any(s in low for s in ("rate", "limit", "throttl", "exceed")):
+            reason = "rate limiting"
+        elif code == 454 or self._SMTP_BRUTE_LOCK_RE.search(text or ""):
+            reason = "lockout"
+        else:
+            reason = None
+        if code and reason:
+            return f"{code} {reason}"
+        if code:
+            return str(code)
+        if reason:
+            return reason
+        return None
 
     def _smtp_brute_mech(self, smtp) -> str | None:
         """One mechanism per guess. PLAIN, then LOGIN, then CRAM-MD5."""
@@ -1289,17 +1308,17 @@ class SharedMixin:
             return "AUTH requires encryption. Password guessing was not tested."
         return "AUTH could not be used. Password guessing was not tested."
 
-    def _smtp_brute_one(self, cred: Creds, output) -> tuple[str, str | None]:
-        """One AUTH. Returns ok, fail, blocked, down, or unsupported, plus a note."""
+    def _smtp_brute_one(self, cred: Creds, output) -> tuple[str, str | None, str | None]:
+        """One AUTH. Returns kind, note, and a block label such as ``421 rate limiting``."""
         if self._brute_stop.is_set():
-            return "skip", None
+            return "skip", None, None
         shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
         try:
             smtp, status, banner = self.connect(timeout=10, fatal=False)
         except Exception as e:
             self._smtp_brute_line(output, f"Send: Connect {shown}")
             self._smtp_brute_line(output, f"Receive: {self._snip(str(e)) if hasattr(self, '_snip') else str(e)}")
-            return "down", None
+            return "down", None, None
         try:
             banner_s = self._smtp_brute_text(banner)
             if status == 421 or self._SMTP_BRUTE_LOCK_RE.search(banner_s):
@@ -1310,53 +1329,70 @@ class SharedMixin:
                     note = "Connection rate limit. Password guessing was not tested."
                 else:
                     note = "Server closed the connection before AUTH. Password guessing was not tested."
-                return "limited", note
+                return "limited", note, self._smtp_brute_block_paren(int(status), banner_s)
             if status != 220:
                 self._smtp_brute_line(output, "Send: Connect")
                 self._smtp_brute_line(output, f"Receive: {status} {banner_s}".strip())
-                return "down", None
+                return "down", None, None
             try:
                 smtp.ehlo()
             except Exception as e:
                 self._smtp_brute_line(output, "Send: EHLO")
                 self._smtp_brute_line(output, f"Receive: {e}")
-                return "down", None
+                return "down", None, None
             mech = self._smtp_brute_mech(smtp)
             if mech is None:
                 self._smtp_brute_line(output, "Send: EHLO")
                 self._smtp_brute_line(output, "Receive: AUTH not offered")
-                return "unsupported", "AUTH is not offered. Password guessing was not tested."
+                return "unsupported", "AUTH is not offered. Password guessing was not tested.", None
             send = f"AUTH {mech} {shown}"
             if cred.passw == "":
                 send += ' ""'
+            block_code: int | None = None
             try:
                 smtp.user, smtp.password = cred.user, cred.passw
                 method = getattr(smtp, "auth_" + mech.lower().replace("-", "_"))
                 code, resp = smtp.auth(mech, method)
                 text = self._smtp_brute_text(resp)
                 shown_reply = text if text.startswith(str(code)) else f"{code} {text}".strip()
-                kind = self._smtp_brute_kind(int(code), shown_reply)
+                block_code = int(code)
+                kind = self._smtp_brute_kind(block_code, shown_reply)
             except smtplib.SMTPAuthenticationError as e:
                 text = self._smtp_brute_text(e.smtp_error)
-                code = int(e.smtp_code)
-                shown_reply = text if text.startswith(str(code)) else f"{code} {text}".strip()
-                kind = self._smtp_brute_kind(code, shown_reply)
+                block_code = int(e.smtp_code)
+                shown_reply = text if text.startswith(str(block_code)) else f"{block_code} {text}".strip()
+                kind = self._smtp_brute_kind(block_code, shown_reply)
             except smtplib.SMTPNotSupportedError as e:
                 shown_reply = str(e)
                 kind = "unsupported"
             except (smtplib.SMTPServerDisconnected, OSError, TimeoutError) as e:
                 shown_reply = str(e)
-                kind = "blocked" if self._SMTP_BRUTE_LOCK_RE.search(shown_reply) else "down"
+                raw_code = getattr(e, "smtp_code", None)
+                if raw_code is not None:
+                    try:
+                        block_code = int(raw_code)
+                    except (TypeError, ValueError):
+                        block_code = None
+                kind = "blocked" if (
+                    block_code in (421, 454) or self._SMTP_BRUTE_LOCK_RE.search(shown_reply)
+                ) else "down"
             self._smtp_brute_line(output, f"Send: {send}")
             self._smtp_brute_line(output, f"Receive: {shown_reply}")
             if kind == "ok":
+                self._smtp_brute_line(output, f"user: {cred.user}", "VULN", colortext=False)
                 self._smtp_brute_line(
                     output,
-                    f"user: {cred.user}, password: {shown_password(cred.passw)}",
-                    "VULN",
+                    f"password: {shown_password(cred.passw)}",
+                    "TEXT",
+                    colortext=False,
+                    indent=4,
                 )
-            note = self._smtp_brute_unsupported_detail(shown_reply) if kind == "unsupported" else None
-            return kind, note
+            if kind == "unsupported":
+                note = self._smtp_brute_unsupported_detail(shown_reply)
+            else:
+                note = None
+            block = self._smtp_brute_block_paren(block_code, shown_reply) if kind == "blocked" else None
+            return kind, note, block
         finally:
             try:
                 smtp.close()
@@ -1438,7 +1474,11 @@ class SharedMixin:
             creds = [Creds(u, p) for p in passwords for u in users]
         else:
             creds = [Creds(u, p) for u in users for p in passwords]
-        threads = self.args.threads if getattr(self.args, "threads", None) is not None else 10
+        threads = getattr(self.args, "threads", None)
+        if threads is None:
+            threads = getattr(self.args, "enum_threads", None)
+        if threads is None:
+            threads = 10
         threads = max(1, int(threads))
         self._brute_stop = threading.Event()
         self._brute_guessing = None
@@ -1454,21 +1494,27 @@ class SharedMixin:
             len(creds), enabled=not self.use_json, indent=4, bar_indent=4,
         )
         progress.kickoff(self._smtp_brute_label(creds[0]))
-        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None}
+        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "limited": False, "note": None, "block": None}
         lock = threading.Lock()
 
+        def _promote_limit() -> None:
+            if state["limited"] and state["tested"]:
+                state["blocked"] = True
+
         def work(cred: Creds, output) -> str:
-            kind, note = self._smtp_brute_one(cred, output)
+            kind, note, block = self._smtp_brute_one(cred, output)
             with lock:
                 if kind == "ok":
                     found.add(cred)
                     state["saw_reply"] = True
                     state["tested"] = True
                     state["downs"] = 0
+                    _promote_limit()
                 elif kind == "fail":
                     state["saw_reply"] = True
                     state["tested"] = True
                     state["downs"] = 0
+                    _promote_limit()
                 elif kind == "unsupported":
                     state["saw_reply"] = True
                     state["note"] = state["note"] or note
@@ -1476,8 +1522,13 @@ class SharedMixin:
                 elif kind == "blocked":
                     state["blocked"] = True
                     state["saw_reply"] = True
+                    if block:
+                        state["block"] = state["block"] or block
                     self._brute_stop.set()
                 elif kind == "limited":
+                    state["limited"] = True
+                    if block:
+                        state["block"] = state["block"] or block
                     if state["tested"]:
                         state["blocked"] = True
                         state["saw_reply"] = True
@@ -1496,8 +1547,9 @@ class SharedMixin:
         finally:
             progress.finalize()
 
-        if state["blocked"]:
+        if state["blocked"] or (state["limited"] and state["tested"]):
             self._brute_guessing = "stopped"
+            self._brute_block_paren = state.get("block")
         elif state["tested"]:
             self._brute_guessing = "not_limited"
         else:
@@ -1518,9 +1570,10 @@ class SharedMixin:
             word = "login" if n == 1 else "logins"
             self._ptprint_raw(
                 f"Found {n} valid {word}",
-                bullet_type="INFO",
+                bullet_type="TITLE",
                 condition=not self.use_json,
                 indent=4,
+                colortext=False,
             )
         if guessing == "not_limited":
             self._ptprint_raw(
@@ -1530,8 +1583,10 @@ class SharedMixin:
                 indent=4,
             )
         elif guessing == "stopped":
+            paren = getattr(self, "_brute_block_paren", None)
+            msg = f"Attack was blocked ({paren})" if paren else "Attack was blocked"
             self._ptprint_raw(
-                "Password guessing was stopped",
+                msg,
                 bullet_type="NOTVULN",
                 condition=not self.use_json,
                 indent=4,

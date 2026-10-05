@@ -69,7 +69,7 @@ POP3_TESTS: dict[str, dict] = {
         "mods": [
             ["-u", "--user", "<name> …", "Username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "[password]", "Single password. No value or \"\" tests an empty password"],
+            ["-p", "--password", "[password] …", "Password(s), space or comma separated. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
@@ -109,6 +109,15 @@ POP3_TESTS: dict[str, dict] = {
 }
 
 
+def _option_rows(rows: list) -> list:
+    """Drop the empty short-flag column when a test has none."""
+    if not rows or not all(isinstance(row, list) and len(row) >= 4 for row in rows):
+        return rows
+    if any(row[0] for row in rows):
+        return rows
+    return [row[1:] for row in rows]
+
+
 def pop3_test_help(codes: list[str]):
     """Build a help object describing the given test codes."""
     if not codes:
@@ -125,11 +134,11 @@ def pop3_test_help(codes: list[str]):
         desc.extend(spec.get("long", []) or [])
         if spec.get("requires"):
             desc.append("Requires: " + "; ".join(spec["requires"]))
-        mods = list(spec.get("mods", []) or [])
+        mods = _option_rows(list(spec.get("mods", []) or []))
         has_opts = bool(mods or spec.get("requires"))
         usage = f"ptsrvtester pop3 -ts {code} " + ("<options> -tg <target>" if has_opts else "-tg <target>")
         blocks.append({"description": desc})
-        blocks.append({"usage": [usage]})
         if mods:
             blocks.append({"options": mods})
+        blocks.append({"usage": [usage]})
     return blocks

@@ -16,6 +16,8 @@ __MODULELABEL__ = "HELO/EHLO hostname validation"
 __MODULECODE__ = "HELOVAL"
 __ORDER__ = 50
 
+_NOT_TESTED = "Could not connect. HELO/EHLO validation was not tested."
+
 
 def test_helo_validation(e) -> HeloValidationResult:
     """
@@ -51,9 +53,14 @@ def test_helo_validation(e) -> HeloValidationResult:
     def _try_ehlo(hostname: str) -> tuple[int, str]:
         """Connect, send EHLO hostname, return (status, raw_reply). Close connection."""
         try:
-            smtp, status, reply = e.connect()
-            if status != 220:
-                return (status, e.bytes_to_str(reply))
+            smtp, status, reply = e.connect(fatal=False)
+        except Exception as ex:
+            if getattr(e.args, "debug", False) and not e.use_json:
+                e.ptdebug(f"Connect: {ex}", indent_override=4)
+            return (-1, "")
+        if status != 220:
+            return (status, e.bytes_to_str(reply))
+        try:
             status, reply = smtp.docmd("EHLO", hostname)
             raw = e.bytes_to_str(reply)
             e._smtp_vv_io(f"EHLO {hostname}", f"{status} {raw}" if raw else str(status))
@@ -64,7 +71,7 @@ def test_helo_validation(e) -> HeloValidationResult:
             return (status, raw)
         except Exception as ex:
             e._smtp_vv_io(f"EHLO {hostname}", str(ex))
-            return (-1, str(ex))
+            return (-1, "")
 
     def _store_ehlo(hostname: str, raw: str) -> None:
         """Store EHLO extensions keyed by hostname.lower() (RFC: domain names case-insensitive)."""
@@ -74,6 +81,17 @@ def test_helo_validation(e) -> HeloValidationResult:
     status, raw = _try_ehlo(BASELINE)
     if status in RATE_LIMIT_CODES:
         return _rate_limit_result(BASELINE, status)
+    if status < 0 and not accepted:
+        return HeloValidationResult(
+            vulnerable=False,
+            weak_config=False,
+            indeterminate=True,
+            ehlo_bypass=None,
+            accepted_vectors=[],
+            rejected_vectors=[],
+            ehlo_comparison=None,
+            detail=_NOT_TESTED,
+        )
     if status != 250:
         return HeloValidationResult(
             vulnerable=False,
@@ -183,6 +201,9 @@ def _stream_helo_validation_result(e) -> None:
         return
     hv = e.results.helo_validation
     if hv is None:
+        return
+    if hv.detail == _NOT_TESTED:
+        pp(_NOT_TESTED, bullet_type="WARNING", condition=show, indent=4)
         return
     if hv.indeterminate:
         pp(f"Indeterminate: {hv.detail or 'Baseline failed'}", bullet_type="WARNING", condition=show, indent=4)

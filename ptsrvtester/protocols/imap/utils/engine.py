@@ -35,8 +35,10 @@ from .helpers import (
     Target,
     brute_passwords,
     check_if_brute,
+    first_cli_password,
     get_mode,
     one_cli_user,
+    password_request_text,
     shown_password,
     simple_bruteforce,
     text_or_file,
@@ -5179,7 +5181,7 @@ class ImapEngine:
                 login_disabled_advertised=False,
                 auth_plain_advertised=False,
             )
-        pwd = getattr(self.args, "password", None) or _IMAP_USRENUM_DEFAULT_PASSWORD
+        pwd = first_cli_password(getattr(self.args, "password", None)) or _IMAP_USRENUM_DEFAULT_PASSWORD
         threads = self._imap_usrenum_threads()
 
         login_disabled_advertised = False
@@ -5236,7 +5238,7 @@ class ImapEngine:
                 login_disabled_advertised=False,
                 auth_plain_advertised=False,
             )
-        pwd = getattr(self.args, "password", None) or _IMAP_USRENUM_DEFAULT_PASSWORD
+        pwd = first_cli_password(getattr(self.args, "password", None)) or _IMAP_USRENUM_DEFAULT_PASSWORD
         threads = self._imap_usrenum_threads()
 
         auth_plain_advertised = False
@@ -5335,12 +5337,14 @@ class ImapEngine:
         re.I,
     )
 
-    def _imap_brute_line(self, output, msg: str, category: str = "ADDITIONS") -> None:
+    def _imap_brute_line(
+        self, output, msg: str, category: str = "ADDITIONS", *, colortext: bool = True, indent: int = 0,
+    ) -> None:
         if output is None or self.use_json:
             return
         if category == "ADDITIONS" and not getattr(self.args, "debug", False):
             return
-        line = out_if(msg, category, True, colortext=True, indent=0)
+        line = out_if(msg, category, True, colortext=colortext, indent=indent)
         if line:
             output.add_string_to_output(line.rstrip("\n"))
 
@@ -5399,16 +5403,39 @@ class ImapEngine:
             return "blocked"
         return "fail"
 
-    def _imap_brute_one(self, cred: Creds, output, method: str) -> tuple[str, str | None]:
+    def _imap_brute_block_paren(self, typ: str, raw: str) -> str | None:
+        """Short block reason, e.g. ``LIMIT rate limiting``."""
+        text = raw or ""
+        up = text.upper()
+        found = re.search(r"\[([A-Z][A-Z0-9-]*)\]", up)
+        code = found.group(1) if found else None
+        if code is None and (typ == "ABORT" or "* BYE" in up or up.startswith("BYE")):
+            code = "BYE"
+        low = text.lower()
+        if code == "LIMIT" or any(s in low for s in ("rate", "limit", "throttl", "exceed")):
+            reason = "rate limiting"
+        elif code in ("UNAVAILABLE", "CONTACTADMIN", "BYE") or self._IMAP_BRUTE_LOCK_RE.search(text):
+            reason = "lockout"
+        else:
+            reason = None
+        if code and reason:
+            return f"{code} {reason}"
+        if code:
+            return code
+        if reason:
+            return reason
+        return None
+
+    def _imap_brute_one(self, cred: Creds, output, method: str) -> tuple[str, str | None, str | None]:
         if self._brute_stop.is_set():
-            return "skip", None
+            return "skip", None, None
         shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
         cmd = "AUTHENTICATE PLAIN" if method == "PLAIN" else "LOGIN"
         try:
             imap = self.connect()
         except Exception as e:
             self._imap_brute_line(output, f"{shown!r}: connect failed {self._snip(str(e))}")
-            return "down", None
+            return "down", None, None
         try:
             if method == "PLAIN":
                 typ, raw, _ms = self._imap_usrenum_measure_plain(imap, cred.user, cred.passw)
@@ -5418,15 +5445,19 @@ class ImapEngine:
             cmd_show = f'{cmd} ""' if cred.passw == "" else cmd
             self._imap_brute_line(output, f"{shown!r}: {cmd_show} {self._imap_brute_reply(typ, raw)}")
             if kind == "ok":
+                self._imap_brute_line(output, f"user: {cred.user}", "VULN", colortext=False)
                 self._imap_brute_line(
                     output,
-                    f"user: {cred.user}, password: {shown_password(cred.passw)}",
-                    "VULN",
+                    f"password: {shown_password(cred.passw)}",
+                    "TEXT",
+                    colortext=False,
+                    indent=4,
                 )
             note = None
             if kind == "unsupported":
                 note = "LOGIN is disabled. Password guessing was not tested."
-            return kind, note
+            block = self._imap_brute_block_paren(typ, raw) if kind == "blocked" else None
+            return kind, note, block
         finally:
             try:
                 imap.logout()
@@ -5472,11 +5503,11 @@ class ImapEngine:
             len(creds), enabled=not self.use_json, indent=4, bar_indent=4,
         )
         progress.kickoff(self._imap_brute_label(creds[0]))
-        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None}
+        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None, "block": None}
         lock = threading.Lock()
 
         def work(cred: Creds, output) -> str:
-            kind, note = self._imap_brute_one(cred, output, method)
+            kind, note, block = self._imap_brute_one(cred, output, method)
             with lock:
                 if kind == "ok":
                     found.add(cred)
@@ -5494,6 +5525,8 @@ class ImapEngine:
                 elif kind == "blocked":
                     state["blocked"] = True
                     state["saw_reply"] = True
+                    if block:
+                        state["block"] = state["block"] or block
                     self._brute_stop.set()
                 elif kind == "down":
                     state["downs"] += 1
@@ -5509,6 +5542,7 @@ class ImapEngine:
 
         if state["blocked"]:
             self._brute_guessing = "stopped"
+            self._brute_block_paren = state.get("block")
         elif state["tested"]:
             self._brute_guessing = "not_limited"
         else:
@@ -6558,9 +6592,10 @@ class ImapEngine:
                 word = "login" if n == 1 else "logins"
                 self._ptprint_raw(
                     f"Found {n} valid {word}",
-                    bullet_type="INFO",
+                    bullet_type="TITLE",
                     condition=not self.use_json,
                     indent=4,
+                    colortext=False,
                 )
             if guessing == "not_limited":
                 self._ptprint_raw(
@@ -6570,8 +6605,10 @@ class ImapEngine:
                     indent=4,
                 )
             elif guessing == "stopped":
+                paren = getattr(self, "_brute_block_paren", None)
+                msg = f"Attack was blocked ({paren})" if paren else "Attack was blocked"
                 self._ptprint_raw(
-                    "Password guessing was stopped",
+                    msg,
                     bullet_type="NOTVULN",
                     condition=not self.use_json,
                     indent=4,
@@ -7325,7 +7362,7 @@ class ImapEngine:
             else:
                 user_str = f"usernames: {self.args.users}"
             if self.args.password is not None:
-                passw_str = f"password: {shown_password(self.args.password)}"
+                passw_str = password_request_text(self.args.password)
             else:
                 passw_str = f"passwords: {self.args.passwords}"
             deferred_vulns.append(

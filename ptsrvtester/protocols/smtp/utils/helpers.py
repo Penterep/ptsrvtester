@@ -168,10 +168,10 @@ def add_bruteforce_args(
     brutepass.add_argument(
         "-p",
         "--password",
-        nargs="?",
-        const="",
+        nargs="*",
         default=None,
-        help='password; no value or "" tests an empty password',
+        metavar="password",
+        help='password(s), separated by space or comma; no value or "" tests an empty password',
     )
     brutepass.add_argument("-P", "--passwords", type=str, help="file containing passwords")
 
@@ -184,7 +184,7 @@ def add_bruteforce_args(
     bruteforce.add_argument(
         "--brute-threads",
         type=int,
-        default=10,
+        default=None,
         nargs="?",
         dest="threads",
         help="number of threads for bruteforce (default: 10)",
@@ -398,10 +398,11 @@ def text_or_file(text: str | list[str] | None, filepath: str | None) -> list[str
     """
     result = []
     if text is not None:
-        if isinstance(text, list):
-            result = [str(t).strip() for t in text if t is not None and str(t).strip()]
-        else:
-            result = [text]
+        items = text if isinstance(text, list) else [text]
+        for item in items:
+            if item is None:
+                continue
+            result.extend(str(item).split(","))
     elif filepath is not None:
         _encodings = ("utf-8", "cp1250", "iso-8859-2", "cp1252", "latin-1")
         try:
@@ -430,16 +431,56 @@ def text_or_file(text: str | list[str] | None, filepath: str | None) -> list[str
     return cleaned
 
 
-def brute_passwords(password: str | None, passwords_file: str | None) -> list[str]:
-    """Passwords for BRUTE. An explicit -p keeps an empty string."""
-    if password is not None:
-        return [password]
-    return text_or_file(None, passwords_file)
+def brute_passwords(password: str | list[str] | None, passwords_file: str | None) -> list[str]:
+    """Passwords for BRUTE. Space or comma on -p; a bare -p or \"\" is one empty password."""
+    if password is None:
+        return text_or_file(None, passwords_file)
+    if isinstance(password, list) and len(password) == 0:
+        return [""]
+    items = password if isinstance(password, list) else [password]
+    out: list[str] = []
+    saw = False
+    for item in items:
+        if item is None:
+            continue
+        saw = True
+        text = str(item)
+        if text == "":
+            out.append("")
+            continue
+        parts = [part.strip() for part in text.split(",")]
+        nonempty = [part for part in parts if part]
+        if nonempty:
+            out.extend(nonempty)
+        else:
+            out.append("")
+    if not saw:
+        return [""]
+    return out
 
 
 def shown_password(password: str) -> str:
     """Visible form of a password. An empty password is a quoted empty string."""
     return '""' if password == "" else password
+
+
+def first_cli_password(password: str | list[str] | None) -> str | None:
+    """First non-empty -p value. None when -p was omitted or only an empty password was given."""
+    if password is None:
+        return None
+    for item in brute_passwords(password, None):
+        if item:
+            return item
+    return None
+
+
+def password_request_text(password: str | list[str] | None) -> str:
+    """Vuln-request label for one or more -p passwords."""
+    values = brute_passwords(password, None)
+    if len(values) <= 1:
+        shown = shown_password(values[0]) if values else '""'
+        return f"password: {shown}"
+    return "passwords: " + ", ".join(shown_password(item) for item in values)
 
 
 def filepaths(directory: str, ext: str) -> list[str]:

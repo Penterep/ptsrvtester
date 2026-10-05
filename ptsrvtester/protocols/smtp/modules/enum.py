@@ -337,7 +337,7 @@ def _enum_vv_dbg(e, msg: str) -> None:
 
 def _enum_streaming_emit_first_finding(e, _idx: int, _total: int, display: str) -> None:
     """Print first EXPN/VRFY hit on its own line (no time/%); progress line stays separate."""
-    if e.use_json or getattr(e.args, 'enum_threads', 1) > 1:
+    if e.use_json or int(getattr(e.args, 'enum_threads', None) or 1) > 1:
         return
     e._raw_write(f'\x1b[2K\r    {display}\n'.encode('utf-8', errors='replace'))
     e._enum_progress_line_dirty = False
@@ -359,7 +359,7 @@ def _print_enum_finding(e, _idx: int, _total: int, payload: str, *, replace_prog
 
 
 def expn_vrfy_enumeration(e, method, smtp) -> list[str]:
-    enum_threads = getattr(e.args, 'enum_threads', 1)
+    enum_threads = int(getattr(e.args, 'enum_threads', None) or 1)
     ehlo = e.results.info and e.results.info.ehlo or ''
     supports_smtputf8 = 'SMTPUTF8' in ehlo.upper()
     if getattr(e, '_wordlist_skipped', 0) > 0:
@@ -793,7 +793,7 @@ def test_catchall(e, smtp: smtplib.SMTP) -> CatchAllResult:
 
 
 def rcpt_enumeration(e, smtp) -> list[str]:
-    enum_threads = getattr(e.args, 'enum_threads', 1)
+    enum_threads = int(getattr(e.args, 'enum_threads', None) or 1)
     ehlo = e.results.info and e.results.info.ehlo or ''
     supports_smtputf8 = 'SMTPUTF8' in ehlo.upper()
     domain = e._get_rcpt_limit_domain()

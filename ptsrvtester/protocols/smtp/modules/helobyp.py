@@ -16,6 +16,8 @@ __MODULELABEL__ = "HELO/EHLO Bypass Test"
 __MODULECODE__ = "HELOBYP"
 __ORDER__ = 52
 
+_NOT_TESTED = "Could not connect. HELO/EHLO bypass was not tested."
+
 
 def test_helo_bypass(e) -> HeloBypassResult:
     """
@@ -159,17 +161,32 @@ def test_helo_bypass(e) -> HeloBypassResult:
                     )
                 continue
         except (socket.timeout, ConnectionRefusedError, OSError) as ex:
+            if not ehlo_comparison:
+                if getattr(e.args, "debug", False) and not e.use_json:
+                    e.ptdebug(f"Connect: {ex}", indent_override=4)
+                return HeloBypassResult(
+                    vulnerable=False,
+                    indeterminate=True,
+                    submission_bypass_ehlo=(),
+                    relay_bypass_ehlo=(),
+                    accepts_invalid_format=tuple(accepts_invalid),
+                    ehlo_consistent=True,
+                    ehlo_comparison=ehlo_comparison,
+                    tarpitting_detected=tuple(tarpitting_list),
+                    rcpt_latencies=rcpt_latencies,
+                    detail=_NOT_TESTED,
+                )
             return HeloBypassResult(
                 vulnerable=False,
                 indeterminate=True,
-                submission_bypass_ehlo=(),
-                relay_bypass_ehlo=(),
+                submission_bypass_ehlo=tuple(submission_bypass),
+                relay_bypass_ehlo=tuple(relay_bypass),
                 accepts_invalid_format=tuple(accepts_invalid),
-                ehlo_consistent=True,
+                ehlo_consistent=len(set(frozenset(row.get("extensions", [])) for row in ehlo_comparison.values())) <= 1,
                 ehlo_comparison=ehlo_comparison,
                 tarpitting_detected=tuple(tarpitting_list),
                 rcpt_latencies=rcpt_latencies,
-                detail=str(ex),
+                detail="Reconnect failed",
             )
 
         try:
@@ -266,6 +283,9 @@ def _stream_helo_bypass_result(e) -> None:
         return
     hb = e.results.helo_bypass
     if hb is None:
+        return
+    if hb.detail == _NOT_TESTED:
+        pp(_NOT_TESTED, bullet_type="WARNING", condition=show, indent=4)
         return
     if hb.accepts_invalid_format:
         pp(f"Info: Accepts loose EHLO formats: {', '.join(hb.accepts_invalid_format)}",

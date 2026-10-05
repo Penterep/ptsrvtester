@@ -1121,6 +1121,19 @@ class ReportingMixin:
                     "verificationInstructions": bc.verification_instructions,
                     "smtpTrace": list(bc.smtp_trace),
                     "testId": bc.test_id or None,
+                    "probes": [
+                        {
+                            "role": p.role,
+                            "testId": p.test_id,
+                            "messageAccepted": p.message_accepted,
+                            "smtpStatus": p.smtp_status,
+                            "recipientsTo": list(p.recipients_to),
+                            "recipientsCc": list(p.recipients_cc),
+                            "recipientsBcc": list(p.recipients_bcc),
+                            "detail": p.detail,
+                        }
+                        for p in bc.probes
+                    ],
                 }
             elif (bc_err := self.results.bcc_test_error) is not None:
                 props["bccTestError"] = bc_err
@@ -1781,8 +1794,8 @@ class ReportingMixin:
                 global_vulns.append(
                     {
                         "vuln_code": VULNS.Flood.value,
-                        "vuln_request": f"Queue flood ({fr.queue_attempts} attempts, {fr.messages_accepted} delivered) + SIZE test",
-                        "vuln_response": fr.detail or "Server accepts excessive messages or SIZE not enforced",
+                        "vuln_request": "MAIL FROM SIZE= (1 TB down to 1 MB)",
+                        "vuln_response": fr.detail or "No size limit at MAIL",
                     }
                 )
 
@@ -1870,6 +1883,19 @@ class ReportingMixin:
                     "verificationInstructions": bc.verification_instructions,
                     "smtpTrace": list(bc.smtp_trace),
                     "testId": bc.test_id or None,
+                    "probes": [
+                        {
+                            "role": p.role,
+                            "testId": p.test_id,
+                            "messageAccepted": p.message_accepted,
+                            "smtpStatus": p.smtp_status,
+                            "recipientsTo": list(p.recipients_to),
+                            "recipientsCc": list(p.recipients_cc),
+                            "recipientsBcc": list(p.recipients_bcc),
+                            "detail": p.detail,
+                        }
+                        for p in bc.probes
+                    ],
                 }
             })
 
@@ -1997,7 +2023,7 @@ class ReportingMixin:
                     user_str = f"usernames: {self.args.users}"
 
                 if self.args.password is not None:
-                    passw_str = f"password: {shown_password(self.args.password)}"
+                    passw_str = password_request_text(self.args.password)
                 else:
                     passw_str = f"passwords: {self.args.passwords}"
 

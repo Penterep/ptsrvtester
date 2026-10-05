@@ -1,5 +1,5 @@
 """SPOOF — From / Reply-To / Return-Path spoofing."""
-import ipaddress, random, smtplib, socket, ssl, time
+import ipaddress, random, re, smtplib, socket, ssl, time
 from email.mime.text import MIMEText
 
 from ..utils.helpers import *
@@ -36,7 +36,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
     use_tls = e.args.tls or port == 465
     use_starttls = e.args.starttls and (not use_tls)
     auth_user = getattr(e.args, 'user', None) or ''
-    auth_pass = getattr(e.args, 'password', None) or ''
+    auth_pass = first_cli_password(getattr(e.args, 'password', None)) or ''
     do_auth = bool(auth_user and auth_pass)
     start_time = time.perf_counter()
     var_results: list[SpoofHeaderVariantResult] = []
@@ -191,11 +191,21 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
     elif not indeterminate:
         detail_parts.append('All variants rejected – server blocks spoofed headers.')
     if indeterminate:
-        if any_error and any_data_rejected:
+        if var_results and all((_spoof_is_421(v) for v in var_results)):
+            detail_parts.append('421 rate limiting')
+        elif any_error and any_data_rejected:
             detail_parts.append('Test incomplete: some variants failed before DATA; spoofing was not confirmed for every variant.')
         else:
             detail_parts.append('Could not complete – connection, timeout, or recipient rejected before DATA.')
     return SpoofHeaderResult(vulnerable=any_accepted, indeterminate=indeterminate, variants=tuple(var_results), elapsed_sec=elapsed, detail=' '.join(detail_parts) if detail_parts else None, vulnerable_note=VULNERABLE_NOTE if any_accepted else None)
+
+
+def _spoof_is_421(v: SpoofHeaderVariantResult) -> bool:
+    """True when this variant stopped on SMTP 421 (connection rate limit)."""
+    if v.smtp_status == 421:
+        return True
+    blob = f'{v.detail or ''} {v.smtp_reply or ''}'
+    return re.search(r'(?<!\d)421(?!\d)', blob) is not None
 
 
 def _sh_variant_section_title(e, variant: str) -> str:
@@ -223,7 +233,8 @@ def _sh_stream_variant_section(e, v: SpoofHeaderVariantResult, rcpt: str, *, str
     elif v.error:
         one_line = e._smtp_detail_one_line(v.detail) or v.detail or 'error'
         pp(f'Test failed — {one_line}', bullet_type='WARNING', condition=True, indent=8)
-        pp('Indeterminate', bullet_type='WARNING', condition=True, indent=8)
+        verdict = '421 rate limiting' if _spoof_is_421(v) else 'Indeterminate'
+        pp(verdict, bullet_type='WARNING', condition=True, indent=8)
 
 
 def _stream_spoof_header_result(e) -> None:

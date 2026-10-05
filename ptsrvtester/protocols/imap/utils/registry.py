@@ -125,7 +125,7 @@ IMAP_TESTS: dict[str, dict] = {
         "mods": [
             ["-u", "--user", "<name> …", "Username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "[password]", "Single password. No value or \"\" tests an empty password"],
+            ["-p", "--password", "[password] …", "Password(s), space or comma separated. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
@@ -169,14 +169,14 @@ IMAP_TESTS: dict[str, dict] = {
         "long": [
             "APPEND zip bombs as mail attachments. Without --variant-* flags,",
             "sends the small and medium payloads. --variant-huge unpacks to",
-            "about 1 TiB in a single extract.",
+            "about 1 TB in a single extract.",
             "Watch disk, memory and IMAP responsiveness.",
         ],
         "requires": ["-u/--user and -p/--password (no wordlists)"],
         "mods": [
             ["", "--variant-small", "", "Small zip bomb (sent by default)"],
             ["", "--variant-medium", "", "Medium zip bomb, ~100 MB unpacked (sent by default)"],
-            ["", "--variant-huge", "", "Huge zip bomb, ~1 TiB unpacked (not default; extreme DoS)"],
+            ["", "--variant-huge", "", "Huge zip bomb, ~1 TB unpacked (not default; extreme DoS)"],
             ["", "--timeout", "<sec>", "Per-message timeout (default: 30)"],
         ],
     },
@@ -272,6 +272,23 @@ _IMAP_FOLDER_TESTS = frozenset({
 _IMAP_CONTENT_FOLDER_TESTS = frozenset({
     "EICAR", "XXESSRF", "XXEEXP", "ZIPBOMB",
 })
+# Single -u/-p, no wordlists. Listed in Options, not only in Requires.
+_IMAP_SINGLE_LOGIN_TESTS = frozenset({
+    "SNIFF", "EICAR", "XXESSRF", "XXEEXP", "ZIPBOMB", "RESLOAD", "MBOXISO",
+})
+_IMAP_CONTENT_LOGIN_OPTS = (
+    ["-u", "--user", "<name>", "Username (required)"],
+    ["-p", "--password", "<pass>", "Password (required)"],
+)
+
+
+def _option_rows(rows: list) -> list:
+    """Drop the empty short-flag column when a test has none."""
+    if not rows or not all(isinstance(row, list) and len(row) >= 4 for row in rows):
+        return rows
+    if any(row[0] for row in rows):
+        return rows
+    return [row[1:] for row in rows]
 
 
 def imap_test_help(codes: list[str]):
@@ -295,10 +312,15 @@ def imap_test_help(codes: list[str]):
         ):
             opt = _IMAP_FOLDER_APPEND_OPT if code in _IMAP_CONTENT_FOLDER_TESTS else _IMAP_FOLDER_OPT
             mods.insert(0, list(opt))
+        if code in _IMAP_SINGLE_LOGIN_TESTS:
+            for row in _IMAP_CONTENT_LOGIN_OPTS:
+                if not any(len(existing) > 1 and existing[1] == row[1] for existing in mods):
+                    mods.append(list(row))
+        mods = _option_rows(mods)
         has_opts = bool(mods or spec.get("requires"))
         usage = f"ptsrvtester imap -ts {code} " + ("<options> -tg <target>" if has_opts else "-tg <target>")
         blocks.append({"description": desc})
-        blocks.append({"usage": [usage]})
         if mods:
             blocks.append({"options": mods})
+        blocks.append({"usage": [usage]})
     return blocks

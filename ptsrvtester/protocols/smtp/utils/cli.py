@@ -67,7 +67,7 @@ class SMTPArgs(ArgsWithBruteforce):
     def get_help():
         # Test selection table (-ts): one code + one-line description per test.
         options: list[list[str]] = [
-            ["-ts", "--tests", "<test>", "One or more tests, comma-separated (e.g. BANNER,AV); ALL runs everything:"],
+            ["-ts", "--tests", "<test>", "Comma-separated codes, or ALL. No -ts and ALL: basic suite; -r --send adds delivery tests; -u -p adds the rest"],
         ]
         for group_title, codes in SMTP_TEST_GROUPS:
             options.append(["", "", "", ""])
@@ -94,14 +94,14 @@ class SMTPArgs(ArgsWithBruteforce):
             ["", "--data", "<text>", f"Message body (default: {DEFAULT_SMTP_DATA!r})"],
             ["", "", "", ""],
             [get_colored_text("Credentials", "TITLE")],
-            ["-u", "--user", "<name> …", "Username(s) for BRUTE, ENUM and RCPTLIM"],
+            ["-u", "--user", "<name> …", "Username(s), space or comma separated, for BRUTE, ENUM and RCPTLIM; optional AUTH when sending"],
             ["-U", "--users", "<wordlist>", "Username wordlist for BRUTE, ENUM and RCPTLIM"],
-            ["-p", "--password", "[password]", "Password for BRUTE (no value tests an empty password); RCPTLIM on submission"],
+            ["-p", "--password", "[password] …", "Password(s), space or comma separated, for BRUTE (no value or \"\" tests an empty password); RCPTLIM and optional AUTH when sending"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "", "", ""],
             [get_colored_text("Targeting & misc", "TITLE")],
-            ["-t", "--threads", "<n>", "Threads for enumeration (default: 1)"],
-            ["-d", "--domain", "<domain>", "Mail domain (ENUM, RCPTLIM, PROBEDOM, IDENTIFY; default: banner/EHLO)"],
+            ["-t", "--threads", "<n>", "Threads for ENUM (default: 1) and BRUTE (default: 10)"],
+            ["-d", "--domain", "<domain>", "Mail domain (ENUM, RCPTLIM, DOMAIN, IDENTIFY; default: banner/EHLO)"],
             ["-R", "--role", "<mta|submission>", "Expected server role"],
             *rate_limit_help_rows(get_colored_text),
             ["", "", "", ""],
@@ -117,7 +117,9 @@ class SMTPArgs(ArgsWithBruteforce):
             {"usage": ["ptsrvtester smtp -ts <test>[,<test>...] <options> -tg <target>"]},
             {"usage_example": [
                 "ptsrvtester smtp -ts BANNER,EHLO -tg mail.example.com:25",
-                "ptsrvtester smtp -ts ALL -tg mail.example.com:25",
+                "ptsrvtester smtp -tg mail.example.com:25",
+                "ptsrvtester smtp -r user@mail.example.com --send -tg mail.example.com:25",
+                "ptsrvtester smtp -r user@mail.example.com --send -u user -p pass -tg mail.example.com:25",
                 "ptsrvtester smtp -ts OPENREL -tg mail.example.com:25",
                 "ptsrvtester smtp -ts BOUNCE -m attacker@example.com -r foo@foo.com -tg smtp.example.com:25",
                 "ptsrvtester smtp -ts BOMB -r victim@example.com -tg smtp.example.com:587",
@@ -140,7 +142,9 @@ class SMTPArgs(ArgsWithBruteforce):
         examples = """example usage:
   ptsrvtester smtp -h
   ptsrvtester smtp -ts BANNER,EHLO -tg mail.example.com:25
-  ptsrvtester smtp -ts ALL -tg mail.example.com:25
+  ptsrvtester smtp -tg mail.example.com:25
+  ptsrvtester smtp -r user@mail.example.com --send -tg mail.example.com:25
+  ptsrvtester smtp -r user@mail.example.com --send -u user -p pass -tg mail.example.com:25
   ptsrvtester smtp -ts ENUM -e ALL -U wordlist.txt -tg mail.example.com:25
   ptsrvtester smtp -ts BOUNCE -m attacker@example.com -r foo@foo.com -tg smtp.example.com:25
   ptsrvtester smtp -ts BOMB -r victim@example.com -tg smtp.example.com:587
@@ -215,7 +219,7 @@ class SMTPArgs(ArgsWithBruteforce):
             metavar="emails",
             dest="cc",
             default=None,
-            help="Cc recipients, comma-separated; used by BOMB, AV, SSRF; required for BCC (no validation)",
+            help="Cc header addresses, comma-separated; used by BOMB, AV, SSRF; optional for BCC",
         )
         direct.add_argument(
             "--subject",
@@ -232,7 +236,7 @@ class SMTPArgs(ArgsWithBruteforce):
             default=False,
             help=(
                 "Actually deliver the test message(s) via DATA. Required for delivery tests "
-                "(BCC, SPOOF, BOUNCE, BOMB, FLOOD, AV, SSRF, ZIPXXE, ALIAS); also enables the "
+                "(BCC, SPOOF, BOUNCE, BOMB, AV, SSRF, ZIPXXE, ALIAS); also enables the "
                 "optional DATA step for RCPTLIM and RCPTDUP. Without it these tests are refused "
                 "or run without sending."
             ),
@@ -268,7 +272,7 @@ class SMTPArgs(ArgsWithBruteforce):
             metavar="<emails>",
             dest="bcc_test",
             default=None,
-            help="Bcc recipients, comma-separated (used by -ts BCC)",
+            help="Bcc header addresses, comma-separated (optional for -ts BCC; not used as RCPT TO)",
         )
         direct.add_argument(
             "--bcc-timeout",
@@ -298,10 +302,10 @@ class SMTPArgs(ArgsWithBruteforce):
             "-t",
             "--threads",
             type=int,
-            default=1,
+            default=None,
             metavar="threads",
             dest="enum_threads",
-            help="Threads for enumeration (default: 1)",
+            help="Threads for enumeration (default: 1); BRUTE (default: 10)",
         )
         direct.add_argument(
             "--enum-reconnect-after",
@@ -437,8 +441,8 @@ class SMTPArgs(ArgsWithBruteforce):
         add_bruteforce_args(parser, user_nargs="+", mutually_exclusive_user_and_users=False)
 
         stress = parser.add_argument_group(
-            "BOMB / ANTIVIRUS / SSRF / FLOOD / ZIPXXE",
-            "Stress and content tests; combine flags (order: BOMB → ANTIVIRUS → SSRF → FLOOD → ZIPXXE).",
+            "BOMB / ANTIVIRUS / SSRF / ZIPXXE",
+            "Stress and content tests; combine flags (order: BOMB → ANTIVIRUS → SSRF → ZIPXXE).",
         )
         stress.add_argument(
             "--bomb-count",
@@ -537,28 +541,6 @@ class SMTPArgs(ArgsWithBruteforce):
             help="Timeout per message for SSRF test (default: 30)",
         )
         stress.add_argument(
-            "--flood-count",
-            type=int,
-            default=150,
-            metavar="n",
-            dest="flood_count",
-            help="Messages for queue stress (default: 150, max 500). Stops on 421 (panic).",
-        )
-        stress.add_argument(
-            "--flood-timeout",
-            type=float,
-            default=90.0,
-            metavar="sec",
-            dest="flood_timeout",
-            help="Max time for queue stress in seconds (default: 90)",
-        )
-        stress.add_argument(
-            "--flood-skip-size-test",
-            action="store_true",
-            dest="flood_skip_size_test",
-            help="Skip MAIL FROM SIZE=oversized test (SIZE_ENFORCEMENT phase)",
-        )
-        stress.add_argument(
             "--zipxxe-canary-url",
             type=str,
             metavar="URL",
@@ -575,16 +557,22 @@ class SMTPArgs(ArgsWithBruteforce):
             help="ZIPXXE variants: billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx,xxe_body (default: all). Use --zipxxe-canary-url for xxe_*.",
         )
         stress.add_argument(
-            "--zipxxe-zip-bomb",
+            "--zipxxe-zip-bomb-small",
             action="store_true",
-            dest="zipxxe_zip_bomb",
-            help="Include zip_bomb variant (minimal ~200KB; DoS risk!)",
+            dest="zipxxe_zip_bomb_small",
+            help="Include zip_bomb (minimal ~200KB; DoS risk!)",
         )
         stress.add_argument(
-            "--zipxxe-zip-bomb-full",
+            "--zipxxe-zip-bomb-medium",
             action="store_true",
-            dest="zipxxe_zip_bomb_full",
-            help="Include zip_bomb_full variant (~100KB→~100MB expansion; extreme DoS risk!)",
+            dest="zipxxe_zip_bomb_medium",
+            help="Include zip_bomb_full (~100KB→~100MB; extreme DoS risk!)",
+        )
+        stress.add_argument(
+            "--zipxxe-zip-bomb-large",
+            action="store_true",
+            dest="zipxxe_zip_bomb_large",
+            help="Huge zip bomb, ~1 TB unpacked (not default; extreme DoS)",
         )
         stress.add_argument(
             "--zipxxe-timeout",

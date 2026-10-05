@@ -178,14 +178,37 @@ def test_bomb(e) -> BombResult:
         headers.extend([f'Subject: {subject}', f'{EMAIL_HDR_TEST_ID}: {msg_test_id}', 'Date: ' + time.strftime('%a, %d %b %Y %H:%M:%S +0000', time.gmtime())])
         msg = '\r\n'.join(headers) + '\r\n\r\n' + body + '\r\n'
         recipients = [rcpt] + cc_list
+        def _by_code(status: int, text: str) -> tuple[str, int | str | None, str] | None:
+            """4xx is rate limiting, 5xx is a block. 250/251 means carry on."""
+            if status in (250, 251, 220, 354):
+                return None
+            if status == 500:
+                return ('fatal_500', 500, '')
+            if 400 <= status < 500:
+                return ('rate_limited', status, text)
+            if status >= 500:
+                return ('blocked', status, text)
+            return ('not_tested', text, 'before_data')
+
         smtp, conn_err = _connect_bomb()
         if smtp is None:
-            err_type, err_msg = _classify_connection_error(Exception(conn_err or 'Connection failed'))
+            code_text = conn_err or 'Connection failed'
+            digits = ''
+            for part in code_text.replace(':', ' ').split():
+                if part.isdigit() and len(part) == 3:
+                    digits = part
+                    break
+            if digits:
+                coded = _by_code(int(digits), code_text)
+                if coded is not None and coded[0] in ('rate_limited', 'blocked', 'fatal_500'):
+                    return coded
+            err_type, err_msg = _classify_connection_error(Exception(code_text))
             return ('connection_lost', err_msg, err_type)
         try:
-            ehlo_s, _ = smtp.docmd('EHLO', e.fqdn or 'bomb-test.local')
-            if ehlo_s == 500:
-                return ('fatal_500', 500, '')
+            ehlo_s, ehlo_reply = smtp.docmd('EHLO', e.fqdn or 'bomb-test.local')
+            coded = _by_code(ehlo_s, e._smtp_trace_reply(ehlo_s, ehlo_reply))
+            if coded is not None:
+                return coded
             used_auth, auth_err = e._mail_test_auth_login(smtp, smtp_trace)
             if auth_err:
                 return ('not_tested', auth_err, 'auth_failed')
@@ -193,21 +216,18 @@ def test_bomb(e) -> BombResult:
                 with lock:
                     auth_used_ref[0] = True
             mail_s, mail_reply = smtp.docmd('MAIL', f'FROM:<{mail_from}>')
-            if mail_s == 500:
-                return ('fatal_500', 500, '')
-            if mail_s not in (250, 251):
-                return ('not_tested', e._smtp_trace_reply(mail_s, mail_reply), 'before_data')
+            coded = _by_code(mail_s, e._smtp_trace_reply(mail_s, mail_reply))
+            if coded is not None:
+                return coded
             status, reply = smtp.docmd('RCPT', f'TO:<{rcpt}>')
-            if status == 500:
-                return ('fatal_500', 500, '')
-            if status not in (250, 251):
-                return ('not_tested', e._smtp_trace_reply(status, reply), 'before_data')
+            coded = _by_code(status, e._smtp_trace_reply(status, reply))
+            if coded is not None:
+                return coded
             for c in cc_list:
                 s, cc_reply = smtp.docmd('RCPT', f'TO:<{c}>')
-                if s == 500:
-                    return ('fatal_500', 500, '')
-                if s not in (250, 251):
-                    return ('not_tested', e._smtp_trace_reply(s, cc_reply), 'before_data')
+                coded = _by_code(s, e._smtp_trace_reply(s, cc_reply))
+                if coded is not None:
+                    return coded
             data_status, data_reply = smtp.data(msg)
             if data_status == 500:
                 return ('fatal_500', 500, '')

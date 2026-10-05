@@ -2,7 +2,7 @@
 import sys
 
 from ..utils.connection import login_bruteforce, test_catch_all
-from ..utils.helpers import check_if_brute, shown_password, text_or_file
+from ..utils.helpers import check_if_brute, password_request_text, shown_password, text_or_file
 from ..utils.results import VULNS
 
 __MODULELABEL__ = ""
@@ -52,7 +52,7 @@ def run(ctx):
     if creds:
         n = len(creds)
         word = "login" if n == 1 else "logins"
-        ctx.out(f"Found {n} valid {word}", "INFO", colortext=True, indent=4)
+        ctx.out(f"Found {n} valid {word}", "TITLE", colortext=False, indent=4)
         if ctx.json:
             for cred in creds:
                 ctx.out(f"user: {cred.user}, password: {shown_password(cred.passw)}", "TEXT", indent=4)
@@ -63,7 +63,7 @@ def run(ctx):
             else f"usernames: {ctx.args.users}"
         )
         pass_str = (
-            f"password: {shown_password(ctx.args.password)}"
+            password_request_text(ctx.args.password)
             if ctx.args.password is not None
             else f"passwords: {ctx.args.passwords}"
         )
@@ -94,7 +94,9 @@ def _pop3_guessing_line(ctx, guessing: str | None) -> None:
     if guessing == "not_limited":
         ctx.out("No protection against password guessing", "VULN", indent=4)
     elif guessing == "stopped":
-        ctx.out("Password guessing was stopped", "NOTVULN", indent=4)
+        paren = getattr(ctx, "_brute_block_paren", None)
+        msg = f"Attack was blocked ({paren})" if paren else "Attack was blocked"
+        ctx.out(msg, "NOTVULN", indent=4)
     elif guessing == "not_tested":
         ctx.out(
             getattr(ctx, "_brute_guessing_detail", None)

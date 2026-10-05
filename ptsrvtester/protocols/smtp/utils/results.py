@@ -146,6 +146,7 @@ ZIPXXE_VARIANT_TITLES: dict[str, str] = {
     "xxe_body": "XXE in body test",
     "zip_bomb": "Zip bomb test",
     "zip_bomb_full": "Zip bomb full test",
+    "zip_bomb_huge": "Zip bomb huge",
 }
 
 ZIPXXE_VARIANT_PAYLOAD_LABELS: dict[str, str] = {
@@ -156,6 +157,7 @@ ZIPXXE_VARIANT_PAYLOAD_LABELS: dict[str, str] = {
     "xxe_body": "body (XML)",
     "zip_bomb": "zipbomb.zip",
     "zip_bomb_full": "zipbomb_full.zip",
+    "zip_bomb_huge": "zipbomb-huge.zip",
 }
 
 
@@ -563,6 +565,8 @@ class AcceptedDomainProbeResult(NamedTuple):
     candidates_tested: tuple[str, ...] = ()
     universal_accept_detected: bool = False
     likely_placeholder_domain: bool = False
+    unknown_user: str | None = None
+    postmaster: str | None = None
 
 
 class EnumResult(NamedTuple):
@@ -1044,6 +1048,20 @@ class SpoofHeaderResult(NamedTuple):
     vulnerable_note: str | None  # Blue Team: SPF/DMARC impact disclaimer
 
 
+class BccProbeResult(NamedTuple):
+    """One BCC message. Envelope RCPT TO is only the checked mailbox."""
+    role: str
+    test_id: str
+    message_accepted: bool
+    smtp_status: int | None
+    smtp_reply: str | None
+    recipients_to: tuple[str, ...]
+    recipients_cc: tuple[str, ...]
+    recipients_bcc: tuple[str, ...]
+    detail: str | None
+    smtp_trace: tuple[str, ...]
+
+
 class BccTestResult(NamedTuple):
     """Result of Bcc header test – manual verification required."""
     message_accepted: bool
@@ -1057,6 +1075,7 @@ class BccTestResult(NamedTuple):
     verification_instructions: str
     smtp_trace: tuple[str, ...]
     test_id: str = ""
+    probes: tuple[BccProbeResult, ...] = ()
 
 
 class AliasVariantResult(NamedTuple):

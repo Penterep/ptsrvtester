@@ -38,8 +38,10 @@ from .helpers import (
     Target,
     brute_passwords,
     check_if_brute,
+    first_cli_password,
     get_mode,
     one_cli_user,
+    password_request_text,
     shown_password,
     simple_bruteforce,
     text_or_file,
@@ -216,10 +218,12 @@ class FtpEngine:
     def _ftp_is_single_known_login(self) -> bool:
         """True when CLI supplies one username and one password (no -U/-P wordlists)."""
         u = one_cli_user(getattr(self.args, "user", None))
-        p = getattr(self.args, "password", None)
+        raw_pw = getattr(self.args, "password", None)
+        p = first_cli_password(raw_pw)
         uf = getattr(self.args, "users", None)
         pf = getattr(self.args, "passwords", None)
-        return bool(u and p and not uf and not pf)
+        one_password = raw_pw is not None and len(brute_passwords(raw_pw, None)) == 1
+        return bool(u and p and one_password and not uf and not pf)
 
     def _get_path_enum_creds(self) -> Creds | None:
         """Get credentials: anonymous, or first successful login from -u/-p or wordlists."""
@@ -1904,7 +1908,7 @@ class FtpEngine:
             pidx += 1
 
         pwd = (
-            getattr(self.args, "password", None)
+            first_cli_password(getattr(self.args, "password", None))
             or getattr(self.args, "user_enum_password", None)
             or "PtsrvUEnumWrongPass!77~"
         )
@@ -5779,14 +5783,17 @@ class FtpEngine:
                 word = "login" if n == 1 else "logins"
                 self._ptprint_raw(
                     f"Found {n} valid {word}",
-                    bullet_type="INFO",
+                    bullet_type="TITLE",
                     condition=not self.use_json,
                     indent=4,
+                    colortext=False,
                 )
             if guessing == "not_limited":
                 self._tprint("No protection against password guessing", "VULN")
             elif guessing == "stopped":
-                self._tprint("Password guessing was stopped", "NOTVULN")
+                paren = getattr(self, "_brute_block_paren", None)
+                msg = f"Attack was blocked ({paren})" if paren else "Attack was blocked"
+                self._tprint(msg, "NOTVULN")
             elif guessing == "not_tested":
                 self._tprint(
                     getattr(self, "_brute_guessing_detail", None)
@@ -5991,15 +5998,16 @@ class FtpEngine:
     )
 
     def _ftp_brute_hit(self, output, cred: Creds) -> None:
-        line = out_if(
-            f"user: {cred.user}, password: {shown_password(cred.passw)}",
-            "VULN",
-            True,
-            colortext=True,
-            indent=0,
+        if output is None or self.use_json:
+            return
+        user_line = out_if(f"user: {cred.user}", "VULN", True, colortext=False, indent=0)
+        pass_line = out_if(
+            f"password: {shown_password(cred.passw)}", "TEXT", True, colortext=False, indent=4,
         )
-        if line and output is not None:
-            output.add_string_to_output(line.rstrip("\n"))
+        if user_line:
+            output.add_string_to_output(user_line.rstrip("\n"))
+        if pass_line:
+            output.add_string_to_output(pass_line.rstrip("\n"))
 
     def _ftp_brute_kind(self, raw: str) -> str:
         code, _line = self._ftp_parse_reply_line(raw)
@@ -6008,6 +6016,23 @@ class FtpEngine:
         if "cannot change directory" in (raw or "").lower():
             return "ok"
         return "fail"
+
+    def _ftp_brute_block_paren(self, code: int | None, text: str) -> str | None:
+        """Short block reason, e.g. ``421 rate limiting``."""
+        low = (text or "").lower()
+        if code == 421 or any(s in low for s in ("rate", "limit", "throttl", "exceed")):
+            reason = "rate limiting"
+        elif self._FTP_BRUTE_LOCK_RE.search(text or ""):
+            reason = "lockout"
+        else:
+            reason = None
+        if code and reason:
+            return f"{code} {reason}"
+        if code:
+            return str(code)
+        if reason:
+            return reason
+        return None
 
     def _ftp_brute_cmd(self, ftp, command: str) -> tuple[int | None, str, str]:
         """Send one command. Returns code, reply line, and ok|fail|blocked|down."""
@@ -6026,10 +6051,10 @@ class FtpEngine:
             return code, line, "ok"
         return code, line, self._ftp_brute_kind(line)
 
-    def _ftp_brute_one(self, cred: Creds, output) -> str:
-        """One USER/PASS. ok, fail, blocked, or down."""
+    def _ftp_brute_one(self, cred: Creds, output) -> tuple[str, str | None]:
+        """One USER/PASS. Kind, plus a block label such as ``421 rate limiting``."""
         if self._brute_stop.is_set():
-            return "skip"
+            return "skip", None
         shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
         try:
             ftp = self.connect()
@@ -6037,8 +6062,9 @@ class FtpEngine:
             raw = str(e)
             self._user_enum_trace(f"{shown!r}: connect failed {self._snip(raw)}", output)
             if self._FTP_BRUTE_LOCK_RE.search(raw) or "421" in raw:
-                return "limited"
-            return "down"
+                code = 421 if "421" in raw else None
+                return "limited", self._ftp_brute_block_paren(code, raw)
+            return "down", None
         try:
             ucode, uline, ukind = self._ftp_brute_cmd(ftp, "USER " + cred.user)
             if ukind in ("blocked", "down") or ucode not in (331, 332):
@@ -6048,7 +6074,8 @@ class FtpEngine:
                 )
                 if ukind == "ok":
                     self._ftp_brute_hit(output, cred)
-                return ukind
+                block = self._ftp_brute_block_paren(ucode, uline) if ukind == "blocked" else None
+                return ukind, block
             pcode, pline, pkind = self._ftp_brute_cmd(ftp, "PASS " + cred.passw)
             pass_label = 'PASS ""' if cred.passw == "" else "PASS"
             self._user_enum_trace(
@@ -6058,7 +6085,8 @@ class FtpEngine:
             )
             if pkind == "ok":
                 self._ftp_brute_hit(output, cred)
-            return pkind
+            block = self._ftp_brute_block_paren(pcode, pline) if pkind == "blocked" else None
+            return pkind, block
         finally:
             try:
                 ftp.close()
@@ -6132,24 +6160,35 @@ class FtpEngine:
             bar_indent=4,
         )
         progress.kickoff(self._ftp_brute_label(creds[0]))
-        state = {"downs": 0, "saw_reply": False, "blocked": False, "note": None}
+        state = {"downs": 0, "saw_reply": False, "blocked": False, "limited": False, "note": None, "block": None}
         lock = threading.Lock()
 
+        def _promote_limit() -> None:
+            if state["limited"] and state["saw_reply"]:
+                state["blocked"] = True
+
         def work(cred: Creds, output) -> str:
-            kind = self._ftp_brute_one(cred, output)
+            kind, block = self._ftp_brute_one(cred, output)
             with lock:
                 if kind == "ok":
                     found.add(cred)
                     state["saw_reply"] = True
                     state["downs"] = 0
+                    _promote_limit()
                 elif kind == "fail":
                     state["saw_reply"] = True
                     state["downs"] = 0
+                    _promote_limit()
                 elif kind == "blocked":
                     state["blocked"] = True
                     state["saw_reply"] = True
+                    if block:
+                        state["block"] = state["block"] or block
                     self._brute_stop.set()
                 elif kind == "limited":
+                    state["limited"] = True
+                    if block:
+                        state["block"] = state["block"] or block
                     if state["saw_reply"]:
                         state["blocked"] = True
                     else:
@@ -6169,8 +6208,9 @@ class FtpEngine:
         finally:
             progress.finalize()
 
-        if state["blocked"]:
+        if state["blocked"] or (state["limited"] and state["saw_reply"]):
             self._brute_guessing = "stopped"
+            self._brute_block_paren = state.get("block")
         elif state["saw_reply"]:
             self._brute_guessing = "not_limited"
         else:
@@ -6624,7 +6664,7 @@ class FtpEngine:
                     user_str = f"usernames: {self.args.users}"
 
                 if self.args.password is not None:
-                    passw_str = f"password: {shown_password(self.args.password)}"
+                    passw_str = password_request_text(self.args.password)
                 else:
                     passw_str = f"passwords: {self.args.passwords}"
 

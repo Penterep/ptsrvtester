@@ -453,12 +453,15 @@ _POP3_BRUTE_LOCK_RE = re.compile(
 )
 
 
-def _pop3_brute_line(output, msg: str, category: str = "ADDITIONS", *, debug: bool = False, json_mode: bool = False) -> None:
+def _pop3_brute_line(
+    output, msg: str, category: str = "ADDITIONS", *,
+    debug: bool = False, json_mode: bool = False, colortext: bool = True, indent: int = 0,
+) -> None:
     if output is None or json_mode:
         return
     if category == "ADDITIONS" and not debug:
         return
-    line = out_if(msg, category, True, colortext=True, indent=0)
+    line = out_if(msg, category, True, colortext=colortext, indent=indent)
     if line:
         output.add_string_to_output(line.rstrip("\n"))
 
@@ -478,20 +481,41 @@ def _pop3_brute_kind(text: str) -> str:
     return "fail"
 
 
-def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: bool) -> tuple[str, str | None]:
+def _pop3_brute_block_paren(text: str) -> str | None:
+    """Short block reason, e.g. ``LOGIN-DELAY rate limiting``."""
+    up = (text or "").upper()
+    found = re.search(r"\[([A-Z][A-Z0-9/-]*)\]", up)
+    code = found.group(1) if found else None
+    low = (text or "").lower()
+    if code == "LOGIN-DELAY" or "login-delay" in low or any(s in low for s in ("rate", "limit", "throttl", "exceed")):
+        reason = "rate limiting"
+    elif code in ("SYS/TEMP", "IN-USE") or _POP3_BRUTE_LOCK_RE.search(text or ""):
+        reason = "lockout"
+    else:
+        reason = None
+    if code and reason:
+        return f"{code} {reason}"
+    if code:
+        return code
+    if reason:
+        return reason
+    return None
+
+
+def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: bool) -> tuple[str, str | None, str | None]:
     """One USER/PASS (RFC 1939). ok, fail, blocked, down, or unsupported."""
     if stop.is_set():
-        return "skip", None
+        return "skip", None, None
     shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
 
-    def trace(msg: str, category: str = "ADDITIONS") -> None:
-        _pop3_brute_line(output, msg, category, debug=debug, json_mode=json_mode)
+    def trace(msg: str, category: str = "ADDITIONS", **kwargs) -> None:
+        _pop3_brute_line(output, msg, category, debug=debug, json_mode=json_mode, **kwargs)
 
     try:
         pop3 = connect_pop3(args)
     except OSError as e:
         trace(f"{shown!r}: connect failed {_snip(str(e))}")
-        return "down", None
+        return "down", None, None
     try:
         try:
             urep = _pop3_line(pop3.user(cred.user))
@@ -500,10 +524,11 @@ def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: 
             kind = _pop3_brute_kind(urep)
             trace(f"{shown!r}: USER {urep}")
             note = "USER/PASS is not offered. Password guessing was not tested." if kind == "unsupported" else None
-            return kind, note
+            block = _pop3_brute_block_paren(urep) if kind == "blocked" else None
+            return kind, note, block
         except (OSError, TimeoutError) as e:
             trace(f"{shown!r}: USER failed {_snip(str(e))}")
-            return "down", None
+            return "down", None, None
         try:
             prep = _pop3_line(pop3.pass_(cred.passw))
             kind = "ok"
@@ -512,13 +537,15 @@ def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: 
             kind = _pop3_brute_kind(prep)
         except (OSError, TimeoutError) as e:
             trace(f"{shown!r}: USER {urep}; PASS failed {_snip(str(e))}")
-            return "down", None
+            return "down", None, None
         pass_label = 'PASS ""' if cred.passw == "" else "PASS"
         trace(f"{shown!r}: USER {urep}; {pass_label} {prep}")
         if kind == "ok":
-            trace(f"user: {cred.user}, password: {shown_password(cred.passw)}", "VULN")
+            trace(f"user: {cred.user}", "VULN", colortext=False)
+            trace(f"password: {shown_password(cred.passw)}", "TEXT", colortext=False, indent=4)
         note = "USER/PASS is not offered. Password guessing was not tested." if kind == "unsupported" else None
-        return kind, note
+        block = _pop3_brute_block_paren(prep) if kind == "blocked" else None
+        return kind, note, block
     finally:
         try:
             pop3.close()
@@ -553,11 +580,11 @@ def login_bruteforce(ctx) -> set[Creds]:
     progress = ThreadedProgress(len(creds), enabled=not json_mode, indent=4, bar_indent=4)
     first = creds[0].user
     progress.kickoff(first if len(first) <= 24 else first[:21] + "...")
-    state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None}
+    state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None, "block": None}
     lock = threading.Lock()
 
     def work(cred: Creds, output) -> str:
-        kind, note = _pop3_brute_one(args, cred, output, stop, debug=debug, json_mode=json_mode)
+        kind, note, block = _pop3_brute_one(args, cred, output, stop, debug=debug, json_mode=json_mode)
         with lock:
             if kind == "ok":
                 found.add(cred)
@@ -574,6 +601,8 @@ def login_bruteforce(ctx) -> set[Creds]:
             elif kind == "blocked":
                 state["blocked"] = True
                 state["saw_reply"] = True
+                if block:
+                    state["block"] = state["block"] or block
                 stop.set()
             elif kind == "down":
                 state["downs"] += 1
@@ -590,6 +619,7 @@ def login_bruteforce(ctx) -> set[Creds]:
 
     if state["blocked"]:
         ctx._brute_guessing = "stopped"
+        ctx._brute_block_paren = state.get("block")
     elif state["tested"]:
         ctx._brute_guessing = "not_limited"
     else:

@@ -323,7 +323,7 @@ ZIPXXE_VARIANT_TITLES: dict[str, str] = {
     "zip_bomb_small": "Zip bomb small",
     "zip_bomb_full": "Zip bomb medium",
     "zip_bomb_medium": "Zip bomb medium",
-    "zip_bomb_huge": "Zip bomb huge (≥1 TiB)",
+    "zip_bomb_huge": "Zip bomb huge (≥1 TB)",
 }
 
 ZIPXXE_VARIANT_PAYLOAD_LABELS: dict[str, str] = {

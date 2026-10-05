@@ -28,7 +28,10 @@ def help_print(help_object, scriptname, version) -> None:
                 for index, column in enumerate(line):
                     if not index:
                         print("   ", end="")
-                    print(column, end=(cols_width[index]-len(column)+2)*' ')
+                    width = cols_width[index] if cols_width else 0
+                    if width == 0 and not column:
+                        continue
+                    print(column, end=(width - len(column) + 2) * " ")
                 print("")
             else:
                 print(f"   {line}")

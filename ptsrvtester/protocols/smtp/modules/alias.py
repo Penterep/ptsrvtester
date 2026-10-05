@@ -112,7 +112,7 @@ def test_alias(e) -> AliasTestResult:
     mail_from = str(mail_from).strip()
     timeout = max(5.0, getattr(e.args, 'alias_timeout', 30.0))
     auth_user = getattr(e.args, 'user', None) or ''
-    auth_pass = getattr(e.args, 'password', None) or ''
+    auth_pass = first_cli_password(getattr(e.args, 'password', None)) or ''
     do_auth = bool(auth_user and auth_pass)
     variants_arg = getattr(e.args, 'alias_variants', None)
     default_variants = ['case', 'case_domain', 'dotted', 'plus', 'percent', 'bang_simple', 'bang_nested']

@@ -57,7 +57,7 @@ FTP_TESTS: dict[str, dict] = {
         "mods": [
             ["-u", "--user", "<name> …", "Username(s)"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "[password]", "Single password. No value or \"\" tests an empty password"],
+            ["-p", "--password", "[password] …", "Password(s), space or comma separated. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["-t", "--threads", "<n>", "Threads (default: 10)"],
@@ -158,7 +158,7 @@ FTP_TESTS: dict[str, dict] = {
         "requires": ["credentials (-A or -u/-p)"],
         "mods": [
             ["", "--ftp-dos-timeout", "<sec>", "Per-operation socket timeout (default: 30)"],
-            ["", "--ftp-dos-large", "", "Large zip bomb, about 1 TiB expanded (isolated labs only)"],
+            ["", "--ftp-dos-large", "", "Large zip bomb, about 1 TB expanded (isolated labs only)"],
         ],
     },
     "CHROOT": {
@@ -180,6 +180,31 @@ FTP_TESTS: dict[str, dict] = {
     "RATELIMIT": rate_limit_test_spec(),
 }
 
+# Login is required (-A or -u/-p). Shown in Options, not only in Requires.
+_FTP_CRED_TESTS = frozenset({
+    "ACCESS", "ENUMPATH", "MODES", "PASVPORT", "CMDAUDITACTIVE", "DOS", "CHROOT", "EICAR",
+})
+_FTP_LOGIN_OPTS = (
+    ["-A", "--anonymous", "", "Anonymous login"],
+    ["-u", "--user", "<name>", "Username"],
+    ["-p", "--password", "[password]", "Password"],
+)
+
+
+def _append_missing_opts(mods: list, rows: tuple) -> None:
+    for row in rows:
+        if not any(len(existing) > 1 and existing[1] == row[1] for existing in mods):
+            mods.append(list(row))
+
+
+def _option_rows(rows: list) -> list:
+    """Drop the empty short-flag column when a test has none."""
+    if not rows or not all(isinstance(row, list) and len(row) >= 4 for row in rows):
+        return rows
+    if any(row[0] for row in rows):
+        return rows
+    return [row[1:] for row in rows]
+
 
 def ftp_test_help(codes: list[str]):
     if not codes:
@@ -196,10 +221,20 @@ def ftp_test_help(codes: list[str]):
         if spec.get("requires"):
             desc.append("Requires: " + "; ".join(spec["requires"]))
         mods = list(spec.get("mods", []) or [])
+        if code in _FTP_CRED_TESTS:
+            _append_missing_opts(mods, _FTP_LOGIN_OPTS)
+        elif code == "CONNLIM":
+            if not any(len(row) > 1 and row[1] == "--anonymous" for row in mods):
+                at = next(
+                    (i for i, row in enumerate(mods) if len(row) > 1 and row[1] == "--user"),
+                    len(mods),
+                )
+                mods.insert(at, ["-A", "--anonymous", "", "Anonymous login"])
+        mods = _option_rows(mods)
         has_opts = bool(mods or spec.get("requires"))
         usage = f"ptsrvtester ftp -ts {code} " + ("<options> -tg <target>" if has_opts else "-tg <target>")
         blocks.append({"description": desc})
-        blocks.append({"usage": [usage]})
         if mods:
             blocks.append({"options": mods})
+        blocks.append({"usage": [usage]})
     return blocks

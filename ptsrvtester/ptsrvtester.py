@@ -69,7 +69,7 @@ class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
     def end_error(self, message, condition, details=None, *, category="ERROR"):
         full_msg = f"Error: {message}" if category == "ERROR" else str(message)
         try:
-            ptprint(out_ifnot(full_msg, category, condition))
+            ptprint(out_ifnot(full_msg, category, condition, colortext=True))
         except UnicodeEncodeError:
             encoding = sys.stdout.encoding or "utf-8"
             safe_msg = full_msg.encode(encoding, errors="replace").decode(encoding)

@@ -20,7 +20,10 @@ Two scenarios are supported:
 Verdicts are intentionally conservative.  A negative result means only that no
 limiting was observed within the configured sample.  A limiting verdict needs
 repeatable failures followed by a healthy recovery; a single failure is
-reported as inconclusive.  Persistent recovery failures are surfaced
+reported as inconclusive.  The held scenario additionally requires failed
+control probes bracketed by confirmed peer-open retained sockets; failures
+while filling that pool alone do not establish held-open limiting.  Persistent
+recovery failures are surfaced
 separately so a caller can stop all further active tests.
 """
 
@@ -634,6 +637,7 @@ class RateLimitRunner:
         recovery: ProbeMetrics,
         control: ProbeMetrics | None,
         early_stopped: bool,
+        held_control_alive_count: int = 0,
         held_closed_count: int = 0,
         held_liveness_unknown_count: int = 0,
         cleanup_errors: tuple[str, ...] = (),
@@ -667,9 +671,26 @@ class RateLimitRunner:
         if control is not None:
             signal_metrics.append(control)
         observed_failures = sum(metrics.failures for metrics in signal_metrics)
-        if observed_failures >= self.config.failure_threshold:
+        if scenario is Scenario.HELD:
+            if held_control_alive_count == 0:
+                notes.append(
+                    "held-socket liveness through additional-connection probes "
+                    "was not confirmed; rejection of "
+                    "additional connections under held-open pressure was not established"
+                )
+                return RateLimitVerdict.INCONCLUSIVE, False, None, tuple(notes)
+            # Failures while filling the held pool can have the same cause as
+            # completed connect/close failures.  Only additional probes issued
+            # with confirmed peer-open handles distinguish the held scenario.
+            limiting_failures = control.failures if control is not None else 0
+        else:
+            limiting_failures = observed_failures
+        if limiting_failures >= self.config.failure_threshold:
             notes.append(
-                "repeatable negotiation failures occurred during load and "
+                "additional connections failed repeatedly with retained sockets "
+                "confirmed peer-open before and after control probes; recovery succeeded"
+                if scenario is Scenario.HELD
+                else "repeatable negotiation failures occurred during load and "
                 "recovery succeeded"
             )
             return RateLimitVerdict.LIMITING_OBSERVED, False, None, tuple(notes)
@@ -682,6 +703,16 @@ class RateLimitRunner:
                 "absolute thresholds"
             )
             return RateLimitVerdict.SLOWDOWN_OBSERVED, True, ratio, tuple(notes)
+
+        if (
+            scenario is Scenario.HELD
+            and load.failures >= self.config.failure_threshold
+        ):
+            notes.append(
+                "failures while building the held pool were not reproduced "
+                "by additional probes with confirmed open sockets"
+            )
+            return RateLimitVerdict.INCONCLUSIVE, False, ratio, tuple(notes)
 
         if held_closed_count:
             notes.append(
@@ -815,55 +846,117 @@ class RateLimitRunner:
                             accepted_handles.append(opened.connection)
             return opened.probe
 
+        def held_liveness_snapshot() -> dict[int, bool | None]:
+            snapshot: dict[int, bool | None] = {}
+            for handle in accepted_handles:
+                liveness_check = getattr(handle, "is_alive", None)
+                alive = None
+                if callable(liveness_check):
+                    try:
+                        alive = liveness_check()
+                    except Exception as exc:
+                        operational_errors.append(
+                            f"held-socket liveness check failed: {_error_text(exc)}"
+                        )
+                snapshot[id(handle)] = (
+                    alive if alive is True or alive is False else None
+                )
+            return snapshot
+
         control_results: dict[int, ProbeResult] = {}
         early_stopped = False
         load_results: dict[int, ProbeResult] = {}
         held_alive_count = 0
+        held_control_alive_count = 0
         held_closed_count = 0
         held_liveness_unknown_count = 0
-        held_follow_up_skipped = False
+        held_follow_up_note: str | None = None
         try:
             load_results, early_stopped = self._concurrent(
                 scenario,
                 self.config.held_connections,
                 open_and_track,
             )
-            if early_stopped:
-                # An early stop deliberately avoids extending the load with a
-                # hold period or control probes.  Accepted handles still need
-                # an explicit liveness classification in the report: no
-                # snapshot was taken, so they are unknown rather than zero.
+            load_stopped_early = early_stopped
+            if any(
+                result.outcome is ProbeOutcome.INTERNAL_ERROR
+                for result in load_results.values()
+            ):
                 held_liveness_unknown_count = len(accepted_handles)
-                held_follow_up_skipped = True
-            elif handles:
-                if error := self._sleep_safely(self.config.hold_seconds):
-                    operational_errors.append(error)
-                for handle in accepted_handles:
-                    liveness_check = getattr(handle, "is_alive", None)
-                    if not callable(liveness_check):
-                        held_liveness_unknown_count += 1
-                        continue
-                    try:
-                        alive = liveness_check()
-                    except Exception as exc:
-                        held_liveness_unknown_count += 1
-                        operational_errors.append(
-                            f"held-socket liveness check failed: {_error_text(exc)}"
-                        )
-                        continue
-                    if alive is True:
-                        held_alive_count += 1
-                    elif alive is False:
-                        held_closed_count += 1
-                    else:
-                        held_liveness_unknown_count += 1
-                control_results, control_stopped = self._series(
-                    scenario,
-                    ProbePhase.CONTROL,
-                    self.config.control_probes,
-                    stop_at_impact=True,
+                held_follow_up_note = (
+                    "held-socket liveness checks and control probes were skipped "
+                    "after an internal load-probe error"
                 )
-                early_stopped = early_stopped or control_stopped
+            elif accepted_handles:
+                # Stop opening more load connections after the threshold, but
+                # validate the existing pool and use the bounded control phase
+                # before releasing it.  Do not prolong an early-stopped load
+                # with the configured holding pause.
+                if not load_stopped_early:
+                    if error := self._sleep_safely(self.config.hold_seconds):
+                        operational_errors.append(error)
+                snapshot = held_liveness_snapshot()
+                alive_before_control = {
+                    handle_id for handle_id, alive in snapshot.items() if alive is True
+                }
+                held_alive_count = len(alive_before_control)
+                held_closed_count = sum(alive is False for alive in snapshot.values())
+                held_liveness_unknown_count = sum(
+                    alive is None for alive in snapshot.values()
+                )
+                if held_alive_count:
+                    control_results, control_stopped = self._series(
+                        scenario,
+                        ProbePhase.CONTROL,
+                        self.config.control_probes,
+                        stop_at_impact=True,
+                    )
+                    early_stopped = early_stopped or control_stopped
+                    # A pool that goes away during slow/failed control probes
+                    # no longer establishes held-open pressure.  Require the
+                    # same socket to be peer-open on both sides of that phase.
+                    snapshot = held_liveness_snapshot()
+                    alive_after_control = {
+                        handle_id
+                        for handle_id, alive in snapshot.items()
+                        if alive is True
+                    }
+                    held_control_alive_count = len(
+                        alive_before_control & alive_after_control
+                    )
+                    held_alive_count = len(alive_after_control)
+                    held_closed_count = sum(
+                        alive is False for alive in snapshot.values()
+                    )
+                    held_liveness_unknown_count = sum(
+                        alive is None for alive in snapshot.values()
+                    )
+                    if not held_control_alive_count:
+                        held_follow_up_note = (
+                            "retained sockets closed or became indeterminate "
+                            "during additional-connection control probes"
+                        )
+                else:
+                    held_follow_up_note = (
+                        "additional-connection control probes were skipped "
+                        "because no retained socket was confirmed peer-open"
+                    )
+                if load_stopped_early:
+                    early_note = (
+                        "new held-load attempts stopped after repeated failures; "
+                        "retained sockets were checked immediately without the "
+                        "configured holding pause"
+                    )
+                    held_follow_up_note = (
+                        f"{early_note}; {held_follow_up_note}"
+                        if held_follow_up_note
+                        else early_note
+                    )
+            else:
+                held_follow_up_note = (
+                    "additional-connection control probes were skipped because "
+                    "no accepted held connection was retained"
+                )
         finally:
             for handle in reversed(handles):
                 try:
@@ -887,20 +980,14 @@ class RateLimitRunner:
             recovery=recovery,
             control=control,
             early_stopped=early_stopped,
+            held_control_alive_count=held_control_alive_count,
             held_closed_count=held_closed_count,
             held_liveness_unknown_count=held_liveness_unknown_count,
             cleanup_errors=tuple(cleanup_errors),
             operational_errors=tuple(operational_errors),
         )
-        if held_follow_up_skipped:
-            notes = (
-                *notes,
-                (
-                    "held-socket hold/liveness checks and control probes were "
-                    "skipped after the held-open load stopped early; retained "
-                    "handles, if any, were closed before recovery"
-                ),
-            )
+        if held_follow_up_note:
+            notes = (*notes, held_follow_up_note)
         return ScenarioResult(
             scenario=scenario,
             verdict=verdict,

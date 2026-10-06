@@ -1,7 +1,8 @@
-"""SIZE — message size limit (MAIL FROM SIZE=, no message body)."""
-import ipaddress, smtplib, socket, ssl, time
+"""SIZE — message size limit (MAIL FROM SIZE=). --send uploads a body of X."""
+import ipaddress, os, smtplib, socket, ssl, sys, time
 
 from ..utils.helpers import *
+from ..utils.ptprinthelper import get_colored_text
 from ..utils.results import *
 
 from ._common import eng
@@ -24,8 +25,8 @@ _SIZE_STEPS: tuple[tuple[int, str], ...] = (
     (5 * 1024 ** 2, "5 MB"),
     (1 * 1024 ** 2, "1 MB"),
 )
-# One real message, and never the large steps. 1 TB is only declared.
-_SEND_CAP = 1024 ** 2
+# An allowed size this large (or larger) is still a finding.
+_TOO_OPEN = 100 * 1024 ** 2
 
 
 def _note(kind: str, text: str) -> str:
@@ -45,6 +46,91 @@ def _is_size_refusal(status: int | None, text: str) -> bool:
     return any(word in up for word in ("SIZE", "EXCEED", "TOO LARGE", "TOO BIG", "MAXIMUM"))
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}"
+
+
+def _mb_num(value: float) -> str:
+    if abs(value - round(value)) < 0.05:
+        return str(int(round(value)))
+    return f"{value:.1f}"
+
+
+def _smtp_data_bytes(payload: str) -> bytes:
+    """Bytes ``SMTP.data`` would send, including the terminating dot."""
+    msg = smtplib._fix_eols(payload).encode("ascii")
+    quoted = smtplib._quote_periods(msg)
+    if quoted[-2:] != b"\r\n":
+        quoted += b"\r\n"
+    return quoted + b".\r\n"
+
+
+def _upload_line_enabled(e) -> bool:
+    if getattr(e, "use_json", False):
+        return False
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _paint_upload(e, sent: int, blob_len: int, message_bytes: int, started: float, suffix: str) -> None:
+    """Gray live line: elapsed time, percent, and megabytes already written."""
+    if not _upload_line_enabled(e) or blob_len <= 0:
+        return
+    elapsed = _fmt_elapsed(time.perf_counter() - started)
+    pct = min(100, int(100 * sent / blob_len))
+    shown = min(message_bytes, sent)
+    sent_mb = _mb_num(shown / (1024 ** 2))
+    total_mb = _mb_num(message_bytes / (1024 ** 2))
+    text = f"{elapsed} {pct}% {sent_mb}/{total_mb} MB{suffix}"
+    line = get_colored_text(text, "ADDITIONS")
+    try:
+        os.write(1, f"\033[2K\r{line}".encode("utf-8", errors="replace"))
+    except OSError:
+        pass
+
+
+def _clear_upload(e) -> None:
+    if not _upload_line_enabled(e):
+        return
+    try:
+        os.write(1, b"\033[2K\r")
+    except OSError:
+        pass
+
+
+def _send_blob(client: smtplib.SMTP, blob: bytes, on_sent) -> None:
+    step = 256 * 1024
+    sent = 0
+    view = memoryview(blob)
+    last = 0.0
+    total = len(blob)
+    while sent < total:
+        nxt = min(total, sent + step)
+        client.send(view[sent:nxt])
+        sent = nxt
+        now = time.perf_counter()
+        if sent >= total or now - last >= 0.1:
+            on_sent(sent)
+            last = now
+
+
+def _body_message(mail_from: str, rcpt: str, total: int) -> tuple[str, int]:
+    """Plain message whose DATA length is ``total`` bytes. The body is ``X``.
+
+    ``smtplib`` appends CRLF when the text does not already end with one.
+    """
+    head = f"From: <{mail_from}>\r\nTo: <{rcpt}>\r\nSubject: size check\r\n\r\n"
+    head_n = len(head.encode("ascii"))
+    body_n = max(0, int(total) - head_n - 2)
+    payload = head + ("X" * body_n)
+    return payload, head_n + body_n + 2
+
+
 def _result(
     e,
     *,
@@ -57,6 +143,10 @@ def _result(
     auth: bool = False,
     detail: str | None = None,
     indeterminate: bool = False,
+    sent: int = 0,
+    accepted: int = 0,
+    rejected: int = 0,
+    first_rejection_at: int | None = None,
 ) -> FloodResult:
     vulnerable = any(item.startswith("BAD|") for item in notes)
     partial = (not vulnerable) and any(item.startswith("WARN|") for item in notes)
@@ -67,10 +157,10 @@ def _result(
         size_advertised=advertised,
         size_limit_bytes=limit if advertised else None,
         size_enforced=enforced,
-        messages_sent=0,
-        messages_accepted=0,
-        messages_rejected=0,
-        first_rejection_at=None,
+        messages_sent=sent,
+        messages_accepted=accepted,
+        messages_rejected=rejected,
+        first_rejection_at=first_rejection_at,
         tarpitting_detected=False,
         elapsed_sec=time.perf_counter() - start,
         smtp_trace=tuple(trace),
@@ -83,7 +173,7 @@ def _result(
 
 
 def test_flood(e) -> FloodResult:
-    """Declare sizes from 1 TB down to 1 MB. Stop when one is allowed. No DATA."""
+    """Declare sizes from 1 TB down to 1 MB. Stop when one is allowed."""
     host = e.args.target.ip
     port = e.args.target.port
     mail_from = str(e.args.mail_from or f"sizetest@{e.fqdn}").strip()
@@ -274,25 +364,47 @@ def test_flood(e) -> FloodResult:
         break
 
     msg_note: str | None = None
+    sent_n = 0
+    accepted_n = 0
+    rejected_n = 0
+    first_reject: int | None = None
     want_send = bool(getattr(e.args, "send", False))
     rcpt = str(getattr(e.args, "rcpt_to", None) or "").strip()
+    raw_count = getattr(e.args, "size_count", None)
+    raw_mb = getattr(e.args, "size_mb", None)
+    bad_count = raw_count is not None and int(raw_count) < 1
+    bad_mb = raw_mb is not None and int(raw_mb) < 1
     if want_send and not rcpt:
         e._mail_test_live_done("Message", "not sent. No recipient (-r)")
-    elif want_send and not allowed_n:
+    elif want_send and (bad_count or bad_mb):
+        e._mail_test_live_done("Message", "not sent. -c and -s must be at least 1")
+        msg_note = _note("WARN", "-c and -s must be at least 1.")
+    elif want_send and raw_mb is None and not allowed_n:
         e._mail_test_live_done("Message", "not sent. No size was allowed")
-    elif want_send and allowed_n:
-        send_n = min(allowed_n, _SEND_CAP)
-        head = f"From: <{mail_from}>\r\nTo: <{rcpt}>\r\nSubject: size check\r\n\r\n"
-        payload = head + ("X" * max(0, send_n - len(head.encode())))
-        size = len(payload.encode())
+    elif want_send:
+        if raw_mb is not None:
+            target = int(raw_mb) * 1024 ** 2
+            size_label = f"{int(raw_mb)} MB"
+        else:
+            target = int(allowed_n)
+            size_label = allowed or "allowed size"
+        count = 1 if raw_count is None else int(raw_count)
+        payload, wire = _body_message(mail_from, rcpt, target)
+        upload_timeout = max(60.0, (wire / (1024 ** 2)) * 2)
+        data_text = ""
+        upload_index = 1
 
         def deliver(client: smtplib.SMTP) -> tuple[int | None, str]:
-            mail_cmd = f"MAIL FROM:<{mail_from}> SIZE={size}"
+            mail_cmd = f"MAIL FROM:<{mail_from}> SIZE={wire}"
             try:
-                st, reply = client.docmd("MAIL", f"FROM:<{mail_from}> SIZE={size}")
+                try:
+                    client.sock.settimeout(upload_timeout)
+                except Exception:
+                    pass
+                st, reply = client.docmd("MAIL", f"FROM:<{mail_from}> SIZE={wire}")
                 text = e._smtp_trace_reply(st, reply)
                 e._smtp_vv_io(mail_cmd, text)
-                trace.append(f"MAIL SIZE={size}: {text}")
+                trace.append(f"MAIL SIZE={wire}: {text}")
                 if st not in (250, 251):
                     return st, text
                 st, reply = client.docmd("RCPT", f"TO:<{rcpt}>")
@@ -301,11 +413,30 @@ def test_flood(e) -> FloodResult:
                 trace.append(f"RCPT TO: {text}")
                 if st not in (250, 251):
                     return st, text
-                st, reply = client.data(payload)
-                text = e._smtp_trace_reply(st, reply)
-                e._smtp_vv_io("DATA", text)
-                trace.append(f"DATA: {text}")
-                return st, text
+                blob = _smtp_data_bytes(payload)
+                suffix = f"  {upload_index}/{count}" if count > 1 else ""
+                started = time.perf_counter()
+                try:
+                    client.putcmd("data")
+                    st, reply = client.getreply()
+                    text = e._smtp_trace_reply(st, reply)
+                    if st != 354:
+                        e._smtp_vv_io("DATA", text)
+                        trace.append(f"DATA: {text}")
+                        return st, text
+                    _paint_upload(e, 0, len(blob), wire, started, suffix)
+
+                    def _tick(sent: int) -> None:
+                        _paint_upload(e, sent, len(blob), wire, started, suffix)
+
+                    _send_blob(client, blob, _tick)
+                    st, reply = client.getreply()
+                    text = e._smtp_trace_reply(st, reply)
+                    e._smtp_vv_io("DATA", text)
+                    trace.append(f"DATA: {text}")
+                    return st, text
+                finally:
+                    _clear_upload(e)
             except smtplib.SMTPResponseException as ex:
                 text = e._smtp_trace_reply(ex.smtp_code, ex.smtp_error)
                 e._smtp_vv_io("DATA", text)
@@ -314,12 +445,14 @@ def test_flood(e) -> FloodResult:
                 e._smtp_vv_io("DATA", str(ex))
                 return None, str(ex)
 
-        if smtp is None:
-            smtp, recon_err, _ehlo = session()
+        for i in range(1, count + 1):
+            upload_index = i
             if smtp is None:
-                e._mail_test_live_done("Message", f"not sent ({_clean(recon_err)})")
-                msg_note = _note("WARN", f"Message was not sent ({_clean(recon_err)}).")
-        if smtp is not None and msg_note is None:
+                smtp, recon_err, _ehlo = session()
+                if smtp is None:
+                    e._mail_test_live_done("Message", f"not sent ({_clean(recon_err)})")
+                    msg_note = _note("WARN", f"Message was not sent ({_clean(recon_err)}).")
+                    break
             data_status, data_text = deliver(smtp)
             if data_status is None:
                 try:
@@ -331,18 +464,39 @@ def test_flood(e) -> FloodResult:
                     data_status, data_text = None, recon_err
                 else:
                     data_status, data_text = deliver(smtp)
-            sent_label = "1 MB" if send_n == _SEND_CAP else allowed
+            sent_n += 1
             if data_status in (250, 251):
-                if allowed_n > send_n:
-                    e._mail_test_live_done(
-                        "Message",
-                        f"accepted ({_clean(data_text)}). Sent {sent_label}, {allowed} was not uploaded",
-                    )
-                else:
-                    e._mail_test_live_done("Message", f"accepted ({_clean(data_text)}). Sent {sent_label}")
+                accepted_n += 1
             else:
-                e._mail_test_live_done("Message", f"refused ({_clean(data_text)}). Sent {sent_label}")
-                msg_note = _note("WARN", f"The message was refused ({_clean(data_text)}).")
+                rejected_n += 1
+                if first_reject is None:
+                    first_reject = i
+                if msg_note is None:
+                    msg_note = _note("WARN", f"The message was refused ({_clean(data_text)}).")
+                if data_status == 421 or data_status is None:
+                    try:
+                        if smtp is not None:
+                            smtp.quit()
+                    except Exception:
+                        pass
+                    smtp = None
+                    break
+            if i < count and smtp is not None:
+                try:
+                    smtp.docmd("RSET")
+                except Exception:
+                    try:
+                        smtp.quit()
+                    except Exception:
+                        pass
+                    smtp = None
+        if sent_n and count == 1:
+            if accepted_n:
+                e._mail_test_live_done("Message", f"accepted ({_clean(data_text)}). Sent {size_label}")
+            else:
+                e._mail_test_live_done("Message", f"refused ({_clean(data_text)}). Sent {size_label}")
+        elif sent_n and count > 1:
+            e._mail_test_live_done("Messages", f"{accepted_n}/{count} accepted ({size_label})")
     try:
         if smtp is not None:
             smtp.quit()
@@ -350,7 +504,9 @@ def test_flood(e) -> FloodResult:
         pass
 
     if allowed and refused:
-        verdict = _note("OK", f"Size limit is enforced. {allowed} is allowed, {refused} is not.")
+        too_open = allowed_n is not None and allowed_n >= _TOO_OPEN
+        kind = "BAD" if too_open else "OK"
+        verdict = _note(kind, f"Size limit is enforced. {allowed} is allowed, {refused} is not.")
         enforced: bool | None = True
     elif allowed:
         verdict = _note("BAD", f"No size limit. {allowed} was allowed.")
@@ -381,6 +537,10 @@ def test_flood(e) -> FloodResult:
         enforced=enforced,
         auth=auth_used,
         detail=detail,
+        sent=sent_n,
+        accepted=accepted_n,
+        rejected=rejected_n,
+        first_rejection_at=first_reject,
     )
 
 

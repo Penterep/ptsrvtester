@@ -3,7 +3,7 @@ __MODULELABEL__ = ""
 __MODULECODE__ = "BRUTE"
 __ORDER__ = 60
 
-from ..utils.helpers import check_if_brute
+from ..utils.helpers import apply_default_brute_creds
 from ._common import eng
 
 
@@ -16,11 +16,7 @@ def _section(ctx, e, title: str) -> None:
 
 def run(ctx):
     e = eng(ctx)
-    if not check_if_brute(ctx.args):
-        _section(ctx, e, "Login bruteforce")
-        ctx.out("BRUTE requires credentials (-u/-U and -p/-P)", "ERROR", indent=4)
-        e._flush_terminal()
-        return
+    apply_default_brute_creds(ctx.args)
     _section(ctx, e, "Catch-all test")
     try:
         catch_all = e._ftp_auth_catch_all()

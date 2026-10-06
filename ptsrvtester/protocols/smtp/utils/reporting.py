@@ -88,6 +88,48 @@ class ReportingMixin:
             return False
         return self.results.enum_results is not None or self.results.enum_error is not None
 
+    def _is_brute_only_output(self) -> bool:
+        """``-ts BRUTE`` alone: userAccount nodes and global vuln codes."""
+        if getattr(self, "run_all_mode", False):
+            return False
+        if self.results.banner_requested or self.results.commands_requested:
+            return False
+        if self.results.enum_results is not None or self.results.enum_error is not None:
+            return False
+        return self.results.creds is not None or getattr(self, "_brute_guessing", None) is not None
+
+    def _add_brute_account_nodes(self) -> None:
+        """One ``userAccount`` per accepted login. Properties are name and password."""
+        creds = self.results.creds
+        if not creds:
+            return
+        for cred in sorted(creds, key=lambda c: (c.user, c.passw)):
+            node = self.ptjsonlib.create_node_object(
+                "userAccount",
+                parent_type="userAccounts",
+                parent=None,
+                properties={"name": cred.user, "password": cred.passw},
+            )
+            self.ptjsonlib.add_node(node)
+
+    def _emit_brute_json(self) -> None:
+        """``-ts BRUTE``: userAccount nodes, guessing in properties, codes in the global list."""
+        props: dict = {}
+        guessing = getattr(self, "_brute_guessing", None)
+        if guessing is not None:
+            props["smtpPasswordGuessing"] = guessing
+        if getattr(self, "_auth_catch_all", None) == "indeterminate":
+            props["smtpAuthCatchAll"] = "indeterminate"
+        if props:
+            self.ptjsonlib.add_properties(props)
+        self._add_brute_account_nodes()
+        if self.results.creds:
+            self.ptjsonlib.add_vulnerability(vuln_code=VULNS.WeakCreds.value)
+        if guessing == "not_limited":
+            self.ptjsonlib.add_vulnerability(vuln_code=VULNS.Brute.value)
+        self.ptjsonlib.set_status("finished", "")
+        self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+
     @staticmethod
     def _ehlo_commands_for_flat(ehlo_raw: str | None, ehlo_starttls_raw: str | None) -> list[str]:
         """Extract EHLO extension names (excluding AUTH methods) for flat JSON description."""
@@ -1186,6 +1228,8 @@ class ReportingMixin:
                     "detail": fr.detail,
                     "testId": fr.test_id or None,
                 }
+                if fr.vulnerable:
+                    flat_vulns.append({"vuln_code": VULNS.Size.value})
             elif (flood_err := self.results.flood_error) is not None:
                 props["floodError"] = flood_err
             _adp_props = self._accepted_domain_probe_props_json()
@@ -1250,6 +1294,10 @@ class ReportingMixin:
                             self.ptjsonlib.add_vulnerability(vuln_code=vc)
             self.ptjsonlib.set_status("finished", "")
             self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+            return
+
+        if self._is_brute_only_output():
+            self._emit_brute_json()
             return
 
         # ── Node-based output: software node + optional userAccount nodes ──
@@ -1791,13 +1839,7 @@ class ReportingMixin:
                 }
             })
             if fr.vulnerable:
-                global_vulns.append(
-                    {
-                        "vuln_code": VULNS.Flood.value,
-                        "vuln_request": "MAIL FROM SIZE= (1 TB down to 1 MB)",
-                        "vuln_response": fr.detail or "No size limit at MAIL",
-                    }
-                )
+                global_vulns.append({"vuln_code": VULNS.Size.value})
 
         # ZIPXXE (PTL-SVC-SMTP-ZIPXXE)
         if (zipxxe_err := self.results.zipxxe_error) is not None:
@@ -2005,35 +2047,11 @@ class ReportingMixin:
         if getattr(self, "_auth_catch_all", None) == "indeterminate":
             properties.update({"smtpAuthCatchAll": "indeterminate"})
 
-        # Login bruteforce
-        if (creds := self.results.creds) is not None:
-            if len(creds) > 0:
-                json_lines: list[str] = []
-                for cred in creds:
-                    json_lines.append(
-                        f"user: {cred.user}, password: {shown_password(cred.passw)}"
-                    )
-
-                if self.args.user is not None:
-                    if isinstance(self.args.user, list):
-                        user_str = f"usernames: {', '.join(self.args.user)}"
-                    else:
-                        user_str = f"username: {self.args.user}"
-                else:
-                    user_str = f"usernames: {self.args.users}"
-
-                if self.args.password is not None:
-                    passw_str = password_request_text(self.args.password)
-                else:
-                    passw_str = f"passwords: {self.args.passwords}"
-
-                global_vulns.append(
-                    {
-                        "vuln_code": VULNS.WeakCreds.value,
-                        "vuln_request": f"{user_str}\n{passw_str}",
-                        "vuln_response": "\n".join(json_lines),
-                    }
-                )
+        # Login bruteforce. Accounts are userAccount nodes; codes stay global.
+        if self.results.creds:
+            global_vulns.append({"vuln_code": VULNS.WeakCreds.value})
+        if getattr(self, "_brute_guessing", None) == "not_limited":
+            global_vulns.append({"vuln_code": VULNS.Brute.value})
 
         # Create main software node (vulnerabilities are always global)
         smtp_node = self.ptjsonlib.create_node_object(
@@ -2058,6 +2076,8 @@ class ReportingMixin:
                             properties=user_props,
                         )
                         self.ptjsonlib.add_node(user_node)
+
+        self._add_brute_account_nodes()
 
         # All vulnerabilities go to global results.vulnerabilities[]
         for v in global_vulns:

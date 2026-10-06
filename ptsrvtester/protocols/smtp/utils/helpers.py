@@ -209,6 +209,24 @@ def check_if_brute(args: ArgsWithBruteforce) -> bool:
         return False
 
 
+DEFAULT_BRUTE_USERS = ("root", "admin", "demo", "test", "user", "jane", "john")
+DEFAULT_BRUTE_PASSWORDS = (
+    "pass", "pass123", "Pass123", "password", "Pa$$w0rd",
+    "abcd", "abcde", "abcdef", "0000", "1234", "12345", "123456", "Admin123",
+)
+
+
+def apply_default_brute_creds(args) -> None:
+    """Use the built-in lists when BRUTE was started without -u/-U or -p/-P.
+
+    A given -u/-U or -p/-P is kept. An empty -p stays an empty password.
+    """
+    if not (getattr(args, "user", None) or getattr(args, "users", None)):
+        args.user = list(DEFAULT_BRUTE_USERS)
+    if getattr(args, "password", None) is None and not getattr(args, "passwords", None):
+        args.password = list(DEFAULT_BRUTE_PASSWORDS)
+
+
 def threaded_bruteforce(
     creds: list,
     try_login: Callable,

@@ -1,5 +1,5 @@
 """BRUTE — catch-all + LOGIN bruteforce."""
-from ..utils.helpers import check_if_brute
+from ..utils.helpers import apply_default_brute_creds
 from ._common import eng
 
 __MODULELABEL__ = ""
@@ -16,15 +16,7 @@ def _section(ctx, e, title: str) -> None:
 
 def run(ctx):
     e = eng(ctx)
-    if not check_if_brute(ctx.args):
-        _section(ctx, e, "Login bruteforce")
-        ctx.out(
-            "BRUTE requires -u/--user or -U/--users and -p/--password or -P/--passwords",
-            "ERROR",
-            indent=4,
-        )
-        e._flush_terminal()
-        return
+    apply_default_brute_creds(ctx.args)
 
     _section(ctx, e, "Catch-all test")
     try:

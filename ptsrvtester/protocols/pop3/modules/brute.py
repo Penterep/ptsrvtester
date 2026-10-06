@@ -2,7 +2,7 @@
 import sys
 
 from ..utils.connection import login_bruteforce, test_catch_all
-from ..utils.helpers import check_if_brute, password_request_text, shown_password, text_or_file
+from ..utils.helpers import apply_default_brute_creds, password_request_text, shown_password, text_or_file
 from ..utils.results import VULNS
 
 __MODULELABEL__ = ""
@@ -18,15 +18,7 @@ def _section(ctx, title: str) -> None:
 
 
 def run(ctx):
-    if not check_if_brute(ctx.args):
-        _section(ctx, "Login bruteforce")
-        ctx.out(
-            "BRUTE requires -u/--user or -U/--users and -p/--password or -P/--passwords",
-            "ERROR",
-            indent=4,
-        )
-        _flush_pop3(ctx)
-        return
+    apply_default_brute_creds(ctx.args)
 
     # Catch-all lives inside BRUTE (not a separate -ts code).
     _section(ctx, "Catch-all test")

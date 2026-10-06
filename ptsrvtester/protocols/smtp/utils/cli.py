@@ -363,13 +363,19 @@ class SMTPArgs(ArgsWithBruteforce):
             help=argparse.SUPPRESS,
         )
         direct.add_argument(
-            "--count",
-            nargs="?",
+            "-c", "--count",
             type=int,
-            const=None,
             default=None,
             metavar="N",
-            dest="noop2_count",
+            dest="size_count",
+            help=argparse.SUPPRESS,
+        )
+        direct.add_argument(
+            "-s", "--size",
+            type=int,
+            default=None,
+            metavar="MB",
+            dest="size_mb",
             help=argparse.SUPPRESS,
         )
         direct.add_argument(

@@ -564,7 +564,9 @@ def login_bruteforce(ctx) -> set[Creds]:
         creds = [Creds(u, p) for p in passwords for u in users]
     else:
         creds = [Creds(u, p) for u in users for p in passwords]
-    threads = args.threads if getattr(args, "threads", None) is not None else 10
+    threads = getattr(args, "noop2_threads", None)
+    if threads is None:
+        threads = args.threads if getattr(args, "threads", None) is not None else 10
     threads = max(1, int(threads))
     stop = threading.Event()
     debug = bool(getattr(args, "debug", False))

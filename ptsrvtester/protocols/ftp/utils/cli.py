@@ -175,8 +175,6 @@ def validate_ftp_selection(args) -> None:
     codes = _codes(args)
     if not codes or "ALL" in codes:
         return
-    if "BRUTE" in codes and not check_if_brute(args):
-        raise argparse.ArgumentError(None, "BRUTE requires -u/--user or -U/--users; -p/--password or -P/--passwords")
     if "USRENUM" in codes and not (
         getattr(args, "user", None) or getattr(args, "users", None) or getattr(args, "user_enum_wordlist", None)
     ):

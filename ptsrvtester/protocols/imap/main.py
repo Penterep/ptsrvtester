@@ -12,6 +12,7 @@ from ptlibs.threads import printlock
 from .._base import BaseArgs, BaseMain
 from .._shared.utils.connection import banner_tcp_adapter
 from .utils.cli import IMAPArgs, validate_imap_selection
+from .utils.helpers import apply_default_brute_creds
 from .utils.engine import ImapEngine
 from .utils.registry import IMAP_DEFAULT_SUITE
 from .utils.report import ImapReport
@@ -31,6 +32,10 @@ class IMAP(BaseMain):
                 None, f'module "{getattr(args, "module", "?")}" received wrong arguments namespace'
             )
         validate_imap_selection(args)
+        raw = getattr(args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        if "BRUTE" in codes and "ALL" not in codes:
+            apply_default_brute_creds(args)
         if not getattr(args, "module_threads", None):
             args.module_threads = 1
         self.report = ImapReport()

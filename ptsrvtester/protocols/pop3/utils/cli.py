@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 
 from .capa import valid_target_pop3
-from .helpers import ArgsWithBruteforce, Target, add_bruteforce_args, check_if_brute
+from .helpers import ArgsWithBruteforce, Target, add_bruteforce_args
 from .ptprinthelper import get_colored_text
 from .registry import POP3_TEST_GROUPS, POP3_TESTS, pop3_test_help
 from ptsrvtester.protocols._shared.utils.cli import rate_limit_help_rows
@@ -43,7 +43,7 @@ class POP3Args(ArgsWithBruteforce):
             ["-p", "--password", "[password] …", "Password(s), space or comma separated. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
-            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            ["-t", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
             *rate_limit_help_rows(get_colored_text),
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
@@ -145,13 +145,7 @@ class POP3Args(ArgsWithBruteforce):
 
 
 def validate_brute_selection(args) -> None:
-    """Raise if BRUTE was explicitly selected without credentials."""
+    """Raise when a numeric option is out of range."""
     th = getattr(args, "noop2_threads", None)
     if th is not None and int(th) < 1:
         raise argparse.ArgumentError(None, "-t/--threads must be >= 1")
-    raw = getattr(args, "tests", None) or ""
-    codes = [c.strip().upper() for c in raw.split(",") if c.strip()]
-    if "BRUTE" in codes and "ALL" not in codes and not check_if_brute(args):
-        raise argparse.ArgumentError(
-            None, "BRUTE requires -u/--user or -U/--users; -p/--password or -P/--passwords",
-        )

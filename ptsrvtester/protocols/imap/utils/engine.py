@@ -5479,7 +5479,9 @@ class ImapEngine:
             creds = [Creds(u, p) for p in passwords for u in users]
         else:
             creds = [Creds(u, p) for u in users for p in passwords]
-        threads = self.args.threads if getattr(self.args, "threads", None) is not None else 10
+        threads = getattr(self.args, "noop2_threads", None)
+        if threads is None:
+            threads = self.args.threads if getattr(self.args, "threads", None) is not None else 10
         threads = max(1, int(threads))
         self._brute_stop = threading.Event()
         self._brute_guessing = None

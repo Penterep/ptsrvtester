@@ -6,7 +6,7 @@ try:
 except ImportError:
     NtlmContext = None
 
-from .helpers import ArgsWithBruteforce, check_if_brute
+from .helpers import ArgsWithBruteforce, apply_default_brute_creds, check_if_brute
 
 try:
     from cryptography import x509
@@ -305,14 +305,13 @@ SMTP_TESTS: dict[str, dict] = {
     },
     "BRUTE": {
         "desc": "Bruteforce credentials",
-        "long": ["Bruteforce SMTP AUTH using username(s) and password(s).",
+        "long": ["Bruteforce SMTP AUTH. Without -u/-U or -p/-P, built-in lists are used.",
                  "One AUTH per guess. Catch-all check first.",
                  "Error when the server never stops it."],
-        "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
         "mods": [
-            ["-u", "--user", "<name> …", "Username(s)"],
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "[password] …", "Password(s), space or comma separated. No value or \"\" tests an empty password"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["-t", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
@@ -397,12 +396,14 @@ SMTP_TESTS: dict[str, dict] = {
     "SIZE": {
         "desc": "Message size limit",
         "long": ["Declares sizes from 1 TB down to 1 MB and stops at the first",
-                 "one the server allows. With --send and -r, one message is",
-                 "sent (at most 1 MB) to see if the server accepts it."],
+                 "one the server allows. With --send and -r, one message of",
+                 "that size is sent as a body of X. -c and -s send more."],
         "flags": {"flood": True},
         "mods": [
-            ["-r", "--rcpt-to", "<email>", "Recipient for the one real message"],
-            ["", "--send", "", "Send that message (at most 1 MB). Needs -r"],
+            ["-r", "--rcpt-to", "<email>", "Recipient for the real message"],
+            ["", "--send", "", "Send the message. Needs -r"],
+            ["-c", "--count", "<n>", "Messages to send with --send (default: 1)"],
+            ["-s", "--size", "<MB>", "Body size in MB (default: largest size the server allowed)"],
         ],
     },
     "AV": {
@@ -591,6 +592,10 @@ def _apply_smtp_tests(args) -> None:
             dest, default = value
             if getattr(args, dest, None) is None and default is not None:
                 setattr(args, dest, default)
+
+    # Explicit -ts BRUTE uses the built-in lists when -u/-U or -p/-P was omitted.
+    if "BRUTE" in codes:
+        apply_default_brute_creds(args)
 
     # Every explicitly selected test must actually activate; otherwise report what is
     # missing instead of silently falling back to run-all mode.

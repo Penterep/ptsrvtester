@@ -196,8 +196,8 @@ def _stream_bcc_probe(e, probe: BccProbeResult, inbox: str) -> None:
             if line.startswith('---'):
                 continue
             e._stream_smtp_trace_line(line, indent_override=8)
-    pp(f"To: {', '.join(probe.recipients_to)}", bullet_type='TEXT', condition=True, indent=8)
-    pp(f"Cc: {', '.join(probe.recipients_cc)}", bullet_type='TEXT', condition=True, indent=8)
+    pp(f"To:  {', '.join(probe.recipients_to)}", bullet_type='TEXT', condition=True, indent=8)
+    pp(f"Cc:  {', '.join(probe.recipients_cc)}", bullet_type='TEXT', condition=True, indent=8)
     pp(f"Bcc: {', '.join(probe.recipients_bcc)}", bullet_type='TEXT', condition=True, indent=8)
     if probe.message_accepted and probe.test_id:
         e._pp_mail_probe_line(pp, True, accepted=True, sent_msg=e._mail_sent_inbox_msg(inbox, probe.test_id), indent=8)

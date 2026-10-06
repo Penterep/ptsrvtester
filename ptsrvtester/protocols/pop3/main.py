@@ -12,6 +12,7 @@ from ptlibs.threads import printlock
 from .._base import BaseArgs, BaseMain
 from .._shared.utils.connection import banner_tcp_adapter
 from .utils.cli import POP3Args, validate_brute_selection
+from .utils.helpers import apply_default_brute_creds
 from .utils.connection import ServerInfoCache, connect_pop3
 from .utils.registry import POP3_DEFAULT_SUITE
 from .utils.report import Pop3Report
@@ -31,6 +32,10 @@ class POP3(BaseMain):
                 None, f'module "{getattr(args, "module", "?")}" received wrong arguments namespace'
             )
         validate_brute_selection(args)
+        raw = getattr(args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        if "BRUTE" in codes and "ALL" not in codes:
+            apply_default_brute_creds(args)
         # Ensure serial module runs unless operator overrides.
         if not getattr(args, "module_threads", None):
             args.module_threads = 1

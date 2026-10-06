@@ -61,9 +61,25 @@ def _stream_banner_result(e) -> None:
         pp('No information found', bullet_type='TITLE', condition=show, indent=4)
     elif sid is not None:
         e.ptprint('Service Identification', Out.INFO)
-        pp(f'Product:  {sid.product}', bullet_type='TEXT', condition=show, indent=4)
-        pp(f"Version:  {(sid.version if sid.version else 'unknown')}", bullet_type='TEXT', condition=show, indent=4)
-        pp(f'CPE:      {sid.cpe}', bullet_type='TEXT', condition=show, indent=4)
+        pp(
+            f'Product:  {sid.product}',
+            bullet_type='VULN' if sid.product else 'TEXT',
+            condition=show,
+            indent=4,
+        )
+        version_known = bool(sid.version)
+        pp(
+            f"Version:  {(sid.version if version_known else 'unknown')}",
+            bullet_type='VULN' if version_known else 'TEXT',
+            condition=show,
+            indent=4,
+        )
+        pp(
+            f'CPE:      {sid.cpe}',
+            bullet_type='VULN' if sid.cpe else 'TEXT',
+            condition=show,
+            indent=4,
+        )
 
 
 def _stream_ptr_domain(e) -> None:

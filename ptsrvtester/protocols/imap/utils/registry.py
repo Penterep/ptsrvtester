@@ -117,18 +117,17 @@ IMAP_TESTS: dict[str, dict] = {
     "BRUTE": {
         "desc": "Login bruteforce (USER/PASS)",
         "long": [
-            "Bruteforce IMAP login with the supplied username(s) and",
-            "password(s). Uses AUTHENTICATE PLAIN when LOGIN is disabled.",
+            "Bruteforce IMAP login. Without -u/-U or -p/-P, built-in lists are used.",
+            "Uses AUTHENTICATE PLAIN when LOGIN is disabled.",
             "Catch-all check first. Error when the server never stops guessing.",
         ],
-        "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
         "mods": [
-            ["-u", "--user", "<name> …", "Username(s)"],
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "[password] …", "Password(s), space or comma separated. No value or \"\" tests an empty password"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
-            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            ["-t", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
         ],
     },
     "EICAR": {

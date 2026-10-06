@@ -358,6 +358,8 @@ SMTP_NOOP_POSTAUTH_CONN_MAX_ATTEMPTS = 600
 def noop2_count_from_args(args, default: int, cap: int | None = None) -> int:
     n = getattr(args, "noop2_count", None)
     if n is None:
+        n = getattr(args, "size_count", None)
+    if n is None:
         n = getattr(args, "noop_flood2", None)
     if n is None:
         n = getattr(args, "noop2_connections", None)

@@ -18,6 +18,7 @@ from impacket.nt_errors import (
     STATUS_NOT_SUPPORTED,
 )
 
+from .samr_output import format_samr_fields, print_samr_authentication_failure
 from .samr_policy import old_large_integer_value
 from .samr_session import (
     ENUMERATION_PAGE_BYTES,
@@ -329,23 +330,37 @@ def query_samr_user_info(engine) -> dict:
         result.update(status="partial" if result["domains"] else status, reason=reason)
         if status == "error":
             _record_error(engine, exc)
+    if print_samr_authentication_failure(engine, result):
+        return result
     lines = [f"SAMR user details status: {result['status']}; users returned: {result['returned']}"]
     if result["reason"]:
         lines.append(f"Reason: {result['reason']}")
     lines.append(f"Logon statistics source: {engine.args.ip} (queried server only)")
     for domain in result["domains"]:
-        lines.append(f"Domain: {domain['name']} ({domain['sid']}): {domain['status']}")
+        domain_heading = f"Domain: {domain['name']} ({domain['sid'] or 'SID unavailable'})"
+        if domain["status"] != "complete":
+            domain_heading += f": {domain['status']}"
+        lines.append(domain_heading)
         if domain["reason"]:
-            lines.append(f"Reason: {domain['reason']}")
+            lines.append(f"    Reason: {domain['reason']}")
+        if domain["users"]:
+            lines.append("")
         for user in domain["users"]:
-            lines.append(f"{domain['name']}\\{user['name']} ({user['sid']}): {user['status']}")
+            heading = f"{domain['name']}\\{user['name']}"
+            if user["status"] != "complete":
+                heading += f": {user['status']}"
+            lines.append(heading)
+            fields_to_print = [("SID", user["sid"])]
             for section, fields in (("account", _ACCOUNT_FIELDS), ("logon", _LOGON_FIELDS)):
                 for key, _, _, zero in fields:
                     value = user[section][key]
                     rendered = (value.get("utc") or value.get("meaning")) if zero is not None else value["value"]
                     if value["status"] != "complete":
                         rendered = f"{value['status']} ({value['reason']})"
-                    lines.append(f"  {key}: {rendered}")
+                    elif rendered == "not_set":
+                        rendered = "not set"
+                    fields_to_print.append((key, rendered))
+            lines.extend(format_samr_fields(fields_to_print, indent=4))
             lines.append("")
         if not domain["users"]:
             lines.append("")

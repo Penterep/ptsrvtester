@@ -541,7 +541,7 @@ def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: 
         pass_label = 'PASS ""' if cred.passw == "" else "PASS"
         trace(f"{shown!r}: USER {urep}; {pass_label} {prep}")
         if kind == "ok":
-            trace(f"user: {cred.user}", "VULN", colortext=False)
+            trace(f"user:{' ' * 5}{cred.user}", "VULN", colortext=False)
             trace(f"password: {shown_password(cred.passw)}", "TEXT", colortext=False, indent=4)
         note = "USER/PASS is not offered. Password guessing was not tested." if kind == "unsupported" else None
         block = _pop3_brute_block_paren(prep) if kind == "blocked" else None
@@ -582,12 +582,14 @@ def login_bruteforce(ctx) -> set[Creds]:
     progress = ThreadedProgress(len(creds), enabled=not json_mode, indent=4, bar_indent=4)
     first = creds[0].user
     progress.kickoff(first if len(first) <= 24 else first[:21] + "...")
-    state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None, "block": None}
+    state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None, "block": None, "tried": 0}
     lock = threading.Lock()
 
     def work(cred: Creds, output) -> str:
         kind, note, block = _pop3_brute_one(args, cred, output, stop, debug=debug, json_mode=json_mode)
         with lock:
+            if kind in ("ok", "fail", "blocked"):
+                state["tried"] += 1
             if kind == "ok":
                 found.add(cred)
                 state["saw_reply"] = True
@@ -619,6 +621,7 @@ def login_bruteforce(ctx) -> set[Creds]:
     finally:
         progress.finalize()
 
+    ctx._brute_tested = state["tried"]
     if state["blocked"]:
         ctx._brute_guessing = "stopped"
         ctx._brute_block_paren = state.get("block")
@@ -627,6 +630,8 @@ def login_bruteforce(ctx) -> set[Creds]:
     else:
         ctx._brute_guessing = "not_tested"
         ctx._brute_guessing_detail = state["note"] or "Could not connect. Password guessing was not tested."
+    if ctx._brute_guessing in ("not_limited", "stopped") and state["tried"] < 50:
+        ctx._brute_guessing = "insufficient"
     if ctx._brute_guessing is not None:
         ctx.report.update_properties(pop3PasswordGuessing=ctx._brute_guessing)
     return found

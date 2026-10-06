@@ -66,6 +66,7 @@ class ConnectionMixin:
                     self._smtp_upgrade_starttls(smtp)
 
             self._smtp_sock_set_tcp_nodelay(smtp)
+            self.end_if_blocked(status, reply)
             return smtp, status, reply
         except Exception as e:
             mode = "TLS" if (self.args.tls or self.args.target.port == 465) else get_mode(self.args)
@@ -159,6 +160,42 @@ class ConnectionMixin:
             sk.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except (OSError, ValueError, AttributeError):
             pass
+
+    def end_if_blocked(self, status, reply=None, *, greeting: bool = True) -> None:
+        """Stop the scan when the server blocks the client.
+
+        A 421 greeting, or a connection rate-limit text, is not a test result.
+        ``end_error`` makes the JSON status ``error`` and prints the red line.
+        ``greeting=False`` is for a later SMTP command: only connection
+        rate-limit text stops the scan, so greylisting 421 stays a result.
+        RATELIM does not use this: its ban is the measurement.
+        """
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            return
+        if isinstance(reply, (bytes, bytearray)):
+            text = self.bytes_to_str(reply)
+        else:
+            text = str(reply or "")
+        text = " ".join(text.split())
+        low = text.lower()
+        rate = any(
+            s in low
+            for s in (
+                "connection rate limit",
+                "rate limit exceeded",
+                "too many connections",
+                "4.3.2",
+            )
+        )
+        if not ((greeting and code == 421) or rate):
+            return
+        shown = text or "Connection rate limit exceeded"
+        msg = f"SMTP Info - [{code}] {shown}".strip()
+        if getattr(self, "ptjsonlib", None) is not None:
+            self.ptjsonlib.end_error(msg, getattr(self, "use_json", False))
+        raise SystemExit
 
     def get_smtp_handler(self, timeout: float = 15.0) -> smtplib.SMTP:
         smtp_handler, status, reply = self.connect(timeout=timeout)

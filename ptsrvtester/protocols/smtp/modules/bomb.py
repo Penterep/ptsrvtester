@@ -131,13 +131,15 @@ def test_bomb(e) -> BombResult:
                 smtp = smtplib.SMTP(timeout=socket_timeout)
                 smtp.sock = sock_ssl
                 smtp.file = None
-                status, _ = smtp.getreply()
+                status, reply = smtp.getreply()
                 if status != 220:
+                    e.end_if_blocked(status, reply)
                     return (None, f'Connect: {status}')
                 return (smtp, '')
             smtp = smtplib.SMTP(timeout=socket_timeout)
-            status, _ = smtp.connect(host, port)
+            status, reply = smtp.connect(host, port)
             if status != 220:
+                e.end_if_blocked(status, reply)
                 return (None, f'Connect: {status}')
             if use_starttls:
                 st_status, _ = smtp.docmd('STARTTLS')

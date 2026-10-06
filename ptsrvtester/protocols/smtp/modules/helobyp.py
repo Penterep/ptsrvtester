@@ -1,8 +1,7 @@
 """HELOBYP — HELO/EHLO restriction bypass."""
 import ipaddress, re, smtplib, socket, ssl, statistics, time
 
-
-
+from ptlibs.ptdefs import colors
 
 
 from ..utils.helpers import *
@@ -12,16 +11,17 @@ from ..utils.registry import *
 from ._common import eng
 
 
-__MODULELABEL__ = "HELO/EHLO Bypass Test"
+__MODULELABEL__ = "HELO/EHLO Bypass to Open Relay"
 __MODULECODE__ = "HELOBYP"
 __ORDER__ = 52
 
 _NOT_TESTED = "Could not connect. HELO/EHLO bypass was not tested."
+_OPEN_RELAY_IRRELEVANT = "Test is irelevant, because server is set as Open Relay"
 
 
 def test_helo_bypass(e) -> HeloBypassResult:
     """
-    Test HELO/EHLO value for bypassing security restrictions (PTL-SVC-SMTP-HELO).
+    Test HELO/EHLO value for bypassing security restrictions (PTV-SVC-SMTP-HELO).
     Each attempt is isolated (new connection) so previous AUTH or EHLO cannot affect state.
     """
     host = e.args.target.ip
@@ -45,11 +45,13 @@ def test_helo_bypass(e) -> HeloBypassResult:
                 smtp = smtplib.SMTP(timeout=timeout)
                 smtp.sock = sock_ssl
                 smtp.file = None
-                status, _ = smtp.getreply()
+                status, reply = smtp.getreply()
+                e.end_if_blocked(status, reply)
                 return smtp, status
             smtp = smtplib.SMTP(timeout=timeout)
-            status, _ = smtp.connect(host, port)
+            status, reply = smtp.connect(host, port)
             if status != 220:
+                e.end_if_blocked(status, reply)
                 return smtp, status
             if use_starttls:
                 status_stls, _ = smtp.docmd("STARTTLS")
@@ -136,10 +138,26 @@ def test_helo_bypass(e) -> HeloBypassResult:
             seen_payloads.add(p)
             unique_payloads.append(p)
 
+    if _server_is_open_relay(e, _connect_helo_bypass):
+        return HeloBypassResult(
+            vulnerable=False,
+            indeterminate=False,
+            submission_bypass_ehlo=(),
+            relay_bypass_ehlo=(),
+            accepts_invalid_format=(),
+            ehlo_consistent=True,
+            ehlo_comparison={},
+            tarpitting_detected=(),
+            rcpt_latencies={},
+            detail=_OPEN_RELAY_IRRELEVANT,
+            irrelevant_open_relay=True,
+        )
+
     # Role: port-based hint or ``-R`` / ``--role`` (same as role identification)
     ph = e._role_port_hint()
     port_hint = ph if ph != "unknown" else ("submission" if port in (587, 465, 2525) else "mta")
     rcpt_external = "external-test@gmail.com"
+    tested: list[str] = []
 
     for helo_value in unique_payloads:
         smtp = None
@@ -194,6 +212,8 @@ def test_helo_bypass(e) -> HeloBypassResult:
             ehlo_status, ehlo_reply_bytes = smtp.docmd("EHLO", helo_value)
             ehlo_reply_str = ehlo_reply_bytes.decode(errors="replace") if ehlo_reply_bytes else ""
             e._smtp_vv_io(f"EHLO {helo_value}", f"{ehlo_status} {ehlo_reply_str}")
+            tested.append(helo_value)
+            e.end_if_blocked(ehlo_status, ehlo_reply_str)
             extensions = _get_ehlo_extension_keys(ehlo_reply_str)
             ehlo_comparison[helo_value] = {"status": ehlo_status, "extensions": extensions}
 
@@ -209,6 +229,7 @@ def test_helo_bypass(e) -> HeloBypassResult:
             mail_status, mail_reply = smtp.docmd("MAIL", "FROM:<tester@example.com>")
             mail_latency = time.monotonic() - start
             e._smtp_vv_io("MAIL FROM:<tester@example.com>", f"{mail_status} {e.bytes_to_str(mail_reply)}")
+            e.end_if_blocked(mail_status, mail_reply)
 
             if mail_status not in (250, 251):
                 rcpt_latencies[helo_value] = mail_latency  # Store MAIL latency when rejected here
@@ -222,6 +243,7 @@ def test_helo_bypass(e) -> HeloBypassResult:
             rcpt_status, rcpt_reply = smtp.docmd("RCPT", f"TO:<{rcpt_external}>")
             rcpt_latency = time.monotonic() - start
             e._smtp_vv_io(f"RCPT TO:<{rcpt_external}>", f"{rcpt_status} {e.bytes_to_str(rcpt_reply)}")
+            e.end_if_blocked(rcpt_status, rcpt_reply)
             rcpt_latencies[helo_value] = rcpt_latency
 
             if rcpt_latency > 5.0:
@@ -273,7 +295,43 @@ def test_helo_bypass(e) -> HeloBypassResult:
         tarpitting_detected=tuple(tarpitting_list),
         rcpt_latencies=rcpt_latencies,
         detail="; ".join(detail_parts),
+        tested_ehlo=tuple(tested),
     )
+
+def _server_is_open_relay(e, connect) -> bool:
+    """True when open relay is already known, or a fresh probe confirms it."""
+    if e.results.open_relay is True and not getattr(e.results, "open_relay_incomplete", False):
+        return True
+    if e.results.open_relay is False and not getattr(e.results, "open_relay_incomplete", False):
+        return False
+    from .openrel import open_relay_test
+    try:
+        smtp, status = connect()
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+    if status != 220:
+        try:
+            smtp.close()
+        except Exception:
+            pass
+        return False
+    try:
+        is_open = open_relay_test(e, smtp, None, None)
+    except Exception:
+        return False
+    finally:
+        try:
+            smtp.quit()
+        except Exception:
+            try:
+                smtp.close()
+            except Exception:
+                pass
+    e.results.open_relay = bool(is_open)
+    if getattr(e.results, "open_relay_incomplete", False):
+        return False
+    return bool(is_open)
+
 
 def _stream_helo_bypass_result(e) -> None:
     pp = e._ptprint_raw
@@ -284,23 +342,31 @@ def _stream_helo_bypass_result(e) -> None:
     hb = e.results.helo_bypass
     if hb is None:
         return
+    if hb.irrelevant_open_relay:
+        pp(_OPEN_RELAY_IRRELEVANT, bullet_type="TITLE", condition=show, indent=4)
+        return
     if hb.detail == _NOT_TESTED:
         pp(_NOT_TESTED, bullet_type="WARNING", condition=show, indent=4)
         return
-    if hb.accepts_invalid_format:
-        pp(f"Info: Accepts loose EHLO formats: {', '.join(hb.accepts_invalid_format)}",
-           bullet_type="TITLE", condition=show, indent=4)
-    if hb.tarpitting_detected:
-        pp(f"Tarpitting detected for: {', '.join(hb.tarpitting_detected)}",
-           bullet_type="TITLE", condition=show, indent=4)
+    if hb.indeterminate and not hb.tested_ehlo:
+        pp(f"Indeterminate: {hb.detail or 'Could not complete'}", bullet_type="WARNING", condition=show, indent=4)
+        return
+    pp("Tested values", bullet_type="TITLE", condition=show, indent=4)
+    bypass = set(hb.submission_bypass_ehlo) | set(hb.relay_bypass_ehlo)
+    gray = colors["ADDITIONS"]
+    reset = colors["TEXT"]
+    for name in hb.tested_ehlo:
+        if name in bypass:
+            pp(name, bullet_type="VULN", condition=show, indent=8)
+        else:
+            pp(
+                f"{name} {gray}(not accepted){reset}",
+                bullet_type="NOTVULN",
+                condition=show,
+                indent=8,
+            )
     if hb.indeterminate:
         pp(f"Indeterminate: {hb.detail or 'Could not complete'}", bullet_type="WARNING", condition=show, indent=4)
-    elif hb.vulnerable:
-        bypass_ehlo = tuple(hb.submission_bypass_ehlo) + tuple(hb.relay_bypass_ehlo)
-        pp(f"Relay/Submission bypass with EHLO: {', '.join(bypass_ehlo)}",
-           bullet_type="VULN", condition=show, indent=4)
-    else:
-        pp("No relay bypass detected (Authorization required)", bullet_type="NOTVULN", condition=show, indent=4)
 
 def run(ctx):
     e = eng(ctx)

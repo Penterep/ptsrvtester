@@ -476,6 +476,43 @@ def password_request_text(password: str | list[str] | None) -> str:
     return "passwords: " + ", ".join(shown_password(item) for item in values)
 
 
+def brute_sorted_creds(creds) -> list:
+    return sorted(creds or [], key=lambda c: (c.user, c.passw))
+
+
+def brute_discovered_description(creds) -> str:
+    """BRUTE JSON description. No hits, or one ``login : password`` line per hit."""
+    ordered = brute_sorted_creds(creds)
+    if not ordered:
+        return "No credentials discovered"
+    lines = [f"{c.user} : {shown_password(c.passw)}" for c in ordered]
+    return "Discovered credentials\n\r" + "\r\n".join(lines)
+
+
+def brute_weak_request(args) -> str:
+    """``usernames:`` / ``passwords:`` for PTV-SVC-AUTH-WEAK. A file is the path."""
+    users = getattr(args, "user", None)
+    users_file = getattr(args, "users", None)
+    if users:
+        user_label = ", ".join(text_or_file(users, None))
+    else:
+        user_label = users_file or ""
+    passwords = getattr(args, "password", None)
+    passwords_file = getattr(args, "passwords", None)
+    if passwords is not None:
+        pass_label = ", ".join(shown_password(item) for item in brute_passwords(passwords, None))
+    else:
+        pass_label = passwords_file or ""
+    return f"usernames: {user_label}\npasswords: {pass_label}"
+
+
+def brute_weak_response(creds) -> str:
+    ordered = brute_sorted_creds(creds)
+    return "\n".join(
+        f"user: {c.user}, password: {shown_password(c.passw)}" for c in ordered
+    )
+
+
 def one_cli_user(user: str | list[str] | None) -> str | None:
     """Single ``-u`` name, or ``None`` when ``-u`` has zero or several names."""
     names = [x.strip() for x in text_or_file(user, None) if str(x).strip()]

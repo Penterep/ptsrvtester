@@ -62,6 +62,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
                 smtp.file = None
                 st, reply = smtp.getreply()
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     _sh_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
                     return (None, f'Connect: {st}')
                 _sh_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
@@ -69,6 +70,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
                 smtp = smtplib.SMTP(timeout=timeout)
                 st, reply = smtp.connect(host, port)
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     _sh_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
                     return (None, f'Connect: {st}')
                 _sh_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
@@ -91,6 +93,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
                     smtp.does_esmtp = False
             ehlo_st, ehlo_reply = smtp.docmd('EHLO', e.fqdn or 'spoofhdr-test.local')
             _sh_trace_append(trace, f'EHLO: {e._smtp_trace_reply(ehlo_st, ehlo_reply)}')
+            e.end_if_blocked(ehlo_st, ehlo_reply)
             if do_auth:
                 try:
                     smtp.login(auth_user, auth_pass)
@@ -129,6 +132,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
             try:
                 mail_st, mail_reply = smtp.docmd('MAIL', f'FROM:<{envelope_addr}>')
                 _sh_trace_append(smtp_trace, f'MAIL FROM <{envelope_addr}>: {e._smtp_trace_reply(mail_st, mail_reply)}')
+                e.end_if_blocked(mail_st, mail_reply)
                 if mail_st not in (250, 251):
                     err = True
                     status_code = mail_st
@@ -139,6 +143,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
                     status_code = status
                     reply_str = e._smtp_reply_text_one_line(reply)
                     _sh_trace_append(smtp_trace, f'RCPT TO <{rcpt}>: {e._smtp_trace_reply(status, reply)}')
+                    e.end_if_blocked(status, reply)
                     if status not in (250, 251):
                         err = True
                         detail = f'RCPT rejected before DATA: {e._smtp_trace_reply(status, reply)}'
@@ -147,6 +152,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
                         status_code = data_status
                         reply_str = e._smtp_reply_text_one_line(data_reply)
                         _sh_trace_append(smtp_trace, e._data_trace_entry(raw_msg, data_status, data_reply))
+                        e.end_if_blocked(data_status, data_reply)
                         if data_status == 250:
                             accepted = True
                             detail = accepted_detail

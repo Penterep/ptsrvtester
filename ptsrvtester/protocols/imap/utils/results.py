@@ -808,7 +808,8 @@ class IMAPResults:
 class VULNS(Enum):
     Anonymous = "PTL-SVC-IMAP-ANONYMOUS"
     NTLM = "PTL-SVC-IMAP-NTLMINFO"
-    WeakCreds = "PTV-GENERAL-WEAKCREDENTIALS"
+    WeakCreds = "PTV-SVC-AUTH-WEAK"
+    Brute = "PTV-SVC-AUTH-BRUTE"
     AuthMethods = "PTV-SVC-IMAP-AUTHMETHODS"
     Sniffable = "PTV-SVC-SNIFFABLE"
     InvComm = "PTV-SVC-IMAP-INVCOMM"

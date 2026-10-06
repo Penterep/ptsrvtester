@@ -53,6 +53,6 @@ def run(ctx):
         ctx.out("Not configured (server rejects invalid creds)", "NOTVULN", indent=4)
 
     e._flush_terminal()
-    _section(ctx, e, "Login bruteforce")
+    _section(ctx, e, "Guessing (credential bruteforce)")
     e.login_bruteforce()
     e._stream_brute_result()

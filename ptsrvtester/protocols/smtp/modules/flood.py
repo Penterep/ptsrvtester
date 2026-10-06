@@ -201,12 +201,14 @@ def test_flood(e) -> FloodResult:
                 st, reply = smtp.getreply()
                 e._mail_test_trace_append(trace, f"Connect: {e._smtp_trace_reply(st, reply)}")
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     return None, e._smtp_trace_reply(st, reply)
                 return smtp, ""
             smtp = smtplib.SMTP(timeout=15)
             st, reply = smtp.connect(host, port)
             e._mail_test_trace_append(trace, f"Connect: {e._smtp_trace_reply(st, reply)}")
             if st != 220:
+                e.end_if_blocked(st, reply)
                 return None, e._smtp_trace_reply(st, reply)
             if use_starttls:
                 st2, reply2 = smtp.docmd("STARTTLS")
@@ -341,6 +343,7 @@ def test_flood(e) -> FloodResult:
                 pass
             break
         if status == 421:
+            e.end_if_blocked(status, text)
             e._mail_test_live_done(label, f"stopped ({_clean(text)})")
             stopped = text
             break
@@ -473,6 +476,8 @@ def test_flood(e) -> FloodResult:
                     first_reject = i
                 if msg_note is None:
                     msg_note = _note("WARN", f"The message was refused ({_clean(data_text)}).")
+                if data_status == 421:
+                    e.end_if_blocked(data_status, data_text)
                 if data_status == 421 or data_status is None:
                     try:
                         if smtp is not None:

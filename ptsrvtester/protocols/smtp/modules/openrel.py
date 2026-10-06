@@ -108,7 +108,29 @@ def open_relay_test(e, smtp, mail_from, rcpt_to) -> bool:
         except Exception:
             pass
         return False
+
+    def _greet() -> bool:
+        """MAIL FROM is illegal until EHLO/HELO. A 503 here is not a relay denial."""
+        host = e.fqdn or 'relaytest.local'
+        try:
+            st, reply = smtp.docmd('EHLO', host)
+            e._smtp_vv_io(f'EHLO {host}', f'{st} {_reply_one_line(reply)}')
+            e.end_if_blocked(st, reply)
+            if st == 250:
+                return True
+            st, reply = smtp.docmd('HELO', host)
+            e._smtp_vv_io(f'HELO {host}', f'{st} {_reply_one_line(reply)}')
+            e.end_if_blocked(st, reply)
+            return st == 250
+        except Exception as ex:
+            e.ptdebug(f'Open relay: EHLO failed — {ex}', Out.INFO)
+            return False
+
     incomplete = False
+    if smtp is None or not _greet():
+        e.results.open_relay_incomplete = True
+        e.ptdebug('Open relay not confirmed (EHLO/HELO was not accepted)', Out.INFO)
+        return False
     e.results.open_relay_incomplete = False
     for label, from_addr, to_addr in vectors:
         outcome = _relay_vector(label, from_addr, to_addr)

@@ -38,6 +38,10 @@ from .helpers import (
     first_cli_password,
     get_mode,
     one_cli_user,
+    brute_discovered_description,
+    brute_sorted_creds,
+    brute_weak_request,
+    brute_weak_response,
     password_request_text,
     shown_password,
     simple_bruteforce,
@@ -5445,7 +5449,7 @@ class ImapEngine:
             cmd_show = f'{cmd} ""' if cred.passw == "" else cmd
             self._imap_brute_line(output, f"{shown!r}: {cmd_show} {self._imap_brute_reply(typ, raw)}")
             if kind == "ok":
-                self._imap_brute_line(output, f"user: {cred.user}", "VULN", colortext=False)
+                self._imap_brute_line(output, f"user:{' ' * 5}{cred.user}", "VULN", colortext=False)
                 self._imap_brute_line(
                     output,
                     f"password: {shown_password(cred.passw)}",
@@ -5505,12 +5509,14 @@ class ImapEngine:
             len(creds), enabled=not self.use_json, indent=4, bar_indent=4,
         )
         progress.kickoff(self._imap_brute_label(creds[0]))
-        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None, "block": None}
+        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None, "block": None, "tried": 0}
         lock = threading.Lock()
 
         def work(cred: Creds, output) -> str:
             kind, note, block = self._imap_brute_one(cred, output, method)
             with lock:
+                if kind in ("ok", "fail", "blocked"):
+                    state["tried"] += 1
                 if kind == "ok":
                     found.add(cred)
                     state["saw_reply"] = True
@@ -5542,6 +5548,7 @@ class ImapEngine:
         finally:
             progress.finalize()
 
+        self._brute_tested = state["tried"]
         if state["blocked"]:
             self._brute_guessing = "stopped"
             self._brute_block_paren = state.get("block")
@@ -5552,6 +5559,8 @@ class ImapEngine:
             self._brute_guessing_detail = state["note"] or (
                 "Could not connect. Password guessing was not tested."
             )
+        if self._brute_guessing in ("not_limited", "stopped") and state["tried"] < 50:
+            self._brute_guessing = "insufficient"
         self.results.creds = found
         return found
 
@@ -6599,7 +6608,14 @@ class ImapEngine:
                     indent=4,
                     colortext=False,
                 )
-            if guessing == "not_limited":
+            if guessing == "insufficient":
+                self._ptprint_raw(
+                    "The test cannot be evaluated. At least 50 combinations must be tested.",
+                    bullet_type="WARNING",
+                    condition=not self.use_json,
+                    indent=4,
+                )
+            elif guessing == "not_limited":
                 self._ptprint_raw(
                     "No protection against password guessing",
                     bullet_type="VULN",
@@ -6637,8 +6653,54 @@ class ImapEngine:
 
     # region output
 
+    def _is_brute_only_output(self) -> bool:
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"BRUTE"}
+
+    def _brute_vuln_entries(self) -> list[dict]:
+        vulns: list[dict] = []
+        if getattr(self, "_brute_guessing", None) == "not_limited":
+            vulns.append({"vuln_code": VULNS.Brute.value})
+        creds = brute_sorted_creds(self.results.creds)
+        if creds:
+            vulns.append({
+                "vuln_code": VULNS.WeakCreds.value,
+                "vuln_request": brute_weak_request(self.args),
+                "vuln_response": brute_weak_response(creds),
+            })
+        return vulns
+
+    def _add_brute_account_nodes(self, ptjsonlib) -> None:
+        for cred in brute_sorted_creds(self.results.creds):
+            node = ptjsonlib.create_node_object(
+                "userAccount",
+                parent_type="userAccounts",
+                parent=None,
+                properties={"login": cred.user, "password": cred.passw},
+            )
+            ptjsonlib.add_node(node)
+
+    def _emit_brute_json(self, ptjsonlib) -> None:
+        ptjsonlib.add_properties({
+            "description": brute_discovered_description(self.results.creds),
+        })
+        self._add_brute_account_nodes(ptjsonlib)
+        for vuln in self._brute_vuln_entries():
+            ptjsonlib.add_vulnerability(**vuln)
+        ptjsonlib.set_status("finished", "")
+        self._ptprint(ptjsonlib.get_result_json(), json=True)
+
     def build_json(self, ptjsonlib) -> None:
         """Build JSON node(s). Terminal output is streamed from run()."""
+        if (info_error := getattr(self.results, "info_error", None)) is not None:
+            if self.use_json:
+                ptjsonlib.end_error(info_error, self.use_json)
+            self._ptprint_raw(info_error, bullet_type="VULN", condition=not self.use_json, indent=4)
+            return
+        if self._is_brute_only_output():
+            self._emit_brute_json(ptjsonlib)
+            return
         properties = {
             "software_type": None,
             "name": "imap",
@@ -6647,13 +6709,6 @@ class ImapEngine:
             "description": None,
         }
         deferred_vulns = []
-
-        # Connection error: use unified error format (status=error, empty nodes)
-        if (info_error := getattr(self.results, "info_error", None)) is not None:
-            if self.use_json:
-                ptjsonlib.end_error(info_error, self.use_json)
-            self._ptprint_raw(info_error, bullet_type="VULN", condition=not self.use_json, indent=4)
-            return
 
         # Banner (skip terminal if streamed; always add to properties for JSON)
         if (info := self.results.info) and info.banner is not None:
@@ -7353,28 +7408,6 @@ class ImapEngine:
         if guessing is not None:
             properties.update({"imapPasswordGuessing": guessing})
 
-        # Login bruteforce (skip terminal output if streamed; always add to deferred for JSON)
-        if (creds := self.results.creds) is not None and len(creds) > 0:
-            json_lines = [
-                f"user: {cred.user}, password: {shown_password(cred.passw)}" for cred in creds
-            ]
-            names = text_or_file(self.args.user, None)
-            if names:
-                user_str = "username: " + ", ".join(names)
-            else:
-                user_str = f"usernames: {self.args.users}"
-            if self.args.password is not None:
-                passw_str = password_request_text(self.args.password)
-            else:
-                passw_str = f"passwords: {self.args.passwords}"
-            deferred_vulns.append(
-                {
-                    "vuln_code": VULNS.WeakCreds.value,
-                    "vuln_request": f"{user_str}\n{passw_str}",
-                    "vuln_response": "\n".join(json_lines),
-                }
-            )
-
         # Create node at the end with all collected properties and bind vulnerabilities
         imap_node = ptjsonlib.create_node_object(
             "software",
@@ -7386,6 +7419,9 @@ class ImapEngine:
         node_key = imap_node["key"]
         for v in deferred_vulns:
             ptjsonlib.add_vulnerability(node_key=node_key, **v)
+        self._add_brute_account_nodes(ptjsonlib)
+        for vuln in self._brute_vuln_entries():
+            ptjsonlib.add_vulnerability(**vuln)
 
         ptjsonlib.set_status("finished", "")
         self._ptprint(ptjsonlib.get_result_json(), json=True)

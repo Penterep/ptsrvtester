@@ -1322,6 +1322,7 @@ class SharedMixin:
         try:
             banner_s = self._smtp_brute_text(banner)
             if status == 421 or self._SMTP_BRUTE_LOCK_RE.search(banner_s):
+                self.end_if_blocked(status, banner_s)
                 self._smtp_brute_line(output, "Send: Connect")
                 self._smtp_brute_line(output, f"Receive: {status} {banner_s}".strip())
                 low = banner_s.lower()
@@ -1379,7 +1380,7 @@ class SharedMixin:
             self._smtp_brute_line(output, f"Send: {send}")
             self._smtp_brute_line(output, f"Receive: {shown_reply}")
             if kind == "ok":
-                self._smtp_brute_line(output, f"user: {cred.user}", "VULN", colortext=False)
+                self._smtp_brute_line(output, f"user:{' ' * 5}{cred.user}", "VULN", colortext=False)
                 self._smtp_brute_line(
                     output,
                     f"password: {shown_password(cred.passw)}",
@@ -1392,6 +1393,10 @@ class SharedMixin:
             else:
                 note = None
             block = self._smtp_brute_block_paren(block_code, shown_reply) if kind == "blocked" else None
+            if kind == "blocked" and (
+                block_code == 421 or "rate" in (shown_reply or "").lower()
+            ):
+                self.end_if_blocked(block_code or 421, shown_reply)
             return kind, note, block
         finally:
             try:
@@ -1412,6 +1417,7 @@ class SharedMixin:
         try:
             banner_s = self._smtp_brute_text(banner)
             if status == 421 or self._SMTP_BRUTE_LOCK_RE.search(banner_s):
+                self.end_if_blocked(status, banner_s)
                 self.ptdebug(f"Catch-all: {status} {banner_s}".strip())
                 return "limited"
             if status != 220:
@@ -1494,7 +1500,7 @@ class SharedMixin:
             len(creds), enabled=not self.use_json, indent=4, bar_indent=4,
         )
         progress.kickoff(self._smtp_brute_label(creds[0]))
-        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "limited": False, "note": None, "block": None}
+        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "limited": False, "note": None, "block": None, "tried": 0}
         lock = threading.Lock()
 
         def _promote_limit() -> None:
@@ -1504,6 +1510,8 @@ class SharedMixin:
         def work(cred: Creds, output) -> str:
             kind, note, block = self._smtp_brute_one(cred, output)
             with lock:
+                if kind in ("ok", "fail", "blocked"):
+                    state["tried"] += 1
                 if kind == "ok":
                     found.add(cred)
                     state["saw_reply"] = True
@@ -1547,6 +1555,7 @@ class SharedMixin:
         finally:
             progress.finalize()
 
+        self._brute_tested = state["tried"]
         if state["blocked"] or (state["limited"] and state["tested"]):
             self._brute_guessing = "stopped"
             self._brute_block_paren = state.get("block")
@@ -1557,6 +1566,10 @@ class SharedMixin:
             self._brute_guessing_detail = state["note"] or (
                 "Could not connect. Password guessing was not tested."
             )
+            self.results.creds = found
+            return found
+        if self._brute_guessing in ("not_limited", "stopped") and state["tried"] < 50:
+            self._brute_guessing = "insufficient"
         self.results.creds = found
         return found
 
@@ -1575,7 +1588,14 @@ class SharedMixin:
                 indent=4,
                 colortext=False,
             )
-        if guessing == "not_limited":
+        if guessing == "insufficient":
+            self._ptprint_raw(
+                "The test cannot be evaluated. At least 50 combinations must be tested.",
+                bullet_type="WARNING",
+                condition=not self.use_json,
+                indent=4,
+            )
+        elif guessing == "not_limited":
             self._ptprint_raw(
                 "No protection against password guessing",
                 bullet_type="VULN",

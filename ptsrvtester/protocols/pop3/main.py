@@ -12,7 +12,14 @@ from ptlibs.threads import printlock
 from .._base import BaseArgs, BaseMain
 from .._shared.utils.connection import banner_tcp_adapter
 from .utils.cli import POP3Args, validate_brute_selection
-from .utils.helpers import apply_default_brute_creds
+from .utils.helpers import (
+    apply_default_brute_creds,
+    brute_discovered_description,
+    brute_sorted_creds,
+    brute_weak_request,
+    brute_weak_response,
+)
+from .utils.results import VULNS
 from .utils.connection import ServerInfoCache, connect_pop3
 from .utils.registry import POP3_DEFAULT_SUITE
 from .utils.report import Pop3Report
@@ -125,10 +132,52 @@ class POP3(BaseMain):
             "rate_limit_adapter": banner_tcp_adapter(self.target[0], self.target[1], self.args),
         }
 
+    def _brute_only(self) -> bool:
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"BRUTE"}
+
+    def _brute_vuln_entries(self) -> list[dict]:
+        vulns: list[dict] = []
+        if self.report.properties.get("pop3PasswordGuessing") == "not_limited":
+            vulns.append({"vuln_code": VULNS.Brute.value})
+        creds = brute_sorted_creds(self.report.brute_creds)
+        if creds:
+            vulns.append({
+                "vuln_code": VULNS.WeakCreds.value,
+                "vuln_request": brute_weak_request(self.args),
+                "vuln_response": brute_weak_response(creds),
+            })
+        return vulns
+
+    def _add_brute_account_nodes(self) -> None:
+        for cred in brute_sorted_creds(self.report.brute_creds):
+            node = self.ptjsonlib.create_node_object(
+                "userAccount",
+                parent_type="userAccounts",
+                parent=None,
+                properties={"login": cred.user, "password": cred.passw},
+            )
+            self.ptjsonlib.add_node(node)
+
+    def _emit_brute_json(self) -> None:
+        self.ptjsonlib.add_properties({
+            "description": brute_discovered_description(self.report.brute_creds),
+        })
+        self._add_brute_account_nodes()
+        for vuln in self._brute_vuln_entries():
+            self.ptjsonlib.add_vulnerability(**vuln)
+        self.ptjsonlib.set_status("finished", "")
+        if self.use_json:
+            print(self.ptjsonlib.get_result_json())
+
     def output(self) -> None:
         """Emit one software node + collected vulnerabilities (JSON mode)."""
         if self.report.connect_error and self.use_json:
             self.ptjsonlib.end_error(self.report.connect_error, self.use_json)
+            return
+        if self._brute_only():
+            self._emit_brute_json()
             return
 
         node = self.ptjsonlib.create_node_object("software", None, None, self.report.properties)
@@ -136,6 +185,9 @@ class POP3(BaseMain):
         node_key = node["key"]
         for vuln in self.report.vulns:
             self.ptjsonlib.add_vulnerability(node_key=node_key, **vuln)
+        self._add_brute_account_nodes()
+        for vuln in self._brute_vuln_entries():
+            self.ptjsonlib.add_vulnerability(**vuln)
 
         self.ptjsonlib.set_status("finished", "")
         if self.use_json:

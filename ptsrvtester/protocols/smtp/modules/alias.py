@@ -146,6 +146,7 @@ def test_alias(e) -> AliasTestResult:
                 smtp.file = None
                 st, reply = smtp.getreply()
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     _al_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
                     return (None, f'Connect: {st}')
                 _al_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
@@ -153,6 +154,7 @@ def test_alias(e) -> AliasTestResult:
                 smtp = smtplib.SMTP(timeout=timeout)
                 st, reply = smtp.connect(host, port)
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     _al_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
                     return (None, f'Connect: {st}')
                 _al_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')

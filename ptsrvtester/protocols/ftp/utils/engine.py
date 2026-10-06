@@ -5788,7 +5788,12 @@ class FtpEngine:
                     indent=4,
                     colortext=False,
                 )
-            if guessing == "not_limited":
+            if guessing == "insufficient":
+                self._tprint(
+                    "The test cannot be evaluated. At least 50 combinations must be tested.",
+                    "WARNING",
+                )
+            elif guessing == "not_limited":
                 self._tprint("No protection against password guessing", "VULN")
             elif guessing == "stopped":
                 paren = getattr(self, "_brute_block_paren", None)
@@ -6000,7 +6005,7 @@ class FtpEngine:
     def _ftp_brute_hit(self, output, cred: Creds) -> None:
         if output is None or self.use_json:
             return
-        user_line = out_if(f"user: {cred.user}", "VULN", True, colortext=False, indent=0)
+        user_line = out_if(f"user:{' ' * 5}{cred.user}", "VULN", True, colortext=False, indent=0)
         pass_line = out_if(
             f"password: {shown_password(cred.passw)}", "TEXT", True, colortext=False, indent=4,
         )
@@ -6160,7 +6165,7 @@ class FtpEngine:
             bar_indent=4,
         )
         progress.kickoff(self._ftp_brute_label(creds[0]))
-        state = {"downs": 0, "saw_reply": False, "blocked": False, "limited": False, "note": None, "block": None}
+        state = {"downs": 0, "saw_reply": False, "blocked": False, "limited": False, "note": None, "block": None, "tried": 0}
         lock = threading.Lock()
 
         def _promote_limit() -> None:
@@ -6170,6 +6175,8 @@ class FtpEngine:
         def work(cred: Creds, output) -> str:
             kind, block = self._ftp_brute_one(cred, output)
             with lock:
+                if kind in ("ok", "fail", "blocked"):
+                    state["tried"] += 1
                 if kind == "ok":
                     found.add(cred)
                     state["saw_reply"] = True
@@ -6208,6 +6215,7 @@ class FtpEngine:
         finally:
             progress.finalize()
 
+        self._brute_tested = state["tried"]
         if state["blocked"] or (state["limited"] and state["saw_reply"]):
             self._brute_guessing = "stopped"
             self._brute_block_paren = state.get("block")
@@ -6216,6 +6224,8 @@ class FtpEngine:
         else:
             self._brute_guessing = "not_tested"
             self._brute_guessing_detail = state["note"]
+        if self._brute_guessing in ("not_limited", "stopped") and state["tried"] < 50:
+            self._brute_guessing = "insufficient"
         self.results.creds = found
         return found
 

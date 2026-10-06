@@ -54,6 +54,7 @@ def _role_rcpt_probe(e, smtp: smtplib.SMTP, target_domain: str | None) -> tuple[
             status, reply = smtp.docmd('MAIL FROM:', mail_from)
             _log_step(f'MAIL FROM:{mail_from}', status, reply)
             if status not in (250, 251):
+                e.end_if_blocked(status, reply)
                 return (None, f'MAIL FROM rejected: {status} {e.bytes_to_str(reply)}')
         except Exception as ex:
             return (None, f'MAIL FROM error: {ex}')
@@ -75,6 +76,7 @@ def _role_rcpt_probe(e, smtp: smtplib.SMTP, target_domain: str | None) -> tuple[
                 local_auth_required = False
                 local_detail = f'RCPT TO:{local_env} greylisting detected ({status}); no auth required'
             elif status == 421:
+                e.end_if_blocked(status, reply)
                 return (None, f'Server closed connection ({status})')
             else:
                 local_detail = f'RCPT TO:{local_env} unexpected response: {status} {reply_str}'

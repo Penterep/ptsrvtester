@@ -876,7 +876,7 @@ class HeloOnlyResult(NamedTuple):
 
 
 class HeloBypassResult(NamedTuple):
-    """Result of HELO/EHLO bypass test (PTL-SVC-SMTP-HELO)."""
+    """Result of HELO/EHLO bypass test (PTV-SVC-SMTP-HELO)."""
     vulnerable: bool
     indeterminate: bool
     submission_bypass_ehlo: tuple[str, ...]
@@ -887,6 +887,8 @@ class HeloBypassResult(NamedTuple):
     tarpitting_detected: tuple[str, ...]
     rcpt_latencies: dict
     detail: str | None
+    irrelevant_open_relay: bool = False
+    tested_ehlo: tuple[str, ...] = ()
 
 
 class BounceReplayResult(NamedTuple):
@@ -1270,18 +1272,18 @@ class VULNS(Enum):
     RcptDuplicate = "PTV-SVC-SMTP-RCPTDUP"
     NoStarttls = "PTV-SVC-SMTP-NOSTARTTLS"
     NTLM = "PTV-SVC-NTLMINFO"
-    OpenRelay = "PTV-SVC-SMTP-RELAY"
-    UserEnumAUTH = "PTV-SVC-SMTP-USRENUMAUTH"
-    UserEnumEXPN = "PTV-SVC-SMTP-USRENUMEXPN"
-    UserEnumVRFY = "PTV-SVC-SMTP-USRENUMVRFY"
-    UserEnumRCPT = "PTV-SVC-SMTP-USRENUMRCPT"
-    WeakCreds = "PTV-GENERAL-WEAKCREDENTIALS"
-    Brute = "PTV-SVC-SMTP-BRUTE"
+    OpenRelay = "PTV-SVC-SMTP-OPENRELAY"
+    UserEnumAUTH = "PTV-SVC-SMTP-ENUMAUTH"
+    UserEnumEXPN = "PTV-SVC-SMTP-ENUMEXPN"
+    UserEnumVRFY = "PTV-SVC-SMTP-ENUMVRFY"
+    UserEnumRCPT = "PTV-SVC-SMTP-ENUMRCPT"
+    WeakCreds = "PTV-SVC-AUTH-WEAK"
+    Brute = "PTV-SVC-AUTH-BRUTE"
     HeloNoValidation = "PTV-SVC-SMTP-HELONOVAL"
     AuthDowngrade = "PTV-SVC-SMTP-DOWN"
     InvComm = "PTV-SVC-SMTP-INVCOMM"
-    HeloOnly = "PTL-SVC-SMTP-HELOONLY"
-    HeloBypass = "PTL-SVC-SMTP-HELO"
+    HeloOnly = "PTV-SVC-SMTP-HELOONLY"
+    HeloBypass = "PTV-SVC-SMTP-HELO"
     BounceReplay = "PTL-SVC-SMTP-REPLAY"
     Bomb = "PTL-SVC-SMTP-BOMB"
     Antivirus = "PTL-SVC-SMTP-ANTIVIRUS"

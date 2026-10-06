@@ -80,6 +80,7 @@ def test_bcc(e) -> BccTestResult:
                 smtp.file = None
                 st, reply = smtp.getreply()
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     _bcc_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
                     return (None, f'Connect: {st}')
                 _bcc_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
@@ -87,6 +88,7 @@ def test_bcc(e) -> BccTestResult:
                 smtp = smtplib.SMTP(timeout=timeout)
                 st, reply = smtp.connect(host, port)
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     _bcc_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
                     return (None, f'Connect: {st}')
                 _bcc_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')

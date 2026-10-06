@@ -62,6 +62,7 @@ def test_helo_validation(e) -> HeloValidationResult:
             return (status, e.bytes_to_str(reply))
         try:
             status, reply = smtp.docmd("EHLO", hostname)
+            e.end_if_blocked(status, reply)
             raw = e.bytes_to_str(reply)
             e._smtp_vv_io(f"EHLO {hostname}", f"{status} {raw}" if raw else str(status))
             try:

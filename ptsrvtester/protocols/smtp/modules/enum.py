@@ -2,6 +2,8 @@
 import os, queue, random, re, smtplib, socket, sys, threading, time
 from typing import Callable
 
+from ptlibs.ptprinthelper import out_if
+
 from ..._base import Out
 from ..utils.helpers import get_mode
 from ..utils.progress import ThreadedProgress
@@ -335,15 +337,24 @@ def _enum_vv_dbg(e, msg: str) -> None:
     e.ptdebug(msg)
 
 
+def _enum_finding_text(payload: str, *, detail: bool = False, indent: int | None = None) -> str:
+    """Account line is ``[✗]``; a following alias or forward sits four columns further right."""
+    if indent is None:
+        indent = 8 if detail else 4
+    category = "TEXT" if detail else "VULN"
+    return out_if(payload, category, True, colortext=False, indent=indent)
+
+
 def _enum_streaming_emit_first_finding(e, _idx: int, _total: int, display: str) -> None:
     """Print first EXPN/VRFY hit on its own line (no time/%); progress line stays separate."""
     if e.use_json or int(getattr(e.args, 'enum_threads', None) or 1) > 1:
         return
-    e._raw_write(f'\x1b[2K\r    {display}\n'.encode('utf-8', errors='replace'))
+    line = _enum_finding_text(display)
+    e._raw_write(f'\x1b[2K\r{line}\n'.encode('utf-8', errors='replace'))
     e._enum_progress_line_dirty = False
 
 
-def _print_enum_finding(e, _idx: int, _total: int, payload: str, *, replace_progress: bool=True) -> None:
+def _print_enum_finding(e, _idx: int, _total: int, payload: str, *, replace_progress: bool=True, detail: bool=False) -> None:
     """Print one enumerated value (single-thread); clear the live progress line when replace_progress.
 
         Multi-thread enumeration prints findings via ``ThreadedProgress`` + ``PrintLock``
@@ -351,11 +362,12 @@ def _print_enum_finding(e, _idx: int, _total: int, payload: str, *, replace_prog
         """
     if e.use_json:
         return
+    line = _enum_finding_text(payload, detail=detail)
     if replace_progress:
-        e._raw_write(f'\x1b[2K\r    {payload}\n'.encode('utf-8', errors='replace'))
+        e._raw_write(f'\x1b[2K\r{line}\n'.encode('utf-8', errors='replace'))
         e._enum_progress_line_dirty = False
     else:
-        e._raw_write(f'    {payload}\n'.encode('utf-8', errors='replace'))
+        e._raw_write(f'{line}\n'.encode('utf-8', errors='replace'))
 
 
 def expn_vrfy_enumeration(e, method, smtp) -> list[str]:
@@ -451,7 +463,7 @@ def expn_vrfy_enumeration(e, method, smtp) -> list[str]:
                     if not e.use_json:
                         for em in user_email:
                             if em != preview:
-                                _print_enum_finding(e, idx, wl_total, em, replace_progress=False)
+                                _print_enum_finding(e, idx, wl_total, em, replace_progress=False, detail=True)
                     elif e.use_json:
                         e.ptdebug(user_email[0])
                     if method == 'EXPN' and len(user_email) > 1:
@@ -518,8 +530,10 @@ def expn_vrfy_enumeration(e, method, smtp) -> list[str]:
                             if e.use_json:
                                 e.ptdebug(user_email[0])
                             else:
-                                for em in user_email:
-                                    out.add_string_to_output(em)
+                                for i, em in enumerate(user_email):
+                                    out.add_string_to_output(
+                                        _enum_finding_text(em, detail=i > 0, indent=4 if i else 0)
+                                    )
                     finally:
                         if not e.use_json:
                             progress.flush(out, repaint=False)
@@ -927,7 +941,7 @@ def rcpt_enumeration(e, smtp) -> list[str]:
                             if e.use_json:
                                 e.ptdebug(label)
                             else:
-                                out.add_string_to_output(label)
+                                out.add_string_to_output(_enum_finding_text(label, indent=0))
                             with result_lock:
                                 enumerated_users.append(label)
                     finally:
@@ -1116,9 +1130,13 @@ def _stream_enumeration_result(e) -> None:
     if not skip_hits:
         for e in filtered:
             if e.vulnerable and (results := e.results) is not None:
-                sorted_results = sorted(results, key=str)
-                for r in sorted_results:
-                    pp(str(r), bullet_type='TEXT', condition=show, indent=4)
+                have_head = False
+                for r in results:
+                    text = str(r)
+                    detail = have_head and "@" not in text
+                    pp(text, bullet_type='TEXT' if detail else 'VULN', condition=show, indent=8 if detail else 4)
+                    if not detail:
+                        have_head = True
     if catch_all == 'configured':
         pp('Catch All mailbox configured', bullet_type='TITLE', condition=show, indent=4)
     elif catch_all == 'not_configured':

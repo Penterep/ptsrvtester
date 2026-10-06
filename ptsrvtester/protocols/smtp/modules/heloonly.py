@@ -46,11 +46,13 @@ def test_helo_only(e) -> HeloOnlyResult:
             smtp = smtplib.SMTP(timeout=timeout)
             smtp.sock = sock_ssl
             smtp.file = None
-            status, _ = smtp.getreply()
+            status, reply = smtp.getreply()
+            e.end_if_blocked(status, reply)
             return smtp, status
         smtp = smtplib.SMTP(timeout=timeout)
-        status, _ = smtp.connect(host, port)
+        status, reply = smtp.connect(host, port)
         if status != 220:
+            e.end_if_blocked(status, reply)
             return smtp, status
         if use_starttls:
             status_stls, _ = smtp.docmd("STARTTLS")
@@ -108,6 +110,7 @@ def test_helo_only(e) -> HeloOnlyResult:
         helo_status, helo_reply_bytes = smtp1.docmd("HELO", helo_host)
         helo_reply = helo_reply_bytes.decode(errors="replace") if helo_reply_bytes else None
         e._smtp_vv_io(f"HELO {helo_host}", f"{helo_status} {helo_reply or ''}")
+        e.end_if_blocked(helo_status, helo_reply)
         try:
             smtp1.quit()
         except Exception:
@@ -158,6 +161,7 @@ def test_helo_only(e) -> HeloOnlyResult:
             pass
 
         if ehlo_status in (421, 451):
+            e.end_if_blocked(ehlo_status, ehlo_reply)
             return HeloOnlyResult(
                 vulnerable=False,
                 indeterminate=True,

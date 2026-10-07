@@ -8,7 +8,7 @@ from impacket.smbconnection import (
 )
 
 from .helpers import get_if_available
-from .helpers import SMBResults
+from .helpers import SMBResults, SMBv1Flags, SMBv23Flags
 import nmap
 
 
@@ -79,7 +79,7 @@ class ServerConnection():
 
         except Exception as e:
             output.had_error = True
-            output.error_info = str(e)
+            output.error_info = "error during dialect scan: " + str(e)
             return
 
         for dialect in nm_dialects:
@@ -90,7 +90,7 @@ class ServerConnection():
                 remoteName="*SMBSERVER",
                 remoteHost=ip,
                 sess_port=port,
-                # TODO: check if I might have to try more diealects than the first accepted
+                # TODO: check if I might have to try more dialects than the first accepted
                 preferredDialect=self.dial_str_converter(nm_dialects[0]), # lowest accepted dialect
                 timeout=timeout
             )
@@ -102,7 +102,7 @@ class ServerConnection():
             smb_client.close()
         except Exception as e:
             output.had_error = True
-            output.error_info = str(e)
+            output.error_info = str(e) + " (main scan)"
             return
         
         getters = {
@@ -129,14 +129,28 @@ class ServerConnection():
             setattr(output, name, get_if_available(getter))
 
         output.used_dialect = self.dial_str_converter(smb_client.getDialect())
-
-        # TODO: revamp encryption
-        # if dialect in [SMB2_DIALECT_30, SMB2_DIALECT_311]:
-        #     server = smb_client.getSMBServer()
-        #     # NOTE: sensitive to impacket changes
-        #     status = "Supported" if server._Connection['SupportsEncryption'] else "Unsupported"
-        #     if dialect == SMB2_DIALECT_30:
-        #         output.v30_encryption = status
-        #     else:
-        #         output.v311_encryption = status       
         
+        if smb_client.getDialect() == SMB_DIALECT:
+            flags1, flags2 = smb_client.getSMBServer().get_flags()
+            security_mode = smb_client._SMBConnection._dialects_parameters.fields.get('SecurityMode', None)
+            capabilities = smb_client._SMBConnection._dialects_parameters.fields.get('Capabilities', None)
+            output.v1_flags = (flags1, flags2, security_mode, capabilities)
+        else:
+            security_mode = smb_client._SMBConnection._Connection.get('ServerSecurityMode', None)
+            capabilities = smb_client._SMBConnection._Connection.get('ServerCapabilities', None)
+            output.v23_flags = (security_mode, capabilities)
+        
+        
+        # auth_level = {
+        #     "user":	    "Separate username/password per user",
+        #     "share":	"Shared password for the whole share",
+        # }
+        # challenge_response = {
+        #     "supported"	        "Supports hashed/challenge-response auth"
+        #     "plaintext-only"	"Only accepts plaintext passwords"
+        # }
+        # msg_signing = {
+        #     "required"	        "Signing is mandatory"
+        #     "supported"	        "Signing is available but optional"
+        #     "disabled"	        "No message signing"
+        # }

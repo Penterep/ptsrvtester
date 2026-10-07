@@ -25,7 +25,7 @@ Contract:
     aborting the other selected modules.
 """
 
-__MODULELABEL__ = "The dialects used by the target system"
+__MODULELABEL__ = "Dialects used by target"
 __MODULECODE__ = "DIALECTS"
 __ORDER__ = 11
 

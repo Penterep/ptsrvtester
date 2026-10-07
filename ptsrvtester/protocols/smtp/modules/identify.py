@@ -598,6 +598,26 @@ def _identify_probe_snippet(text: str, max_len: int=120) -> str:
     return one
 
 
+def _id_kv(label: str, value: str, *, width: int | None = None) -> str:
+    """``Label:`` padded so values start in one column across the whole IDENTIFY block."""
+    w = _ID_KV_W if width is None else width
+    return f"{f'{label}:':<{w}} {value}"
+
+
+# One column for every ``Label: value`` line in IDENTIFY (probe / behavior / TLS / score / result).
+_ID_KV_W = max(len(s) + 1 for s in (
+    "HELP", "RCPT error", "Unknown command", "Error sample 9",
+    "EHLO profile", "Matched verbs", "Missing verbs", "Latency", "TLS cert context",
+    "Subject", "SAN", "Issuer", "Self-signed", "TLS policy",
+    "TLS downgrade", "Cert domain match", "OS hint",
+    "ehlo_keywords", "os_hint_match", "banner", "help",
+    "Product", "Version", "Confidence", "CPE", "Integrity",
+    "Behavioral hint", "Discrepancy", "Recommendation",
+    "Information exposure", "Sensitive info", "Extracted", "Risk",
+    "MX vs cert",
+))
+
+
 def _stream_identify_probe_evidence(e, r: ServerIdentifyResult) -> None:
     """HELP / RCPT error / unknown-command samples collected during -id."""
     pp = e._ptprint_raw
@@ -615,7 +635,7 @@ def _stream_identify_probe_evidence(e, r: ServerIdentifyResult) -> None:
     verbose = e.args.debug
     if has_help and not verbose:
         help_snip = _identify_probe_snippet(r.help_response or '')
-        pp(f'HELP: {help_snip}', bullet_type='TITLE', condition=show, indent=8)
+        pp(_id_kv('HELP', help_snip), bullet_type='TITLE', condition=show, indent=8)
         if verbose and r.help_response and (len((r.help_response or '').strip()) > len(help_snip)):
             for line in (r.help_response or '').replace('\r', '').splitlines()[:10]:
                 ln = line.strip()
@@ -626,7 +646,7 @@ def _stream_identify_probe_evidence(e, r: ServerIdentifyResult) -> None:
             continue
         label = 'RCPT error' if i == 0 else f'Error sample {i + 1}'
         snip = _identify_probe_snippet(sample)
-        pp(f'{label}: {snip}', bullet_type='TITLE', condition=show, indent=8)
+        pp(_id_kv(label, snip), bullet_type='TITLE', condition=show, indent=8)
         if verbose and len(sample.strip()) > len(snip):
             for line in sample.replace('\r', '').splitlines()[:6]:
                 ln = line.strip()
@@ -634,7 +654,7 @@ def _stream_identify_probe_evidence(e, r: ServerIdentifyResult) -> None:
                     pp(ln, bullet_type='TEXT', condition=show, indent=12)
     if has_unk and not verbose:
         snip = _identify_probe_snippet(r.unknown_cmd_response or '')
-        pp(f'Unknown command: {snip}', bullet_type='TITLE', condition=show, indent=8)
+        pp(_id_kv('Unknown command', snip), bullet_type='TITLE', condition=show, indent=8)
 
 
 def _stream_identify_result(e) -> None:
@@ -649,79 +669,110 @@ def _stream_identify_result(e) -> None:
     if not show:
         return
     banner_display = (r.banner or '').replace('\r', '').strip()
-    if r.hidden_banner and banner_display:
-        pp(f'Banner: {banner_display} (Hidden)', bullet_type='TITLE', condition=show, indent=4)
-    elif r.banner:
-        pp(f'Banner: {banner_display}', bullet_type='TITLE', condition=show, indent=4)
+    if banner_display or r.hidden_banner:
+        pp('Banner', bullet_type='TITLE', condition=show, indent=4)
+        if r.hidden_banner and banner_display:
+            pp(f'{banner_display} (Hidden)', bullet_type='TITLE', condition=show, indent=8, colortext=False)
+        elif banner_display:
+            pp(banner_display, bullet_type='TITLE', condition=show, indent=8, colortext=False)
     if r.hidden_banner or not r.scoring_matrix:
         pp('Analyzing behavioral patterns...', bullet_type='TITLE', condition=show, indent=4)
     _stream_identify_probe_evidence(e, r)
     if getattr(r, 'behavioral_profile_product', None) or getattr(r, 'behavioral_profile_detail', None) or getattr(r, 'behavioral_discrepancies', None) or (getattr(r, 'latency_avg_ms', None) is not None) or getattr(r, 'cert_software_context', None):
         pp('Behavioral Analysis', bullet_type='TITLE', condition=show, indent=4)
         if getattr(r, 'behavioral_profile_product', None) and getattr(r, 'behavioral_profile_sim', 0) > 0:
-            pp(f"EHLO profile: {r.behavioral_profile_sim}% match '{r.behavioral_profile_product}' {(f'({r.behavioral_profile_detail})' if getattr(r, 'behavioral_profile_detail', None) else '')}", bullet_type='TITLE', condition=show, indent=8)
+            profile_val = (
+                f"{r.behavioral_profile_sim}% match '{r.behavioral_profile_product}'"
+                f"{(f' ({r.behavioral_profile_detail})' if getattr(r, 'behavioral_profile_detail', None) else '')}"
+            )
+            pp(_id_kv('EHLO profile', profile_val), bullet_type='TITLE', condition=show, indent=8)
             matched = getattr(r, 'behavioral_matched_verbs', None) or ()
             missing = getattr(r, 'behavioral_missing_verbs', None) or ()
             product_name = r.behavioral_profile_product or ''
             signature_label = f' ({product_name} signature)' if product_name.strip() else ' (EHLO profile match)'
             if matched:
-                pp(f"Matched verbs: {', '.join(matched)}{signature_label}", bullet_type='TITLE', condition=show, indent=8)
+                pp(
+                    _id_kv('Matched verbs', f"{', '.join(matched)}{signature_label}"),
+                    bullet_type='TITLE', condition=show, indent=8,
+                )
             if missing:
                 parts = []
                 for v in missing:
                     hint = PROFILE_MISSING_HINTS.get((product_name, (v or '').upper()))
                     parts.append(f'{v} ({hint})' if hint else v)
-                pp(f"Missing verbs: {', '.join(parts)}", bullet_type='TITLE', condition=show, indent=8)
+                pp(
+                    _id_kv('Missing verbs', ', '.join(parts)),
+                    bullet_type='TITLE', condition=show, indent=8,
+                )
         if getattr(r, 'latency_avg_ms', None) is not None:
             jitter = getattr(r, 'latency_jitter_ms', None)
             jitter_str = f', jitter {jitter:.0f} ms' if jitter is not None and jitter > 0 else ''
             proxy_hint = ' (possible proxy/filter)' if jitter and jitter > 50 else ' (direct MTA)'
-            pp(f'Latency: avg {r.latency_avg_ms:.0f} ms{jitter_str}{proxy_hint}', bullet_type='TITLE', condition=show, indent=8)
+            pp(
+                _id_kv('Latency', f'avg {r.latency_avg_ms:.0f} ms{jitter_str}{proxy_hint}'),
+                bullet_type='TITLE', condition=show, indent=8,
+            )
         if getattr(r, 'cert_software_context', None):
-            pp(f'TLS cert context: {r.cert_software_context}', bullet_type='TEXT', condition=show, indent=8)
+            pp(
+                _id_kv('TLS cert context', r.cert_software_context),
+                bullet_type='TITLE', condition=show, indent=8,
+            )
         for d in getattr(r, 'behavioral_discrepancies', None) or []:
             pp(d, bullet_type='WARNING', condition=show, indent=8)
     has_tls_cert = bool(r.tls_cert_subject or r.tls_cert_issuer or (r.tls_cert_san and r.tls_cert_san))
-    pp('TLS Certificate Info:', bullet_type='TITLE', condition=show, indent=4)
+    pp('TLS Certificate Info', bullet_type='TITLE', condition=show, indent=4)
     if has_tls_cert:
         if r.tls_cert_subject:
-            pp(f'Subject: {r.tls_cert_subject}', bullet_type='TITLE', condition=show, indent=8)
+            pp(_id_kv('Subject', r.tls_cert_subject), bullet_type='TITLE', condition=show, indent=8)
         if r.tls_cert_san:
-            pp(f"SAN: {', '.join(r.tls_cert_san)}", bullet_type='TITLE', condition=show, indent=8)
+            pp(_id_kv('SAN', ', '.join(r.tls_cert_san)), bullet_type='TITLE', condition=show, indent=8)
         if r.tls_cert_issuer:
-            pp(f'Issuer: {r.tls_cert_issuer}', bullet_type='TITLE', condition=show, indent=8)
+            pp(_id_kv('Issuer', r.tls_cert_issuer), bullet_type='TITLE', condition=show, indent=8)
         if r.tls_cert_self_signed:
-            pp('Self-signed: yes', bullet_type='VULN', condition=show, indent=8)
+            pp(_id_kv('Self-signed', 'yes'), bullet_type='VULN', condition=show, indent=8)
         else:
-            pp('Self-signed: no', bullet_type='NOTVULN', condition=show, indent=8)
+            pp(_id_kv('Self-signed', 'no'), bullet_type='NOTVULN', condition=show, indent=8)
         mx_msg = getattr(r, 'mx_cert_message', None)
         mx_st = getattr(r, 'mx_cert_ok', None)
         if mx_msg:
+            mx_body = mx_msg
+            if mx_body.startswith('MX vs cert:'):
+                mx_body = mx_body[len('MX vs cert:'):].lstrip()
+            mx_line = _id_kv('MX vs cert', mx_body)
             if mx_st is True:
-                pp(mx_msg, bullet_type='NOTVULN', condition=show, indent=8)
+                pp(mx_line, bullet_type='NOTVULN', condition=show, indent=8)
             elif mx_st is False:
-                pp(mx_msg, bullet_type='WARNING', condition=show, indent=8)
+                pp(mx_line, bullet_type='WARNING', condition=show, indent=8)
             else:
-                pp(mx_msg, bullet_type='TITLE', condition=show, indent=8)
+                pp(mx_line, bullet_type='TITLE', condition=show, indent=8)
         if getattr(r, 'tls_policy', None) and r.tls_policy != 'n/a':
-            pp(f'TLS policy: {r.tls_policy}', bullet_type='TEXT', condition=show, indent=8)
+            pp(_id_kv('TLS policy', r.tls_policy), bullet_type='TITLE', condition=show, indent=8)
         if getattr(r, 'tls_downgrade_probed', False):
             downgrade = getattr(r, 'tls_downgrade_findings', None) or []
             if downgrade:
                 for w in downgrade:
-                    pp(f'TLS downgrade: {w}', bullet_type='WARNING', condition=show, indent=8)
+                    pp(_id_kv('TLS downgrade', w), bullet_type='WARNING', condition=show, indent=8)
             else:
-                pp('TLS downgrade: TLS 1.0/1.1 rejected (Good)', bullet_type='NOTVULN', condition=show, indent=8)
+                pp(
+                    _id_kv('TLS downgrade', 'TLS 1.0/1.1 rejected (Good)'),
+                    bullet_type='NOTVULN', condition=show, indent=8,
+                )
         if getattr(r, 'cert_domain_match', False):
-            pp('Cert domain match: SAN aligns with target', bullet_type='NOTVULN', condition=show, indent=8)
+            pp(
+                _id_kv('Cert domain match', 'SAN aligns with target'),
+                bullet_type='NOTVULN', condition=show, indent=8,
+            )
         elif has_tls_cert and (r.tls_cert_subject or (r.tls_cert_san and len(r.tls_cert_san) > 0)):
-            pp('Cert domain match: no clear SAN/Subject tie to connection target', bullet_type='TITLE', condition=show, indent=8)
+            pp(
+                _id_kv('Cert domain match', 'no clear SAN/Subject tie to connection target'),
+                bullet_type='TITLE', condition=show, indent=8,
+            )
         for w in getattr(r, 'tls_cert_warnings', None) or []:
             pp(w, bullet_type='WARNING', condition=show, indent=8)
         for w in getattr(r, 'tls_cipher_warnings', None) or []:
             pp(w, bullet_type='WARNING', condition=show, indent=8)
         if getattr(r, 'os_hint', None):
-            pp(f'OS hint: {r.os_hint}', bullet_type='TITLE', condition=show, indent=8)
+            pp(_id_kv('OS hint', r.os_hint), bullet_type='TITLE', condition=show, indent=8)
     else:
         transport_tls = getattr(r, 'transport_tls', False)
         starttls_adv = getattr(r, 'starttls_advertised', False)
@@ -741,33 +792,69 @@ def _stream_identify_result(e) -> None:
             downgrade = getattr(r, 'tls_downgrade_findings', None) or []
             if downgrade:
                 for w in downgrade:
-                    pp(f'TLS downgrade: {w}', bullet_type='WARNING', condition=show, indent=8)
+                    pp(_id_kv('TLS downgrade', w), bullet_type='WARNING', condition=show, indent=8)
             else:
-                pp('TLS downgrade: TLS 1.0/1.1 rejected (Good)', bullet_type='NOTVULN', condition=show, indent=8)
+                pp(
+                    _id_kv('TLS downgrade', 'TLS 1.0/1.1 rejected (Good)'),
+                    bullet_type='NOTVULN', condition=show, indent=8,
+                )
         if getattr(r, 'os_hint', None):
-            pp(f'OS hint: {r.os_hint}', bullet_type='TITLE', condition=show, indent=8)
+            pp(_id_kv('OS hint', r.os_hint), bullet_type='TITLE', condition=show, indent=8)
     if r.scoring_matrix:
         pp('Scoring Matrix', bullet_type='TITLE', condition=show, indent=4)
         for s in r.scoring_matrix:
             pts_fmt = f'{s.points:+d}%'
-            pp(f"{s.method}: {pts_fmt} {(f'({s.detail})' if s.detail else '')}", bullet_type='TITLE', condition=show, indent=8)
+            detail = f' ({s.detail})' if s.detail else ''
+            pp(_id_kv(s.method, f'{pts_fmt}{detail}'), bullet_type='TITLE', condition=show, indent=8)
     pp('Identification Result', bullet_type='TITLE', condition=show, indent=4)
-    pp(f"Product:     {r.product or 'Unknown'}", bullet_type='VULN', condition=show, indent=8)
+    pp(
+        _id_kv('Product', r.product or 'Unknown'),
+        bullet_type='VULN', condition=show, indent=8,
+    )
     _bh = getattr(r, 'behavioral_hint', None)
     if _bh and (not str(_bh).rstrip().endswith('(0%)')):
-        pp(f'Behavioral hint: {_bh}', bullet_type='TEXT', condition=show, indent=8)
-    pp(f"Version:     {r.version or '—'}", bullet_type='VULN', condition=show, indent=8)
-    pp(f'Confidence: {r.confidence_pct}% ({r.confidence_label})', bullet_type='VULN', condition=show, indent=8)
+        pp(
+            _id_kv('Behavioral hint', _bh),
+            bullet_type='TITLE', condition=show, indent=8, colortext=False,
+        )
+    pp(
+        _id_kv('Version', r.version or '—'),
+        bullet_type='VULN', condition=show, indent=8,
+    )
+    pp(
+        _id_kv('Confidence', f'{r.confidence_pct}% ({r.confidence_label})'),
+        bullet_type='VULN', condition=show, indent=8,
+    )
     if r.cpe:
-        pp(f'CPE:        {r.cpe}', bullet_type='VULN', condition=show, indent=8)
+        pp(_id_kv('CPE', r.cpe), bullet_type='VULN', condition=show, indent=8)
     if getattr(r, 'discrepancy_detected', False) and getattr(r, 'discrepancy_banner_product', None) and getattr(r, 'discrepancy_behavior_product', None):
-        pp(f"Discrepancy: Banner claims '{r.discrepancy_banner_product}', behavior matches '{r.discrepancy_behavior_product}'", bullet_type='TITLE', condition=show, indent=8)
+        pp(
+            _id_kv(
+                'Discrepancy',
+                f"Banner claims '{r.discrepancy_banner_product}', behavior matches '{r.discrepancy_behavior_product}'",
+                
+            ),
+            bullet_type='TITLE', condition=show, indent=8,
+        )
     elif r.anomalous_identity:
-        pp(f"Discrepancy: Banner claims '{r.banner_claims}', behavior matches '{r.behavior_matches}'", bullet_type='TITLE', condition=show, indent=8)
+        pp(
+            _id_kv(
+                'Discrepancy',
+                f"Banner claims '{r.banner_claims}', behavior matches '{r.behavior_matches}'",
+                
+            ),
+            bullet_type='TITLE', condition=show, indent=8,
+        )
     if r.integrity_note:
-        pp(f'Integrity: {r.integrity_note}', bullet_type='TITLE', condition=show, indent=8)
+        pp(
+            _id_kv('Integrity', r.integrity_note),
+            bullet_type='TITLE', condition=show, indent=8,
+        )
     if r.recommendation:
-        pp(f'Recommendation: {r.recommendation}', bullet_type='TITLE', condition=show, indent=8)
+        pp(
+            _id_kv('Recommendation', r.recommendation),
+            bullet_type='TITLE', condition=show, indent=8,
+        )
     leaks = getattr(r, 'data_leakage_findings', None) or ()
     if leaks:
         pp('Data Leakage / Privacy', bullet_type='INFO', condition=show, indent=4)
@@ -775,32 +862,66 @@ def _stream_identify_result(e) -> None:
             src = ', '.join(leak.sources)
             _lk = getattr(leak, 'kind', 'email')
             if _lk == 'internal_hostname':
+                msg = 'Internal infrastructure naming leaked in TLS Certificate (Non-routable domain).'
                 if leak.risk == 'high':
-                    pp('Information exposure: Internal infrastructure naming leaked in TLS Certificate (Non-routable domain).', bullet_type='WARNING', condition=show, indent=8)
-                    pp(f'Extracted: {leak.email} [High Risk]', bullet_type='WARNING', condition=show, indent=8)
+                    pp(_id_kv('Information exposure', msg), bullet_type='WARNING', condition=show, indent=8)
+                    pp(_id_kv('Extracted', f'{leak.email} [High Risk]'), bullet_type='WARNING', condition=show, indent=8)
                 else:
-                    pp('Information exposure: Internal infrastructure naming leaked in TLS Certificate (Non-routable domain).', bullet_type='WARNING', condition=show, indent=8)
-                    pp(f'Extracted: {leak.email} [Medium Risk]', bullet_type='WARNING', condition=show, indent=8)
+                    pp(_id_kv('Information exposure', msg), bullet_type='WARNING', condition=show, indent=8)
+                    pp(_id_kv('Extracted', f'{leak.email} [Medium Risk]'), bullet_type='WARNING', condition=show, indent=8)
                 continue
             if leak.risk == 'high':
-                pp(f'Sensitive info: E-mail address found in {src} (domain aligns with scan target).', bullet_type='WARNING', condition=show, indent=8)
-                pp(f'Extracted: {leak.email} [High Risk]', bullet_type='WARNING', condition=show, indent=8)
+                pp(
+                    _id_kv('Sensitive info', f'E-mail address found in {src} (domain aligns with scan target).'),
+                    bullet_type='WARNING', condition=show, indent=8,
+                )
+                pp(_id_kv('Extracted', f'{leak.email} [High Risk]'), bullet_type='WARNING', condition=show, indent=8)
             elif leak.risk == 'medium':
-                pp(f'Information exposure: Routable address in {src} (domain does not match scan target).', bullet_type='WARNING', condition=show, indent=8)
-                pp(f'Extracted: {leak.email} [Medium Risk]', bullet_type='WARNING', condition=show, indent=8)
+                pp(
+                    _id_kv('Information exposure', f'Routable address in {src} (domain does not match scan target).'),
+                    bullet_type='WARNING', condition=show, indent=8,
+                )
+                pp(_id_kv('Extracted', f'{leak.email} [Medium Risk]'), bullet_type='WARNING', condition=show, indent=8)
             else:
-                pp(f'Information exposure: Generic, noreply, or non-routable contact in {src}.', bullet_type='TITLE', condition=show, indent=8)
-                pp(f'Extracted: {leak.email} [Low Risk]', bullet_type='TITLE', condition=show, indent=8)
+                pp(
+                    _id_kv('Information exposure', f'Generic, noreply, or non-routable contact in {src}.'),
+                    bullet_type='TITLE', condition=show, indent=8,
+                )
+                pp(_id_kv('Extracted', f'{leak.email} [Low Risk]'), bullet_type='TITLE', condition=show, indent=8)
         email_leaks = [x for x in leaks if getattr(x, 'kind', 'email') == 'email']
         if email_leaks:
             if any((x.risk == 'high' for x in email_leaks)):
-                pp(f'Risk: Address domain matches the scanned host — strong signal for organizational exposure; targeted phishing or brute-force against admin mailboxes is more credible.', bullet_type='TITLE', condition=show, indent=8)
+                pp(
+                    _id_kv(
+                        'Risk',
+                        'Address domain matches the scanned host — strong signal for organizational exposure; targeted phishing or brute-force against admin mailboxes is more credible.',
+                    ),
+                    bullet_type='TITLE', condition=show, indent=8,
+                )
             elif any((x.risk == 'medium' for x in email_leaks)):
-                pp(f'Risk: Routable address leaked but not aligned with scan target — still information exposure (e.g. vendor or third-party identity in cert).', bullet_type='TITLE', condition=show, indent=8)
+                pp(
+                    _id_kv(
+                        'Risk',
+                        'Routable address leaked but not aligned with scan target — still information exposure (e.g. vendor or third-party identity in cert).',
+                    ),
+                    bullet_type='TITLE', condition=show, indent=8,
+                )
             else:
-                pp(f'Risk: Little direct phishing value for noreply / @localhost / reserved domains, but may still indicate default or placeholder TLS/DN setup.', bullet_type='TITLE', condition=show, indent=8)
+                pp(
+                    _id_kv(
+                        'Risk',
+                        'Little direct phishing value for noreply / @localhost / reserved domains, but may still indicate default or placeholder TLS/DN setup.',
+                    ),
+                    bullet_type='TITLE', condition=show, indent=8,
+                )
         if any((getattr(x, 'kind', 'email') == 'internal_hostname' and x.risk in ('medium', 'high') for x in leaks)):
-            pp(f'Risk: Exposure of internal hostnames aids in network reconnaissance and targeted internal attacks.', bullet_type='TITLE', condition=show, indent=8)
+            pp(
+                _id_kv(
+                    'Risk',
+                    'Exposure of internal hostnames aids in network reconnaissance and targeted internal attacks.',
+                ),
+                bullet_type='TITLE', condition=show, indent=8,
+            )
 
 
 def run(ctx):

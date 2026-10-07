@@ -191,6 +191,38 @@ class ReportingMixin:
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)
 
+    @staticmethod
+    def _domfill_description(df) -> str:
+        reply = " ".join((df.reply or "").split())
+        status = "" if df.status is None else str(df.status)
+        line = f"MAIL FROM:<test> -> {status} {reply}".strip()
+        if df.vulnerable and df.domain:
+            return f"Domain name was disclosed: {df.domain}\r\n{line}"
+        return line or "Domain name was not disclosed"
+
+    def _is_domfill_only_output(self) -> bool:
+        """``-ts DOMFILL`` alone: description and, when a domain is disclosed, one vuln code."""
+        if getattr(self, "run_all_mode", False):
+            return False
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"DOMFILL"}
+
+    def _emit_domfill_json(self) -> None:
+        df = self.results.domfill
+        err = self.results.domfill_error
+        if err is not None:
+            description = f"Sender domain autofill error: {err}"
+        elif df is not None:
+            description = self._domfill_description(df)
+        else:
+            description = "Domain name was not disclosed"
+        self.ptjsonlib.add_properties({"description": description})
+        if df is not None and df.vulnerable:
+            self.ptjsonlib.add_vulnerability(vuln_code=VULNS.Domfill.value)
+        self.ptjsonlib.set_status("finished", "")
+        self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+
     def _is_brute_only_output(self) -> bool:
         """``-ts BRUTE`` alone: description, userAccount nodes, global vuln codes."""
         if getattr(self, "run_all_mode", False):
@@ -691,6 +723,12 @@ class ReportingMixin:
         if self.results.open_relay and not getattr(self.results, "open_relay_incomplete", False):
             vulns.append({"vuln_code": VULNS.OpenRelay.value})
 
+        if self.results.relay_unauth and not getattr(self.results, "relay_unauth_incomplete", False):
+            vulns.append({"vuln_code": VULNS.RelayUnauth.value})
+
+        if (df := self.results.domfill) is not None and df.vulnerable:
+            vulns.append({"vuln_code": VULNS.Domfill.value})
+
         if (blacklist := self.results.blacklist) is not None:
             if blacklist.listed:
                 vulns.append({"vuln_code": VULNS.Blacklist.value})
@@ -1020,6 +1058,10 @@ class ReportingMixin:
 
         if self._is_auth_downgrade_only_output():
             self._emit_auth_downgrade_json()
+            return
+
+        if self._is_domfill_only_output():
+            self._emit_domfill_json()
             return
 
         # ── Flat output: no nodes, global properties + global vulnerabilities ──
@@ -1509,6 +1551,17 @@ class ReportingMixin:
         elif (open_relay := self.results.open_relay) is not None:
             if open_relay and not getattr(self.results, "open_relay_incomplete", False):
                 global_vulns.append({"vuln_code": VULNS.OpenRelay.value})
+
+        if (relay_unauth_error := self.results.relay_unauth_error) is not None:
+            properties.update({"relayUnauthError": relay_unauth_error})
+        elif (relay_unauth := self.results.relay_unauth) is not None:
+            if relay_unauth and not getattr(self.results, "relay_unauth_incomplete", False):
+                global_vulns.append({"vuln_code": VULNS.RelayUnauth.value})
+
+        if (domfill_error := self.results.domfill_error) is not None:
+            properties.update({"domfillError": domfill_error})
+        elif (df := self.results.domfill) is not None and df.vulnerable:
+            global_vulns.append({"vuln_code": VULNS.Domfill.value})
 
         # Catch All mailbox
         if (catch_all := self.results.catch_all) is not None:

@@ -53,6 +53,8 @@ class SMTPArgs(ArgsWithBruteforce):
     slow_down: bool
     spf_test: bool
     open_relay: bool
+    relay_unauth: bool
+    domfill: bool
     interactive: bool
     isencrypt: bool
     role_identify: bool

@@ -410,6 +410,8 @@ class SharedMixin:
 
     def _enum_clock_paint_unlocked(self) -> None:
         """One progress line per attempt: ETA, N% (vs wordlist / -u size), current label."""
+        if getattr(self, "_enum_progress_sealed", False):
+            return
         st = self._enum_clock_state
         if st is None:
             return

@@ -19,8 +19,7 @@ from ptlibs.ptprinthelper import out_if
 
 from .capa import bytes_to_text
 from .helpers import Creds, brute_passwords, get_mode, shown_password, text_or_file
-from .progress import ThreadedProgress
-from .ptprinthelper import get_colored_text
+from .progress import ThreadedProgress, clear_raw_line, paint_raw_line
 from .results import (
     EncryptionResult,
     HelpInfoResult,
@@ -777,16 +776,14 @@ def _run_noop_duration_loop(
         nonlocal live_line_dirty
         if not show_progress or verbose:
             return
-        sys.stdout.write(f"\033[2K\r            {text:<100}")
-        sys.stdout.flush()
+        paint_raw_line(f"            {text:<100}")
         live_line_dirty = True
 
     def clear_live():
         nonlocal live_line_dirty
         if not show_progress or not live_line_dirty:
             return
-        sys.stdout.write("\033[2K\r")
-        sys.stdout.flush()
+        clear_raw_line()
         live_line_dirty = False
 
     def emit_vv(msg: str) -> None:
@@ -1243,17 +1240,14 @@ def _noop2_conn_count_test(
         nonlocal live_line_dirty
         if not show_progress:
             return
-        line = get_colored_text(text, "ADDITIONS")
-        sys.stdout.write(f"\033[2K\r{line}")
-        sys.stdout.flush()
+        paint_raw_line(text)
         live_line_dirty = True
 
     def clear_live():
         nonlocal live_line_dirty
         if not show_progress or not live_line_dirty:
             return
-        sys.stdout.write("\033[2K\r")
-        sys.stdout.flush()
+        clear_raw_line()
         live_line_dirty = False
 
     connections, est_err, est_disc, est_timeout = _noop2_establish_pool(

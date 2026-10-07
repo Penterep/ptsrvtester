@@ -193,6 +193,12 @@ class ConnectionMixin:
             return
         shown = text or "Connection rate limit exceeded"
         msg = f"SMTP Info - [{code}] {shown}".strip()
+        if getattr(self, "_enum_progress_line_dirty", False):
+            write = getattr(self, "_raw_write", None)
+            if callable(write):
+                write(b"\n")
+            self._enum_progress_line_dirty = False
+            self._enum_progress_sealed = True
         if getattr(self, "ptjsonlib", None) is not None:
             self.ptjsonlib.end_error(msg, getattr(self, "use_json", False))
         raise SystemExit

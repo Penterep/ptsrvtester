@@ -1,7 +1,6 @@
 """NOOP1 — NOOP connection duration."""
 import select
 import socket
-import sys
 import time
 
 from ._common import eng
@@ -12,6 +11,7 @@ from ._noop import (
     _smtp_noop_open,
     _smtp_noop_safe,
 )
+from ..utils.progress import clear_raw_line, paint_raw_line
 from ..utils.results import *
 
 def _noop1_wait_idle(sock, delay: float, start_time: float, duration: float, *, tick=None) -> str:
@@ -95,8 +95,7 @@ def _run_noop_duration_loop(e, smtp, *, authenticated: bool, duration: float, de
         nonlocal live_line_dirty
         if not show_progress:
             return
-        sys.stdout.write(f"\033[2K\r{text}")
-        sys.stdout.flush()
+        paint_raw_line(text)
         live_line_dirty = True
 
     def paint() -> None:
@@ -107,8 +106,7 @@ def _run_noop_duration_loop(e, smtp, *, authenticated: bool, duration: float, de
         nonlocal live_line_dirty
         if not show_progress or not live_line_dirty:
             return
-        sys.stdout.write("\033[2K\r")
-        sys.stdout.flush()
+        clear_raw_line()
         live_line_dirty = False
 
     def emit_vv(msg: str) -> None:

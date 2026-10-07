@@ -43,8 +43,21 @@ class SMTP(BaseMain):
     def _import_module_file(self, name: str, path: str):
         return importlib.import_module(f"ptsrvtester.protocols.smtp.modules.{name}")
 
+    def _relay_code_for_all(self) -> str:
+        """ALL runs one relay test: Submission -> RELANON, otherwise OPENREL (MTA and hybrid)."""
+        role = getattr(getattr(self.engine.results, "role", None), "role", None)
+        if role == "submission":
+            return "RELANON"
+        return "OPENREL"
+
     def _run_module(self, code: str, discovered, extras: dict) -> None:
         """Heading now; ``-vv`` live; verdicts through ``ctx.out`` (IMAP/POP3)."""
+        if (
+            self.engine.run_all_mode
+            and code in ("OPENREL", "RELANON")
+            and code != self._relay_code_for_all()
+        ):
+            return
         entry = discovered[code]
         lock = printlock.PrintLock()
         ctx = self._make_context(lock, extras)

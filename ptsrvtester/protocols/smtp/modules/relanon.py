@@ -1,0 +1,192 @@
+"""RELANON — relay without authentication (Submission)."""
+import secrets, smtplib, socket, sys, threading, time
+
+from ..._base import Out
+
+from ..utils.helpers import *
+from ..utils.results import *
+from ..utils.registry import *
+
+from ._common import ensure_info
+
+
+__MODULELABEL__ = "Relay without authentication"
+__MODULECODE__ = "RELANON"
+__ORDER__ = 41
+
+
+def relay_unauth_test(e, smtp, mail_from, rcpt_to) -> bool:
+    """OWASP/Nmap-style multi-vector open relay test. Tests: empty FROM, internal→external,
+        external→external, literal IP sender. Returns True if any vector succeeds."""
+    verbose = bool(e.args.debug and (not e.args.json))
+    ext_domain = 'external.relaytest.local'
+    host_domain = e.fqdn or 'relaytest.local'
+    target_ip = getattr(e.args.target, 'ip', None) or '127.0.0.1'
+    sample_to = rcpt_to or f'relaytest@{ext_domain}'
+    sample_from = mail_from or f'relaytest@{host_domain}'
+    msg = f'From: <{sample_from}>\r\nTo: <{sample_to}>\r\nSubject: {e._outbound_subject()}\r\n\r\n{e._outbound_data()}\r\n'
+    vectors: list[tuple[str, str, str]] = [('MAIL FROM:<> (null sender)', '<>', f'relaytest@{ext_domain}'), (f'relaytest@{host_domain} -> external', f'relaytest@{host_domain}', f'relaytest@{ext_domain}'), (f'relaytest@[{target_ip}] -> external', f'relaytest@[{target_ip}]', f'relaytest@{ext_domain}'), ('external -> external', f'relaytest@{ext_domain}', f'relaytest@other.{ext_domain}')]
+    if mail_from and rcpt_to:
+        vectors.insert(0, (f'user: {mail_from} -> {rcpt_to}', mail_from, rcpt_to))
+
+    def _reply_one_line(raw: str | bytes, limit: int=160) -> str:
+        if isinstance(raw, str):
+            s = raw.strip().replace('\r\n', ' ').replace('\n', ' ')
+        else:
+            s = e.bytes_to_str(raw).strip().replace('\r\n', ' ').replace('\n', ' ')
+        return s if len(s) <= limit else s[:limit - 3] + '...'
+
+    def _envelope_addr(addr: str) -> str:
+        if addr == '<>':
+            return '<>'
+        if addr.startswith('<') and addr.endswith('>'):
+            return addr
+        return f'<{addr}>'
+
+    def _relay_vector(label: str, from_addr: str, to_addr: str) -> bool | None:
+        """Run one relay vector. True = open, False = denied, None = timeout/disconnect."""
+        mail_env = _envelope_addr(from_addr)
+        rcpt_env = _envelope_addr(to_addr)
+        try:
+            smtp.docmd('RSET')
+        except Exception:
+            pass
+        try:
+            mail_status, mail_reply = smtp.docmd('MAIL FROM:', mail_env)
+            mail_rep = _reply_one_line(mail_reply)
+            e._smtp_vv_io(f'MAIL FROM:{mail_env}', f'{mail_status} {mail_rep}')
+            if mail_status not in (250, 251):
+                return None if 400 <= mail_status < 500 else False
+            rcpt_status, rcpt_reply = smtp.docmd('RCPT TO:', rcpt_env)
+            rcpt_rep = _reply_one_line(rcpt_reply)
+            e._smtp_vv_io(f'RCPT TO:{rcpt_env}', f'{rcpt_status} {rcpt_rep}')
+            if rcpt_status not in (250, 251, 252):
+                return None if 400 <= rcpt_status < 500 else False
+            data_status, data_reply = smtp.data(msg)
+            data_rep = _reply_one_line(data_reply)
+            if verbose:
+                e._stream_smtp_trace_line(e._data_trace_entry(msg, data_status, data_reply))
+            if data_status == 250:
+                return True
+            return None if 400 <= data_status < 500 else False
+        except smtplib.SMTPRecipientsRefused as ex:
+            detail = _reply_one_line(str(ex))
+            if verbose:
+                e.ptdebug(f'Relay without authentication ({label}): RCPT TO:{rcpt_env} → {detail}', Out.INFO)
+            else:
+                e.ptdebug(f'Relay rejected: {label} — RCPT TO {detail}', Out.INFO)
+            return False
+        except smtplib.SMTPResponseException as ex:
+            code = getattr(ex, 'smtp_code', None)
+            err = _reply_one_line(getattr(ex, 'smtp_error', b'') or str(ex))
+            transient = isinstance(code, int) and 400 <= code < 500
+            if verbose:
+                e.ptdebug(f'Relay without authentication ({label}): SMTP [{code}] {err}', Out.INFO)
+            elif transient or e._smtp_exc_is_timeout(ex):
+                e.ptdebug(f'Relay without authentication ({label}): transient error — [{code}] {err}', Out.INFO)
+            else:
+                e.ptdebug(f'Relay rejected: {label} — [{code}] {err}', Out.INFO)
+            if transient or e._smtp_exc_is_timeout(ex):
+                return None
+            return False
+        except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError, TimeoutError, socket.timeout) as ex:
+            detail = _reply_one_line(str(ex))
+            if verbose:
+                e.ptdebug(f'Relay without authentication ({label}): connection error — {detail}', Out.INFO)
+            else:
+                e.ptdebug(f'Relay without authentication ({label}): timed out / disconnected — {detail}', Out.INFO)
+            return None
+        except Exception as ex:
+            detail = _reply_one_line(str(ex))
+            if verbose:
+                e.ptdebug(f'Relay without authentication ({label}): error — {detail}', Out.INFO)
+            else:
+                e.ptdebug(f'Relay without authentication ({label}): error — {detail}', Out.INFO)
+            return None
+        try:
+            smtp.docmd('RSET')
+        except Exception:
+            pass
+        return False
+
+    def _greet() -> bool:
+        """MAIL FROM is illegal until EHLO/HELO. A 503 here is not a relay denial."""
+        host = e.fqdn or 'relaytest.local'
+        try:
+            st, reply = smtp.docmd('EHLO', host)
+            e._smtp_vv_io(f'EHLO {host}', f'{st} {_reply_one_line(reply)}')
+            e.end_if_blocked(st, reply)
+            if st == 250:
+                return True
+            st, reply = smtp.docmd('HELO', host)
+            e._smtp_vv_io(f'HELO {host}', f'{st} {_reply_one_line(reply)}')
+            e.end_if_blocked(st, reply)
+            return st == 250
+        except Exception as ex:
+            e.ptdebug(f'Relay without authentication: EHLO failed — {ex}', Out.INFO)
+            return False
+
+    incomplete = False
+    if smtp is None or not _greet():
+        e.results.relay_unauth_incomplete = True
+        e.ptdebug('Relay without authentication not confirmed (EHLO/HELO was not accepted)', Out.INFO)
+        return False
+    e.results.relay_unauth_incomplete = False
+    for label, from_addr, to_addr in vectors:
+        outcome = _relay_vector(label, from_addr, to_addr)
+        if outcome is True:
+            return True
+        if outcome is None:
+            incomplete = True
+            try:
+                smtp.docmd('RSET')
+            except Exception:
+                pass
+            try:
+                smtp.close()
+            except Exception:
+                pass
+                try:
+                    smtp, status, _ = e.connect(timeout=15.0, fatal=False)
+                    if status == 220:
+                        smtp.docmd('EHLO', e.fqdn)
+                except Exception as ex:
+                    e.ptdebug(f'Relay without authentication: reconnect after timeout failed — {ex}', Out.INFO)
+    if incomplete:
+        e.results.relay_unauth_incomplete = True
+        e.ptdebug('Relay without authentication not confirmed (timeout, disconnect, or transient SMTP error)', Out.INFO)
+        return False
+    e.ptdebug('Server is not vulnerable to Relay without authentication', Out.NOTVULN)
+    return False
+
+
+def _stream_relay_unauth_result(e) -> None:
+    pp = e._ptprint_raw
+    show = not e.use_json
+    if (relay_unauth_error := e.results.relay_unauth_error) is not None:
+        pp(f'Relay without authentication test failed: {relay_unauth_error}', bullet_type='VULN', condition=show, indent=4)
+        return
+    if getattr(e.results, 'relay_unauth_incomplete', False):
+        pp('Relay without authentication not confirmed (timeout, disconnect, or transient SMTP error)', bullet_type='WARNING', condition=show, indent=4)
+        return
+    if (relay_unauth := e.results.relay_unauth) is None:
+        return
+    if relay_unauth:
+        pp('Relay without authentication is allowed', bullet_type='VULN', condition=show, indent=4)
+    else:
+        pp('Relay without authentication is denied', bullet_type='NOTVULN', condition=show, indent=4)
+
+
+def run(ctx):
+    e = ensure_info(ctx, get_commands=False)
+    if getattr(e.results, "info_error", None):
+        return
+    mail_from = e.args.mail_from or f"relaytest@{e.fqdn}"
+    rcpt_to = e.args.rcpt_to or "relaytest@external.relaytest.local"
+    try:
+        e.results.relay_unauth = relay_unauth_test(e, e.smtp, mail_from, rcpt_to)
+    except Exception as ex:
+        e.results.relay_unauth_error = str(ex)
+        ctx.out(f"Relay without authentication probe failed: {ex}", "ERROR", indent=4)
+        return
+    _stream_relay_unauth_result(e)

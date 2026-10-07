@@ -9,7 +9,7 @@ from .helpers import Creds
 from .ptntlmauth.ptntlmauth import NTLMInfo
 
 class NTLMResult(NamedTuple):
-    """NTLMSSP info from AUTHENTICATE NTLM challenge (PTL-SVC-IMAP-NTLMINFO when decoded)."""
+    """NTLMSSP info from AUTHENTICATE NTLM challenge (PTV-SVC-NTLMINFO when decoded)."""
     success: bool
     ntlm: NTLMInfo | None
     auth_ntlm_advertised: bool  # AUTH=NTLM in pre-login CAPABILITY (or banner)
@@ -806,8 +806,8 @@ class IMAPResults:
 
 
 class VULNS(Enum):
-    Anonymous = "PTL-SVC-IMAP-ANONYMOUS"
-    NTLM = "PTL-SVC-IMAP-NTLMINFO"
+    Anonymous = "PTV-SVC-IMAP-ANON"
+    NTLM = "PTV-SVC-NTLMINFO"
     WeakCreds = "PTV-SVC-AUTH-WEAK"
     Brute = "PTV-SVC-AUTH-BRUTE"
     AuthMethods = "PTV-SVC-IMAP-AUTHMETHODS"

@@ -19,6 +19,17 @@ from ptlibs.threads.printlock import PrintLock
 from .ptprinthelper import get_colored_text
 
 
+_live: ThreadedProgress | None = None
+_sealed = False
+
+
+def release_live_line() -> None:
+    """Finish the live progress row so a fatal error starts on the next line."""
+    bar = _live
+    if bar is not None:
+        bar.break_line()
+
+
 class ThreadedProgress:
     """Live-progress line plus ``PrintLock``-based per-item output.
 
@@ -75,7 +86,7 @@ class ThreadedProgress:
         return remaining * elapsed / float(self._done)
 
     def _paint_unlocked(self) -> None:
-        if not self.enabled or not self._tty or self.total <= 0:
+        if _sealed or not self.enabled or not self._tty or self.total <= 0:
             return
         pct = min(100, max(0, int(100 * self._done / self.total)))
         eta = self._eta_seconds()
@@ -88,6 +99,8 @@ class ThreadedProgress:
         )
         self._write(f"\033[2K\r{line}")
         self._active = True
+        global _live
+        _live = self
 
     @staticmethod
     def _write(text: str) -> None:
@@ -136,7 +149,19 @@ class ThreadedProgress:
             if repaint:
                 self._paint_unlocked()
 
+    def break_line(self) -> None:
+        """Leave the live row in place and move the cursor to the next line."""
+        global _live, _sealed
+        with self._lock:
+            _sealed = True
+            if self._active:
+                self._write("\n")
+                self._active = False
+            if _live is self:
+                _live = None
+
     def finalize(self) -> None:
+        global _live
         if not self.enabled:
             return
         with self._lock:
@@ -146,6 +171,8 @@ class ThreadedProgress:
                 else:
                     self._write("\n")
                 self._active = False
+            if _live is self:
+                _live = None
 
     def run(
         self,

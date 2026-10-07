@@ -56,7 +56,7 @@ FTP_TESTS: dict[str, dict] = {
         "mods": [
             ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["-t", "--threads", "<n>", "Threads (default: 10)"],

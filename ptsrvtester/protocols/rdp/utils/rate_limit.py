@@ -453,6 +453,13 @@ class RateLimitRunner:
         self.clock = clock
         self.sleeper = sleeper
 
+    def _validate_held_configuration(self) -> None:
+        """Reject an unreachable held-control threshold before network activity."""
+        if self.config.failure_threshold > self.config.control_probes:
+            raise ValueError(
+                "failure_threshold must not exceed control_probes for held scenarios"
+            )
+
     def _invoke_probe(self, request: ProbeRequest) -> ProbeResult:
         started = self.clock()
         try:
@@ -808,6 +815,7 @@ class RateLimitRunner:
         )
 
     def run_held(self) -> ScenarioResult:
+        self._validate_held_configuration()
         scenario = Scenario.HELD
         if self.held_connection_factory is None:
             return ScenarioResult(
@@ -1007,6 +1015,7 @@ class RateLimitRunner:
         )
 
     def run_both(self) -> RateLimitReport:
+        self._validate_held_configuration()
         completed = self.run_completed()
         if not completed.safe_to_continue:
             return RateLimitReport(

@@ -5640,7 +5640,8 @@ class RDP(BaseModule):
         )
         self.ptdebug(
             f"Wordlist candidates: {result.candidate_count_requested} requested, "
-            f"{result.candidate_count_tested} tested, "
+            f"{result.candidate_count_tested} probed, "
+            f"{result.candidate_count_baseline_reused} reused from baseline, "
             f"{result.candidate_count_skipped} skipped"
         )
 
@@ -6110,6 +6111,7 @@ class RDP(BaseModule):
             "baselineAttempts": result.baseline_attempts,
             "candidateCountRequested": result.candidate_count_requested,
             "candidateCountTested": result.candidate_count_tested,
+            "candidateCountBaselineReused": result.candidate_count_baseline_reused,
             "candidateCountSkipped": result.candidate_count_skipped,
             "invalidBaselinesConsistent": result.invalid_baselines_consistent,
             "knownUserFingerprint": self._semantic_fingerprint_json(
@@ -6125,6 +6127,7 @@ class RDP(BaseModule):
                 {
                     "login": candidate.login,
                     "classification": candidate.classification,
+                    "baselineReused": candidate.baseline_reused,
                     "durationMs": (
                         round(candidate.duration_ms, 3)
                         if candidate.duration_ms is not None

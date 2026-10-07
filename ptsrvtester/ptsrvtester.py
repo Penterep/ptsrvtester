@@ -68,6 +68,7 @@ class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
 
     def end_error(self, message, condition, details=None, *, category="ERROR"):
         full_msg = f"Error: {message}" if category == "ERROR" else str(message)
+        _release_live_progress()
         try:
             ptprint(out_ifnot(full_msg, category, condition, colortext=True))
         except UnicodeEncodeError:
@@ -88,6 +89,24 @@ class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
             sys.stdout.write("\033[?25h")
         sys.stdout.flush()
         os._exit(1)
+
+
+def _release_live_progress() -> None:
+    """End a live bruteforce row so the fatal line starts underneath it."""
+    for name in (
+        "ptsrvtester.protocols.smtp.utils.progress",
+        "ptsrvtester.protocols.pop3.utils.progress",
+        "ptsrvtester.protocols.imap.utils.progress",
+        "ptsrvtester.protocols.ftp.utils.progress",
+    ):
+        mod = sys.modules.get(name)
+        release = getattr(mod, "release_live_line", None) if mod is not None else None
+        if not callable(release):
+            continue
+        try:
+            release()
+        except Exception:
+            pass
 
 
 _LAST_ERROR: dict[str, str | None] = {"message": None}
@@ -260,6 +279,16 @@ def parse_args() -> BaseArgs:
     if len(argv) == 1:
         _print_module_help(module, argv)
         sys.exit(0)
+
+    folded: list[str] = []
+    replaced = False
+    for tok in argv:
+        if not replaced and not tok.startswith("-"):
+            folded.append(module)
+            replaced = True
+        else:
+            folded.append(tok)
+    argv = folded
 
     parser = CustomArgumentParser(add_help=True, parents=[_global_parent()])
     subparsers = parser.add_subparsers(required=True, dest="module", parser_class=CustomArgumentParser)

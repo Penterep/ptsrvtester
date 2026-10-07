@@ -31,21 +31,28 @@ __ORDER__ = 12
 
 # from ..smb_utils.helpers import SMBContext
 from ..smb_utils.server_connection import ServerConnection
+from ..smb_utils.helpers import SMBResults
 from impacket.smbconnection import (
     SMB2_DIALECT_30,
     SMB2_DIALECT_311,
 )
 
-
 # TODO: add encryption requirement check
 
 def run(ctx) -> None:
-    ip, port = ctx.target
-    # ctx.out(f"Would check {ip}:{port} here.", "TEXT")
-    # For JSON mode, add structured findings instead of text, e.g.:
-    #   ctx.ptjsonlib.add_vulnerability("PTV-SMTP-...")
-    
+    # pending complete overhaul
+    return
+    output: SMBResults = ctx.output
     sc = ServerConnection(ctx)
+    # ip, port = ctx.target
+
+    if not output.has_ran:
+        # TODO: add login and password check
+        sc.connect()
+
+    if output.had_error:
+        ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
+        return
     
     for dialect in [SMB2_DIALECT_30, SMB2_DIALECT_311]:
         out = sc.connect(dialect, try_login=False, parse_info=False, parse_encryption=True)

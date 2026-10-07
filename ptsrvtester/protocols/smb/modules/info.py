@@ -25,7 +25,7 @@ Contract:
     aborting the other selected modules.
 """
 
-__MODULELABEL__ = "Information about the target system"
+__MODULELABEL__ = "Information about target"
 __MODULECODE__ = "INFO"
 __ORDER__ = 10
 
@@ -111,8 +111,12 @@ def win_version_translate(ver: str) -> str:
 
 
 def run(ctx) -> None:
+    ip, port = ctx.target
     output: SMBResults = ctx.output
     sc = ServerConnection(ctx)
+
+    ctx.out(f"IP address:              {ip}", "INFO", indent=4)
+    ctx.out(f"Port:                    {port}", "INFO", indent=4)
 
     if not output.has_ran:
         # TODO: add login and password check
@@ -150,10 +154,10 @@ def run(ctx) -> None:
     ctx.out(f"DNS domain name:         {output.dns_domain_name}", "INFO", indent=4)
     ctx.out(f"DNS host name:           {output.dns_hostname}", "INFO", indent=4,
                 condition=output.dns_domain_name != output.dns_hostname and output.dns_domain_name.lower() != "unknown")
-    ctx.out(f"Lowest dialect version:  {output.used_dialect}",
-                "VULN" if output.used_dialect == "SMBv1" else "NOTVULN", indent=4)
+    # ctx.out(f"Lowest dialect version:  {output.used_dialect}",
+    #             "VULN" if output.used_dialect == "SMBv1" else "NOTVULN", indent=4)
     ctx.out(f"Login required:          {output.is_login_required}",
                 "WARNING" if not output.is_login_required else "OK", indent=4)
     ctx.out(f"Signing required:        {output.is_signing_required}",
-                "VULN" if not output.is_signing_required else "NOTVULN", indent=4)
+                "WARNING" if not output.is_signing_required else "NOTVULN", indent=4)
     ctx.out(f"NTLMv2 supported:        {output.does_support_NTLMv2}", "INFO", indent=4)

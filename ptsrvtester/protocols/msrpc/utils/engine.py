@@ -49,6 +49,7 @@ from ..._shared.utils.progress import CredentialProgress
 from .helpers import text_or_file
 from .samr_policy import format_interval, parse_lockout_policy, parse_password_policy
 from .samr_users import parse_samr_user, unavailable_samr_user
+from .samr_output import format_samr_fields, print_samr_authentication_failure
 from .samr_session import (
     ENUMERATION_PAGE_BYTES, MAX_ENUMERATION_PAGES, enumeration_page, iter_samr_domains,
 )
@@ -240,7 +241,7 @@ class _PrintMixin:
         self.ptjsonlib = ctx.ptjsonlib
         return self
 
-    def ptprint(self, string="", out=Out.TEXT, title=False, end="\n", json=False):
+    def ptprint(self, string="", out=Out.TEXT, title=False, end="\n", json=False, indent=4):
         if json:
             if self.use_json:
                 sys.stdout.write(str(string) + (end if end is not None else "\n"))
@@ -255,7 +256,7 @@ class _PrintMixin:
                 str(string),
                 category,
                 colortext=title or category == Out.INFO.value,
-                indent=4,
+                indent=indent,
             )
 
     def ptdebug(self, string="") -> None:
@@ -744,43 +745,35 @@ class MsrpcEngine(_PrintMixin):
         return iter_samr_domains(self, dce, server_handle)
 
     def _print_samr_policy(self, result: dict) -> list[str]:
+        if print_samr_authentication_failure(self, result):
+            return []
         lines = [
             f"SAMR policy source: {result['sourceHost']}",
             "Policy scope: queried SAM domain (local account policy or AD domain default)",
             "Effective per-user password and lockout policies: not queried; "
             "AD users may have different policies",
         ]
-        self.ptprint(f"SAMR policy query status: {result['status']}", out=Out.INFO if result["status"] == "complete" else Out.TITLE)
+        self.ptprint(
+            f"SAMR policy query status: {result['status']}",
+            out=Out.INFO if result["status"] == "complete" else Out.TITLE,
+        )
         for line in lines:
             self.ptprint(line, out=Out.INFO)
         for domain in result["domains"]:
-            name = domain.get("name", "unknown")
-            sid = domain.get("sid", "unknown")
-            self.ptprint(f"Domain: {name} ({sid})")
-            lines.append(f"Domain: {name} ({sid})")
-            if domain["status"] == "denied":
-                self.ptprint("Policy access denied", out=Out.TITLE)
-                lines.append("Policy access denied")
-                self.ptprint("")
-                lines.append("")
-                continue
-
+            fields = [
+                ("Domain name", domain.get("name", "unknown")),
+                ("Domain SID", domain.get("sid") or "unknown"),
+            ]
             password = domain.get("passwordPolicy")
             if password is not None:
-                password_lines = [
-                    f"Minimum password length: {password['minimumPasswordLength']}",
-                    f"Password history length: {password['passwordHistoryLength']}",
-                    "Password complexity required: "
-                    + ("yes" if password["passwordComplexityRequired"] else "no"),
-                    "Reversible encryption enabled: "
-                    + ("yes" if password["reversibleEncryptionEnabled"] else "no"),
-                    f"Minimum password age: {format_interval(password['minimumPasswordAge'])}",
-                    f"Maximum password age: {format_interval(password['maximumPasswordAge'])}",
-                ]
-                for line in password_lines:
-                    self.ptprint(line)
-                lines.extend(password_lines)
-
+                fields.extend([
+                    ("Minimum password length", password["minimumPasswordLength"]),
+                    ("Password history length", password["passwordHistoryLength"]),
+                    ("Password complexity required", "yes" if password["passwordComplexityRequired"] else "no"),
+                    ("Reversible encryption enabled", "yes" if password["reversibleEncryptionEnabled"] else "no"),
+                    ("Minimum password age", format_interval(password["minimumPasswordAge"])),
+                    ("Maximum password age", format_interval(password["maximumPasswordAge"])),
+                ])
             lockout = domain.get("lockoutPolicy")
             if lockout is not None:
                 duration = lockout["lockoutDuration"]
@@ -789,23 +782,24 @@ class MsrpcEngine(_PrintMixin):
                     if duration.get("untilAdministratorUnlock")
                     else format_interval(duration)
                 )
-                lockout_lines = [
-                    "Account lockout enabled: "
-                    + ("yes" if lockout["lockoutEnabled"] else "no"),
-                    f"Lockout threshold: {lockout['lockoutThreshold']}",
-                    f"Lockout duration: {duration_text}",
-                    "Lockout observation window: "
-                    + format_interval(lockout["lockoutObservationWindow"]),
-                ]
-                for line in lockout_lines:
-                    self.ptprint(line)
-                lines.extend(lockout_lines)
-
-            for error in domain.get("errors", []):
-                self.ptprint(
-                    f"{error['section']} unavailable: {error['reason']}", out=Out.TITLE
-                )
-                lines.append(f"{error['section']} unavailable: {error['reason']}")
+                fields.extend([
+                    ("Account lockout enabled", "yes" if lockout["lockoutEnabled"] else "no"),
+                    ("Lockout threshold", lockout["lockoutThreshold"]),
+                    ("Lockout duration", duration_text),
+                    ("Lockout observation window", format_interval(lockout["lockoutObservationWindow"])),
+                ])
+            field_lines = format_samr_fields(fields)
+            for line in field_lines:
+                self.ptprint(line)
+            lines.extend(field_lines)
+            if domain["status"] == "denied":
+                self.ptprint("    Policy access denied", out=Out.TITLE)
+                lines.append("    Policy access denied")
+            else:
+                for error in domain.get("errors", []):
+                    line = f"    {error['section']} unavailable: {error['reason']}"
+                    self.ptprint(line, out=Out.TITLE)
+                    lines.append(line)
             self.ptprint("")
             lines.append("")
         return lines
@@ -854,17 +848,14 @@ class MsrpcEngine(_PrintMixin):
                     _AUTH_REJECTION_STATUSES | {STATUS_ACCESS_DENIED}
                 ):
                     result.update(status="denied", reason="authentication_denied")
-                    self.ptprint("SAMR authentication was denied", out=Out.TITLE)
+                    print_samr_authentication_failure(self, result)
                     return result
                 raise
 
             identity = self._smb_session_identity(smb)
             if identity != "authenticated":
                 result.update(status="denied", reason=f"{identity}_session")
-                self.ptprint(
-                    "SAMR policy was not queried because authentication mapped to Guest or anonymous",
-                    out=Out.TITLE,
-                )
+                print_samr_authentication_failure(self, result)
                 return result
 
             binding = f"ncacn_np:{self.args.ip}[\\pipe\\samr]"
@@ -1154,10 +1145,12 @@ class MsrpcEngine(_PrintMixin):
             context = next_context
 
     def _print_samr_users(self, result: dict) -> list[str]:
+        if print_samr_authentication_failure(self, result):
+            return []
         lines: list[str] = []
         self.ptprint(
             f"SAMR user enumeration status: {result['status']}",
-            out=Out.INFO if result["status"] == "complete" else Out.TITLE
+            out=Out.INFO if result["status"] == "complete" else Out.TITLE,
         )
         if result.get("reason"):
             reason = str(result["reason"]).replace("_", " ")
@@ -1165,36 +1158,48 @@ class MsrpcEngine(_PrintMixin):
             self.ptprint(line, out=Out.TITLE)
             lines.append(line)
         for domain in result["domains"]:
-            name = domain.get("name", "unknown")
-            sid = domain.get("sid") or "unknown"
-            header = f"Domain: {name} ({sid})"
-            self.ptprint(header)
-            lines.append(header)
+            self.ptprint("Domain", out=Out.INFO, indent=8)
+            lines.append("    Domain")
+            domain_lines = format_samr_fields([
+                ("Name", domain.get("name", "unknown")),
+                ("SID", domain.get("sid") or "unknown"),
+            ], indent=8, colon=False)
+            for line in domain_lines:
+                self.ptprint(line)
+            lines.extend(domain_lines)
             if domain["status"] == "denied":
-                self.ptprint("User enumeration access denied", out=Out.TITLE)
-                lines.append("User enumeration access denied")
+                self.ptprint("    User enumeration access denied", out=Out.TITLE)
+                lines.extend(["    User enumeration access denied", ""])
+                self.ptprint("")
+                continue
+            self.ptprint("Users", out=Out.INFO, indent=8)
+            lines.append("    Users")
+            for user in domain["users"]:
+                name_line = f"        {user['name']}"
+                self.ptprint(name_line)
+                lines.append(name_line)
+                complete_state = user.get("stateStatus") == "complete"
+                fields = [
+                    ("RID", user["rid"]),
+                    ("SID", user["sid"]),
+                    ("disabled", ("yes" if user["disabled"] else "no") if complete_state else "unknown"),
+                    ("locked", ("yes" if user["lockedOut"] else "no") if complete_state else "unknown"),
+                ]
+                user_lines = format_samr_fields(fields, indent=12, colon=False)
+                for line in user_lines:
+                    self.ptprint(line)
+                lines.extend(user_lines)
+                if not complete_state:
+                    reason = str(user.get("stateReason") or user.get("stateStatus") or "unavailable").replace("_", " ")
+                    line = f"            account state: {reason}"
+                    self.ptprint(line, out=Out.TITLE)
+                    lines.append(line)
                 self.ptprint("")
                 lines.append("")
-                continue
-            for user in domain["users"]:
-                if user["stateStatus"] == "complete":
-                    state = (
-                        f"disabled: {'yes' if user['disabled'] else 'no'}, "
-                        f"locked: {'yes' if user['lockedOut'] else 'no'}"
-                    )
-                else:
-                    reason = str(user["stateReason"] or user["stateStatus"]).replace("_", " ")
-                    state = f"account state: {reason}"
-                line = (
-                    f"{user['name']} (RID {user['rid']}, SID {user['sid']}, "
-                    f"{state})"
-                )
-                self.ptprint(line)
-                lines.append(line)
-            self.ptprint(f"Users returned: {domain['returned']}", out=Out.INFO)
-            lines.append(f"Users returned: {domain['returned']}")
+            count_line = f"Users returned: {domain.get('returned', len(domain['users']))}"
+            self.ptprint(count_line, out=Out.INFO)
+            lines.extend([count_line, ""])
             self.ptprint("")
-            lines.append("")
         return lines
 
     def enumerate_samr_users(self) -> dict:
@@ -1231,17 +1236,14 @@ class MsrpcEngine(_PrintMixin):
                     _AUTH_REJECTION_STATUSES | {STATUS_ACCESS_DENIED}
                 ):
                     result.update(status="denied", reason="authentication_denied")
-                    self.ptprint("SAMR authentication was denied", out=Out.TITLE)
+                    print_samr_authentication_failure(self, result)
                     return result
                 raise
 
             identity = self._smb_session_identity(smb)
             if identity != "authenticated":
                 result.update(status="denied", reason=f"{identity}_session")
-                self.ptprint(
-                    "SAMR users were not enumerated because authentication mapped to Guest or anonymous",
-                    out=Out.TITLE,
-                )
+                print_samr_authentication_failure(self, result)
                 return result
 
             binding = f"ncacn_np:{self.args.ip}[\\pipe\\samr]"

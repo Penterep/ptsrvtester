@@ -4,7 +4,7 @@ from ptsrvtester.protocols.snmp.utils.helpers import write_to_file
 from ptsrvtester.protocols.snmp.utils.registry import text_or_file
 
 __MODULELABEL__ = "SNMPv3 User Enumeration Test"
-__MODULECODE__ = "v3_enum"
+__MODULECODE__ = "v3enum"
 __ORDER__ = 100
 
 

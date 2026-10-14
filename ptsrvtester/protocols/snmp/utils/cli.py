@@ -163,6 +163,11 @@ SNMP_TESTS: dict[str, dict] = {
             ["-ap", "--auth-protocols", "", "Authentication protocol"],
             ["-pp", "--priv-protocols", "", "Private protocol"],
             ["-v", "--value", "<value>", "Value to write to the specified OID (default: 'Testvalue123')"]
+        ],
+        "usage": [
+            "-tg 192.168.15.53:161 -u user123 -p letm3in",
+            "-tg 192.168.15.53:161 -cred creds.txt",
+            "-tg 192.168.15.53:161 -u user123 -p letm3in -ap usmHMACSHAAuthProtocol -pp usmAesCfb128Protocol -v value123"
         ]
     }
 }

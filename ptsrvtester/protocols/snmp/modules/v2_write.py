@@ -5,7 +5,7 @@ from pysnmp.hlapi.v3arch.asyncio import *
 import asyncio
 
 __MODULELABEL__ = "SNMPv2 Write Permission Test"
-__MODULECODE__ = "v2_write"
+__MODULECODE__ = "v2write"
 __ORDER__ = 100
 
 

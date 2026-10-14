@@ -4,7 +4,7 @@ from ptsrvtester.protocols.snmp.utils.helpers import write_to_file, format_timet
 from ptsrvtester.protocols.snmp.utils.registry import text_or_file
 
 __MODULELABEL__ = "SNMPv2 Walk"
-__MODULECODE__ = "v2_walk"
+__MODULECODE__ = "v2walk"
 __ORDER__ = 100
 
 

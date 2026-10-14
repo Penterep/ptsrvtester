@@ -5,7 +5,7 @@ from ptsrvtester.protocols.snmp.utils.registry import PROTOCOL_NAMES, AuthPrivPr
 
 
 __MODULELABEL__ = "SNMPv3 Walk"
-__MODULECODE__ = "v3_walk"
+__MODULECODE__ = "v3walk"
 __ORDER__ = 100
 
 

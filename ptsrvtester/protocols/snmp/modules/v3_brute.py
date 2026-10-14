@@ -7,7 +7,7 @@ from ptsrvtester.protocols.snmp.utils.registry import (PROTOCOL_NAMES, text_or_f
 from ptsrvtester.protocols.snmp.modules.v3_enum import user_enum
 
 __MODULELABEL__ = "SNMPv3 Brute Force Test"
-__MODULECODE__ = "v3_brute"
+__MODULECODE__ = "v3brute"
 __ORDER__ = 100
 
 

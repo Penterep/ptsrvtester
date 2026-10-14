@@ -120,7 +120,7 @@ class Rsync(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain
         needs_modules = (
             not test_codes
             or "ALL" in test_codes
-            or bool(test_codes & {"GRAB_MODULES", "MODULE_AUTH", "WRITE", "OWNERSHIP"})
+            or bool(test_codes & {"GRAB_MODULES", "MODULE_AUTH", "WRITE", "OWNERSHIP", "SYMLINK"})
             or ("FILL_SPACE" in test_codes and getattr(self.args, "dos", False))
         )
         modules = getattr(self.args, "modules", None)

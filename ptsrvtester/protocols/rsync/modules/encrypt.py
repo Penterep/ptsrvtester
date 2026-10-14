@@ -1,5 +1,6 @@
 import socket
 from ptsrvtester.protocols.ssh.modules.authmethods import get_auth_methods
+from ptsrvtester.protocols.rsync.modules.banner import get_supported_digests
 
 __MODULELABEL__ = "Rsync SSH and authentication method detection"
 __MODULECODE__ = "encrypt"
@@ -30,7 +31,18 @@ def _rsync_try_ssh(ctx):
         ctx.out(f"The host does not support SSH: {e}", "INFO", indent=4)
 
 def run(ctx):
+    supported_digests = list(ctx.supported_digests)
+    if not supported_digests:
+        try:
+            supported_digests = get_supported_digests(ctx)
+        except OSError as e:
+            ctx.out(
+                f"Error fetching supported hash digest algorithms: {e}",
+                "ERROR",
+                indent=4,
+            )
+
     ctx.out(f"Supported hash digest algorithms:", "INFO", indent=4)
-    for hd in ctx.supported_digests:
+    for hd in supported_digests:
         ctx.out(f"{hd}", DIGEST_SECURITY_MAPPING.get(hd, "INFO"), indent=8)
     _rsync_try_ssh(ctx)

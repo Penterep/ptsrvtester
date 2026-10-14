@@ -6,16 +6,27 @@ __MODULECODE__ = "banner"
 __ORDER__ = 10
 
 
+def _parse_greeting(greeting):
+    return (
+        greeting.removeprefix("@RSYNCD:").strip().split()
+        if greeting.startswith("@RSYNCD:")
+        else []
+    )
+
+
+def get_supported_digests(ctx):
+    with socket.create_connection((ctx.ip, ctx.port), timeout=ctx.timeout) as sock:
+        with sock.makefile("rb") as reader:
+            greeting = reader.readline().decode(errors="replace").strip()
+    return _parse_greeting(greeting)[1:]
+
+
 def _rsync_grab_banner(ctx):
     try:
         with socket.create_connection((ctx.ip, ctx.port), timeout=ctx.timeout) as sock:
             with sock.makefile("rb") as reader:
                 greeting = reader.readline().decode(errors="replace").strip()
-                greeting_fields = (
-                    greeting.removeprefix("@RSYNCD:").strip().split()
-                    if greeting.startswith("@RSYNCD:")
-                    else []
-                )
+                greeting_fields = _parse_greeting(greeting)
                 ctx.supported_digests.extend(greeting_fields[1:])
                 version = greeting_fields[0] if greeting_fields else ""
                 if version:

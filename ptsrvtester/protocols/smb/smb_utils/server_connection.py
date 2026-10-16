@@ -139,18 +139,3 @@ class ServerConnection():
             security_mode = smb_client._SMBConnection._Connection.get('ServerSecurityMode', None)
             capabilities = smb_client._SMBConnection._Connection.get('ServerCapabilities', None)
             output.v23_flags = (security_mode, capabilities)
-        
-        
-        # auth_level = {
-        #     "user":	    "Separate username/password per user",
-        #     "share":	"Shared password for the whole share",
-        # }
-        # challenge_response = {
-        #     "supported"	        "Supports hashed/challenge-response auth"
-        #     "plaintext-only"	"Only accepts plaintext passwords"
-        # }
-        # msg_signing = {
-        #     "required"	        "Signing is mandatory"
-        #     "supported"	        "Signing is available but optional"
-        #     "disabled"	        "No message signing"
-        # }

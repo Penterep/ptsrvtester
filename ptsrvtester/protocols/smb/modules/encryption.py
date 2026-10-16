@@ -31,15 +31,30 @@ __ORDER__ = 12
 
 # from ..smb_utils.helpers import SMBContext
 from ..smb_utils.server_connection import ServerConnection
-from ..smb_utils.helpers import SMBResults
+from ..smb_utils.helpers import SMBResults, SMBv1Flags, SMBv23Flags
+from ptsrvtester.protocols._base import ModuleContext
 from impacket.smbconnection import (
     SMB2_DIALECT_30,
     SMB2_DIALECT_311,
 )
 
-# TODO: add encryption requirement check
+def run(ctx: ModuleContext) -> None:
+    ip, port = ctx.target
+    output: SMBResults = ctx.output
 
-def run(ctx) -> None:
+    sc = ServerConnection(ctx)
+    if not output.has_ran:
+        ctx.out(f"IP address:              {ip}", "INFO", indent=4)
+        ctx.out(f"Port:                    {port}", "INFO", indent=4)
+        # TODO: add login and password check
+        sc.connect()
+    
+    if output.had_error:
+        ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
+        return
+    
+    
+    
     # pending complete overhaul
     return
     output: SMBResults = ctx.output

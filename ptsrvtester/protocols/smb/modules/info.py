@@ -31,6 +31,7 @@ __ORDER__ = 10
 
 from ..smb_utils.server_connection import ServerConnection
 from ..smb_utils.helpers import SMBResults
+from ptsrvtester.protocols._base import ModuleContext
 
 
 def win_version_translate(ver: str) -> str:
@@ -110,15 +111,14 @@ def win_version_translate(ver: str) -> str:
     return output
 
 
-def run(ctx) -> None:
+def run(ctx: ModuleContext) -> None:
     ip, port = ctx.target
     output: SMBResults = ctx.output
+
     sc = ServerConnection(ctx)
-
-    ctx.out(f"IP address:              {ip}", "INFO", indent=4)
-    ctx.out(f"Port:                    {port}", "INFO", indent=4)
-
     if not output.has_ran:
+        ctx.out(f"IP address:              {ip}", "INFO", indent=4)
+        ctx.out(f"Port:                    {port}", "INFO", indent=4)
         # TODO: add login and password check
         sc.connect()
     

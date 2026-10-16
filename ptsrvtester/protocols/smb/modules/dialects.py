@@ -31,17 +31,20 @@ __ORDER__ = 11
 
 from ..smb_utils.server_connection import ServerConnection
 from ..smb_utils.helpers import SMBResults
+from ptsrvtester.protocols._base import ModuleContext
 
 
-def run(ctx) -> None:
+def run(ctx: ModuleContext) -> None:
+    ip, port = ctx.target
     output: SMBResults = ctx.output
-    sc = ServerConnection(ctx)
-    # ip, port = ctx.target
 
+    sc = ServerConnection(ctx)
     if not output.has_ran:
+        ctx.out(f"IP address:              {ip}", "INFO", indent=4)
+        ctx.out(f"Port:                    {port}", "INFO", indent=4)
         # TODO: add login and password check
         sc.connect()
-
+    
     if output.had_error:
         ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
         return

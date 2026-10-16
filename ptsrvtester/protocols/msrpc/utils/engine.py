@@ -75,13 +75,23 @@ class Out(Enum):
 
 
 class VULNS(Enum):
-    # The MSRCP typo is a historical downstream identifier. Do not rename it
-    # without confirming the central vulnerability catalogue.
-    NullSession = "PTV-MSRCP-SMBNULLSESSION"
-    WeakCreds_pipes = "PTV-MSRPC-WEAKPIPECREDS"
-    WeakCreds_SMB = "PTV-MSRPC-WEAKSMBCREDS"
-    WeakCreds_TCP = "PTV-MSRPC-WEAKRPCCREDS"
-    WeakCreds_HTTP = "PTV-MSRPC-WEAKHTTPCREDS"
+    NullSession = "PTV-SVC-MSRCP-SMBNULLSESSION"
+    WeakCreds_pipes = "PTV-SVC-MSRPC-WEAKPIPECREDS"
+    WeakCreds_SMB = "PTV-SVC-MSRPC-WEAKSMBCREDS"
+    WeakCreds_TCP = "PTV-SVC-MSRPC-WEAKRPCCREDS"
+    WeakCreds_HTTP = "PTV-SVC-MSRPC-WEAKHTTPCREDS"
+
+    # Disclosure identifiers follow the corresponding methodology test suffix.
+    # Declaring a code does not make authenticated inventory a vulnerability;
+    # reporting requires confirmed data disclosure without authentication.
+    RpcInterfaces = "PTV-SVC-MSRPC-INTER"
+    ManagementInterfaces = "PTV-SVC-MSRPC-MNG"
+    NamedPipes = "PTV-SVC-MSRPC-PIPES"
+    AnonymousShares = "PTV-SVC-MSRPC-SHARES"
+    SamrPolicy = "PTV-SVC-MSRPC-PWPOLICY"
+    SamrUsers = "PTV-SVC-MSRPC-USERLIST"
+    SamrGroups = "PTV-SVC-MSRPC-GROUPS"
+    SamrUserInfo = "PTV-SVC-MSRPC-USERINF"
 
 
 class Credential(NamedTuple):

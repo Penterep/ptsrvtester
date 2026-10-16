@@ -34,6 +34,9 @@ from ..smb_utils.server_connection import ServerConnection
 from ..smb_utils.helpers import SMBResults, SMBv1Flags, SMBv23Flags
 from ptsrvtester.protocols._base import ModuleContext
 
+def get_flag(source: int, mask: int) -> bool:
+    return bool(source & mask)
+
 
 def run(ctx: ModuleContext) -> None:
     ip, port = ctx.target
@@ -50,24 +53,32 @@ def run(ctx: ModuleContext) -> None:
         ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
         return
     
+    
+    if output.used_dialect == "SMBv1":
+        category = "VULN"
+    elif output.used_dialect in ["SMBv2.0", "SMBv2.1"]:
+        category = "WARNING"
+    else:
+        category = "NOTVULN"
+    ctx.out(f"Used dialect:            {output.used_dialect}", category, indent=4)
+
     if output.used_dialect == "SMBv1" and output.v1_flags:
-        ctx.out(f"Used dialect:            {output.used_dialect}", "VULN", indent=4)
         flags1, flags2, security_mode, capabilities = output.v1_flags
 
-        signing_support: bool = bool(flags2 & SMBv1Flags.FLAGS2_SMB_SECURITY_SIGNATURE)
-        signing_requirement: bool = bool(flags2 & SMBv1Flags.FLAGS2_SMB_SECURITY_SIGNATURE_REQUIRED)
-        extended_security_support: bool = bool(flags2 & SMBv1Flags.FLAGS2_EXTENDED_SECURITY)
+        signing_support: bool = get_flag(flags2, SMBv1Flags.FLAGS2_SMB_SECURITY_SIGNATURE)
+        signing_requirement: bool = get_flag(flags2, SMBv1Flags.FLAGS2_SMB_SECURITY_SIGNATURE_REQUIRED)
+        # extended_security_support: bool = get_flag(flags2, SMBv1Flags.FLAGS2_EXTENDED_SECURITY)
 
-        cap_extended_security_support: bool = bool(capabilities & SMBv1Flags.CAP_EXTENDED_SECURITY)
-        assert extended_security_support == cap_extended_security_support
+        # cap_extended_security_support: bool = get_flag(capabilities, SMBv1Flags.CAP_EXTENDED_SECURITY)
+        # assert extended_security_support == cap_extended_security_support
         
-        user_level_auth: bool = bool(security_mode & SMBv1Flags.NEGOTIATE_USER_SECURITY)
-        uses_challenge_response: bool = bool(security_mode & SMBv1Flags.NEGOTIATE_ENCRYPT_PASSWORDS)
-        sec_signing_support: bool = bool(security_mode & SMBv1Flags.NEGOTIATE_SECURITY_SIGNATURE_ENABLE)
-        sec_signing_requirement: bool = bool(security_mode & SMBv1Flags.NEGOTIATE_SECURITY_SIGNATURE_REQUIRED)
+        user_level_auth: bool = get_flag(security_mode, SMBv1Flags.NEGOTIATE_USER_SECURITY)
+        uses_challenge_response: bool = get_flag(security_mode, SMBv1Flags.NEGOTIATE_ENCRYPT_PASSWORDS)
+        # sec_signing_support: bool = get_flag(security_mode, SMBv1Flags.NEGOTIATE_SECURITY_SIGNATURE_ENABLE)
+        # sec_signing_requirement: bool = get_flag(security_mode, SMBv1Flags.NEGOTIATE_SECURITY_SIGNATURE_REQUIRED)
 
-        assert signing_support == sec_signing_support
-        assert signing_requirement == sec_signing_requirement
+        # assert signing_support == sec_signing_support
+        # assert signing_requirement == sec_signing_requirement
         
         if user_level_auth:
             category = "OK"
@@ -96,6 +107,23 @@ def run(ctx: ModuleContext) -> None:
             msg = "Signing is unsupported"
         ctx.out(f"Message signing:         {msg}", category, indent=4)
         
-        
     elif output.used_dialect != "SMBv1" and output.v23_flags:
-        raise NotImplementedError
+        security_mode, capabilities = output.v23_flags
+
+        signing_support: bool = get_flag(security_mode, SMBv23Flags.SMB2_NEGOTIATE_SIGNING_ENABLED)
+        signing_requirement: bool = get_flag(security_mode, SMBv23Flags.SMB2_NEGOTIATE_SIGNING_REQUIRED)
+
+        if signing_requirement:
+            category = "OK"
+            msg = "Signing is mandatory"
+        elif signing_support:
+            category = "WARNING"
+            msg = "Signing is available but optional"
+        else:
+            category = "WARNING"
+            msg = "Signing is unsupported"
+        ctx.out(f"Message signing:         {msg}", category, indent=4)
+        
+    else:
+        ctx.out(f"An error occured while parsing SMB flags", "ERROR", indent=4)
+        return

@@ -33,10 +33,7 @@ __ORDER__ = 12
 from ..smb_utils.server_connection import ServerConnection
 from ..smb_utils.helpers import SMBResults, SMBv1Flags, SMBv23Flags
 from ptsrvtester.protocols._base import ModuleContext
-from impacket.smbconnection import (
-    SMB2_DIALECT_30,
-    SMB2_DIALECT_311,
-)
+
 
 def run(ctx: ModuleContext) -> None:
     ip, port = ctx.target
@@ -53,39 +50,52 @@ def run(ctx: ModuleContext) -> None:
         ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
         return
     
-    
-    
-    # pending complete overhaul
-    return
-    output: SMBResults = ctx.output
-    sc = ServerConnection(ctx)
-    # ip, port = ctx.target
+    if output.used_dialect == "SMBv1" and output.v1_flags:
+        ctx.out(f"Used dialect:            {output.used_dialect}", "VULN", indent=4)
+        flags1, flags2, security_mode, capabilities = output.v1_flags
 
-    if not output.has_ran:
-        # TODO: add login and password check
-        sc.connect()
+        signing_support: bool = bool(flags2 & SMBv1Flags.FLAGS2_SMB_SECURITY_SIGNATURE)
+        signing_requirement: bool = bool(flags2 & SMBv1Flags.FLAGS2_SMB_SECURITY_SIGNATURE_REQUIRED)
+        extended_security_support: bool = bool(flags2 & SMBv1Flags.FLAGS2_EXTENDED_SECURITY)
 
-    if output.had_error:
-        ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
-        return
-    
-    for dialect in [SMB2_DIALECT_30, SMB2_DIALECT_311]:
-        out = sc.connect(dialect, try_login=False, parse_info=False, parse_encryption=True)
-        if out is not None:
-            if dialect == SMB2_DIALECT_30:
-                ctx.v30_encryption = out["v30_encryption"]
-                ctx.successful_dialects.append("SMBv3.0")
-            elif dialect == SMB2_DIALECT_311:
-                ctx.v311_encryption = out["v311_encryption"]
-                ctx.successful_dialects.append("SMBv3.1.1")
-            else:
-                assert(False)
-    
-    if "SMBv3.0" not in ctx.successful_dialects and "SMBv3.1.1" not in ctx.successful_dialects:
-        ctx.out("Encryption is only supported on SMBv3 and above. The server doensn't use them", category="INFO", condition=True, indent=4)
-    else:
-        ctx.out(f"SMBv3.0:    {ctx.v30_encryption if ctx.v30_encryption is not None else "Unknown"}",
-                category="INFO", condition="SMBv3.0" in ctx.successful_dialects, indent=4)
+        cap_extended_security_support: bool = bool(capabilities & SMBv1Flags.CAP_EXTENDED_SECURITY)
+        assert extended_security_support == cap_extended_security_support
+        
+        user_level_auth: bool = bool(security_mode & SMBv1Flags.NEGOTIATE_USER_SECURITY)
+        uses_challenge_response: bool = bool(security_mode & SMBv1Flags.NEGOTIATE_ENCRYPT_PASSWORDS)
+        sec_signing_support: bool = bool(security_mode & SMBv1Flags.NEGOTIATE_SECURITY_SIGNATURE_ENABLE)
+        sec_signing_requirement: bool = bool(security_mode & SMBv1Flags.NEGOTIATE_SECURITY_SIGNATURE_REQUIRED)
 
-        ctx.out(f"SMBv3.1.1:  {ctx.v311_encryption if ctx.v311_encryption is not None else "Unknown"}",
-                category="INFO", condition="SMBv3.1.1" in ctx.successful_dialects, indent=4)
+        assert signing_support == sec_signing_support
+        assert signing_requirement == sec_signing_requirement
+        
+        if user_level_auth:
+            category = "OK"
+            msg = "Separate username/password per user"
+        else:
+            category = "WARNING"
+            msg = "Shared password for the whole share"
+        ctx.out(f"Authentication level:    {msg}", category, indent=4)
+
+        if uses_challenge_response:
+            category = "OK"
+            msg = "Supports hashed/challenge-response auth"
+        else:
+            category = "WARNING"
+            msg = "Only accepts plaintext passwords"
+        ctx.out(f"Challenge response:      {msg}", category, indent=4)
+        
+        if signing_requirement:
+            category = "OK"
+            msg = "Signing is mandatory"
+        elif signing_support:
+            category = "WARNING"
+            msg = "Signing is available but optional"
+        else:
+            category = "WARNING"
+            msg = "Signing is unsupported"
+        ctx.out(f"Message signing:         {msg}", category, indent=4)
+        
+        
+    elif output.used_dialect != "SMBv1" and output.v23_flags:
+        raise NotImplementedError

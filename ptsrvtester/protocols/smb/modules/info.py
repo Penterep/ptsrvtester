@@ -159,5 +159,6 @@ def run(ctx: ModuleContext) -> None:
     ctx.out(f"Login required:          {output.is_login_required}",
                 "WARNING" if not output.is_login_required else "OK", indent=4)
     ctx.out(f"Signing required:        {output.is_signing_required}",
-                "WARNING" if not output.is_signing_required else "NOTVULN", indent=4)
-    ctx.out(f"NTLMv2 supported:        {output.does_support_NTLMv2}", "INFO", indent=4)
+                "WARNING" if not output.is_signing_required else "OK", indent=4)
+    ctx.out(f"NTLMv2 supported:        {output.does_support_NTLMv2}",
+            "WARNING" if not output.does_support_NTLMv2 else "OK", indent=4)

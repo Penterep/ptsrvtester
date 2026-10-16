@@ -22,7 +22,13 @@ from .registry import *
 
 class ConnectionMixin:
 
-    def connect(self, timeout: float = 15.0, *, fatal: bool = True) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL, int, bytes]:
+    def connect(
+        self,
+        timeout: float = 15.0,
+        *,
+        fatal: bool = True,
+        starttls: bool | None = None,
+    ) -> tuple[smtplib.SMTP | smtplib.SMTP_SSL, int, bytes]:
         """Port 465 is implicit TLS only (SMTPS), so we use TLS even without --tls.
         For IP targets we connect manually with server_hostname=None so SNI does not break.
 
@@ -31,8 +37,14 @@ class ConnectionMixin:
         uses 30 s; retry after server silence uses 10 s) pass it explicitly.
 
         When ``fatal`` is False the caller receives :class:`ConnectionError` instead of
-        ``end_error`` / process exit — used by threaded AUTH-ENUM probes."""
+        ``end_error`` / process exit — used by threaded AUTH-ENUM probes.
+
+        ``starttls`` follows ``--starttls`` when omitted. The upgrade is EHLO, then
+        STARTTLS only if the server advertises it (RFC 3207). A refusal leaves the
+        plaintext connection in place."""
         try:
+            if starttls is None:
+                starttls = bool(getattr(self.args, "starttls", False))
             if self.args.tls or self.args.target.port == 465:
                 ctx = ssl._create_unverified_context()
                 host, port = self.args.target.ip, self.args.target.port
@@ -50,24 +62,11 @@ class ConnectionMixin:
             else:
                 smtp = smtplib.SMTP(timeout=timeout)
                 status, reply = smtp.connect(self.args.target.ip, self.args.target.port)
-                if self.args.starttls and status == 220:
-                    status_stls, _ = smtp.docmd("STARTTLS")
-                    if status_stls == 220:
-                        ctx = ssl._create_unverified_context()
-                        try:
-                            _is_ip = ipaddress.ip_address(self.args.target.ip)
-                            server_hostname = None
-                        except ValueError:
-                            server_hostname = self.args.target.ip
-                        sock_ssl = ctx.wrap_socket(smtp.sock, server_hostname=server_hostname)
-                        smtp.sock = sock_ssl
-                        smtp.file = None
-                        smtp.helo_resp = None
-                        smtp.ehlo_resp = None
-                        smtp.esmtp_features = {}
-                        smtp.does_esmtp = False
+                if starttls and status == 220:
+                    self._smtp_upgrade_starttls(smtp)
 
             self._smtp_sock_set_tcp_nodelay(smtp)
+            self.end_if_blocked(status, reply)
             return smtp, status, reply
         except Exception as e:
             mode = "TLS" if (self.args.tls or self.args.target.port == 465) else get_mode(self.args)
@@ -80,6 +79,35 @@ class ConnectionMixin:
             if fatal:
                 self._fail(msg)
             raise ConnectionError(msg) from e
+
+    def _smtp_upgrade_starttls(self, smtp) -> bool:
+        """EHLO, then STARTTLS only when advertised. True when the socket is TLS."""
+        try:
+            code, _msg = smtp.ehlo(getattr(self, "fqdn", None) or smtp.local_hostname)
+        except Exception:
+            return False
+        if code != 250 or "starttls" not in (smtp.esmtp_features or {}):
+            return False
+        try:
+            code, _msg = smtp.docmd("STARTTLS")
+        except Exception:
+            return False
+        if code != 220:
+            return False
+        ctx = ssl._create_unverified_context()
+        try:
+            ipaddress.ip_address(self.args.target.ip)
+            server_hostname = None
+        except ValueError:
+            server_hostname = self.args.target.ip
+        sock_ssl = ctx.wrap_socket(smtp.sock, server_hostname=server_hostname)
+        smtp.sock = sock_ssl
+        smtp.file = None
+        smtp.helo_resp = None
+        smtp.ehlo_resp = None
+        smtp.esmtp_features = {}
+        smtp.does_esmtp = False
+        return True
 
     def _connect_silent(self, timeout: float = 15.0, send_ehlo: bool = True) -> smtplib.SMTP:
         """Like connect() but NEVER calls _fail() – raises plain Exception on failure.
@@ -132,6 +160,48 @@ class ConnectionMixin:
             sk.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except (OSError, ValueError, AttributeError):
             pass
+
+    def end_if_blocked(self, status, reply=None, *, greeting: bool = True) -> None:
+        """Stop the scan when the server blocks the client.
+
+        A 421 greeting, or a connection rate-limit text, is not a test result.
+        ``end_error`` makes the JSON status ``error`` and prints the red line.
+        ``greeting=False`` is for a later SMTP command: only connection
+        rate-limit text stops the scan, so greylisting 421 stays a result.
+        RATELIM does not use this: its ban is the measurement.
+        """
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            return
+        if isinstance(reply, (bytes, bytearray)):
+            text = self.bytes_to_str(reply)
+        else:
+            text = str(reply or "")
+        text = " ".join(text.split())
+        low = text.lower()
+        rate = any(
+            s in low
+            for s in (
+                "connection rate limit",
+                "rate limit exceeded",
+                "too many connections",
+                "4.3.2",
+            )
+        )
+        if not ((greeting and code == 421) or rate):
+            return
+        shown = text or "Connection rate limit exceeded"
+        msg = f"SMTP Info - [{code}] {shown}".strip()
+        if getattr(self, "_enum_progress_line_dirty", False):
+            write = getattr(self, "_raw_write", None)
+            if callable(write):
+                write(b"\n")
+            self._enum_progress_line_dirty = False
+            self._enum_progress_sealed = True
+        if getattr(self, "ptjsonlib", None) is not None:
+            self.ptjsonlib.end_error(msg, getattr(self, "use_json", False))
+        raise SystemExit
 
     def get_smtp_handler(self, timeout: float = 15.0) -> smtplib.SMTP:
         smtp_handler, status, reply = self.connect(timeout=timeout)

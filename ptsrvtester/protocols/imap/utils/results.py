@@ -9,7 +9,7 @@ from .helpers import Creds
 from .ptntlmauth.ptntlmauth import NTLMInfo
 
 class NTLMResult(NamedTuple):
-    """NTLMSSP info from AUTHENTICATE NTLM challenge (PTL-SVC-IMAP-NTLMINFO when decoded)."""
+    """NTLMSSP info from AUTHENTICATE NTLM challenge (PTV-SVC-NTLMINFO when decoded)."""
     success: bool
     ntlm: NTLMInfo | None
     auth_ntlm_advertised: bool  # AUTH=NTLM in pre-login CAPABILITY (or banner)
@@ -70,7 +70,7 @@ class SniffableResult(NamedTuple):
     detail: str
 
 
-CatchAllResult = str  # "configured" | "not_configured" | "indeterminate" | "unreachable"
+CatchAllResult = str  # "configured" | "not_configured" | "indeterminate" | "unreachable" | "disabled"
 
 # Order of AUTHENTICATE probes when multiple mechanisms are advertised (most sensitive first).
 _SNIFFABLE_AUTH_PROBE_PRIORITY = (
@@ -323,7 +323,7 @@ ZIPXXE_VARIANT_TITLES: dict[str, str] = {
     "zip_bomb_small": "Zip bomb small",
     "zip_bomb_full": "Zip bomb medium",
     "zip_bomb_medium": "Zip bomb medium",
-    "zip_bomb_huge": "Zip bomb huge (≥1 TiB)",
+    "zip_bomb_huge": "Zip bomb huge (≥1 TB)",
 }
 
 ZIPXXE_VARIANT_PAYLOAD_LABELS: dict[str, str] = {
@@ -806,9 +806,10 @@ class IMAPResults:
 
 
 class VULNS(Enum):
-    Anonymous = "PTL-SVC-IMAP-ANONYMOUS"
-    NTLM = "PTL-SVC-IMAP-NTLMINFO"
-    WeakCreds = "PTV-GENERAL-WEAKCREDENTIALS"
+    Anonymous = "PTV-SVC-IMAP-ANON"
+    NTLM = "PTV-SVC-NTLMINFO"
+    WeakCreds = "PTV-SVC-AUTH-WEAK"
+    Brute = "PTV-SVC-AUTH-BRUTE"
     AuthMethods = "PTV-SVC-IMAP-AUTHMETHODS"
     Sniffable = "PTV-SVC-SNIFFABLE"
     InvComm = "PTV-SVC-IMAP-INVCOMM"

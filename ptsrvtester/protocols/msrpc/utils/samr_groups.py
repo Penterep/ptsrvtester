@@ -32,7 +32,7 @@ def _failure(engine, exc: Exception) -> tuple[str, str]:
         1745, 0x1C010002,  # RPC procnum out of range / nca_s_op_rng_error
     ):
         return "unsupported", "operation_not_supported"
-    engine.record_module_error("SAMRGROUPS", engine._sanitized_samr_error(exc))
+    engine.record_module_error("SAMRGROUPS", engine._sanitized_samr_error(exc), transport_error=exc)
     return "error", "operational_error"
 
 
@@ -190,8 +190,12 @@ def _print_result(engine, result):
                     f"    {member['sid']}"
                     + (f"; attributes: 0x{attributes:08x}" if attributes is not None else "")
                 )
-    for line in lines:
-        engine.ptprint(line)
+            lines.append("")
+        if not domain["groups"]:
+            lines.append("")
+    for index, line in enumerate(lines):
+        category = "TITLE" if index == 0 and result["status"] != "complete" else "TEXT"
+        engine.ptprint(line, out=category)
     if getattr(engine.args, "output", None):
         engine.write_to_file(lines)
 

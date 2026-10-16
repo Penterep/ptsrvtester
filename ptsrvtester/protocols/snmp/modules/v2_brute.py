@@ -5,7 +5,7 @@ from ptsrvtester.protocols.snmp.utils.registry import text_or_file
 from typing import List
 
 __MODULELABEL__ = "SNMPv2 Brute Force Module"
-__MODULECODE__ = "v2_brute"
+__MODULECODE__ = "v2brute"
 __ORDER__ = 100
 
 async def _snmpv2_brute(ctx: dict) -> List[str]:

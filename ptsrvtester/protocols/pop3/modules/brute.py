@@ -1,27 +1,31 @@
 """BRUTE — catch-all probe + USER/PASS bruteforce."""
-from ..utils.connection import test_catch_all, try_login
-from ..utils.helpers import check_if_brute, simple_bruteforce, text_or_file
-from ..utils.results import VULNS
+import sys
 
-__MODULELABEL__ = "Login bruteforce"
+from ..utils.connection import login_bruteforce, test_catch_all
+from ..utils.helpers import apply_default_brute_creds
+
+__MODULELABEL__ = ""
 __MODULECODE__ = "BRUTE"
 __ORDER__ = 70
 
 
-def run(ctx):
-    if not check_if_brute(ctx.args):
-        ctx.out(
-            "BRUTE requires -u/--user or -U/--users and -p/--password or -P/--passwords",
-            "ERROR",
-            indent=4,
-        )
+def _section(ctx, title: str) -> None:
+    if getattr(ctx, "json", False):
         return
+    ctx.out(title, "INFO", colortext=True)
+    _flush_pop3(ctx)
+
+
+def run(ctx):
+    ctx.report.brute_creds = set()
+    apply_default_brute_creds(ctx.args)
 
     # Catch-all lives inside BRUTE (not a separate -ts code).
-    ctx.out("Catch-all test", "INFO", colortext=True)
+    _section(ctx, "Catch-all test")
     catch_all = test_catch_all(ctx.args, debug=ctx.debug)
     if catch_all == "unreachable":
         ctx.out("Catch-all timed out or could not connect. Not confirmed.", "WARNING", indent=4)
+        _flush_pop3(ctx)
         return
     if catch_all == "indeterminate":
         ctx.out(
@@ -33,40 +37,48 @@ def run(ctx):
     else:
         ctx.out("Not configured (server rejects invalid creds)", "NOTVULN", indent=4)
 
-    def _on_success(cred):
-        if not ctx.json:
-            import sys
-            sys.stdout.write(f"    user: {cred.user}, password: {cred.passw}\n")
-            sys.stdout.flush()
-
-    creds = simple_bruteforce(
-        lambda c: try_login(ctx.args, c, debug=ctx.debug),
-        ctx.args.user,
-        ctx.args.users,
-        ctx.args.password,
-        ctx.args.passwords,
-        ctx.args.spray,
-        ctx.args.threads,
-        on_success=_on_success if not ctx.json else None,
-    )
+    _flush_pop3(ctx)
+    _section(ctx, "Guessing (credential bruteforce)")
+    creds = login_bruteforce(ctx)
+    ctx.report.brute_creds = creds
+    guessing = getattr(ctx, "_brute_guessing", None)
     if creds:
-        ctx.out(f"Found {len(creds)} valid credentials", "INFO", indent=4)
-        if ctx.json:
-            for cred in creds:
-                ctx.out(f"user: {cred.user}, password: {cred.passw}", "TEXT", indent=4)
-        names = text_or_file(ctx.args.user, None)
-        user_str = (
-            "username: " + ", ".join(names)
-            if names
-            else f"usernames: {ctx.args.users}"
+        n = len(creds)
+        word = "login" if n == 1 else "logins"
+        ctx.out(f"Found {n} valid {word}", "TITLE", colortext=False, indent=4)
+    _pop3_guessing_line(ctx, guessing)
+
+
+def _flush_pop3(ctx) -> None:
+    if getattr(ctx, "json", False):
+        return
+    lock = getattr(ctx, "print_lock", None)
+    if lock is None:
+        return
+    chunk = lock.get_output_string()
+    if chunk:
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+        lock.output_string = ""
+
+
+def _pop3_guessing_line(ctx, guessing: str | None) -> None:
+    if guessing == "insufficient":
+        ctx.out(
+            "The test cannot be evaluated. At least 50 combinations must be tested.",
+            "WARNING",
+            indent=4,
         )
-        pass_str = (
-            f"password: {ctx.args.password}"
-            if ctx.args.password is not None
-            else f"passwords: {ctx.args.passwords}"
-        )
-        ctx.report.add_vulnerability(
-            vuln_code=VULNS.WeakCreds.value,
-            vuln_request=f"{user_str}\n{pass_str}",
-            vuln_response="\n".join(f"user: {c.user}, password: {c.passw}" for c in creds),
+    elif guessing == "not_limited":
+        ctx.out("No protection against password guessing", "VULN", indent=4)
+    elif guessing == "stopped":
+        paren = getattr(ctx, "_brute_block_paren", None)
+        msg = f"Attack was blocked ({paren})" if paren else "Attack was blocked"
+        ctx.out(msg, "NOTVULN", indent=4)
+    elif guessing == "not_tested":
+        ctx.out(
+            getattr(ctx, "_brute_guessing_detail", None)
+            or "Could not connect. Password guessing was not tested.",
+            "WARNING",
+            indent=4,
         )

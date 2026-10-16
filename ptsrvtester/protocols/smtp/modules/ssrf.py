@@ -118,13 +118,15 @@ def test_ssrf(e) -> SsrfResult:
                 smtp = smtplib.SMTP(timeout=timeout)
                 smtp.sock = sock_ssl
                 smtp.file = None
-                st, _ = smtp.getreply()
+                st, reply = smtp.getreply()
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     return (None, f'Connect: {st}')
                 return (smtp, '')
             smtp = smtplib.SMTP(timeout=timeout)
-            st, _ = smtp.connect(host, port)
+            st, reply = smtp.connect(host, port)
             if st != 220:
+                e.end_if_blocked(st, reply)
                 return (None, f'Connect: {st}')
             if use_starttls:
                 st2, _ = smtp.docmd('STARTTLS')

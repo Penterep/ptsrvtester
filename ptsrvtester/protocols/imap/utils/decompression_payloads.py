@@ -183,7 +183,7 @@ def build_huge_zip_bomb(
     one DEFLATE kernel of NULs is reused by chaining later local file headers
     inside RFC 1951 stored blocks (BFINAL=0, BTYPE=00). Each central-directory
     name matches its local header (unlike full-overlap). Not recursive. Zip64
-    is not used. Default: 32768 files × 32 MiB kernel ≈ 1.00 TiB expanded.
+    is not used. Default: 32768 files × 32 MiB kernel ≈ 1.00 TB expanded.
     """
     if not (1 <= num_files <= 0xFFFE):
         raise ValueError("num_files must fit in EOCD uint16 (max 65534)")

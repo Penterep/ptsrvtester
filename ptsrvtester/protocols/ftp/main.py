@@ -12,6 +12,7 @@ from ptlibs.threads import printlock
 from .._base import BaseArgs, BaseMain
 from .._shared.utils.connection import banner_tcp_adapter
 from .utils.cli import FTPArgs, validate_ftp_selection
+from .utils.helpers import apply_default_brute_creds
 from .utils.engine import FtpEngine
 from .utils.registry import FTP_DEFAULT_SUITE
 from .utils.report import FtpReport
@@ -31,6 +32,10 @@ class FTP(BaseMain):
                 None, f'module "{getattr(args, "module", "?")}" received wrong arguments namespace'
             )
         validate_ftp_selection(args)
+        raw = getattr(args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        if "BRUTE" in codes and "ALL" not in codes:
+            apply_default_brute_creds(args)
         # Legacy engine/build_json still reads per-test dest flags; modules set them
         # when they run. Initialise missing ones so AttributeError cannot occur.
         for dest in (

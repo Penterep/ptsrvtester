@@ -1,5 +1,5 @@
 """SPOOF — From / Reply-To / Return-Path spoofing."""
-import ipaddress, random, smtplib, socket, ssl, time
+import ipaddress, random, re, smtplib, socket, ssl, time
 from email.mime.text import MIMEText
 
 from ..utils.helpers import *
@@ -36,7 +36,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
     use_tls = e.args.tls or port == 465
     use_starttls = e.args.starttls and (not use_tls)
     auth_user = getattr(e.args, 'user', None) or ''
-    auth_pass = getattr(e.args, 'password', None) or ''
+    auth_pass = first_cli_password(getattr(e.args, 'password', None)) or ''
     do_auth = bool(auth_user and auth_pass)
     start_time = time.perf_counter()
     var_results: list[SpoofHeaderVariantResult] = []
@@ -62,6 +62,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
                 smtp.file = None
                 st, reply = smtp.getreply()
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     _sh_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
                     return (None, f'Connect: {st}')
                 _sh_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
@@ -69,6 +70,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
                 smtp = smtplib.SMTP(timeout=timeout)
                 st, reply = smtp.connect(host, port)
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     _sh_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
                     return (None, f'Connect: {st}')
                 _sh_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
@@ -91,6 +93,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
                     smtp.does_esmtp = False
             ehlo_st, ehlo_reply = smtp.docmd('EHLO', e.fqdn or 'spoofhdr-test.local')
             _sh_trace_append(trace, f'EHLO: {e._smtp_trace_reply(ehlo_st, ehlo_reply)}')
+            e.end_if_blocked(ehlo_st, ehlo_reply)
             if do_auth:
                 try:
                     smtp.login(auth_user, auth_pass)
@@ -129,6 +132,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
             try:
                 mail_st, mail_reply = smtp.docmd('MAIL', f'FROM:<{envelope_addr}>')
                 _sh_trace_append(smtp_trace, f'MAIL FROM <{envelope_addr}>: {e._smtp_trace_reply(mail_st, mail_reply)}')
+                e.end_if_blocked(mail_st, mail_reply)
                 if mail_st not in (250, 251):
                     err = True
                     status_code = mail_st
@@ -139,6 +143,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
                     status_code = status
                     reply_str = e._smtp_reply_text_one_line(reply)
                     _sh_trace_append(smtp_trace, f'RCPT TO <{rcpt}>: {e._smtp_trace_reply(status, reply)}')
+                    e.end_if_blocked(status, reply)
                     if status not in (250, 251):
                         err = True
                         detail = f'RCPT rejected before DATA: {e._smtp_trace_reply(status, reply)}'
@@ -147,6 +152,7 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
                         status_code = data_status
                         reply_str = e._smtp_reply_text_one_line(data_reply)
                         _sh_trace_append(smtp_trace, e._data_trace_entry(raw_msg, data_status, data_reply))
+                        e.end_if_blocked(data_status, data_reply)
                         if data_status == 250:
                             accepted = True
                             detail = accepted_detail
@@ -191,11 +197,21 @@ def test_spoof_headers(e) -> SpoofHeaderResult:
     elif not indeterminate:
         detail_parts.append('All variants rejected – server blocks spoofed headers.')
     if indeterminate:
-        if any_error and any_data_rejected:
+        if var_results and all((_spoof_is_421(v) for v in var_results)):
+            detail_parts.append('421 rate limiting')
+        elif any_error and any_data_rejected:
             detail_parts.append('Test incomplete: some variants failed before DATA; spoofing was not confirmed for every variant.')
         else:
             detail_parts.append('Could not complete – connection, timeout, or recipient rejected before DATA.')
     return SpoofHeaderResult(vulnerable=any_accepted, indeterminate=indeterminate, variants=tuple(var_results), elapsed_sec=elapsed, detail=' '.join(detail_parts) if detail_parts else None, vulnerable_note=VULNERABLE_NOTE if any_accepted else None)
+
+
+def _spoof_is_421(v: SpoofHeaderVariantResult) -> bool:
+    """True when this variant stopped on SMTP 421 (connection rate limit)."""
+    if v.smtp_status == 421:
+        return True
+    blob = f'{v.detail or ''} {v.smtp_reply or ''}'
+    return re.search(r'(?<!\d)421(?!\d)', blob) is not None
 
 
 def _sh_variant_section_title(e, variant: str) -> str:
@@ -223,7 +239,8 @@ def _sh_stream_variant_section(e, v: SpoofHeaderVariantResult, rcpt: str, *, str
     elif v.error:
         one_line = e._smtp_detail_one_line(v.detail) or v.detail or 'error'
         pp(f'Test failed — {one_line}', bullet_type='WARNING', condition=True, indent=8)
-        pp('Indeterminate', bullet_type='WARNING', condition=True, indent=8)
+        verdict = '421 rate limiting' if _spoof_is_421(v) else 'Indeterminate'
+        pp(verdict, bullet_type='WARNING', condition=True, indent=8)
 
 
 def _stream_spoof_header_result(e) -> None:

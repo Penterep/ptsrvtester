@@ -220,7 +220,8 @@ class NoopConnectionCountResult(NamedTuple):
 class VULNS(Enum):
     Anonymous = "PTV-GENERAL-ANONYMOUS"
     NTLM = "PTV-GENERAL-NTLMINFO"
-    WeakCreds = "PTV-GENERAL-WEAKCREDENTIALS"
+    WeakCreds = "PTV-SVC-AUTH-WEAK"
+    Brute = "PTV-SVC-AUTH-BRUTE"
     Banner = "PTV-SVC-BANNER"
     NoopDurationPreauth = "PTV-SVC-POP3-NOOPLIMDUR-PREAUTH"
     NoopDurationPostauth = "PTV-SVC-POP3-NOOPLIMDUR-POSTAUTH"

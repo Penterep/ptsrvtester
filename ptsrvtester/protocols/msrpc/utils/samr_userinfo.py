@@ -132,7 +132,7 @@ def _error_status(engine, exc: Exception) -> tuple[str, str]:
 
 
 def _record_error(engine, exc: Exception) -> None:
-    engine.record_module_error("SAMRUSERINFO", engine._sanitized_samr_error(exc))
+    engine.record_module_error("SAMRUSERINFO", engine._sanitized_samr_error(exc), transport_error=exc)
 
 
 def _query_section(engine, dce, domain_handle, rid: int, access: int, fields) -> dict:
@@ -346,8 +346,12 @@ def query_samr_user_info(engine) -> dict:
                     if value["status"] != "complete":
                         rendered = f"{value['status']} ({value['reason']})"
                     lines.append(f"  {key}: {rendered}")
-    for line in lines:
-        engine.ptprint(line)
+            lines.append("")
+        if not domain["users"]:
+            lines.append("")
+    for index, line in enumerate(lines):
+        category = "TITLE" if index == 0 and result["status"] != "complete" else "TEXT"
+        engine.ptprint(line, out=category)
     if getattr(engine.args, "output", None):
         engine.write_to_file(lines)
     return result

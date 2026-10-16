@@ -218,15 +218,9 @@ class SmtpEngine(
         spoof_headers_requested = getattr(args, "spoof_headers", False)
         if spoof_headers_requested and (not args.rcpt_to or not str(args.rcpt_to).strip()):
             raise argparse.ArgumentError(None, "-sh/--spoof-headers requires -r/--rcpt-to (recipient)")
-        bcc_test_requested = getattr(args, "bcc_test", None)
-        if bcc_test_requested:
+        if getattr(args, "bcc_disclosure", False):
             if not args.rcpt_to or not str(args.rcpt_to).strip():
-                raise argparse.ArgumentError(None, "-ts BCC requires -r/--rcpt-to (To recipient)")
-            cc_val = getattr(args, "cc", None) or ""
-            if not cc_val.strip():
-                raise argparse.ArgumentError(None, "-ts BCC requires -cc/--cc (Cc recipient)")
-            if not str(bcc_test_requested).strip():
-                raise argparse.ArgumentError(None, "-ts BCC requires -bcc/--bcc <emails> (Bcc addresses)")
+                raise argparse.ArgumentError(None, "-ts BCC requires -r/--rcpt-to (recipient)")
         alias_test_requested = getattr(args, "alias_test", False)
         if alias_test_requested and (not args.rcpt_to or not str(args.rcpt_to).strip()):
             raise argparse.ArgumentError(None, "-al/--alias-test requires -r/--rcpt-to (base recipient)")
@@ -259,9 +253,11 @@ class SmtpEngine(
                 )
         if zipxxe_requested:
             variants_arg = getattr(args, "zipxxe_variants", None)
+            # Default list includes xxe_*; those are skipped in the module when no canary is set.
+            # Require the URL only when an XXE variant was requested explicitly.
             zipxxe_variants = [
                 v.strip().lower()
-                for v in (variants_arg or "billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx").split(",")
+                for v in str(variants_arg or "").split(",")
                 if v.strip()
             ]
             xxe_variants = {"xxe_zip", "xxe_docx", "xxe_body"}

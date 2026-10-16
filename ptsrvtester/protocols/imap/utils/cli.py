@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 
 from .capa import valid_target_imap
-from .helpers import ArgsWithBruteforce, Target, add_bruteforce_args, check_if_brute, one_cli_user
+from .helpers import ArgsWithBruteforce, Target, add_bruteforce_args, one_cli_user
 from .ptprinthelper import get_colored_text
 from .registry import IMAP_TEST_GROUPS, IMAP_TESTS, imap_test_help
 from ptsrvtester.protocols._shared.utils.cli import rate_limit_help_rows
@@ -52,13 +52,13 @@ class IMAPArgs(ArgsWithBruteforce):
             ["", "--starttls", "", "Use explicit STARTTLS (default port 143)"],
             ["", "", "", ""],
             [get_colored_text("Credentials (BRUTE / authenticated tests)", "TITLE")],
-            ["-u", "--user", "<name> …", "Username(s) for BRUTE / USRENUM"],
+            ["-u", "--user", "<name> …", "Username(s), space or comma separated, for BRUTE, USRENUM and authenticated tests"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "<password>", "Single password"],
+            ["-p", "--password", "[password] …", "Password(s), space or comma separated. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
-            ["", "--mailbox", "<name>", "IMAP Folder"],
+            ["", "--mailbox", "<name>", "IMAP folder for APPEND (default: INBOX)"],
             ["", "--spray", "", "Try one password against all users"],
-            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            ["-t", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
             *rate_limit_help_rows(get_colored_text),
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
@@ -148,7 +148,7 @@ class IMAPArgs(ArgsWithBruteforce):
             default="INBOX",
             metavar="NAME",
             dest="mailbox",
-            help="IMAP Folder",
+            help="IMAP folder for APPEND (default: INBOX)",
         )
 
         mods = parser.add_argument_group("TEST OPTIONS")
@@ -224,11 +224,6 @@ def validate_imap_selection(args) -> None:
         raise argparse.ArgumentError(None, "-t/--threads must be >= 1")
     if not codes or "ALL" in codes:
         return
-
-    if "BRUTE" in codes and not check_if_brute(args):
-        raise argparse.ArgumentError(
-            None, "BRUTE requires -u/--user or -U/--users; -p/--password or -P/--passwords",
-        )
 
     if ("USRENUM" in codes or "USRENUMPLAIN" in codes) and not (
         getattr(args, "user", None) or getattr(args, "users", None)

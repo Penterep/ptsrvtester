@@ -6,7 +6,7 @@ try:
 except ImportError:
     NtlmContext = None
 
-from .helpers import ArgsWithBruteforce, check_if_brute
+from .helpers import ArgsWithBruteforce, apply_default_brute_creds, check_if_brute
 
 try:
     from cryptography import x509
@@ -21,7 +21,7 @@ from .results import *
 
 from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
 
-__all__ = ['_smtp_users_file_supplies_name_list', '_rcpt_limit_active', '_rcpt_limit_send_mode', '_rcpt_limit_max_attempts', '_normalize_smtp_role', '_TS_COMMON_MSG', 'SMTP_DEFAULT_SUITE', 'SMTP_TEST_GROUPS', 'SMTP_TESTS', 'SMTP_SEND_REQUIRED', 'SMTP_TEST_DESTS', 'SMTP_VALUE_DESTS', '_smtp_parse_test_codes', '_apply_smtp_tests', '_smtp_test_help']
+__all__ = ['_smtp_users_file_supplies_name_list', '_rcpt_limit_active', '_rcpt_limit_send_mode', '_rcpt_limit_max_attempts', '_normalize_smtp_role', '_TS_COMMON_MSG', 'SMTP_DEFAULT_SUITE', 'SMTP_SEND_SUITE', 'SMTP_AUTH_SUITE', 'smtp_auto_suite', 'SMTP_TEST_GROUPS', 'SMTP_TESTS', 'SMTP_SEND_REQUIRED', 'SMTP_TEST_DESTS', 'SMTP_VALUE_DESTS', '_smtp_parse_test_codes', '_apply_smtp_tests', '_smtp_test_help']
 
 
 # region arguments
@@ -70,6 +70,15 @@ def _normalize_smtp_role(value: str) -> str:
 
 # region -ts test registry (single source of truth for `-ts/--tests`)
 
+# Tests that AUTH when -u/-p are set. The flags are optional.
+_SMTP_OPTIONAL_AUTH = frozenset({
+    "ALIAS", "BCC", "SPOOF", "BOUNCE", "BOMB", "SIZE", "AV", "SSRF", "ZIPXXE",
+})
+_SMTP_AUTH_OPTS = (
+    ["-u", "--user", "<name>", "AUTH username (optional)"],
+    ["-p", "--password", "[password]", "AUTH password (optional)"],
+)
+
 # Common outbound message options (shown in per-test help for tests that send mail)
 _TS_COMMON_MSG: list[list[str]] = [
     ["-r", "--rcpt-to", "<email>", "Recipient (To)"],
@@ -80,20 +89,34 @@ _TS_COMMON_MSG: list[list[str]] = [
     ["", "--data", "<text>", "Message body"],
 ]
 
-# Default suite when -ts omitted or ALL (matches previous ``_run_all_tests``).
+# Bare target or ALL, with no -r/--send. Same set as the previous default scan.
 SMTP_DEFAULT_SUITE: tuple[str, ...] = (
-    "BANNER", "ROLE", "EHLO", "ENCRYPT", "OPENREL", "HELOVAL", "AUTHDN",
+    "BANNER", "ROLE", "EHLO", "ENCRYPT", "OPENREL", "RELANON", "DOMFILL", "HELOVAL", "AUTHDN",
     "BLACKLIST", "SPF", "ENUM", "NTLM",
+)
+
+# Added when the bare target / ALL also has -r and --send.
+# SSRF and BOUNCE stay out until their own extra arguments are present.
+SMTP_SEND_SUITE: tuple[str, ...] = (
+    "ALIAS", "SPOOF", "BCC", "RCPTDUP", "BOMB", "SIZE", "AV", "ZIPXXE",
+)
+
+# Added when -u/-U and -p/-P are set as well, so the three flags together
+# cover the tests that can run without further switches.
+# Left for an explicit -ts: INTERACT, IDAGG, NOOP1, NOOP2, RATELIMIT.
+SMTP_AUTH_SUITE: tuple[str, ...] = (
+    "IDENTIFY", "AUTHLIST", "AUTHFMT", "HELOONLY", "HELOBYP", "INVCMD",
+    "DOMAIN", "AUTHENUM", "BRUTE", "RATELIM", "RCPTLIM",
 )
 
 # Ordered groups for the main help table
 SMTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "IDENTIFY", "IDAGG", "EHLO", "AUTHLIST", "ROLE", "ENCRYPT", "NTLM"]),
-    ("Authentication", ["AUTHFMT", "AUTHENUM", "AUTHDN"]),
+    ("Authentication", ["AUTHFMT", "AUTHDN"]),
     ("Protocol & validation", ["HELOVAL", "HELOONLY", "HELOBYP", "INVCMD"]),
-    ("Relay & addressing", ["OPENREL", "PROBEDOM", "ALIAS", "BCC", "SPOOF", "BOUNCE"]),
-    ("Enumeration & credentials", ["ENUM", "BRUTE"]),
-    ("Rate limiting & stress", ["RATELIM", "RATELIMIT", "RCPTLIM", "RCPTDUP", "NOOP1", "NOOP2", "BOMB", "FLOOD"]),
+    ("Relay & addressing", ["OPENREL", "RELANON", "DOMFILL", "DOMAIN", "ALIAS", "BCC", "SPOOF", "BOUNCE"]),
+    ("Enumeration & credentials", ["ENUM", "AUTHENUM", "BRUTE"]),
+    ("Rate limiting & stress", ["RATELIM", "RATELIMIT", "RCPTLIM", "RCPTDUP", "NOOP1", "NOOP2", "BOMB", "SIZE"]),
     ("Content security", ["AV", "SSRF", "ZIPXXE"]),
     ("Indirect (no direct SMTP connection)", ["BLACKLIST", "SPF"]),
     ("Utility", ["INTERACT"]),
@@ -212,13 +235,25 @@ SMTP_TESTS: dict[str, dict] = {
                  "(open relay)."],
         "flags": {"open_relay": True},
     },
-    "PROBEDOM": {
-        "desc": "Probe which recipient domains are accepted as local",
+    "RELANON": {
+        "desc": "Test relay without authentication",
+        "long": ["Same relay probes as OPENREL. Used when the server role is",
+                 "Submission: mail accepted for external recipients without AUTH."],
+        "flags": {"relay_unauth": True},
+    },
+    "DOMAIN": {
+        "desc": "Accepted incoming domain",
         "long": ["Probe which recipient domain the server's RCPT TO treats as local."],
         "flags": {"probe_accepted_domain": True},
         "mods": [
             ["-d", "--domain", "<domain>", "Recipient domain to probe (default: banner/EHLO)"],
         ],
+    },
+    "DOMFILL": {
+        "desc": "MAIL FROM domain autofill",
+        "long": ["Send MAIL FROM:<test> without a domain. A reply that echoes",
+                 "test@domain discloses the sender domain the server filled in."],
+        "flags": {"domfill": True},
     },
     "ALIAS": {
         "desc": "Test alias and addressing bypass",
@@ -234,13 +269,14 @@ SMTP_TESTS: dict[str, dict] = {
     },
     "BCC": {
         "desc": "Test BCC header disclosure",
-        "long": ["Send a message with To, Cc and Bcc; verify the server strips the",
-                 "Bcc header so hidden recipients are not disclosed to To/Cc."],
-        "value": ("bcc_test", None),
-        "requires": ["-bcc/--bcc <emails> (Bcc addresses)", "-r/--rcpt-to (To)", "-cc/--cc (Cc)"],
+        "long": ["Send mail with To, Cc and Bcc headers. Envelope RCPT TO is only -r.",
+                 "Without -cc and -bcc, three messages rotate -r through those headers",
+                 "and the other addresses are random. Check the inbox source for a Bcc header."],
+        "flags": {"bcc_disclosure": True},
+        "requires": ["-r/--rcpt-to (recipient mailbox to check)"],
         "common": True,
         "mods": [
-            ["-bcc", "--bcc", "<emails>", "Bcc recipients (comma-separated)"],
+            ["-bcc", "--bcc", "<emails>", "Bcc header addresses (optional; random when omitted)"],
             ["", "--bcc-timeout", "<sec>", "Timeout for BCC test (default: 30)"],
         ],
     },
@@ -281,14 +317,16 @@ SMTP_TESTS: dict[str, dict] = {
     },
     "BRUTE": {
         "desc": "Bruteforce credentials",
-        "long": ["Bruteforce SMTP AUTH using username(s) and password(s).",
-                 "Requires credentials via -u/-p or -U/-P."],
-        "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
+        "long": ["Bruteforce SMTP AUTH. Without -u/-U or -p/-P, built-in lists are used.",
+                 "One AUTH per guess. Catch-all check first.",
+                 "Error when the server never stops it."],
         "mods": [
-            ["-u", "--user", "<name> …", "Username(s)"],
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "<password>", "Single password"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["-t", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
         ],
     },
     "RATELIM": {
@@ -303,9 +341,10 @@ SMTP_TESTS: dict[str, dict] = {
     "RATELIMIT": rate_limit_test_spec(flags={"shared_rate_limit": True}),
     "RCPTLIM": {
         "desc": "Test RCPT TO recipient limit",
-        "long": ["Storm RCPT TO in one message to find the per-message recipient",
-                 "limit. Without -u/-U generates random recipients. With --send it",
-                 "also submits one message (DATA) after the RCPT storm."],
+        "long": ["Storm RCPT TO in one message to find the per-message recipient limit.",
+                 "A closed MTA needs local names in -u/-U. An open relay uses numbered",
+                 "recipients (1@domain, 2@domain, ...). Submission needs -u and -p;",
+                 "those names are the recipients. --send also submits DATA."],
         "value": ("rcpt_limit", RCPT_LIMIT_DEFAULT_ATTEMPTS),
         "mods": [
             ["-rl", "--recipient-limit", "<n>", f"Max RCPT attempts per session (default: {RCPT_LIMIT_DEFAULT_ATTEMPTS})"],
@@ -313,6 +352,9 @@ SMTP_TESTS: dict[str, dict] = {
             ["", "--rl-no-precheck", "", "Skip role/open-relay/AUTH pre-check"],
             ["-d", "--domain", "<domain>", "Recipient domain (default: banner/EHLO)"],
             ["-m", "--mail-from", "<email>", "Envelope MAIL FROM (default <>)"],
+            ["-u", "--user", "<name> …", "Local recipients; on submission also the login"],
+            ["-U", "--users", "<wordlist>", "Local recipient wordlist"],
+            ["-p", "--password", "[password]", "AUTH password (submission only)"],
         ],
     },
     "RCPTDUP": {
@@ -363,18 +405,17 @@ SMTP_TESTS: dict[str, dict] = {
             ["", "--bomb-randomize", "", "Add unique ID to each message"],
         ],
     },
-    "FLOOD": {
-        "desc": "Queue overload via SIZE and volume",
-        "long": ["Check the SIZE limit. When EHLO gives no fixed maximum, send",
-                 "one message body if -r is set, then a queue of small messages.",
-                 "Stops on 421."],
+    "SIZE": {
+        "desc": "Message size limit",
+        "long": ["Declares sizes from 1 TB down to 1 MB and stops at the first",
+                 "one the server allows. With --send and -r, one message of",
+                 "that size is sent as a body of X. -c and -s send more."],
         "flags": {"flood": True},
-        "requires": ["-r/--rcpt-to for the message body and the queue"],
-        "common": True,
         "mods": [
-            ["", "--flood-count", "<n>", "Messages for queue stress (default: 150, max 500)"],
-            ["", "--flood-timeout", "<sec>", "Max time for queue stress (default: 90)"],
-            ["", "--flood-skip-size-test", "", "Skip the SIZE declaration and the single large message"],
+            ["-r", "--rcpt-to", "<email>", "Recipient for the real message"],
+            ["", "--send", "", "Send the message. Needs -r"],
+            ["-c", "--count", "<n>", "Messages to send with --send (default: 1)"],
+            ["-s", "--size", "<MB>", "Body size in MB (default: largest size the server allowed)"],
         ],
     },
     "AV": {
@@ -415,8 +456,9 @@ SMTP_TESTS: dict[str, dict] = {
         "mods": [
             ["", "--zipxxe-canary-url", "<URL>", "Canary URL for xxe_zip / xxe_docx / xxe_body"],
             ["", "--zipxxe-variants", "<v1,v2,...>", "billion_laughs_attach,billion_laughs_body,xxe_zip,xxe_docx,xxe_body (default: all)"],
-            ["", "--zipxxe-zip-bomb", "", "Include zip_bomb (minimal ~200KB; DoS risk!)"],
-            ["", "--zipxxe-zip-bomb-full", "", "Include zip_bomb_full (~100KB→~100MB; extreme DoS risk!)"],
+            ["", "--zipxxe-zip-bomb-small", "", "Include zip_bomb (minimal ~200KB; DoS risk!)"],
+            ["", "--zipxxe-zip-bomb-medium", "", "Include zip_bomb_full (~100KB→~100MB; extreme DoS risk!)"],
+            ["", "--zipxxe-zip-bomb-large", "", "Huge zip bomb, ~1 TB unpacked (not default; extreme DoS)"],
             ["", "--zipxxe-timeout", "<sec>", "Per-message timeout (default: 30)"],
         ],
     },
@@ -447,7 +489,7 @@ SMTP_TESTS: dict[str, dict] = {
 # ``--send`` is given (RCPTLIM, RCPTDUP). OPENREL is intentionally exempt: it is a
 # core recon test that runs in run-all mode.
 SMTP_SEND_REQUIRED: frozenset[str] = frozenset(
-    {"BCC", "BOUNCE", "BOMB", "FLOOD", "AV", "ZIPXXE", "SSRF", "SPOOF", "ALIAS"}
+    {"BCC", "BOUNCE", "BOMB", "AV", "ZIPXXE", "SSRF", "SPOOF", "ALIAS"}
 )
 
 
@@ -462,9 +504,9 @@ SMTP_TEST_DESTS: tuple[str, ...] = (
     "auth_format", "auth_enum", "auth_downgrade", "helo_validation",
     "invalid_commands", "helo_only", "helo_bypass", "bounce_replay",
     "spoof_headers", "alias_test", "isencrypt", "ntlm", "noop_flood1",
-    "probe_accepted_domain", "open_relay", "role_identify", "interactive",
+    "probe_accepted_domain", "open_relay", "relay_unauth", "domfill", "role_identify", "interactive",
     "blacklist_test", "spf_test", "bomb", "antivirus", "ssrf", "flood", "zipxxe",
-    "shared_rate_limit",
+    "shared_rate_limit", "bcc_disclosure",
 )
 
 # Value-carrying tests whose dest doubles as the selection signal (``None`` means
@@ -472,8 +514,42 @@ SMTP_TEST_DESTS: tuple[str, ...] = (
 # can stay data-driven instead of a hand-maintained boolean expression.
 SMTP_VALUE_DESTS: tuple[str, ...] = (
     "enumerate", "rate_limit", "noop2_count", "rcpt_limit", "rcpt_duplicate",
-    "bcc_test",
 )
+
+
+def _cli_present(value) -> bool:
+    """True when a CLI value was given and is not blank."""
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(str(item).strip() for item in value)
+    return bool(str(value).strip())
+
+
+def smtp_auto_suite(args) -> tuple[str, ...]:
+    """Tests for a bare target or ``-ts ALL``.
+
+    1. Basic suite.
+    2. With ``-r`` and ``--send``, delivery tests that those two switches are enough for.
+    3. With ``-u``/``-U`` and ``-p``/``-P`` as well, credential tests and the remaining
+       tests that do not need another switch.
+    """
+    codes = list(SMTP_DEFAULT_SUITE)
+    if _cli_present(getattr(args, "rcpt_to", None)) and getattr(args, "send", False):
+        codes.extend(SMTP_SEND_SUITE)
+        if _cli_present(getattr(args, "mail_from", None)):
+            codes.append("BOUNCE")
+        if _cli_present(getattr(args, "ssrf_canary_url", None)):
+            codes.append("SSRF")
+        if check_if_brute(args):
+            codes.extend(SMTP_AUTH_SUITE)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for code in codes:
+        if code not in seen:
+            seen.add(code)
+            ordered.append(code)
+    return tuple(ordered)
 
 
 def _smtp_parse_test_codes(raw: str | None) -> list[str]:
@@ -529,6 +605,10 @@ def _apply_smtp_tests(args) -> None:
             if getattr(args, dest, None) is None and default is not None:
                 setattr(args, dest, default)
 
+    # Explicit -ts BRUTE uses the built-in lists when -u/-U or -p/-P was omitted.
+    if "BRUTE" in codes:
+        apply_default_brute_creds(args)
+
     # Every explicitly selected test must actually activate; otherwise report what is
     # missing instead of silently falling back to run-all mode.
     inactive: list[tuple[str, list[str]]] = []
@@ -552,6 +632,20 @@ def _apply_smtp_tests(args) -> None:
         raise argparse.ArgumentError(None, "; ".join(parts))
 
 
+def _smtp_option_rows(rows: list) -> list:
+    """Drop the empty short-flag column when a test has none.
+
+    The help printer still reserves that column, so ``--duration`` starts
+    two spaces further right than the description. A table that already has
+    ``-t`` / ``-u`` keeps the column so the long flags stay aligned.
+    """
+    if not rows or not all(isinstance(row, list) and len(row) >= 4 for row in rows):
+        return rows
+    if any(row[0] for row in rows):
+        return rows
+    return [row[1:] for row in rows]
+
+
 def _smtp_test_help(codes: list[str]):
     """Build a help object (for ptprinthelper.help_print) describing given test codes."""
     if not codes:
@@ -567,15 +661,21 @@ def _smtp_test_help(codes: list[str]):
     for code in valid:
         spec = SMTP_TESTS[code]
         header = f"{code} — {spec.get('desc', '')}"
-        out.append({"description": [header, *spec.get("long", [])]})
+        desc = [header, *spec.get("long", [])]
         req = list(spec.get("requires", []))
         if code in SMTP_SEND_REQUIRED:
             req.append("--send (required to actually deliver the test message(s))")
         if req:
-            out.append({"requires": req})
+            desc.append("Requires: " + "; ".join(req))
+        out.append({"description": desc})
         rows: list[list[str]] = list(spec.get("mods", []))
         if spec.get("common"):
             rows = rows + _TS_COMMON_MSG
+        if code in _SMTP_OPTIONAL_AUTH:
+            for row in _SMTP_AUTH_OPTS:
+                if not any(len(existing) > 1 and existing[1] == row[1] for existing in rows):
+                    rows.append(list(row))
+        rows = _smtp_option_rows(rows)
         if rows:
             out.append({"test_options": rows})
         has_opts = bool(rows or req)

@@ -23,7 +23,7 @@ import netifaces as ni
 from scapy.sendrecv import AsyncSniffer, sniff
 
 __MODULELABEL__ = "DHCP spoofer"
-__MODULECODE__ = "rogue_dhcp"
+__MODULECODE__ = "rogue"
 __ORDER__ = 100
 
 OFFER_TTL = 30

@@ -19,6 +19,7 @@ class Pop3Report:
         }
         self.vulns: list[dict[str, Any]] = []
         self.connect_error: str | None = None
+        self.brute_creds = None
 
     def set_connect_error(self, message: str) -> None:
         with self._lock:

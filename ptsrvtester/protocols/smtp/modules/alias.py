@@ -112,7 +112,7 @@ def test_alias(e) -> AliasTestResult:
     mail_from = str(mail_from).strip()
     timeout = max(5.0, getattr(e.args, 'alias_timeout', 30.0))
     auth_user = getattr(e.args, 'user', None) or ''
-    auth_pass = getattr(e.args, 'password', None) or ''
+    auth_pass = first_cli_password(getattr(e.args, 'password', None)) or ''
     do_auth = bool(auth_user and auth_pass)
     variants_arg = getattr(e.args, 'alias_variants', None)
     default_variants = ['case', 'case_domain', 'dotted', 'plus', 'percent', 'bang_simple', 'bang_nested']
@@ -146,6 +146,7 @@ def test_alias(e) -> AliasTestResult:
                 smtp.file = None
                 st, reply = smtp.getreply()
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     _al_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
                     return (None, f'Connect: {st}')
                 _al_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
@@ -153,6 +154,7 @@ def test_alias(e) -> AliasTestResult:
                 smtp = smtplib.SMTP(timeout=timeout)
                 st, reply = smtp.connect(host, port)
                 if st != 220:
+                    e.end_if_blocked(st, reply)
                     _al_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')
                     return (None, f'Connect: {st}')
                 _al_trace_append(trace, f'Connect: {e._smtp_trace_reply(st, reply)}')

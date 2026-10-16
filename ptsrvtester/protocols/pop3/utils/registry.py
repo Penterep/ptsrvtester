@@ -61,17 +61,17 @@ POP3_TESTS: dict[str, dict] = {
     "BRUTE": {
         "desc": "Login bruteforce (USER/PASS)",
         "long": [
-            "Bruteforce POP3 login with the supplied username(s) and",
-            "password(s); runs a catch-all check first.",
+            "Bruteforce POP3 USER/PASS. Without -u/-U or -p/-P, built-in lists are used.",
+            "Catch-all check first. Error when the server",
+            "never stops password guessing.",
         ],
-        "requires": ["-u/--user or -U/--users", "-p/--password or -P/--passwords"],
         "mods": [
-            ["-u", "--user", "<name> …", "Username(s)"],
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "<password>", "Single password"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
-            ["", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            ["-t", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
         ],
     },
     "NOOP1": {
@@ -108,6 +108,15 @@ POP3_TESTS: dict[str, dict] = {
 }
 
 
+def _option_rows(rows: list) -> list:
+    """Drop the empty short-flag column when a test has none."""
+    if not rows or not all(isinstance(row, list) and len(row) >= 4 for row in rows):
+        return rows
+    if any(row[0] for row in rows):
+        return rows
+    return [row[1:] for row in rows]
+
+
 def pop3_test_help(codes: list[str]):
     """Build a help object describing the given test codes."""
     if not codes:
@@ -124,11 +133,11 @@ def pop3_test_help(codes: list[str]):
         desc.extend(spec.get("long", []) or [])
         if spec.get("requires"):
             desc.append("Requires: " + "; ".join(spec["requires"]))
-        mods = list(spec.get("mods", []) or [])
+        mods = _option_rows(list(spec.get("mods", []) or []))
         has_opts = bool(mods or spec.get("requires"))
         usage = f"ptsrvtester pop3 -ts {code} " + ("<options> -tg <target>" if has_opts else "-tg <target>")
         blocks.append({"description": desc})
-        blocks.append({"usage": [usage]})
         if mods:
             blocks.append({"options": mods})
+        blocks.append({"usage": [usage]})
     return blocks

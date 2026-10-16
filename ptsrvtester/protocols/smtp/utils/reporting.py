@@ -89,6 +89,185 @@ class ReportingMixin:
         return self.results.enum_results is not None or self.results.enum_error is not None
 
     @staticmethod
+    def _helo_only_description(ho) -> str:
+        if ho.extensions:
+            return "Server supports ESMTP extensions:\r\n" + ", ".join(ho.extensions)
+        return ho.detail or "Server supports only HELO; EHLO rejected or provides no ESMTP extensions."
+
+    def _is_helo_only_output(self) -> bool:
+        """``-ts HELOONLY`` alone: description and, when vulnerable, one vuln code."""
+        if getattr(self, "run_all_mode", False):
+            return False
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"HELOONLY"}
+
+    @staticmethod
+    def _helo_bypass_bypass_names(hb) -> list[str]:
+        bypass = set(hb.submission_bypass_ehlo) | set(hb.relay_bypass_ehlo)
+        ordered = [name for name in hb.tested_ehlo if name in bypass]
+        if ordered:
+            return ordered
+        return list(hb.submission_bypass_ehlo) + list(hb.relay_bypass_ehlo)
+
+    @staticmethod
+    def _helo_bypass_description(hb) -> str:
+        if hb.irrelevant_open_relay:
+            return "Test is irelevant, because server is set as Open Relay"
+        names = ReportingMixin._helo_bypass_bypass_names(hb)
+        if names:
+            return "Relay bypass with EHLO values: " + ", ".join(names)
+        return "Relay bypass with EHLO values:"
+
+    def _is_helo_bypass_only_output(self) -> bool:
+        """``-ts HELOBYP`` alone: description and, when a bypass is found, one vuln code."""
+        if getattr(self, "run_all_mode", False):
+            return False
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"HELOBYP"}
+
+    def _emit_helo_bypass_json(self) -> None:
+        hb = self.results.helo_bypass
+        err = self.results.helo_bypass_error
+        if err is not None:
+            description = f"HELO bypass test error: {err}"
+        elif hb is not None:
+            description = self._helo_bypass_description(hb)
+        else:
+            description = "HELO bypass test"
+        self.ptjsonlib.add_properties({"description": description})
+        if hb is not None and hb.vulnerable and not hb.irrelevant_open_relay:
+            self.ptjsonlib.add_vulnerability(vuln_code=VULNS.HeloBypass.value)
+        self.ptjsonlib.set_status("finished", "")
+        self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+
+    @staticmethod
+    def _auth_downgrade_description(ad) -> str:
+        before = ", ".join(ad.methods_before)
+        after = ", ".join(ad.methods_after)
+        headline = ad.detail or "No authentication downgrade detected"
+        return (
+            f"{headline}\r\n\r\n"
+            f"Methods before bad authentication: {before}\r\n"
+            f"Methods after bad authentication: {after}\r\n"
+        )
+
+    def _is_auth_downgrade_only_output(self) -> bool:
+        """``-ts AUTHDN`` alone: description and, when a downgrade is found, one vuln code."""
+        if getattr(self, "run_all_mode", False):
+            return False
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"AUTHDN"}
+
+    def _emit_auth_downgrade_json(self) -> None:
+        ad = self.results.auth_downgrade
+        err = self.results.auth_downgrade_error
+        if err is not None:
+            description = f"AUTH downgrade test error: {err}"
+        elif ad is not None:
+            description = self._auth_downgrade_description(ad)
+        else:
+            description = "No authentication downgrade detected"
+        self.ptjsonlib.add_properties({"description": description})
+        if ad is not None and ad.vulnerable:
+            self.ptjsonlib.add_vulnerability(vuln_code=VULNS.AuthDowngrade.value)
+        self.ptjsonlib.set_status("finished", "")
+        self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+
+    def _emit_helo_only_json(self) -> None:
+        ho = self.results.helo_only
+        err = self.results.helo_only_error
+        if err is not None:
+            description = f"HELO-only test error: {err}"
+        elif ho is not None:
+            description = self._helo_only_description(ho)
+        else:
+            description = "HELO-only test"
+        self.ptjsonlib.add_properties({"description": description})
+        if ho is not None and ho.vulnerable:
+            self.ptjsonlib.add_vulnerability(vuln_code=VULNS.HeloOnly.value)
+        self.ptjsonlib.set_status("finished", "")
+        self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+
+    @staticmethod
+    def _domfill_description(df) -> str:
+        reply = " ".join((df.reply or "").split())
+        status = "" if df.status is None else str(df.status)
+        line = f"MAIL FROM:<test> -> {status} {reply}".strip()
+        if df.vulnerable and df.domain:
+            return f"Domain name was disclosed: {df.domain}\r\n{line}"
+        return line or "Domain name was not disclosed"
+
+    def _is_domfill_only_output(self) -> bool:
+        """``-ts DOMFILL`` alone: description and, when a domain is disclosed, one vuln code."""
+        if getattr(self, "run_all_mode", False):
+            return False
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"DOMFILL"}
+
+    def _emit_domfill_json(self) -> None:
+        df = self.results.domfill
+        err = self.results.domfill_error
+        if err is not None:
+            description = f"Sender domain autofill error: {err}"
+        elif df is not None:
+            description = self._domfill_description(df)
+        else:
+            description = "Domain name was not disclosed"
+        self.ptjsonlib.add_properties({"description": description})
+        if df is not None and df.vulnerable:
+            self.ptjsonlib.add_vulnerability(vuln_code=VULNS.Domfill.value)
+        self.ptjsonlib.set_status("finished", "")
+        self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+
+    def _is_brute_only_output(self) -> bool:
+        """``-ts BRUTE`` alone: description, userAccount nodes, global vuln codes."""
+        if getattr(self, "run_all_mode", False):
+            return False
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"BRUTE"}
+
+    def _brute_vuln_entries(self) -> list[dict]:
+        """PTV-SVC-AUTH-BRUTE when guessing is not blocked, then PTV-SVC-AUTH-WEAK for hits."""
+        vulns: list[dict] = []
+        if getattr(self, "_brute_guessing", None) == "not_limited":
+            vulns.append({"vuln_code": VULNS.Brute.value})
+        creds = brute_sorted_creds(self.results.creds)
+        if creds:
+            vulns.append({
+                "vuln_code": VULNS.WeakCreds.value,
+                "vuln_request": brute_weak_request(self.args),
+                "vuln_response": brute_weak_response(creds),
+            })
+        return vulns
+
+    def _add_brute_account_nodes(self) -> None:
+        """One ``userAccount`` per accepted login. Properties are login and password."""
+        for cred in brute_sorted_creds(self.results.creds):
+            node = self.ptjsonlib.create_node_object(
+                "userAccount",
+                parent_type="userAccounts",
+                parent=None,
+                properties={"login": cred.user, "password": cred.passw},
+            )
+            self.ptjsonlib.add_node(node)
+
+    def _emit_brute_json(self) -> None:
+        """``-ts BRUTE``: description, userAccount nodes, global vuln codes."""
+        self.ptjsonlib.add_properties({
+            "description": brute_discovered_description(self.results.creds),
+        })
+        self._add_brute_account_nodes()
+        for vuln in self._brute_vuln_entries():
+            self.ptjsonlib.add_vulnerability(**vuln)
+        self.ptjsonlib.set_status("finished", "")
+        self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+
+    @staticmethod
     def _ehlo_commands_for_flat(ehlo_raw: str | None, ehlo_starttls_raw: str | None) -> list[str]:
         """Extract EHLO extension names (excluding AUTH methods) for flat JSON description."""
         seen: set[tuple[str, bool]] = set()
@@ -148,11 +327,11 @@ class ReportingMixin:
         if (ho_err := self.results.helo_only_error) is not None:
             return f"HELO-only test error: {ho_err}"
         if (ho := self.results.helo_only) is not None:
-            return ho.detail or "HELO-only test"
+            return self._helo_only_description(ho)
         if (hb_err := self.results.helo_bypass_error) is not None:
             return f"HELO bypass test error: {hb_err}"
         if (hb := self.results.helo_bypass) is not None:
-            return hb.detail or "HELO bypass test"
+            return self._helo_bypass_description(hb)
         if (id_err := self.results.identify_error) is not None:
             return f"Server identification error: {id_err}"
         if (id_r := self.results.identify) is not None:
@@ -184,13 +363,7 @@ class ReportingMixin:
         if (ad_err := self.results.auth_downgrade_error) is not None:
             return f"AUTH downgrade test error: {ad_err}"
         if (ad := self.results.auth_downgrade) is not None:
-            if ad.indeterminate:
-                return ad.detail or "Indeterminate"
-            if ad.info_defensive:
-                return ad.detail or "AUTH disappeared (defensive reaction)"
-            if ad.vulnerable:
-                return ad.detail or f"Authentication downgrade: {ad.methods_before} -> {ad.methods_after}"
-            return ad.detail or "No authentication downgrade detected"
+            return self._auth_downgrade_description(ad)
 
         if (af_err := self.results.auth_format_error) is not None:
             return f"AUTH format probe error: {af_err}"
@@ -550,6 +723,12 @@ class ReportingMixin:
         if self.results.open_relay and not getattr(self.results, "open_relay_incomplete", False):
             vulns.append({"vuln_code": VULNS.OpenRelay.value})
 
+        if self.results.relay_unauth and not getattr(self.results, "relay_unauth_incomplete", False):
+            vulns.append({"vuln_code": VULNS.RelayUnauth.value})
+
+        if (df := self.results.domfill) is not None and df.vulnerable:
+            vulns.append({"vuln_code": VULNS.Domfill.value})
+
         if (blacklist := self.results.blacklist) is not None:
             if blacklist.listed:
                 vulns.append({"vuln_code": VULNS.Blacklist.value})
@@ -613,10 +792,7 @@ class ReportingMixin:
             vulns.append({"vuln_code": VULNS.NTLM.value})
 
         if (ae := self.results.auth_enum) is not None and ae.vulnerable:
-            ae_entry: dict = {"vuln_code": VULNS.UserEnumAUTH.value}
-            if ae.enumerated_users:
-                ae_entry["enumerated_users"] = list(ae.enumerated_users)
-            vulns.append(ae_entry)
+            vulns.append({"vuln_code": VULNS.UserEnumAUTH.value})
 
         if (ad := self.results.auth_downgrade) is not None and ad.vulnerable:
             vulns.append({"vuln_code": VULNS.AuthDowngrade.value})
@@ -630,7 +806,11 @@ class ReportingMixin:
         if (ho := self.results.helo_only) is not None and ho.vulnerable:
             vulns.append({"vuln_code": VULNS.HeloOnly.value})
 
-        if (hb := self.results.helo_bypass) is not None and hb.vulnerable:
+        if (
+            (hb := self.results.helo_bypass) is not None
+            and hb.vulnerable
+            and not hb.irrelevant_open_relay
+        ):
             vulns.append({"vuln_code": VULNS.HeloBypass.value})
 
         if (br := self.results.bounce_replay) is not None and (
@@ -862,6 +1042,26 @@ class ReportingMixin:
             if not getattr(self, "_info_error_emitted", False):
                 self._ptprint_raw(info_error, bullet_type="VULN",
                                       condition=not self.use_json, indent=4)
+            return
+
+        if self._is_brute_only_output():
+            self._emit_brute_json()
+            return
+
+        if self._is_helo_only_output():
+            self._emit_helo_only_json()
+            return
+
+        if self._is_helo_bypass_only_output():
+            self._emit_helo_bypass_json()
+            return
+
+        if self._is_auth_downgrade_only_output():
+            self._emit_auth_downgrade_json()
+            return
+
+        if self._is_domfill_only_output():
+            self._emit_domfill_json()
             return
 
         # ── Flat output: no nodes, global properties + global vulnerabilities ──
@@ -1121,6 +1321,19 @@ class ReportingMixin:
                     "verificationInstructions": bc.verification_instructions,
                     "smtpTrace": list(bc.smtp_trace),
                     "testId": bc.test_id or None,
+                    "probes": [
+                        {
+                            "role": p.role,
+                            "testId": p.test_id,
+                            "messageAccepted": p.message_accepted,
+                            "smtpStatus": p.smtp_status,
+                            "recipientsTo": list(p.recipients_to),
+                            "recipientsCc": list(p.recipients_cc),
+                            "recipientsBcc": list(p.recipients_bcc),
+                            "detail": p.detail,
+                        }
+                        for p in bc.probes
+                    ],
                 }
             elif (bc_err := self.results.bcc_test_error) is not None:
                 props["bccTestError"] = bc_err
@@ -1173,6 +1386,8 @@ class ReportingMixin:
                     "detail": fr.detail,
                     "testId": fr.test_id or None,
                 }
+                if fr.vulnerable:
+                    flat_vulns.append({"vuln_code": VULNS.Size.value})
             elif (flood_err := self.results.flood_error) is not None:
                 props["floodError"] = flood_err
             _adp_props = self._accepted_domain_probe_props_json()
@@ -1261,9 +1476,16 @@ class ReportingMixin:
                 sid = identify_service(info.banner)
                 vendor = _vendor_from_cpe(sid.cpe) if sid else None
                 version = sid.version if sid else None
+                if vendor and version:
+                    name = f"{vendor} {version}"
+                elif vendor:
+                    name = vendor
+                else:
+                    name = "smtp"
                 properties.update(
                     {
                         "description": f"Banner: {info.banner}",
+                        "name": name,
                         "version": version,
                         "vendor": vendor,
                     }
@@ -1327,10 +1549,19 @@ class ReportingMixin:
         if (open_relay_error := self.results.open_relay_error) is not None:
             properties.update({"openRelayError": open_relay_error})
         elif (open_relay := self.results.open_relay) is not None:
-            if open_relay:
-                global_vulns.append(
-                    {"vuln_code": VULNS.OpenRelay.value, "vuln_request": "Open relay"}
-                )
+            if open_relay and not getattr(self.results, "open_relay_incomplete", False):
+                global_vulns.append({"vuln_code": VULNS.OpenRelay.value})
+
+        if (relay_unauth_error := self.results.relay_unauth_error) is not None:
+            properties.update({"relayUnauthError": relay_unauth_error})
+        elif (relay_unauth := self.results.relay_unauth) is not None:
+            if relay_unauth and not getattr(self.results, "relay_unauth_incomplete", False):
+                global_vulns.append({"vuln_code": VULNS.RelayUnauth.value})
+
+        if (domfill_error := self.results.domfill_error) is not None:
+            properties.update({"domfillError": domfill_error})
+        elif (df := self.results.domfill) is not None and df.vulnerable:
+            global_vulns.append({"vuln_code": VULNS.Domfill.value})
 
         # Catch All mailbox
         if (catch_all := self.results.catch_all) is not None:
@@ -1407,6 +1638,9 @@ class ReportingMixin:
                     if vuln_code:
                         global_vulns.append({"vuln_code": vuln_code})
 
+        if (ae := self.results.auth_enum) is not None and ae.vulnerable:
+            global_vulns.append({"vuln_code": VULNS.UserEnumAUTH.value})
+
         # NTLM information
         if (ntlm_error := self.results.ntlm_error) is not None:
             properties.update({"ntlmError": ntlm_error})
@@ -1480,13 +1714,7 @@ class ReportingMixin:
                 ad_props["rsetOk"] = ad.rset_ok
             properties.update({"authDowngrade": ad_props})
             if ad.vulnerable:
-                global_vulns.append(
-                    {
-                        "vuln_code": VULNS.AuthDowngrade.value,
-                        "vuln_request": f"AUTH {ad.auth_method_used} (bogus token)",
-                        "vuln_response": ad.detail or "",
-                    }
-                )
+                global_vulns.append({"vuln_code": VULNS.AuthDowngrade.value})
 
         # AUTH LOGIN format (PTL-SVC-SMTP-AUTH-FORMAT)
         if (af_err := self.results.auth_format_error) is not None:
@@ -1565,7 +1793,7 @@ class ReportingMixin:
                     }
                 )
 
-        # HELO-only (PTL-SVC-SMTP-HELOONLY)
+        # HELO-only (PTV-SVC-SMTP-HELOONLY)
         if (ho_err := self.results.helo_only_error) is not None:
             properties.update({"heloOnlyError": ho_err})
         elif (ho := self.results.helo_only) is not None:
@@ -1580,15 +1808,9 @@ class ReportingMixin:
             }
             properties.update({"heloOnly": ho_props})
             if ho.vulnerable:
-                global_vulns.append(
-                    {
-                        "vuln_code": VULNS.HeloOnly.value,
-                        "vuln_request": "EHLO test.local",
-                        "vuln_response": ho.detail or "",
-                    }
-                )
+                global_vulns.append({"vuln_code": VULNS.HeloOnly.value})
 
-        # HELO bypass (PTL-SVC-SMTP-HELO)
+        # HELO bypass (PTV-SVC-SMTP-HELO)
         if (hb_err := self.results.helo_bypass_error) is not None:
             properties.update({"heloBypassError": hb_err})
         elif (hb := self.results.helo_bypass) is not None:
@@ -1603,15 +1825,8 @@ class ReportingMixin:
                 "detail": hb.detail,
             }
             properties.update({"heloBypass": hb_props})
-            if hb.vulnerable:
-                bypass_ehlo = ", ".join(hb.submission_bypass_ehlo + hb.relay_bypass_ehlo)
-                global_vulns.append(
-                    {
-                        "vuln_code": VULNS.HeloBypass.value,
-                        "vuln_request": f"EHLO {bypass_ehlo}\nMAIL FROM:<tester@example.com>\nRCPT TO:<external-test@gmail.com>",
-                        "vuln_response": hb.detail or "",
-                    }
-                )
+            if hb.vulnerable and not hb.irrelevant_open_relay:
+                global_vulns.append({"vuln_code": VULNS.HeloBypass.value})
 
         # Bounce replay (PTL-SVC-SMTP-REPLAY)
         if (br_err := self.results.bounce_replay_error) is not None:
@@ -1778,13 +1993,7 @@ class ReportingMixin:
                 }
             })
             if fr.vulnerable:
-                global_vulns.append(
-                    {
-                        "vuln_code": VULNS.Flood.value,
-                        "vuln_request": f"Queue flood ({fr.queue_attempts} attempts, {fr.messages_accepted} delivered) + SIZE test",
-                        "vuln_response": fr.detail or "Server accepts excessive messages or SIZE not enforced",
-                    }
-                )
+                global_vulns.append({"vuln_code": VULNS.Size.value})
 
         # ZIPXXE (PTL-SVC-SMTP-ZIPXXE)
         if (zipxxe_err := self.results.zipxxe_error) is not None:
@@ -1870,6 +2079,19 @@ class ReportingMixin:
                     "verificationInstructions": bc.verification_instructions,
                     "smtpTrace": list(bc.smtp_trace),
                     "testId": bc.test_id or None,
+                    "probes": [
+                        {
+                            "role": p.role,
+                            "testId": p.test_id,
+                            "messageAccepted": p.message_accepted,
+                            "smtpStatus": p.smtp_status,
+                            "recipientsTo": list(p.recipients_to),
+                            "recipientsCc": list(p.recipients_cc),
+                            "recipientsBcc": list(p.recipients_bcc),
+                            "detail": p.detail,
+                        }
+                        for p in bc.probes
+                    ],
                 }
             })
 
@@ -1973,33 +2195,14 @@ class ReportingMixin:
                 }
             })
 
-        # Login bruteforce
-        if (creds := self.results.creds) is not None:
-            if len(creds) > 0:
-                json_lines: list[str] = []
-                for cred in creds:
-                    json_lines.append(f"user: {cred.user}, password: {cred.passw}")
+        guessing = getattr(self, "_brute_guessing", None)
+        if guessing is not None:
+            properties.update({"smtpPasswordGuessing": guessing})
+        if getattr(self, "_auth_catch_all", None) == "indeterminate":
+            properties.update({"smtpAuthCatchAll": "indeterminate"})
 
-                if self.args.user is not None:
-                    if isinstance(self.args.user, list):
-                        user_str = f"usernames: {', '.join(self.args.user)}"
-                    else:
-                        user_str = f"username: {self.args.user}"
-                else:
-                    user_str = f"usernames: {self.args.users}"
-
-                if self.args.password is not None:
-                    passw_str = f"password: {self.args.password}"
-                else:
-                    passw_str = f"passwords: {self.args.passwords}"
-
-                global_vulns.append(
-                    {
-                        "vuln_code": VULNS.WeakCreds.value,
-                        "vuln_request": f"{user_str}\n{passw_str}",
-                        "vuln_response": "\n".join(json_lines),
-                    }
-                )
+        # Login bruteforce. Accounts are userAccount nodes; codes stay global.
+        global_vulns.extend(self._brute_vuln_entries())
 
         # Create main software node (vulnerabilities are always global)
         smtp_node = self.ptjsonlib.create_node_object(
@@ -2024,6 +2227,8 @@ class ReportingMixin:
                             properties=user_props,
                         )
                         self.ptjsonlib.add_node(user_node)
+
+        self._add_brute_account_nodes()
 
         # All vulnerabilities go to global results.vulnerabilities[]
         for v in global_vulns:

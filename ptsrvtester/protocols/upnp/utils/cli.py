@@ -1,4 +1,4 @@
-"""Command-line arguments for targeted IPv4 UPnP/SSDP discovery."""
+"""Command-line arguments for targeted UPnP/SSDP discovery."""
 
 from __future__ import annotations
 
@@ -19,7 +19,44 @@ class Target:
 
 
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-_TESTS = frozenset({"DISCOVER", "DESCRIBE", "IGDINFO", "SCPD", "PORTMAPS", "NOTIFY", "EVENTS"})
+_TEST_HELP = {
+    "DISCOVER": (
+        "Discover SSDP advertisements from the selected target",
+        "Send one bounded UDP M-SEARCH query. No response does not prove that UPnP is absent.",
+        ("--search-target", "--multicast", "--interface-ip", "--interface-index", "--mx", "--ttl", "--max-responses"),
+    ),
+    "DESCRIBE": (
+        "Read advertised device and service descriptions",
+        "Discover the target first, then fetch bounded HTTP/XML descriptions scoped to that target.",
+        ("--max-responses", "--max-description-bytes"),
+    ),
+    "IGDINFO": (
+        "Read Internet Gateway Device status",
+        "Discover and describe the target, then call read-only status actions on advertised IGD services.",
+        ("--max-description-bytes",),
+    ),
+    "SCPD": (
+        "Read service actions and state-variable schemas",
+        "Discover and describe the target before fetching advertised SCPD documents. Requires explicit selection.",
+        ("--max-description-bytes", "--max-scpd"),
+    ),
+    "PORTMAPS": (
+        "Enumerate existing IGD port mappings",
+        "Read a bounded number of existing mappings after discovery and description; does not add or remove mappings. Requires explicit selection.",
+        ("--max-description-bytes", "--max-mappings"),
+    ),
+    "NOTIFY": (
+        "Observe target-scoped SSDP announcements",
+        "Listen on a local interface without sending discovery queries. No notification in the window is inconclusive. Requires explicit selection and UDP port 1900.",
+        ("--interface-ip", "--interface-index", "--notify-seconds", "--max-notifications"),
+    ),
+    "EVENTS": (
+        "Subscribe to bounded GENA property-change events",
+        "Discover and describe the target, subscribe with a local callback, then unsubscribe. Requires explicit selection and a reachable local interface.",
+        ("--interface-ip", "--interface-index", "--max-description-bytes", "--event-seconds", "--max-events"),
+    ),
+}
+_TESTS = frozenset(_TEST_HELP)
 
 
 def valid_target(value: str) -> Target | IPv6Target:
@@ -175,7 +212,9 @@ class UPnPArgs(BaseArgs):
             {"options": [
                 ["-tg", "--target", "<host>", "IPv4, IPv6 literal or hostname[:UDP port]; default port 1900"],
                 ["", "--family", "<4|6>", "Address family for hostnames; IPv6 literals select family 6"],
-                ["-ts", "--tests", "<test>", "DISCOVER, DESCRIBE, IGDINFO, SCPD, PORTMAPS, NOTIFY, EVENTS, ALL; default excludes SCPD, PORTMAPS, NOTIFY and EVENTS"],
+                ["-ts", "--tests", "<test>", "Comma-separated tests listed below"],
+                ["", "", "ALL", "Default suite: DISCOVER, DESCRIBE, IGDINFO"],
+                *[["", "", code, spec[0]] for code, spec in _TEST_HELP.items()],
                 ["", "--timeout-seconds", "<seconds>", "UDP/HTTP timeout (default 3; range 0.1-60; DNS uses system timeout)"],
                 ["", "--search-target", "<ST>", "SSDP search target (default ssdp:all)"],
                 ["", "--multicast", "", "Send SSDP M-SEARCH to IPv4 or IPv6 multicast; keep results scoped to -tg"],
@@ -197,6 +236,34 @@ class UPnPArgs(BaseArgs):
                 ["-h", "--help", "", "Show this help"],
             ]},
         ]
+
+    @staticmethod
+    def get_test_help(codes: list[str]):
+        selected = list(dict.fromkeys(code.strip().upper() for code in codes if code.strip().upper() != "ALL"))
+        if not selected:
+            return None
+        unknown = [code for code in selected if code not in _TESTS]
+        if unknown:
+            return [
+                {"unknown_test": [f"Unknown test: {', '.join(unknown)}"]},
+                {"available_tests": [f"ALL, {', '.join(_TEST_HELP)}"]},
+            ]
+        options = next(section["options"] for section in UPnPArgs.get_help() if "options" in section)
+        common = {"--target", "--family", "--tests", "--timeout-seconds", "--output", "--json", "--verbose", "--help"}
+        help_data = []
+        for code in selected:
+            description, detail, relevant = _TEST_HELP[code]
+            relevant = set(relevant)
+            if code != "NOTIFY":
+                relevant.update(_TEST_HELP["DISCOVER"][2])
+            required = " -i <local-ip>" if code in {"NOTIFY", "EVENTS"} else ""
+            help_data.extend([
+                {"description": [f"{code}: {description}", detail]},
+                {"usage": [f"ptsrvtester upnp -tg <host> -ts {code}{required} <options>"]},
+                {"usage_example": [f"ptsrvtester upnp -tg 192.168.1.1 -ts {code}" + (" -i 192.168.1.10" if required else "")]},
+                {"test_options": [row for row in options if row[1] in common | relevant]},
+            ])
+        return help_data
 
     def add_subparser(self, name: str, subparsers) -> None:
         parser = subparsers.add_parser(name, add_help=True)

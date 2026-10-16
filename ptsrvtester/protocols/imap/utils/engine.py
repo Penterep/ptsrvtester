@@ -33,9 +33,17 @@ from .helpers import (
     ArgsWithBruteforce,
     Creds,
     Target,
+    brute_passwords,
     check_if_brute,
+    first_cli_password,
     get_mode,
     one_cli_user,
+    brute_discovered_description,
+    brute_sorted_creds,
+    brute_weak_request,
+    brute_weak_response,
+    password_request_text,
+    shown_password,
     simple_bruteforce,
     text_or_file,
     valid_target,
@@ -72,7 +80,7 @@ from .capa import (
 )
 from ptlibs.ptprinthelper import out_if, ptprint
 from .ptprinthelper import get_colored_text
-from .progress import ThreadedProgress
+from .progress import ThreadedProgress, clear_raw_line, paint_raw_line
 
 from .decompression_payloads import (
     BILLION_LAUGHS_XML,
@@ -157,6 +165,9 @@ class ImapEngine:
         if self.use_json and not json:
             return
         if json and not self.use_json:
+            return
+        if json:
+            print(string, end=end)
             return
         if title:
             cat, color = "INFO", True
@@ -256,15 +267,14 @@ class ImapEngine:
     ) -> None:
         if not getattr(self.args, "debug", False) or self.use_json:
             return
-        kind = row.probe_kind
         user = row.username
         if row.error:
-            msg = f"USR-ENUM {method} {kind} {user!r}: connect/error {self._snip(row.error)}"
+            msg = f"{method} {user!r}: connect/error {self._snip(row.error)}"
         elif row.unexpected_ok:
-            msg = f"USR-ENUM {method} {kind} {user!r}: unexpected OK"
+            msg = f"{method} {user!r}: unexpected OK"
         else:
             msg = (
-                f"USR-ENUM {method} {kind} {user!r}: {self._snip(row.reply_raw)} "
+                f"{method} {user!r}: {self._snip(row.reply_raw)} "
                 f"(norm={row.reply_normalized!r} t={row.elapsed_ms}ms)"
             )
         if output is not None:
@@ -390,25 +400,6 @@ class ImapEngine:
             return False
         med = statistics.median(invalid_times)
         return elapsed_ms >= max(invalid_times) + 80.0 and elapsed_ms >= med * 2.0
-
-    @staticmethod
-    def _imap_usrenum_delay_note(invalid_times: list[float], wordlist_times: list[float]) -> str | None:
-        """Explain 2s/4s auth_failure_delay when fake users land in both buckets."""
-        inv = [t for t in invalid_times if t is not None]
-        wl = [t for t in wordlist_times if t is not None]
-        all_t = inv + wl
-        if len(all_t) < 4 or len(inv) < 2:
-            return None
-        lo, hi = min(all_t), max(all_t)
-        if hi < 800 or hi < lo * 1.5:
-            return None
-        inv_lo, inv_hi = min(inv), max(inv)
-        if inv_hi < inv_lo * 1.4:
-            return None
-        return (
-            f"Some replies took ~{int(round(lo / 1000))}s and others ~{int(round(hi / 1000))}s. "
-            "That extra wait is a retry delay, not a sign that the account exists."
-        )
 
     def _imap_usrenum_close(self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL | None) -> None:
         if imap is None:
@@ -1378,29 +1369,50 @@ class ImapEngine:
             _end_live()
 
     def _test_catch_all(self) -> CatchAllResult:
-        """Test if server accepts invalid credentials (LOGIN with random user/pass)."""
+        """Random credentials. AUTHENTICATE PLAIN when LOGIN is disabled."""
         try:
-            fake_user = "".join(random.choices(string.ascii_letters + string.digits, k=24))
-            fake_pass = "".join(random.choices(string.ascii_letters + string.digits, k=24))
-            self._dbg(f"Catch-all LOGIN {fake_user!r}")
+            method = self._imap_brute_pick()
+        except Exception as e:
+            self._dbg(f"Catch-all: connect failed: {e}")
+            return "unreachable"
+        if method == "disabled":
+            return "disabled"
+        fake_user = "".join(random.choices(string.ascii_letters + string.digits, k=24))
+        fake_pass = "".join(random.choices(string.ascii_letters + string.digits, k=24))
+        cmd = "AUTHENTICATE PLAIN" if method == "PLAIN" else "LOGIN"
+        self._dbg(f"Catch-all {cmd} {fake_user!r}")
+        try:
             imap = self.connect()
+        except Exception as e:
+            self._dbg(f"Catch-all: connect failed: {e}")
+            return "unreachable"
+        try:
+            if method == "PLAIN":
+                typ, raw, _ms = self._imap_usrenum_measure_plain(imap, fake_user, fake_pass)
+                if typ == "OK":
+                    self._dbg(f"Catch-all {cmd} → accepted (indeterminate)")
+                    return "indeterminate"
+                self._dbg(f"Catch-all rejected (not configured): {self._snip(raw)}")
+                if self._imap_text_is_timeout(raw):
+                    return "unreachable"
+                return "not_configured"
             try:
                 imap.login(fake_user, fake_pass)
-                self._dbg("Catch-all LOGIN → accepted (indeterminate)")
+                self._dbg(f"Catch-all {cmd} → accepted (indeterminate)")
                 return "indeterminate"
             except Exception as e:
                 self._dbg(f"Catch-all rejected (not configured): {self._snip(str(e))}")
                 if self._imap_text_is_timeout(str(e)):
                     return "unreachable"
                 return "not_configured"
-            finally:
+        finally:
+            try:
+                imap.logout()
+            except Exception:
                 try:
-                    imap.logout()
+                    imap.shutdown()
                 except Exception:
                     pass
-        except Exception as e:
-            self._dbg(f"Catch-all: connect failed: {e}")
-            return "unreachable"
 
     def _do_info(
         self, imap: imaplib.IMAP4 | imaplib.IMAP4_SSL, get_commands: bool = True
@@ -2891,7 +2903,7 @@ class ImapEngine:
 
     def test_anonymous_access(self) -> AnonymousAccessResult:
         """
-        Probe anonymous and weak default IMAP logins (PTL-SVC-IMAP-ANONYMOUS).
+        Probe anonymous and weak default IMAP logins (PTV-SVC-IMAP-ANON).
         RFC 4505 (SASL ANONYMOUS); pre-auth CAPABILITY may list AUTH=ANONYMOUS (RFC 3501).
         """
         self._anonymous_live = False
@@ -5142,22 +5154,16 @@ class ImapEngine:
                 )
         else:
             detail_parts.append(
-                "All names failed the same way. The server does not reveal whether a username exists."
+                "User enumeration is not possible. All names failed the same way."
             )
-            delay_note = self._imap_usrenum_delay_note(invalid_times, [
-                r.elapsed_ms for r in rows
-                if r.probe_kind == "wordlist" and r.elapsed_ms is not None
-            ])
-            if delay_note:
-                detail_parts.append(delay_note)
         if not self._imap_usrenum_timing_usable(invalid_times):
             self._dbg(
-                "USR-ENUM: timing oracle disabled "
+                "timing oracle disabled "
                 f"(threads={self._imap_usrenum_threads()} invalid_ms={invalid_times!r})"
             )
         # LOGINDISABLED / AUTH=PLAIN notes are printed once as a warning, not repeated in detail.
         self._dbg(
-            f"USR-ENUM {enumeration_method}: enumerated={enumerated!r} "
+            f"{enumeration_method}: enumerated={enumerated!r} "
             f"vulnerable={vulnerable} indeterminate={indeterminate}"
         )
         return ImapUserEnumResult(
@@ -5182,7 +5188,7 @@ class ImapEngine:
                 login_disabled_advertised=False,
                 auth_plain_advertised=False,
             )
-        pwd = getattr(self.args, "password", None) or _IMAP_USRENUM_DEFAULT_PASSWORD
+        pwd = first_cli_password(getattr(self.args, "password", None)) or _IMAP_USRENUM_DEFAULT_PASSWORD
         threads = self._imap_usrenum_threads()
 
         login_disabled_advertised = False
@@ -5198,12 +5204,12 @@ class ImapEngine:
                 imap_chk, banner_chk, merged_chk
             )
             self._dbg(
-                f"USR-ENUM: LOGINDISABLED advertised={login_disabled_advertised} "
+                f"LOGINDISABLED advertised={login_disabled_advertised} "
                 f"starttls={bool(getattr(self.args, 'starttls', False))} "
                 f"tls={bool(getattr(self.args, 'tls', False))}"
             )
         except Exception as e:
-            self._dbg(f"USR-ENUM: capability check failed: {self._snip(str(e))}")
+            self._dbg(f"capability check failed: {self._snip(str(e))}")
         finally:
             if imap_chk is not None:
                 try:
@@ -5221,7 +5227,7 @@ class ImapEngine:
             names=names,
             threads=threads,
             row_method="LOGIN",
-            baseline_dbg="USR-ENUM: LOGIN — synthetic baseline: ",
+            baseline_dbg="LOGIN — synthetic baseline: ",
         )
         return self._analyze_imap_usrenum(
             all_rows,
@@ -5239,7 +5245,7 @@ class ImapEngine:
                 login_disabled_advertised=False,
                 auth_plain_advertised=False,
             )
-        pwd = getattr(self.args, "password", None) or _IMAP_USRENUM_DEFAULT_PASSWORD
+        pwd = first_cli_password(getattr(self.args, "password", None)) or _IMAP_USRENUM_DEFAULT_PASSWORD
         threads = self._imap_usrenum_threads()
 
         auth_plain_advertised = False
@@ -5252,9 +5258,9 @@ class ImapEngine:
                 pass
             banner_chk, merged_chk = self._merged_preauth_capabilities(imap_chk)
             auth_plain_advertised = self._capability_advertises_auth_plain(merged_chk, banner_chk)
-            self._dbg(f"USR-ENUM: AUTH=PLAIN advertised={auth_plain_advertised}")
+            self._dbg(f"AUTH=PLAIN advertised={auth_plain_advertised}")
         except Exception as e:
-            self._dbg(f"USR-ENUM PLAIN: capability check failed: {self._snip(str(e))}")
+            self._dbg(f"PLAIN: capability check failed: {self._snip(str(e))}")
         finally:
             if imap_chk is not None:
                 try:
@@ -5272,7 +5278,7 @@ class ImapEngine:
             names=names,
             threads=threads,
             row_method="PLAIN",
-            baseline_dbg="USR-ENUM: PLAIN (RFC 4616) — synthetic baseline: ",
+            baseline_dbg="PLAIN (RFC 4616) — synthetic baseline: ",
         )
         return self._analyze_imap_usrenum(
             all_rows,
@@ -5284,7 +5290,7 @@ class ImapEngine:
     def auth_ntlm(self) -> NTLMResult:
         """
         CAPABILITY (pre-auth) for AUTH=NTLM, then AUTHENTICATE NTLM with Negotiate message;
-        decode Challenge for NetBIOS/DNS/OS disclosure (PTL-SVC-IMAP-NTLMINFO).
+        decode Challenge for NetBIOS/DNS/OS disclosure (PTV-SVC-NTLMINFO).
         """
         imap = self.connect()
         auth_ntlm_advertised = False
@@ -5333,6 +5339,234 @@ class ImapEngine:
                 except Exception:
                     pass
 
+    _IMAP_BRUTE_LOCK_RE = re.compile(
+        r"lock(?:ed|out)?|too many|banned|blocked|try again|exceed|throttl",
+        re.I,
+    )
+
+    def _imap_brute_line(
+        self, output, msg: str, category: str = "ADDITIONS", *, colortext: bool = True, indent: int = 0,
+    ) -> None:
+        if output is None or self.use_json:
+            return
+        if category == "ADDITIONS" and not getattr(self.args, "debug", False):
+            return
+        line = out_if(msg, category, True, colortext=colortext, indent=indent)
+        if line:
+            output.add_string_to_output(line.rstrip("\n"))
+
+    def _imap_brute_pick(self) -> str:
+        """LOGIN, or AUTHENTICATE PLAIN when LOGIN is disabled (RFC 3501 / RFC 4616)."""
+        imap = None
+        try:
+            imap = self.connect()
+            try:
+                imap.capability()
+            except Exception:
+                pass
+            banner, merged = self._merged_preauth_capabilities(imap)
+            if self._usrenum_logindisabled_on_session(imap, banner, merged):
+                if self._capability_advertises_auth_plain(merged, banner):
+                    return "PLAIN"
+                return "disabled"
+            return "LOGIN"
+        except Exception:
+            return "LOGIN"
+        finally:
+            if imap is not None:
+                try:
+                    imap.logout()
+                except Exception:
+                    try:
+                        imap.shutdown()
+                    except Exception:
+                        pass
+
+    def _imap_brute_reply(self, typ: str, raw: str) -> str:
+        text = self._snip(raw)
+        parts = text.split(" ", 1)
+        if len(parts) == 2 and parts[0][:1].isalpha() and any(ch.isdigit() for ch in parts[0]):
+            text = parts[1]
+        if typ == "ABORT":
+            return text or "connection closed"
+        if typ and text and not text.upper().startswith(typ):
+            return f"{typ} {text}".strip()
+        return text or typ
+
+    def _imap_brute_kind(self, typ: str, raw: str) -> str:
+        text = raw or ""
+        up = text.upper()
+        if "LOGINDISABLED" in up:
+            return "unsupported"
+        if typ == "OK":
+            return "ok"
+        if typ == "ABORT" or "* BYE" in up:
+            if any(s in text.lower() for s in ("timed out", "timeout", "connection refused", "could not connect")):
+                return "down"
+            return "blocked"
+        if any(f"[{c}]" in up for c in ("UNAVAILABLE", "LIMIT", "CONTACTADMIN")):
+            return "blocked"
+        if self._IMAP_BRUTE_LOCK_RE.search(text):
+            return "blocked"
+        return "fail"
+
+    def _imap_brute_block_paren(self, typ: str, raw: str) -> str | None:
+        """Short block reason, e.g. ``LIMIT rate limiting``."""
+        text = raw or ""
+        up = text.upper()
+        found = re.search(r"\[([A-Z][A-Z0-9-]*)\]", up)
+        code = found.group(1) if found else None
+        if code is None and (typ == "ABORT" or "* BYE" in up or up.startswith("BYE")):
+            code = "BYE"
+        low = text.lower()
+        if code == "LIMIT" or any(s in low for s in ("rate", "limit", "throttl", "exceed")):
+            reason = "rate limiting"
+        elif code in ("UNAVAILABLE", "CONTACTADMIN", "BYE") or self._IMAP_BRUTE_LOCK_RE.search(text):
+            reason = "lockout"
+        else:
+            reason = None
+        if code and reason:
+            return f"{code} {reason}"
+        if code:
+            return code
+        if reason:
+            return reason
+        return None
+
+    def _imap_brute_one(self, cred: Creds, output, method: str) -> tuple[str, str | None, str | None]:
+        if self._brute_stop.is_set():
+            return "skip", None, None
+        shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
+        cmd = "AUTHENTICATE PLAIN" if method == "PLAIN" else "LOGIN"
+        try:
+            imap = self.connect()
+        except Exception as e:
+            self._imap_brute_line(output, f"{shown!r}: connect failed {self._snip(str(e))}")
+            return "down", None, None
+        try:
+            if method == "PLAIN":
+                typ, raw, _ms = self._imap_usrenum_measure_plain(imap, cred.user, cred.passw)
+            else:
+                typ, raw, _ms = self._imap_usrenum_measure_login(imap, cred.user, cred.passw)
+            kind = self._imap_brute_kind(typ, raw)
+            cmd_show = f'{cmd} ""' if cred.passw == "" else cmd
+            self._imap_brute_line(output, f"{shown!r}: {cmd_show} {self._imap_brute_reply(typ, raw)}")
+            if kind == "ok":
+                self._imap_brute_line(output, f"user:{' ' * 5}{cred.user}", "VULN", colortext=False)
+                self._imap_brute_line(
+                    output,
+                    f"password: {shown_password(cred.passw)}",
+                    "TEXT",
+                    colortext=False,
+                    indent=4,
+                )
+            note = None
+            if kind == "unsupported":
+                note = "LOGIN is disabled. Password guessing was not tested."
+            block = self._imap_brute_block_paren(typ, raw) if kind == "blocked" else None
+            return kind, note, block
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                try:
+                    imap.shutdown()
+                except Exception:
+                    pass
+
+    def _imap_brute_label(self, cred: Creds) -> str:
+        name = cred.user
+        return name if len(name) <= 24 else name[:21] + "..."
+
+    def login_bruteforce(self) -> set[Creds]:
+        """LOGIN, or AUTHENTICATE PLAIN when LOGIN is disabled. Gray progress like user enumeration."""
+        users = text_or_file(self.args.user, self.args.users)
+        passwords = brute_passwords(self.args.password, self.args.passwords)
+        if getattr(self.args, "spray", False):
+            creds = [Creds(u, p) for p in passwords for u in users]
+        else:
+            creds = [Creds(u, p) for u in users for p in passwords]
+        threads = getattr(self.args, "noop2_threads", None)
+        if threads is None:
+            threads = self.args.threads if getattr(self.args, "threads", None) is not None else 10
+        threads = max(1, int(threads))
+        self._brute_stop = threading.Event()
+        self._brute_guessing = None
+        self._brute_guessing_detail = None
+        found: set[Creds] = set()
+        if not creds:
+            self._brute_guessing = "not_tested"
+            self._brute_guessing_detail = "No usernames or passwords to try."
+            self.results.creds = found
+            return found
+        method = self._imap_brute_pick()
+        if method == "disabled":
+            self._brute_guessing = "not_tested"
+            self._brute_guessing_detail = (
+                "LOGIN is disabled and AUTH=PLAIN is not offered. Password guessing was not tested."
+            )
+            self.results.creds = found
+            return found
+
+        progress = ThreadedProgress(
+            len(creds), enabled=not self.use_json, indent=4, bar_indent=4,
+        )
+        progress.kickoff(self._imap_brute_label(creds[0]))
+        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None, "block": None, "tried": 0}
+        lock = threading.Lock()
+
+        def work(cred: Creds, output) -> str:
+            kind, note, block = self._imap_brute_one(cred, output, method)
+            with lock:
+                if kind in ("ok", "fail", "blocked"):
+                    state["tried"] += 1
+                if kind == "ok":
+                    found.add(cred)
+                    state["saw_reply"] = True
+                    state["tested"] = True
+                    state["downs"] = 0
+                elif kind == "fail":
+                    state["saw_reply"] = True
+                    state["tested"] = True
+                    state["downs"] = 0
+                elif kind == "unsupported":
+                    state["saw_reply"] = True
+                    state["note"] = state["note"] or note
+                    self._brute_stop.set()
+                elif kind == "blocked":
+                    state["blocked"] = True
+                    state["saw_reply"] = True
+                    if block:
+                        state["block"] = state["block"] or block
+                    self._brute_stop.set()
+                elif kind == "down":
+                    state["downs"] += 1
+                    if state["saw_reply"] and state["downs"] >= 3:
+                        state["blocked"] = True
+                        self._brute_stop.set()
+            return self._imap_brute_label(cred)
+
+        try:
+            progress.run(creds, work, threads)
+        finally:
+            progress.finalize()
+
+        self._brute_tested = state["tried"]
+        if state["blocked"]:
+            self._brute_guessing = "stopped"
+            self._brute_block_paren = state.get("block")
+        elif state["tested"]:
+            self._brute_guessing = "not_limited"
+        else:
+            self._brute_guessing = "not_tested"
+            self._brute_guessing_detail = state["note"] or (
+                "Could not connect. Password guessing was not tested."
+            )
+        if self._brute_guessing in ("not_limited", "stopped") and state["tried"] < 50:
+            self._brute_guessing = "insufficient"
+        self.results.creds = found
+        return found
+
     def _try_login(self, creds: Creds) -> Creds | None:
         """Login attempt function for bruteforce
 
@@ -5364,7 +5598,7 @@ class ImapEngine:
         """Callback for real-time streaming of found credentials (thread-safe)."""
         with self._output_lock:
             self._ptprint_raw(
-                f"user: {cred.user}, password: {cred.passw}",
+                f"user: {cred.user}, password: {shown_password(cred.passw)}",
                 bullet_type="TEXT",
                 condition=not self.use_json,
                 indent=4,
@@ -5638,6 +5872,8 @@ class ImapEngine:
             else:
                 self._tprint("Not configured (server rejects invalid creds)", bullet="NOTVULN")
 
+    _ANON_LABEL_W = len('Use LOGIN "anonymous" and password "anonymous":')
+
     def _anonymous_vv(self, text: str) -> None:
         if self.use_json:
             return
@@ -5650,42 +5886,79 @@ class ImapEngine:
         self._ptprint_raw(text, bullet_type=bullet, condition=True, indent=4)
         self._flush_terminal()
 
+    def _anonymous_aligned(self, label: str, value: str, bullet: str) -> None:
+        self._anonymous_verdict(f"{label:<{self._ANON_LABEL_W}} {value}", bullet)
+
+    @staticmethod
+    def _anonymous_login_label(user: str, password: str) -> str:
+        if password:
+            return f'Use LOGIN "{user}" and password "{password}":'
+        return f'Use LOGIN "{user}" and empty password:'
+
+    def _anonymous_login_value(self, accepted: bool, detail: str | None) -> tuple[str, str]:
+        if accepted:
+            return "accepted", "VULN"
+        if self._imap_text_is_timeout(detail):
+            return "timed out (not confirmed)", "WARNING"
+        return "rejected", "NOTVULN"
+
+    def _anonymous_auth_value(self, ok: bool, detail: str | None) -> tuple[str, str]:
+        if ok:
+            return "accepted", "VULN"
+        if self._imap_text_is_timeout(detail):
+            return "timed out (not confirmed)", "WARNING"
+        return "not accepted", "NOTVULN"
+
     def _anonymous_emit_auth_capa(self, advertised: bool) -> None:
         self._anonymous_vv(f"AUTH=ANONYMOUS advertised={advertised}")
         if advertised:
-            self._anonymous_verdict("AUTH method ANONYMOUS advertised", "WARNING")
+            self._anonymous_aligned("AUTH method ANONYMOUS:", "advertised", "WARNING")
         else:
-            self._anonymous_verdict("AUTH method ANONYMOUS not advertised", "NOTVULN")
+            self._anonymous_aligned("AUTH method ANONYMOUS:", "not advertised", "NOTVULN")
 
     def _anonymous_emit_authenticate(self, ok: bool, detail: str | None) -> None:
         extra = f": {detail}" if detail else ""
+        value, bullet = self._anonymous_auth_value(ok, detail)
         if ok:
             self._anonymous_vv(f"AUTHENTICATE ANONYMOUS OK{extra}")
-            self._anonymous_verdict("Use AUTHENTICATE ANONYMOUS: accepted", "VULN")
-        elif self._imap_text_is_timeout(detail):
-            self._anonymous_vv(f"AUTHENTICATE ANONYMOUS failed{extra}")
-            self._anonymous_verdict("Use AUTHENTICATE ANONYMOUS: timed out (not confirmed)", "WARNING")
         else:
             self._anonymous_vv(f"AUTHENTICATE ANONYMOUS failed{extra}")
-            self._anonymous_verdict("Use AUTHENTICATE ANONYMOUS: not accepted", "NOTVULN")
+        self._anonymous_aligned("Use AUTHENTICATE ANONYMOUS:", value, bullet)
 
     def _anonymous_emit_login(self, user: str, password: str, accepted: bool, detail: str | None) -> None:
         pw_disp = '""' if not password else password
         self._anonymous_vv(f"LOGIN {user} {pw_disp}")
+        value, bullet = self._anonymous_login_value(accepted, detail)
         if accepted:
             self._anonymous_vv("OK")
-            tail, bullet = "accepted", "VULN"
-        elif self._imap_text_is_timeout(detail):
-            self._anonymous_vv(f"failed: {detail or 'timed out'}")
-            tail, bullet = "timed out (not confirmed)", "WARNING"
         else:
-            self._anonymous_vv(f"failed: {detail or 'rejected'}")
-            tail, bullet = "rejected", "NOTVULN"
-        if password:
-            text = f'Use LOGIN "{user}" and password "{password}": {tail}'
-        else:
-            text = f'Use LOGIN "{user}" and empty password: {tail}'
-        self._anonymous_verdict(text, bullet)
+            self._anonymous_vv(f"failed: {detail or value}")
+        self._anonymous_aligned(self._anonymous_login_label(user, password), value, bullet)
+
+    def _anonymous_description(self, ar: AnonymousAccessResult) -> str:
+        if not ar.auth_probed and not ar.login_probed:
+            return ar.detail
+        lines: list[str] = []
+        if ar.auth_probed:
+            capa = "advertised" if ar.auth_anonymous_advertised else "not advertised"
+            lines.append(f"AUTH method ANONYMOUS: {capa}")
+            auth_value, _ = self._anonymous_auth_value(
+                ar.authenticate_anonymous_ok, ar.authenticate_detail
+            )
+            lines.append(f"Use AUTHENTICATE ANONYMOUS: {auth_value}")
+        attempts = list(ar.login_attempts)
+        if not attempts and ar.login_probed:
+            attempts.append(
+                AnonymousLoginProbe("anonymous", "", ar.login_anonymous_empty_ok, None)
+            )
+            for hit in ar.weak_credentials_ok:
+                user, _, pw = hit.partition(" / ")
+                password = "" if pw in ("<empty>", "") else pw
+                attempts.append(AnonymousLoginProbe(user, password, True, "OK"))
+        for probe in attempts:
+            value, _ = self._anonymous_login_value(probe.accepted, probe.detail)
+            lines.append(f"{self._anonymous_login_label(probe.username, probe.password)} {value}")
+        return "\r\n".join(lines) if lines else ar.detail
 
     def _anonymous_emit_terminal(self, ar: AnonymousAccessResult) -> None:
         pp = self._ptprint_raw
@@ -6361,17 +6634,53 @@ class ImapEngine:
                     pp(part, bullet_type="TEXT", condition=show, indent=8)
 
     def _stream_brute_result(self) -> None:
-        """Stream brute-force summary (credentials already streamed via on_success) (thread-safe)."""
+        """Found logins, then whether the server stopped password guessing."""
         creds = self.results.creds
-        if creds is None or len(creds) == 0:
+        guessing = getattr(self, "_brute_guessing", None)
+        if (not creds) and guessing is None:
             return
         with self._output_lock:
-            self._ptprint_raw(
-                f"Found {len(creds)} valid credentials",
-                bullet_type="INFO",
-                condition=not self.use_json,
-                indent=4,
-            )
+            if creds:
+                n = len(creds)
+                word = "login" if n == 1 else "logins"
+                self._ptprint_raw(
+                    f"Found {n} valid {word}",
+                    bullet_type="TITLE",
+                    condition=not self.use_json,
+                    indent=4,
+                    colortext=False,
+                )
+            if guessing == "insufficient":
+                self._ptprint_raw(
+                    "The test cannot be evaluated. At least 50 combinations must be tested.",
+                    bullet_type="WARNING",
+                    condition=not self.use_json,
+                    indent=4,
+                )
+            elif guessing == "not_limited":
+                self._ptprint_raw(
+                    "No protection against password guessing",
+                    bullet_type="VULN",
+                    condition=not self.use_json,
+                    indent=4,
+                )
+            elif guessing == "stopped":
+                paren = getattr(self, "_brute_block_paren", None)
+                msg = f"Attack was blocked ({paren})" if paren else "Attack was blocked"
+                self._ptprint_raw(
+                    msg,
+                    bullet_type="NOTVULN",
+                    condition=not self.use_json,
+                    indent=4,
+                )
+            elif guessing == "not_tested":
+                self._ptprint_raw(
+                    getattr(self, "_brute_guessing_detail", None)
+                    or "Could not connect. Password guessing was not tested.",
+                    bullet_type="WARNING",
+                    condition=not self.use_json,
+                    indent=4,
+                )
 
     def _stream_conn_limits_result(self) -> None:
         """Inline verdicts are printed during the probe; this handles hard failures only."""
@@ -6386,8 +6695,161 @@ class ImapEngine:
 
     # region output
 
+    def _is_brute_only_output(self) -> bool:
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"BRUTE"}
+
+    def _brute_vuln_entries(self) -> list[dict]:
+        vulns: list[dict] = []
+        if getattr(self, "_brute_guessing", None) == "not_limited":
+            vulns.append({"vuln_code": VULNS.Brute.value})
+        creds = brute_sorted_creds(self.results.creds)
+        if creds:
+            vulns.append({
+                "vuln_code": VULNS.WeakCreds.value,
+                "vuln_request": brute_weak_request(self.args),
+                "vuln_response": brute_weak_response(creds),
+            })
+        return vulns
+
+    def _add_brute_account_nodes(self, ptjsonlib) -> None:
+        for cred in brute_sorted_creds(self.results.creds):
+            node = ptjsonlib.create_node_object(
+                "userAccount",
+                parent_type="userAccounts",
+                parent=None,
+                properties={"login": cred.user, "password": cred.passw},
+            )
+            ptjsonlib.add_node(node)
+
+    def _emit_brute_json(self, ptjsonlib) -> None:
+        ptjsonlib.add_properties({
+            "description": brute_discovered_description(self.results.creds),
+        })
+        self._add_brute_account_nodes(ptjsonlib)
+        for vuln in self._brute_vuln_entries():
+            ptjsonlib.add_vulnerability(**vuln)
+        ptjsonlib.set_status("finished", "")
+        self._ptprint(ptjsonlib.get_result_json(), json=True)
+
+    def _is_anon_only_output(self) -> bool:
+        """``-ts ANON`` alone: description, and PTV-SVC-IMAP-ANON when access succeeded."""
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"ANON"}
+
+    def _emit_anon_json(self, ptjsonlib) -> None:
+        ar = self.results.anonymous
+        err = getattr(self.results, "anonymous_error", None)
+        if ar is not None:
+            description = self._anonymous_description(ar)
+        elif err:
+            description = f"Anonymous probe error: {err}"
+        else:
+            description = "Anonymous access was not tested."
+        ptjsonlib.add_properties({"description": description})
+        if ar is not None and ar.vulnerable:
+            ptjsonlib.add_vulnerability(vuln_code=VULNS.Anonymous.value)
+        ptjsonlib.set_status("finished", "")
+        self._ptprint(ptjsonlib.get_result_json(), json=True)
+
+    def _is_ntlm_only_output(self) -> bool:
+        """``-ts NTLM`` alone: description, and PTV-SVC-NTLMINFO when the challenge is decoded."""
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"NTLM"}
+
+    def _ntlm_description(self, ntlm) -> str:
+        if getattr(ntlm, "incomplete", False):
+            return "NTLM timed out (not confirmed)"
+        if not (ntlm.success and ntlm.ntlm is not None):
+            return "Not available"
+        lines = ["NTLM Challenge decoded — infrastructure identifiers disclosed"]
+        if ntlm.auth_ntlm_advertised:
+            lines.insert(0, "Pre-login CAPABILITY lists AUTH=NTLM")
+        info = ntlm.ntlm
+        lines.extend([
+            f"Target name: {info.target_name}",
+            f"NetBios domain name: {info.netbios_domain}",
+            f"NetBios computer name: {info.netbios_computer}",
+            f"DNS domain name: {info.dns_domain}",
+            f"DNS computer name: {info.dns_computer}",
+            f"DNS tree: {info.dns_tree}",
+            f"OS version: {info.os_version}",
+        ])
+        return "\r\n".join(lines)
+
+    def _emit_ntlm_json(self, ptjsonlib) -> None:
+        ntlm = self.results.ntlm
+        err = getattr(self.results, "ntlm_error", None)
+        if ntlm is not None:
+            description = self._ntlm_description(ntlm)
+        elif err:
+            description = f"NTLM probe error: {err}"
+        else:
+            description = "NTLM was not tested."
+        ptjsonlib.add_properties({"description": description})
+        if ntlm is not None and ntlm.success and ntlm.ntlm is not None:
+            ptjsonlib.add_vulnerability(vuln_code=VULNS.NTLM.value)
+        ptjsonlib.set_status("finished", "")
+        self._ptprint(ptjsonlib.get_result_json(), json=True)
+
+    def _is_authlist_only_output(self) -> bool:
+        """``-ts AUTHLIST`` alone: description, and PTV-SVC-IMAP-AUTHMETHODS on cleartext."""
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"AUTHLIST"}
+
+    def _authlist_description(self, al) -> str:
+        lines: list[str] = []
+        for p in al.paths:
+            label = self._authlist_path_label(p.path)
+            if not p.available:
+                lines.append(f"{label}: {self._authlist_unavailable_text(p.path, connected=False)}")
+                continue
+            if not p.methods:
+                lines.append(f"{label}: {self._authlist_unavailable_text(p.path, connected=True)}")
+                continue
+            for row in p.methods:
+                _, text = self._authlist_row_display(p.path, row)
+                lines.append(f"{label}: {text}")
+        return "\r\n".join(lines) if lines else (al.detail or "AUTH methods were not tested.")
+
+    def _emit_authlist_json(self, ptjsonlib) -> None:
+        al = getattr(self.results, "imap_authlist", None)
+        err = getattr(self.results, "imap_authlist_error", None)
+        if al is not None:
+            description = self._authlist_description(al)
+        elif err:
+            description = f"AUTHLIST failed: {err}"
+        else:
+            description = "AUTH methods were not tested."
+        ptjsonlib.add_properties({"description": description})
+        if al is not None and al.vulnerable:
+            ptjsonlib.add_vulnerability(vuln_code=VULNS.AuthMethods.value)
+        ptjsonlib.set_status("finished", "")
+        self._ptprint(ptjsonlib.get_result_json(), json=True)
+
     def build_json(self, ptjsonlib) -> None:
         """Build JSON node(s). Terminal output is streamed from run()."""
+        if (info_error := getattr(self.results, "info_error", None)) is not None:
+            if self.use_json:
+                ptjsonlib.end_error(info_error, self.use_json)
+            self._ptprint_raw(info_error, bullet_type="VULN", condition=not self.use_json, indent=4)
+            return
+        if self._is_brute_only_output():
+            self._emit_brute_json(ptjsonlib)
+            return
+        if self._is_anon_only_output():
+            self._emit_anon_json(ptjsonlib)
+            return
+        if self._is_ntlm_only_output():
+            self._emit_ntlm_json(ptjsonlib)
+            return
+        if self._is_authlist_only_output():
+            self._emit_authlist_json(ptjsonlib)
+            return
         properties = {
             "software_type": None,
             "name": "imap",
@@ -6396,13 +6858,6 @@ class ImapEngine:
             "description": None,
         }
         deferred_vulns = []
-
-        # Connection error: use unified error format (status=error, empty nodes)
-        if (info_error := getattr(self.results, "info_error", None)) is not None:
-            if self.use_json:
-                ptjsonlib.end_error(info_error, self.use_json)
-            self._ptprint_raw(info_error, bullet_type="VULN", condition=not self.use_json, indent=4)
-            return
 
         # Banner (skip terminal if streamed; always add to properties for JSON)
         if (info := self.results.info) and info.banner is not None:
@@ -6668,7 +7123,7 @@ class ImapEngine:
         if (catch_all := getattr(self.results, "catch_all", None)) is not None:
             if catch_all == "indeterminate":
                 properties.update({"catchAll": "indeterminate"})
-        # Anonymous / weak default access (PTL-SVC-IMAP-ANONYMOUS)
+        # Anonymous / weak default access (PTV-SVC-IMAP-ANON)
         if (ar := self.results.anonymous) is not None:
             properties.update(
                 {
@@ -7059,7 +7514,7 @@ class ImapEngine:
                         "vuln_response": resp_plain,
                     }
                 )
-        # NTLM info disclosure (PTL-SVC-IMAP-NTLMINFO)
+        # NTLM info disclosure (PTV-SVC-NTLMINFO)
         if ntlm := self.results.ntlm:
             ntlm_props: dict = {
                 "authNtlmAdvertised": ntlm.auth_ntlm_advertised,
@@ -7098,25 +7553,9 @@ class ImapEngine:
                         "vuln_response": "\n".join(out_lines),
                     }
                 )
-        # Login bruteforce (skip terminal output if streamed; always add to deferred for JSON)
-        if (creds := self.results.creds) is not None and len(creds) > 0:
-            json_lines = [f"user: {cred.user}, password: {cred.passw}" for cred in creds]
-            names = text_or_file(self.args.user, None)
-            if names:
-                user_str = "username: " + ", ".join(names)
-            else:
-                user_str = f"usernames: {self.args.users}"
-            if self.args.password is not None:
-                passw_str = f"password: {self.args.password}"
-            else:
-                passw_str = f"passwords: {self.args.passwords}"
-            deferred_vulns.append(
-                {
-                    "vuln_code": VULNS.WeakCreds.value,
-                    "vuln_request": f"{user_str}\n{passw_str}",
-                    "vuln_response": "\n".join(json_lines),
-                }
-            )
+        guessing = getattr(self, "_brute_guessing", None)
+        if guessing is not None:
+            properties.update({"imapPasswordGuessing": guessing})
 
         # Create node at the end with all collected properties and bind vulnerabilities
         imap_node = ptjsonlib.create_node_object(
@@ -7129,6 +7568,9 @@ class ImapEngine:
         node_key = imap_node["key"]
         for v in deferred_vulns:
             ptjsonlib.add_vulnerability(node_key=node_key, **v)
+        self._add_brute_account_nodes(ptjsonlib)
+        for vuln in self._brute_vuln_entries():
+            ptjsonlib.add_vulnerability(**vuln)
 
         ptjsonlib.set_status("finished", "")
         self._ptprint(ptjsonlib.get_result_json(), json=True)
@@ -7249,16 +7691,14 @@ class ImapEngine:
             nonlocal live_line_dirty
             if not show_progress or verbose:
                 return
-            sys.stdout.write(f"\033[2K\r            {text:<100}")
-            sys.stdout.flush()
+            paint_raw_line(f"            {text:<100}")
             live_line_dirty = True
 
         def clear_live():
             nonlocal live_line_dirty
             if not show_progress or not live_line_dirty:
                 return
-            sys.stdout.write("\033[2K\r")
-            sys.stdout.flush()
+            clear_raw_line()
             live_line_dirty = False
 
         def emit_vv(msg: str) -> None:
@@ -7679,17 +8119,14 @@ class ImapEngine:
             nonlocal live_line_dirty
             if not show_progress:
                 return
-            line = get_colored_text(text, "ADDITIONS")
-            sys.stdout.write(f"\033[2K\r{line}")
-            sys.stdout.flush()
+            paint_raw_line(text)
             live_line_dirty = True
 
         def clear_live():
             nonlocal live_line_dirty
             if not show_progress or not live_line_dirty:
                 return
-            sys.stdout.write("\033[2K\r")
-            sys.stdout.flush()
+            clear_raw_line()
             live_line_dirty = False
 
         connections, est_err, est_disc, est_timeout = self._noop2_establish_pool(

@@ -12,7 +12,7 @@ def run(ctx):
     creds = ensure_creds(ctx)
     if creds is None:
         e.results.cmd_audit_active_error = (
-            "Active command probes require credentials (-A/--anonymous or -u/-p)"
+            e._missing_login_line()
         )
         e._stream_cmd_audit_active_result()
         return

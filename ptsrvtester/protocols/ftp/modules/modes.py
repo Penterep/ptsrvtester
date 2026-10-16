@@ -11,7 +11,7 @@ def run(ctx):
     e.args.modes = True
     creds = ensure_creds(ctx)
     if creds is None:
-        e.results.modes_error = "No credentials for mode test (use -A/--anonymous or -u/-p)"
+        e.results.modes_error = e._missing_login_line()
         e._stream_modes_result()
         return
     try:

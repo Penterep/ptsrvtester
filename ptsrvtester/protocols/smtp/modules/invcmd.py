@@ -212,6 +212,7 @@ def test_invalid_commands(e) -> InvCommResult:
                     if ehlo_status != 250:
                         elapsed = time.perf_counter() - t0
                         if ehlo_status in RATE_LIMIT_CODES:
+                            e.end_if_blocked(ehlo_status, ehlo_reply, greeting=False)
                             indeterminate = True
                         return InvCommTestCase(
                             category=category, command_display=display,
@@ -224,6 +225,7 @@ def test_invalid_commands(e) -> InvCommResult:
                     if mail_status != 250:
                         elapsed = time.perf_counter() - t0
                         if mail_status in RATE_LIMIT_CODES:
+                            e.end_if_blocked(mail_status, mail_reply, greeting=False)
                             indeterminate = True
                         return InvCommTestCase(
                             category=category, command_display=display,
@@ -238,6 +240,7 @@ def test_invalid_commands(e) -> InvCommResult:
                 reply = e.bytes_to_str(reply_bytes) if reply_bytes else None
                 got_response = True
                 if status in RATE_LIMIT_CODES:
+                    e.end_if_blocked(status, reply_bytes, greeting=False)
                     indeterminate = True
                 if status in (250, 251):
                     vulnerable = True
@@ -314,6 +317,7 @@ def test_invalid_commands(e) -> InvCommResult:
                 reply = e.bytes_to_str(reply_bytes) if reply_bytes else None
                 got_response = True
                 if status in RATE_LIMIT_CODES:
+                    e.end_if_blocked(status, reply_bytes, greeting=False)
                     indeterminate = True
                 if status in (250, 251):
                     vulnerable = True
@@ -395,6 +399,9 @@ def test_invalid_commands(e) -> InvCommResult:
                     bad_seq_elapsed = time.perf_counter() - t0_bad
                     reply = e.bytes_to_str(reply_bytes) if reply_bytes else None
                     got_response = True
+                    if status in RATE_LIMIT_CODES:
+                        e.end_if_blocked(status, reply_bytes, greeting=False)
+                        indeterminate = True
                     if status in (250, 354):
                         vulnerable = True
                     if _inv_comm_info_leak(e, reply):
@@ -483,6 +490,9 @@ def test_invalid_commands(e) -> InvCommResult:
                     raw_elapsed = 0.0
             except Exception:
                 raw_elapsed = 0.0
+        if status in RATE_LIMIT_CODES:
+            e.end_if_blocked(status, reply, greeting=False)
+            indeterminate = True
         if status is None and not got_response:
             vulnerable = True
         case_vuln = (status in (250, 251) if status else False) or (status is None and not got_response)

@@ -55,13 +55,36 @@ def ensure_creds(ctx) -> Creds | None:
             ctx.args.password,
             ctx.args.passwords,
             ctx.args.spray,
-            getattr(ctx.args, "threads", 10) or 10,
+            10 if getattr(ctx.args, "threads", None) is None else ctx.args.threads,
         )
         e.results.creds = set(creds) if creds else set()
 
     return e._get_path_enum_creds()
 
 
+def _clean_name_list(raw: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in raw:
+        p = p.strip().lstrip("\ufeff").strip()
+        if not p or p.startswith("#"):
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
 def load_paths_wordlist(args) -> list[str]:
-    raw = text_or_file(None, getattr(args, "paths_wordlist", None))
-    return [p.strip() for p in raw if p.strip() and not p.strip().startswith("#")]
+    path = getattr(args, "paths_wordlist", None)
+    if not path:
+        return []
+    return _clean_name_list(text_or_file(None, path))
+
+
+def load_enum_files(args) -> list[str]:
+    path = getattr(args, "enum_files", None)
+    if not path:
+        return []
+    return _clean_name_list(text_or_file(None, path))

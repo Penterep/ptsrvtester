@@ -135,8 +135,9 @@ def samr_session(engine):
             if engine._samr_error_code(exc) in _AUTH_DENIED:
                 raise SamrDenied("authentication_denied") from exc
             raise
-        if smb.isGuestSession():
-            raise SamrDenied("guest_session")
+        identity = engine._smb_session_identity(smb)
+        if identity != "authenticated":
+            raise SamrDenied(f"{identity}_session")
         rpc_transport = transport.DCERPCTransportFactory(
             f"ncacn_np:{engine.args.ip}[\\pipe\\samr]"
         )

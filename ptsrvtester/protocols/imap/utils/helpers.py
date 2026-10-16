@@ -163,7 +163,14 @@ def add_bruteforce_args(
     # password / passwords file
     brutepass = bruteforce.add_mutually_exclusive_group()
     brutepass.title = "brutepass"
-    brutepass.add_argument("-p", "--password", type=str, help="password")
+    brutepass.add_argument(
+        "-p",
+        "--password",
+        nargs="*",
+        default=None,
+        metavar="password",
+        help='password(s), separated by space or comma; no value or "" tests an empty password',
+    )
     brutepass.add_argument("-P", "--passwords", type=str, help="file containing passwords")
 
     # other configuration
@@ -193,10 +200,30 @@ def check_if_brute(args: ArgsWithBruteforce) -> bool:
     Returns:
         bool: whether to perform bruteforce
     """
-    if (args.user or args.users) and (args.password or args.passwords):
+    has_password = args.password is not None or bool(args.passwords)
+    if (args.user or args.users) and has_password:
         return True
     else:
         return False
+
+
+DEFAULT_BRUTE_USERS = ("root", "admin", "demo", "test", "user", "jane", "john")
+DEFAULT_BRUTE_PASSWORDS = (
+    "pass", "pass123", "Pass123", "password", "Pa$$w0rd",
+    "abcd", "abcde", "abcdef", "0000", "1234", "12345", "123456", "Admin123",
+    "test", "root", "admin",
+)
+
+
+def apply_default_brute_creds(args) -> None:
+    """Use the built-in lists when BRUTE was started without -u/-U or -p/-P.
+
+    A given -u/-U or -p/-P is kept. An empty -p stays an empty password.
+    """
+    if not (getattr(args, "user", None) or getattr(args, "users", None)):
+        args.user = list(DEFAULT_BRUTE_USERS)
+    if getattr(args, "password", None) is None and not getattr(args, "passwords", None):
+        args.password = list(DEFAULT_BRUTE_PASSWORDS)
 
 
 def threaded_bruteforce(
@@ -365,10 +392,11 @@ def text_or_file(text: str | list[str] | None, filepath: str | None) -> list[str
     """
     result = []
     if text is not None:
-        if isinstance(text, list):
-            result = [str(t).strip() for t in text if t is not None and str(t).strip()]
-        else:
-            result = [text]
+        items = text if isinstance(text, list) else [text]
+        for item in items:
+            if item is None:
+                continue
+            result.extend(str(item).split(","))
     elif filepath is not None:
         _encodings = ("utf-8", "cp1250", "iso-8859-2", "cp1252", "latin-1")
         try:
@@ -389,7 +417,101 @@ def text_or_file(text: str | list[str] | None, filepath: str | None) -> list[str
         else:
             result = raw.decode("utf-8", errors="replace").splitlines()
 
-    return result
+    cleaned: list[str] = []
+    for item in result:
+        line = str(item).replace("\ufeff", "").strip()
+        if line:
+            cleaned.append(line)
+    return cleaned
+
+
+def brute_passwords(password: str | list[str] | None, passwords_file: str | None) -> list[str]:
+    """Passwords for BRUTE. Space or comma on -p; a bare -p or \"\" is one empty password."""
+    if password is None:
+        return text_or_file(None, passwords_file)
+    if isinstance(password, list) and len(password) == 0:
+        return [""]
+    items = password if isinstance(password, list) else [password]
+    out: list[str] = []
+    saw = False
+    for item in items:
+        if item is None:
+            continue
+        saw = True
+        text = str(item)
+        if text == "":
+            out.append("")
+            continue
+        parts = [part.strip() for part in text.split(",")]
+        nonempty = [part for part in parts if part]
+        if nonempty:
+            out.extend(nonempty)
+        else:
+            out.append("")
+    if not saw:
+        return [""]
+    return out
+
+
+def shown_password(password: str) -> str:
+    """Visible form of a password. An empty password is a quoted empty string."""
+    return '""' if password == "" else password
+
+
+def first_cli_password(password: str | list[str] | None) -> str | None:
+    """First non-empty -p value. None when -p was omitted or only an empty password was given."""
+    if password is None:
+        return None
+    for item in brute_passwords(password, None):
+        if item:
+            return item
+    return None
+
+
+def password_request_text(password: str | list[str] | None) -> str:
+    """Vuln-request label for one or more -p passwords."""
+    values = brute_passwords(password, None)
+    if len(values) <= 1:
+        shown = shown_password(values[0]) if values else '""'
+        return f"password: {shown}"
+    return "passwords: " + ", ".join(shown_password(item) for item in values)
+
+
+def brute_sorted_creds(creds) -> list:
+    return sorted(creds or [], key=lambda c: (c.user, c.passw))
+
+
+def brute_discovered_description(creds) -> str:
+    """BRUTE JSON description. No hits, or one ``login : password`` line per hit."""
+    ordered = brute_sorted_creds(creds)
+    if not ordered:
+        return "No credentials discovered"
+    lines = [f"{c.user} : {shown_password(c.passw)}" for c in ordered]
+    return "Discovered credentials\n\r" + "\r\n".join(lines)
+
+
+def brute_weak_request(args) -> str:
+    """``usernames:`` / ``passwords:`` for PTV-SVC-AUTH-WEAK. A file is the path."""
+    users = getattr(args, "user", None)
+    users_file = getattr(args, "users", None)
+    if users:
+        user_label = ", ".join(text_or_file(users, None))
+    else:
+        user_label = users_file or ""
+    passwords = getattr(args, "password", None)
+    passwords_file = getattr(args, "passwords", None)
+    if passwords is not None:
+        pass_label = ", ".join(shown_password(item) for item in brute_passwords(passwords, None))
+    else:
+        pass_label = passwords_file or ""
+    return f"usernames: {user_label}\npasswords: {pass_label}"
+
+
+def brute_weak_response(creds) -> str:
+    ordered = brute_sorted_creds(creds)
+    return "\n".join(
+        f"user: {c.user}, password: {shown_password(c.passw)}" for c in ordered
+    )
 
 
 def one_cli_user(user: str | list[str] | None) -> str | None:

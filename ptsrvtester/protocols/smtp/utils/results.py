@@ -22,7 +22,7 @@ except ImportError:
 
 from .helpers import *
 
-__all__ = ['NTLMResult', 'RateLimitResult', 'RCPT_LIMIT_DEFAULT_ATTEMPTS', 'RCPT_LIMIT_POLICY_REJECT_CAP', 'RCPT_LIMIT_VERDICT_OK_MAX', 'RCPT_LIMIT_VERDICT_WARN_MAX', 'RCPT_LIMIT_POSTHIT_PROBE_COUNT', 'RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT', 'RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL', '_ID_RCPT_ERROR_MAIL_FROM', '_ID_RCPT_ERROR_RCPT', '_RL_TOO_MUCH_MAIL_RE', '_rl_extract_too_much_mail_error', 'DEFAULT_SMTP_SUBJECT', 'DEFAULT_SMTP_DATA', 'AV_CATEGORY_TITLES', 'ALIAS_VARIANT_TITLES', 'SSRF_VARIANT_TITLES', 'SSRF_VARIANT_PAYLOAD_LABELS', 'ZIPXXE_VARIANT_TITLES', 'ZIPXXE_VARIANT_PAYLOAD_LABELS', '_smtp_minimal_probe_data', 'EMAIL_HDR_TEST', 'EMAIL_HDR_TEST_ID', 'EMAIL_TEST_ANTIVIRUS', 'EMAIL_TEST_SSRF', 'EMAIL_TEST_ZIPXXE', 'EMAIL_TEST_ALIAS', 'EMAIL_TEST_REPLAY', 'EMAIL_TEST_BOMB', '_PTL_EMAIL_TAG_RE', '_email_subject_clean', 'RCPT_DUP_DEFAULT', 'RCPT_DUP_MAX', '_rcpt_duplicate_error_is_environmental', 'RATE_LIMIT_DEFAULT_ATTEMPTS', 'RATE_LIMIT_CONN_VULN_THRESHOLD', 'RATE_LIMIT_BAN_MIN_SECONDS', 'RATE_LIMIT_INITIAL_TIMEOUT_MAX_SECONDS', 'RATE_LIMIT_IDLE_TIMEOUT_MAX_SECONDS', 'RATE_LIMIT_TIMEOUT_CAP_SECONDS', '_rate_limit_duration_display', 'NOOP_FLOOD1_MAX_COMMANDS', 'NOOP_FLOOD1_TIMEOUT_SECONDS', 'NOOP_FLOOD1_OVERALL_CAP_SECONDS', 'NOOP_FLOOD_DISCONNECT_OK_MAX', 'NOOP_FLOOD_SLOWDOWN_MIN_RATIO', 'NOOP_FLOOD_SLOWDOWN_MIN_SECONDS', 'NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT', 'NOOP_FLOOD2_DEFAULT_CONNECTIONS', 'NOOP_FLOOD2_MAX_CONNECTIONS', 'NOOP_FLOOD2_RUN_SECONDS', 'NOOP_FLOOD2_CONNECT_TIMEOUT', 'NOOP_FLOOD2_RECV_TIMEOUT', 'NOOP_FLOOD2_AVG_TIME_OK_MAX_SECONDS', 'NOOP_FLOOD2_DEBUG_TICK_SECONDS', 'NOOP_FLOOD1_PROGRESS_EVERY', 'NoopFlood1Result', 'NoopFlood2Result', '_noop_rt_window_display', 'ACCEPTED_DOMAIN_PLACEHOLDER_DOMAINS', '_accepted_domain_is_placeholder', 'RcptLimitResult', 'RcptDuplicateResult', 'AcceptedDomainProbeResult', 'EnumResult', 'BlacklistEntry', 'BlacklistResult', 'InfoResult', 'EncryptionResult', 'RoleResult', 'CatchAllResult', 'CATCH_ALL_INDETERMINATE_VARIANTS', 'AUTH_ENUM_TIMEOUT_SIG', 'AuthEnumResult', 'NoopDurationResult', 'NoopConnectionCountResult', 'noop2_count_from_args', 'noop1_rt_display', 'noop1_stats_from_rtts', 'conn_limit_count_verdict', 'NOOP1_ERROR_RATE_OK_MAX_PCT', 'NOOP2_AVG_TIME_OK_MAX_SECONDS', 'NOOP2_ERROR_RATE_OK_MAX_PCT', 'NOOP2_DEFAULT_CONNECTIONS', 'SMTP_NOOP_PREAUTH_DUR_HIGH_MIN', 'SMTP_NOOP_PREAUTH_DUR_SIGNIFICANT_MIN', 'SMTP_NOOP_PREAUTH_DUR_INCREASED_MIN', 'SMTP_NOOP_POSTAUTH_DUR_HIGH_MIN', 'SMTP_NOOP_POSTAUTH_DUR_SIGNIFICANT_MIN', 'SMTP_NOOP_POSTAUTH_DUR_INCREASED_MIN', 'SMTP_NOOP_PREAUTH_DUR_TEST_SECONDS', 'SMTP_NOOP_PREAUTH_DUR_INTERVAL_SECONDS', 'SMTP_NOOP_PREAUTH_DUR_TIMEOUT_SECONDS', 'SMTP_NOOP_POSTAUTH_DUR_TEST_SECONDS', 'SMTP_NOOP_POSTAUTH_DUR_INTERVAL_SECONDS', 'SMTP_NOOP_POSTAUTH_DUR_TIMEOUT_SECONDS', 'SMTP_NOOP_PREAUTH_CONN_TEST_SECONDS', 'SMTP_NOOP_PREAUTH_CONN_INTERVAL_SECONDS', 'SMTP_NOOP_PREAUTH_CONN_TIMEOUT_SECONDS', 'SMTP_NOOP_PREAUTH_CONN_MAX_ATTEMPTS', 'SMTP_NOOP_POSTAUTH_CONN_TEST_SECONDS', 'SMTP_NOOP_POSTAUTH_CONN_INTERVAL_SECONDS', 'SMTP_NOOP_POSTAUTH_CONN_TIMEOUT_SECONDS', 'SMTP_NOOP_POSTAUTH_CONN_MAX_ATTEMPTS', 'NOOP1_PROGRESS_EVERY', 'AUTH_FORMAT_PROBE_DELAY_SEC', 'AUTH_FORMAT_EXTERNAL_SUFFIX', 'AuthFormatTargetDomainDerivation', 'AuthFormatProbeRow', 'AuthFormatProbeResult', '_auth_format_row_symbol', '_auth_format_conclude', 'HeloValidationResult', 'AuthDowngradeResult', 'InvCommTestCase', 'InvCommResult', 'HeloOnlyResult', 'HeloBypassResult', 'BounceReplayResult', '_bounce_replay_active', '_bounce_replay_from_addr', '_classify_connection_error', 'AntivirusCategoryResult', 'AntivirusResult', 'SsrfVariantResult', 'SsrfResult', 'ZipxxeVariantResult', 'ZipxxeResult', 'SpoofHeaderVariantResult', 'SpoofHeaderResult', 'BccTestResult', 'AliasVariantResult', 'AliasTestResult', 'FloodResult', 'BombResult', 'SMTPResults', 'VULNS']
+__all__ = ['NTLMResult', 'RateLimitResult', 'RCPT_LIMIT_DEFAULT_ATTEMPTS', 'RCPT_LIMIT_POLICY_REJECT_CAP', 'RCPT_LIMIT_VERDICT_OK_MAX', 'RCPT_LIMIT_VERDICT_WARN_MAX', 'RCPT_LIMIT_POSTHIT_PROBE_COUNT', 'RCPT_LIMIT_MIN_RECOMMENDED_NAME_COUNT', 'RCPT_LIMIT_ACCEPT_ALL_PROBE_LOCAL', '_ID_RCPT_ERROR_MAIL_FROM', '_ID_RCPT_ERROR_RCPT', '_RL_TOO_MUCH_MAIL_RE', '_rl_extract_too_much_mail_error', 'DEFAULT_SMTP_SUBJECT', 'DEFAULT_SMTP_DATA', 'AV_CATEGORY_TITLES', 'ALIAS_VARIANT_TITLES', 'SSRF_VARIANT_TITLES', 'SSRF_VARIANT_PAYLOAD_LABELS', 'ZIPXXE_VARIANT_TITLES', 'ZIPXXE_VARIANT_PAYLOAD_LABELS', '_smtp_minimal_probe_data', 'EMAIL_HDR_TEST', 'EMAIL_HDR_TEST_ID', 'EMAIL_TEST_ANTIVIRUS', 'EMAIL_TEST_SSRF', 'EMAIL_TEST_ZIPXXE', 'EMAIL_TEST_ALIAS', 'EMAIL_TEST_REPLAY', 'EMAIL_TEST_BOMB', '_PTL_EMAIL_TAG_RE', '_email_subject_clean', 'RCPT_DUP_DEFAULT', 'RCPT_DUP_MAX', '_rcpt_duplicate_error_is_environmental', 'RATE_LIMIT_DEFAULT_ATTEMPTS', 'RATE_LIMIT_CONN_VULN_THRESHOLD', 'RATE_LIMIT_BAN_MIN_SECONDS', 'RATE_LIMIT_INITIAL_TIMEOUT_MAX_SECONDS', 'RATE_LIMIT_IDLE_TIMEOUT_MAX_SECONDS', 'RATE_LIMIT_TIMEOUT_CAP_SECONDS', '_rate_limit_duration_display', 'NOOP_FLOOD1_MAX_COMMANDS', 'NOOP_FLOOD1_TIMEOUT_SECONDS', 'NOOP_FLOOD1_OVERALL_CAP_SECONDS', 'NOOP_FLOOD_DISCONNECT_OK_MAX', 'NOOP_FLOOD_SLOWDOWN_MIN_RATIO', 'NOOP_FLOOD_SLOWDOWN_MIN_SECONDS', 'NOOP_FLOOD_ERROR_RATE_OK_MAX_PCT', 'NOOP_FLOOD2_DEFAULT_CONNECTIONS', 'NOOP_FLOOD2_MAX_CONNECTIONS', 'NOOP_FLOOD2_RUN_SECONDS', 'NOOP_FLOOD2_CONNECT_TIMEOUT', 'NOOP_FLOOD2_RECV_TIMEOUT', 'NOOP_FLOOD2_AVG_TIME_OK_MAX_SECONDS', 'NOOP_FLOOD2_DEBUG_TICK_SECONDS', 'NOOP_FLOOD1_PROGRESS_EVERY', 'NoopFlood1Result', 'NoopFlood2Result', '_noop_rt_window_display', 'ACCEPTED_DOMAIN_PLACEHOLDER_DOMAINS', '_accepted_domain_is_placeholder', 'RcptLimitResult', 'RcptDuplicateResult', 'AcceptedDomainProbeResult', 'EnumResult', 'BlacklistEntry', 'BlacklistResult', 'InfoResult', 'EncryptionResult', 'RoleResult', 'DomfillResult', 'CatchAllResult', 'CATCH_ALL_INDETERMINATE_VARIANTS', 'AUTH_ENUM_TIMEOUT_SIG', 'AuthEnumResult', 'NoopDurationResult', 'NoopConnectionCountResult', 'noop2_count_from_args', 'noop1_rt_display', 'noop1_stats_from_rtts', 'conn_limit_count_verdict', 'NOOP1_ERROR_RATE_OK_MAX_PCT', 'NOOP2_AVG_TIME_OK_MAX_SECONDS', 'NOOP2_ERROR_RATE_OK_MAX_PCT', 'NOOP2_DEFAULT_CONNECTIONS', 'SMTP_NOOP_PREAUTH_DUR_HIGH_MIN', 'SMTP_NOOP_PREAUTH_DUR_SIGNIFICANT_MIN', 'SMTP_NOOP_PREAUTH_DUR_INCREASED_MIN', 'SMTP_NOOP_POSTAUTH_DUR_HIGH_MIN', 'SMTP_NOOP_POSTAUTH_DUR_SIGNIFICANT_MIN', 'SMTP_NOOP_POSTAUTH_DUR_INCREASED_MIN', 'SMTP_NOOP_PREAUTH_DUR_TEST_SECONDS', 'SMTP_NOOP_PREAUTH_DUR_INTERVAL_SECONDS', 'SMTP_NOOP_PREAUTH_DUR_TIMEOUT_SECONDS', 'SMTP_NOOP_POSTAUTH_DUR_TEST_SECONDS', 'SMTP_NOOP_POSTAUTH_DUR_INTERVAL_SECONDS', 'SMTP_NOOP_POSTAUTH_DUR_TIMEOUT_SECONDS', 'SMTP_NOOP_PREAUTH_CONN_TEST_SECONDS', 'SMTP_NOOP_PREAUTH_CONN_INTERVAL_SECONDS', 'SMTP_NOOP_PREAUTH_CONN_TIMEOUT_SECONDS', 'SMTP_NOOP_PREAUTH_CONN_MAX_ATTEMPTS', 'SMTP_NOOP_POSTAUTH_CONN_TEST_SECONDS', 'SMTP_NOOP_POSTAUTH_CONN_INTERVAL_SECONDS', 'SMTP_NOOP_POSTAUTH_CONN_TIMEOUT_SECONDS', 'SMTP_NOOP_POSTAUTH_CONN_MAX_ATTEMPTS', 'NOOP1_PROGRESS_EVERY', 'AUTH_FORMAT_PROBE_DELAY_SEC', 'AUTH_FORMAT_EXTERNAL_SUFFIX', 'AuthFormatTargetDomainDerivation', 'AuthFormatProbeRow', 'AuthFormatProbeResult', '_auth_format_row_symbol', '_auth_format_conclude', 'HeloValidationResult', 'AuthDowngradeResult', 'InvCommTestCase', 'InvCommResult', 'HeloOnlyResult', 'HeloBypassResult', 'BounceReplayResult', '_bounce_replay_active', '_bounce_replay_from_addr', '_classify_connection_error', 'AntivirusCategoryResult', 'AntivirusResult', 'SsrfVariantResult', 'SsrfResult', 'ZipxxeVariantResult', 'ZipxxeResult', 'SpoofHeaderVariantResult', 'SpoofHeaderResult', 'BccTestResult', 'AliasVariantResult', 'AliasTestResult', 'FloodResult', 'BombResult', 'SMTPResults', 'VULNS']
 
 
 # region data classes
@@ -146,6 +146,7 @@ ZIPXXE_VARIANT_TITLES: dict[str, str] = {
     "xxe_body": "XXE in body test",
     "zip_bomb": "Zip bomb test",
     "zip_bomb_full": "Zip bomb full test",
+    "zip_bomb_huge": "Zip bomb huge",
 }
 
 ZIPXXE_VARIANT_PAYLOAD_LABELS: dict[str, str] = {
@@ -156,6 +157,7 @@ ZIPXXE_VARIANT_PAYLOAD_LABELS: dict[str, str] = {
     "xxe_body": "body (XML)",
     "zip_bomb": "zipbomb.zip",
     "zip_bomb_full": "zipbomb_full.zip",
+    "zip_bomb_huge": "zipbomb-huge.zip",
 }
 
 
@@ -355,6 +357,8 @@ SMTP_NOOP_POSTAUTH_CONN_MAX_ATTEMPTS = 600
 
 def noop2_count_from_args(args, default: int, cap: int | None = None) -> int:
     n = getattr(args, "noop2_count", None)
+    if n is None:
+        n = getattr(args, "size_count", None)
     if n is None:
         n = getattr(args, "noop_flood2", None)
     if n is None:
@@ -563,6 +567,8 @@ class AcceptedDomainProbeResult(NamedTuple):
     candidates_tested: tuple[str, ...] = ()
     universal_accept_detected: bool = False
     likely_placeholder_domain: bool = False
+    unknown_user: str | None = None
+    postmaster: str | None = None
 
 
 class EnumResult(NamedTuple):
@@ -613,6 +619,14 @@ class RoleResult(NamedTuple):
     auth_advertised: bool  # AUTH found in EHLO (plain or STARTTLS)
     auth_required: bool | None  # True=all RCPT require auth, False=no, None=not tested
     detail: str            # Human-readable reason
+
+
+class DomfillResult(NamedTuple):
+    """MAIL FROM:<test> — server filled in a sender domain."""
+    vulnerable: bool
+    domain: str | None
+    status: int | None
+    reply: str
 
 
 # Catch-all test result:
@@ -870,7 +884,7 @@ class HeloOnlyResult(NamedTuple):
 
 
 class HeloBypassResult(NamedTuple):
-    """Result of HELO/EHLO bypass test (PTL-SVC-SMTP-HELO)."""
+    """Result of HELO/EHLO bypass test (PTV-SVC-SMTP-HELO)."""
     vulnerable: bool
     indeterminate: bool
     submission_bypass_ehlo: tuple[str, ...]
@@ -881,6 +895,8 @@ class HeloBypassResult(NamedTuple):
     tarpitting_detected: tuple[str, ...]
     rcpt_latencies: dict
     detail: str | None
+    irrelevant_open_relay: bool = False
+    tested_ehlo: tuple[str, ...] = ()
 
 
 class BounceReplayResult(NamedTuple):
@@ -1044,6 +1060,20 @@ class SpoofHeaderResult(NamedTuple):
     vulnerable_note: str | None  # Blue Team: SPF/DMARC impact disclaimer
 
 
+class BccProbeResult(NamedTuple):
+    """One BCC message. Envelope RCPT TO is only the checked mailbox."""
+    role: str
+    test_id: str
+    message_accepted: bool
+    smtp_status: int | None
+    smtp_reply: str | None
+    recipients_to: tuple[str, ...]
+    recipients_cc: tuple[str, ...]
+    recipients_bcc: tuple[str, ...]
+    detail: str | None
+    smtp_trace: tuple[str, ...]
+
+
 class BccTestResult(NamedTuple):
     """Result of Bcc header test – manual verification required."""
     message_accepted: bool
@@ -1057,6 +1087,7 @@ class BccTestResult(NamedTuple):
     verification_instructions: str
     smtp_trace: tuple[str, ...]
     test_id: str = ""
+    probes: tuple[BccProbeResult, ...] = ()
 
 
 class AliasVariantResult(NamedTuple):
@@ -1167,6 +1198,9 @@ class SMTPResults:
     open_relay: bool | None = None
     open_relay_incomplete: bool = False  # timeout/disconnect — not a confirmed deny
     open_relay_error: str | None = None  # When run-all open relay test fails
+    relay_unauth: bool | None = None
+    relay_unauth_incomplete: bool = False
+    relay_unauth_error: str | None = None
     blacklist_error: str | None = None  # When run-all blacklist test fails
     encryption: EncryptionResult | None = None
     encryption_error: str | None = None  # When encryption test fails
@@ -1177,6 +1211,8 @@ class SMTPResults:
     rcpt_duplicate_error: str | None = None
     role: RoleResult | None = None
     role_error: str | None = None  # When role identification test fails
+    domfill: DomfillResult | None = None
+    domfill_error: str | None = None
     auth_enum: AuthEnumResult | None = None
     auth_enum_methods: tuple[AuthEnumResult, ...] | None = None
     auth_enum_ntlm_note: str | None = None
@@ -1242,30 +1278,34 @@ class VULNS(Enum):
     CmdVERB = "PTV-SVC-SMTP-COMMVERB"
     CmdVRFY = "PTV-SVC-SMTP-COMMVRFY"
     CryptOnly = "PTV-SVC-CRYPTONLY"
-    HybridRole = "PTV-SMTP-HYBRIDROLE"
+    HybridRole = "PTV-SVC-SMTP-ROLE"
     ManyRcpt = "PTV-SVC-SMTP-MANYRCPT"
     ManyRcptReject = "PTV-SVC-SMTP-MANYRCPTREJECT"
     RcptNoCut = "PTV-SVC-SMTP-RCPTNOCUT"
     RcptDuplicate = "PTV-SVC-SMTP-RCPTDUP"
     NoStarttls = "PTV-SVC-SMTP-NOSTARTTLS"
     NTLM = "PTV-SVC-NTLMINFO"
-    OpenRelay = "PTV-SVC-SMTP-RELAY"
-    UserEnumAUTH = "PTV-SVC-SMTP-USRENUMAUTH"
-    UserEnumEXPN = "PTV-SVC-SMTP-USRENUMEXPN"
-    UserEnumVRFY = "PTV-SVC-SMTP-USRENUMVRFY"
-    UserEnumRCPT = "PTV-SVC-SMTP-USRENUMRCPT"
-    WeakCreds = "PTV-GENERAL-WEAKCREDENTIALS"
+    OpenRelay = "PTV-SVC-SMTP-OPENRELAY"
+    RelayUnauth = "PTV-SVC-SMTP-RELAY"
+    Domfill = "PTV-SVC-SMTP-DOMFILL"
+    UserEnumAUTH = "PTV-SVC-SMTP-ENUMAUTH"
+    UserEnumEXPN = "PTV-SVC-SMTP-ENUMEXPN"
+    UserEnumVRFY = "PTV-SVC-SMTP-ENUMVRFY"
+    UserEnumRCPT = "PTV-SVC-SMTP-ENUMRCPT"
+    WeakCreds = "PTV-SVC-AUTH-WEAK"
+    Brute = "PTV-SVC-AUTH-BRUTE"
     HeloNoValidation = "PTV-SVC-SMTP-HELONOVAL"
     AuthDowngrade = "PTV-SVC-SMTP-DOWN"
     InvComm = "PTV-SVC-SMTP-INVCOMM"
-    HeloOnly = "PTL-SVC-SMTP-HELOONLY"
-    HeloBypass = "PTL-SVC-SMTP-HELO"
+    HeloOnly = "PTV-SVC-SMTP-HELOONLY"
+    HeloBypass = "PTV-SVC-SMTP-HELO"
     BounceReplay = "PTL-SVC-SMTP-REPLAY"
     Bomb = "PTL-SVC-SMTP-BOMB"
     Antivirus = "PTL-SVC-SMTP-ANTIVIRUS"
     Ssrf = "PTL-SVC-SMTP-SSRF"
     Zipxxe = "PTL-SVC-SMTP-ZIPXXE"
     Flood = "PTL-SVC-SMTP-FLOOD"
+    Size = "PTV-SVC-SIZE"
     SpoofHeader = "PTL-SVC-SMTP-SPOOFHDR"
     BccTest = "PTL-SVC-SMTP-BCC"
     AliasBypass = "PTL-SVC-SMTP-ALIAS"

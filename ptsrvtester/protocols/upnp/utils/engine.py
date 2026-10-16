@@ -6,6 +6,7 @@ import ipaddress
 import json
 import re
 import socket
+import ssl
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -368,6 +369,8 @@ class UpnpEngine:
         self.port_mapping_truncated = False
         self.soap_bytes = 0
         self.soap_budget_exhausted = False
+        self._unavailable_http_endpoints: dict[tuple, str] = {}
+        self._failed_http_operations: dict[tuple, str] = {}
 
     def _error(self, test: str, error: Exception | str, **details) -> None:
         self.module_errors.append({"test": test, "error": str(error)[:300], **details})
@@ -591,6 +594,21 @@ class UpnpEngine:
     ) -> tuple[int, bytes] | tuple[int, bytes, list[tuple[str, str]]]:
         """Issue one bounded HTTP request pinned to the selected device IP."""
         scheme, host, port, path, authority = self._description_url(url)
+        endpoint = (
+            self.family, self.target_ip, self.ipv6_target.scope_id if self.ipv6_target else 0,
+            scheme, host, port, source_ip,
+        )
+        if endpoint in self._unavailable_http_endpoints:
+            raise ConnectionError(
+                f"HTTP endpoint {authority} is unavailable: "
+                f"{self._unavailable_http_endpoints[endpoint]}; further connections skipped"
+            )
+        operation = (endpoint, method, path)
+        if operation in self._failed_http_operations:
+            raise ConnectionError(
+                f"HTTP {method} {url} failed before a response: "
+                f"{self._failed_http_operations[operation]}; further requests skipped"
+            )
         timeout = float(self.args.timeout_seconds)
         source_address = (source_ip, 0) if source_ip else None
         if self.family == 6:
@@ -631,11 +649,27 @@ class UpnpEngine:
         deadline.daemon = True
         deadline.start()
         try:
+            try:
+                connection.connect()
+            except ssl.SSLError:
+                # TLS verification/handshake errors do not establish TCP absence.
+                raise
+            except OSError as exc:
+                self._unavailable_http_endpoints[endpoint] = str(exc)[:300]
+                raise
+            if expired.is_set():
+                raise TimeoutError("HTTP connection exceeded total timeout")
             request_headers = {"Host": authority, **headers}
-            connection.request(
-                method, path, body=body, headers=request_headers,
-            )
-            response = connection.getresponse()
+            try:
+                connection.request(
+                    method, path, body=body, headers=request_headers,
+                )
+                response = connection.getresponse()
+            except (OSError, http.client.HTTPException) as exc:
+                # A failed request before HTTP headers provides no result for
+                # this URL/method. Other paths and methods remain independent.
+                self._failed_http_operations[operation] = str(exc)[:300]
+                raise
             encoding = (response.getheader("Content-Encoding") or "identity").lower()
             if encoding != "identity":
                 raise ValueError(f"unsupported Content-Encoding: {encoding}")

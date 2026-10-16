@@ -34,6 +34,60 @@ from typing import Callable, Iterable
 from ptlibs.threads import ptthreads
 from ptlibs.threads.printlock import PrintLock
 
+from .ptprinthelper import get_colored_text
+
+
+_live: ThreadedProgress | None = None
+_sealed = False
+_raw_live = False
+_raw_sealed = False
+_raw_lock = threading.Lock()
+
+
+def _raw_write(data: bytes) -> None:
+    try:
+        os.write(1, data)
+    except OSError:
+        try:
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+        except Exception:
+            pass
+
+
+def paint_raw_line(text: str) -> None:
+    """Gray ``\\r`` progress row. A fatal error finishes it on the next line."""
+    global _raw_live
+    with _raw_lock:
+        if _raw_sealed:
+            return
+        line = get_colored_text(text, "ADDITIONS")
+        _raw_write(f"\033[2K\r{line}".encode("utf-8", errors="replace"))
+        _raw_live = True
+
+
+def clear_raw_line() -> None:
+    """Erase the gray progress row when the test moves on."""
+    global _raw_live
+    with _raw_lock:
+        if not _raw_live:
+            return
+        _raw_write(b"\033[2K\r")
+        _raw_live = False
+
+
+def release_live_line() -> None:
+    """Finish the live progress row so a fatal error starts on the next line."""
+    global _raw_live, _raw_sealed
+    bar = _live
+    if bar is not None:
+        bar.break_line()
+    with _raw_lock:
+        _raw_sealed = True
+        if _raw_live:
+            _raw_write(b"\n")
+            _raw_live = False
+
 
 class ThreadedProgress:
     """Shared live-progress line plus ``PrintLock``-based per-item output.
@@ -47,11 +101,17 @@ class ThreadedProgress:
         call every method as a no-op.
     indent:
         Leading spaces prepended to each flushed finding line.
+    bar_indent:
+        Leading spaces on the live ETA line. Defaults to 0 so existing
+        enumeration bars stay flush left.
     """
 
-    def __init__(self, total: int, *, enabled: bool = True, indent: int = 4) -> None:
+    def __init__(
+        self, total: int, *, enabled: bool = True, indent: int = 4, bar_indent: int = 0,
+    ) -> None:
         self.total = max(0, int(total))
         self.indent = max(0, int(indent))
+        self.bar_indent = max(0, int(bar_indent))
         self._tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
         self.enabled = bool(enabled)
         self._lock = threading.Lock()
@@ -89,15 +149,21 @@ class ThreadedProgress:
         return remaining * elapsed / float(self._done)
 
     def _paint_unlocked(self) -> None:
-        if not self.enabled or not self._tty or self.total <= 0:
+        if _sealed or not self.enabled or not self._tty or self.total <= 0:
             return
         pct = min(100, max(0, int(100 * self._done / self.total)))
         eta = self._eta_seconds()
         time_part = self._fmt_duration(eta) if eta is not None else "--:--:--"
         label = self._last_label or ""
-        line = f"{time_part} {pct}% {self._done}/{self.total} {label}".rstrip()
+        pad = " " * self.bar_indent
+        line = get_colored_text(
+            f"{pad}{time_part} {pct}% {self._done}/{self.total} {label}".rstrip(),
+            "ADDITIONS",
+        )
         self._write(f"\033[2K\r{line}")
         self._active = True
+        global _live
+        _live = self
 
     @staticmethod
     def _write(text: str) -> None:
@@ -113,6 +179,13 @@ class ThreadedProgress:
                 pass
 
     # ── public API ─────────────────────────────────────────────────────────
+    def kickoff(self, label: str = "") -> None:
+        """Show 0% before the first attempt finishes."""
+        with self._lock:
+            if label:
+                self._last_label = label
+            self._paint_unlocked()
+
     def advance(self, label: str = "") -> None:
         """Mark one item done and repaint the live line.
 
@@ -148,8 +221,20 @@ class ThreadedProgress:
             if repaint:
                 self._paint_unlocked()
 
+    def break_line(self) -> None:
+        """Leave the live row in place and move the cursor to the next line."""
+        global _live, _sealed
+        with self._lock:
+            _sealed = True
+            if self._active:
+                self._write("\n")
+                self._active = False
+            if _live is self:
+                _live = None
+
     def finalize(self) -> None:
         """Clear the live line once all workers have finished."""
+        global _live
         if not self.enabled:
             return
         with self._lock:
@@ -159,6 +244,8 @@ class ThreadedProgress:
                 else:
                     self._write("\n")
                 self._active = False
+            if _live is self:
+                _live = None
 
     # ── optional PtThreads engine (for future progress bars) ─────────────────
     def run(

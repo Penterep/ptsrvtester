@@ -102,6 +102,8 @@ def _probe_auth_login_identity(e, identity: str) -> tuple[int | None, bool, int 
         code, resp = smtp.docmd('AUTH', 'LOGIN')
         e._smtp_vv_io('AUTH LOGIN', f'{code} {e.bytes_to_str(resp) if resp else ""}')
         ch_dec = _auth_format_decode_login_challenge(resp)
+        if code == 421:
+            e.end_if_blocked(code, resp)
         if code in (421, 450, 452):
             return (None, False, None, e.bytes_to_str(resp), True, ch_dec)
         if code != 334:
@@ -109,12 +111,16 @@ def _probe_auth_login_identity(e, identity: str) -> tuple[int | None, bool, int 
         id_b64 = b64encode(identity.encode('utf-8')).decode('ascii')
         code_u, resp_u = smtp.docmd(id_b64)
         e._smtp_vv_io(f'AUTH LOGIN user {identity}', f'{code_u} {e.bytes_to_str(resp_u) if resp_u else ""}')
+        if code_u == 421:
+            e.end_if_blocked(code_u, resp_u)
         if code_u in (421, 450, 452):
             return (None, False, None, e.bytes_to_str(resp_u), True, ch_dec)
         if code_u == 334:
             pw_b64 = b64encode(secrets.token_bytes(16)).decode('ascii')
             code_p, resp_p = smtp.docmd(pw_b64)
             e._smtp_vv_io('AUTH LOGIN password', f'{code_p} {e.bytes_to_str(resp_p) if resp_p else ""}')
+            if code_p == 421:
+                e.end_if_blocked(code_p, resp_p)
             return (code_u, True, code_p, e.bytes_to_str(resp_u), False, ch_dec)
         return (code_u, False, None, e.bytes_to_str(resp_u), code_u in (421, 450, 452), ch_dec)
     finally:

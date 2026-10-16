@@ -10,11 +10,11 @@ def run(ctx) -> None:
     described = sum(item["status"] == "described" for item in results)
     ctx.out(
         f"Service descriptions: {described}/{len(results)} ({ctx.engine.scpd_status})",
-        "TEXT", indent=4,
+        "TEXT" if ctx.engine.scpd_status in ("complete", "no_services",) else "TITLE", indent=4,
     )
     for result in results:
         kind = repr((result["serviceType"] or "unknown")[:160])
-        category = "TEXT" if result["status"] == "described" else "WARNING"
+        category = "TEXT" if result["status"] == "described" else "TITLE"
         ctx.out(f"{kind}  status={result['status']}", category, indent=8)
         if result["status"] == "described":
             description = result["description"]
@@ -29,4 +29,5 @@ def run(ctx) -> None:
             if len(actions) > 20:
                 ctx.out(f"... {len(actions) - 20} further actions in JSON", "TEXT", indent=16)
         elif result.get("error"):
-            ctx.out(f"Error: {result['error'][:160]!r}", "WARNING", indent=12)
+            ctx.out(f"Error: {result['error'][:160]!r}", "TITLE", indent=12)
+        ctx.out()

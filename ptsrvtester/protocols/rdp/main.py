@@ -12,7 +12,10 @@ from __future__ import annotations
 import argparse
 import importlib
 import socket
+import sys
 from collections.abc import Iterable
+
+from ptlibs.threads import printlock
 
 from .._base import BaseArgs, BaseMain
 from .utils.cli import (
@@ -36,6 +39,7 @@ class RDP(BaseMain):
     def __init__(self, args: BaseArgs, ptjsonlib) -> None:
         # BaseMain validates the namespace and calls _prepare_target() first.
         super().__init__(args, ptjsonlib)
+        self._validate_credential_options()
 
         # Import lazily so importing CLI/help metadata does not eagerly load the
         # sizeable RDP protocol implementation and its optional dependencies.
@@ -47,6 +51,44 @@ class RDP(BaseMain):
 
         # Exactly one coordinator/engine is shared by every discovered module.
         self.rdp_engine = RDPEngine(args, ptjsonlib)
+
+    def _validate_credential_options(self) -> None:
+        """Validate guessing inputs and the separate disposable lockout mode."""
+        selected = set(self._test_tokens(getattr(self.args, "tests", None)))
+        direct_users = getattr(self.args, "brute_users", None) or ()
+        guessing_tests = {"BRUTE"}
+        if getattr(self.args, "lockout_test", False) and (
+            getattr(self.args, "users", None) is not None
+            or getattr(self.args, "passwords", None) is not None
+            or len(direct_users) > 1
+        ):
+            raise argparse.ArgumentError(
+                None,
+                "--lockout-test requires one known -u/--user and -p/--password "
+                "pair; -U/--users, -P/--passwords and multiple -u values are "
+                "not supported",
+            )
+        if (
+            getattr(self.args, "passwords", None) is not None
+            and not selected & guessing_tests
+        ):
+            raise argparse.ArgumentError(
+                None, "-P/--passwords requires explicit -ts BRUTE"
+            )
+        if len(direct_users) > 1:
+            if not selected & guessing_tests:
+                raise argparse.ArgumentError(
+                    None,
+                    "multiple -u/--user values require explicit -ts BRUTE",
+                )
+            single_user_tests = {"ALL", "AUTH", "AUTHMETHODS", "USERENUM"}
+            incompatible = selected & single_user_tests
+            if incompatible:
+                raise argparse.ArgumentError(
+                    None,
+                    "multiple -u/--user values cannot be combined with "
+                    + ", ".join(sorted(incompatible)),
+                )
 
     def _prepare_target(self) -> None:
         """Apply the RDP port and retain both the hostname and resolved IP.
@@ -190,6 +232,51 @@ class RDP(BaseMain):
     def _thread_count(self) -> int:
         """RDP modules share caches and a possible authenticated session."""
         return 1
+
+    def _run_module(self, code, discovered, extras) -> None:
+        """Put the BRUTE heading before its live progress lines."""
+        if code != "BRUTE" or self.use_json:
+            super()._run_module(code, discovered, extras)
+            return
+
+        # RDP runs modules serially. Earlier module output can be flushed now
+        # without changing selection order, then this test can report progress.
+        for chunk in self._outputs.values():
+            if chunk:
+                sys.stdout.write(chunk)
+        self._outputs.clear()
+
+        entry = discovered[code]
+        heading_lock = printlock.PrintLock()
+        self._make_context(heading_lock, extras).out(
+            entry.label, "INFO", colortext=True
+        )
+        sys.stdout.write(heading_lock.get_output_string())
+        sys.stdout.flush()
+
+        output_lock = printlock.PrintLock()
+        ctx = self._make_context(output_lock, extras)
+        try:
+            entry.module.run(ctx)
+        except Exception as exc:
+            ctx.out(f"Error in module {code}: {exc}", "ERROR")
+        with self._lock:
+            self._outputs[code] = output_lock.get_output_string()
+
+    def run(self) -> None:
+        """Require a valid pre-auth RDP response before dispatching any tests."""
+        probe = self.rdp_engine.preflight_service()
+        if not (probe.successful or probe.failed_by_server):
+            detail = probe.error or "No valid RDP negotiation response"
+            self.ptjsonlib.end_error(
+                f"Cannot connect to RDP service at "
+                f"{self.target_host}:{self.target[1]}: {detail}",
+                self.use_json,
+                category="TITLE",
+            )
+            return
+
+        super().run()
 
     def build_context(self) -> dict:
         """Expose immutable target details and the one shared engine."""

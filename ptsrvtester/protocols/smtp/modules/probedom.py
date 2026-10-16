@@ -1,4 +1,4 @@
-"""PROBEDOM — accepted recipient domain probe."""
+"""DOMAIN — accepted incoming domain."""
 import secrets, smtplib, socket, sys, threading, time
 
 from ..._base import Out
@@ -11,8 +11,8 @@ from ._common import eng
 from .rcptlim import _rcpt_response_suggests_bad_domain
 
 
-__MODULELABEL__ = ""
-__MODULECODE__ = "PROBEDOM"
+__MODULELABEL__ = "Accepted incoming domain"
+__MODULECODE__ = "DOMAIN"
 __ORDER__ = 215
 
 
@@ -49,8 +49,8 @@ def _rcpt_reply_suggests_unknown_user(reply: str | bytes) -> bool:
     return any((k in up for k in keys))
 
 
-def _probe_rcpt_acceptance_for_domain(e, smtp: smtplib.SMTP, domain: str, random_local: str) -> tuple[int, str, str]:
-    """Score one domain: (0–100, confidence high|medium|low|none, short detail)."""
+def _probe_rcpt_acceptance_for_domain(e, smtp: smtplib.SMTP, domain: str, random_local: str) -> tuple[int, str, str, str | None, str | None]:
+    """Score one domain: (0–100, confidence, detail, unknown-user status, postmaster status)."""
     mail_bracket = e._envelope_mail_from_bracket()
     try:
         smtp.docmd('RSET')
@@ -61,18 +61,18 @@ def _probe_rcpt_acceptance_for_domain(e, smtp: smtplib.SMTP, domain: str, random
         e._smtp_vv_io(f'MAIL FROM:{mail_bracket}', f'{st_m} {e.bytes_to_str(rep_m) if rep_m else ""}')
     except Exception as ex:
         e._smtp_vv_io(f'MAIL FROM:{mail_bracket}', str(ex))
-        return (0, 'none', f'MAIL FROM failed: {ex}')
+        return (0, 'none', f'MAIL FROM failed: {ex}', None, None)
     if st_m != 250:
-        return (0, 'none', f'MAIL FROM not accepted ({st_m})')
+        return (0, 'none', f'MAIL FROM not accepted ({st_m})', None, None)
     try:
         st_r, rep_r = smtp.docmd('RCPT TO:', f'<{random_local}@{domain}>')
         e._smtp_vv_io(f'RCPT TO:<{random_local}@{domain}>', f'{st_r} {e.bytes_to_str(rep_r) if rep_r else ""}')
     except Exception as ex:
         e._smtp_vv_io(f'RCPT TO:<{random_local}@{domain}>', str(ex))
-        return (0, 'none', f'RCPT (probe) failed: {ex}')
+        return (0, 'none', f'RCPT (probe) failed: {ex}', None, None)
     reply_r = e.bytes_to_str(rep_r) if rep_r else ''
     if 400 <= st_r < 500:
-        return (5, 'none', f'RCPT probe temporary rejection ({st_r}); try later')
+        return (5, 'none', f'RCPT probe temporary rejection ({st_r}); try later', None, None)
     try:
         smtp.docmd('RSET')
     except Exception:
@@ -81,32 +81,34 @@ def _probe_rcpt_acceptance_for_domain(e, smtp: smtplib.SMTP, domain: str, random
         st_m2, rep_m2 = smtp.docmd('MAIL FROM:', mail_bracket)
         e._smtp_vv_io(f'MAIL FROM:{mail_bracket}', f'{st_m2} {e.bytes_to_str(rep_m2) if rep_m2 else ""}')
     except Exception as ex:
-        return (0, 'none', f'MAIL FROM after RSET failed: {ex}')
+        return (0, 'none', f'MAIL FROM after RSET failed: {ex}', None, None)
     if st_m2 != 250:
-        return (0, 'none', f'MAIL FROM not accepted after RSET ({st_m2})')
+        return (0, 'none', f'MAIL FROM not accepted after RSET ({st_m2})', None, None)
     try:
         st_p, rep_p = smtp.docmd('RCPT TO:', f'<Postmaster@{domain}>')
         e._smtp_vv_io(f'RCPT TO:<Postmaster@{domain}>', f'{st_p} {e.bytes_to_str(rep_p) if rep_p else ""}')
     except Exception as ex:
-        return (0, 'none', f'RCPT Postmaster failed: {ex}')
+        return (0, 'none', f'RCPT Postmaster failed: {ex}', None, None)
     reply_p = e.bytes_to_str(rep_p) if rep_p else ''
     probe_ok = 200 <= st_r < 300
     post_ok = 200 <= st_p < 300
+    unknown_user = 'accepted' if probe_ok else 'rejected'
+    postmaster = 'accepted' if post_ok else 'not accepted or blocked'
     bad_probe = _rcpt_response_suggests_bad_domain(reply_r)
     unk_probe = _rcpt_reply_suggests_unknown_user(reply_r) or (550 <= st_r < 560 and (not bad_probe) and (not probe_ok))
     if bad_probe and (not probe_ok):
-        return (0, 'none', 'Domain-level or relay rejection on probe RCPT')
+        return (0, 'none', 'Domain-level or relay rejection on probe RCPT', None, None)
     if not probe_ok and unk_probe and (not bad_probe):
         if post_ok:
-            return (95, 'high', 'Postmaster accepted; probe mailbox rejected as unknown user at this domain')
-        return (92, 'high', 'Probe mailbox rejected as unknown user; server accepts this recipient domain; Postmaster not accepted or blocked by policy')
+            return (95, 'high', 'Postmaster accepted; probe mailbox rejected as unknown user at this domain', unknown_user, postmaster)
+        return (92, 'high', 'Probe mailbox rejected as unknown user; server accepts this recipient domain; Postmaster not accepted or blocked by policy', unknown_user, postmaster)
     if post_ok and probe_ok:
-        return (40, 'low', 'Server accepts RCPT for probe and Postmaster (possible catch-all or deferred verify)')
+        return (40, 'low', 'Server accepts RCPT for probe and Postmaster (possible catch-all or deferred verify)', unknown_user, postmaster)
     if probe_ok and (not post_ok):
-        return (38, 'low', 'Server accepts probe mailbox; Postmaster not accepted (unusual)')
+        return (38, 'low', 'Server accepts probe mailbox; Postmaster not accepted (unusual)', unknown_user, postmaster)
     if not probe_ok and 550 <= st_r < 560 and (not bad_probe) and (not unk_probe):
-        return (25, 'none', f'RCPT probe rejected ({st_r}) without clear unknown-user semantics')
-    return (0, 'none', 'No clear local-domain signal from RCPT responses')
+        return (25, 'none', f'RCPT probe rejected ({st_r}) without clear unknown-user semantics', None, None)
+    return (0, 'none', 'No clear local-domain signal from RCPT responses', None, None)
 
 
 def test_probe_accepted_domain(e) -> AcceptedDomainProbeResult:
@@ -119,7 +121,7 @@ def test_probe_accepted_domain(e) -> AcceptedDomainProbeResult:
         e.results.commands_requested = False
     candidates = _build_accepted_domain_probe_candidates(e)
     random_local = f'ptsrvnx{secrets.token_hex(4)}'
-    best: tuple[int, str, str, str] | None = None
+    best: tuple[int, str, str, str, str | None, str | None] | None = None
     universal = False
     tried: list[str] = []
     smtp: smtplib.SMTP | None = None
@@ -128,12 +130,12 @@ def test_probe_accepted_domain(e) -> AcceptedDomainProbeResult:
         smtp.docmd('EHLO', e.fqdn)
         for dom in candidates:
             tried.append(dom)
-            sc, conf, det = _probe_rcpt_acceptance_for_domain(e, smtp, dom, random_local)
+            sc, conf, det, unk, post = _probe_rcpt_acceptance_for_domain(e, smtp, dom, random_local)
             if dom.lower() == 'invalid.invalid' and sc >= 38:
                 universal = True
             if dom.lower() != 'invalid.invalid':
                 if best is None or sc > best[0]:
-                    best = (sc, dom, conf, det)
+                    best = (sc, dom, conf, det, unk, post)
     finally:
         if smtp is not None:
             try:
@@ -147,12 +149,16 @@ def test_probe_accepted_domain(e) -> AcceptedDomainProbeResult:
             extra = 'Server is "Accept-All" or uses deferred verification (invalid.invalid accepted).'
             detail = f'{detail} {extra}'.strip() if detail else extra
         return AcceptedDomainProbeResult(None, 'none', detail, tuple(tried), universal)
-    _sc, dom, conf, det = best
+    _sc, dom, conf, det, unk, post = best
     placeholder = _accepted_domain_is_placeholder(dom)
     if conf == 'high' and (universal or placeholder):
         conf = 'medium'
     detail = det
-    return AcceptedDomainProbeResult(dom, conf, detail, tuple(tried), universal, placeholder)
+    return AcceptedDomainProbeResult(dom, conf, detail, tuple(tried), universal, placeholder, unk, post)
+
+
+def _domain_field(label: str, value: str) -> str:
+    return f'{label:<16}{value}'
 
 
 def _stream_accepted_domain_probe_result(e) -> None:
@@ -166,20 +172,24 @@ def _stream_accepted_domain_probe_result(e) -> None:
     r = e.results.accepted_domain_probe
     if r is None:
         return
-    if r.universal_accept_detected:
-        pp('Server is "Accept-All" or uses deferred verification (invalid.invalid accepted).', bullet_type='TITLE', condition=show, indent=4)
-    domain_line_bullet = 'WARNING' if r.universal_accept_detected or getattr(r, 'likely_placeholder_domain', False) else 'TITLE'
     if r.domain and r.confidence != 'none':
-        pp(f'Accepted recipient domain: {r.domain} (confidence: {r.confidence})', bullet_type=domain_line_bullet, condition=show, indent=4)
-        if r.detail:
-            pp(r.detail, bullet_type='TITLE', condition=show, indent=4)
+        pp(_domain_field('Domain:', r.domain), bullet_type='TITLE', condition=show, indent=4)
+        pp(_domain_field('Confidence:', r.confidence), bullet_type='TEXT', condition=show, indent=8)
+        if r.unknown_user:
+            pp(_domain_field('Unknown user:', r.unknown_user), bullet_type='TEXT', condition=show, indent=8)
+        if r.postmaster:
+            pp(_domain_field('Postmaster:', r.postmaster), bullet_type='TEXT', condition=show, indent=8)
+        if r.universal_accept_detected:
+            pp('Server is "Accept-All" or uses deferred verification (invalid.invalid accepted).', bullet_type='WARNING', condition=show, indent=4)
         if getattr(r, 'likely_placeholder_domain', False):
-            pp(f'WARNING: {r.domain} matches a known placeholder / example domain; this often reflects default MTA configuration, not an operational recipient namespace.', bullet_type='WARNING', condition=show, indent=4)
+            pp(f'{r.domain} matches a known placeholder / example domain; this often reflects default MTA configuration, not an operational recipient namespace.', bullet_type='WARNING', condition=show, indent=4)
     else:
-        no_dom_bullet = 'WARNING' if r.universal_accept_detected else 'TITLE'
-        pp('Could not determine an accepted recipient domain', bullet_type=no_dom_bullet, condition=show, indent=4)
-        if r.detail:
-            pp(r.detail, bullet_type='TITLE', condition=show, indent=4)
+        bullet = 'WARNING' if r.universal_accept_detected else 'TITLE'
+        pp('Could not determine incoming domain', bullet_type=bullet, condition=show, indent=4)
+        if r.universal_accept_detected:
+            pp('Server accepts every recipient domain', bullet_type='TEXT', condition=show, indent=8)
+        if not (getattr(e.args, 'domain', None) or '').strip():
+            pp('Try -d <domain>', bullet_type='TEXT', condition=show, indent=8)
 
 
 def _accepted_domain_probe_props_json(e) -> dict[str, object]:
@@ -204,6 +214,6 @@ def run(ctx):
         e.results.accepted_domain_probe = test_probe_accepted_domain(e)
     except Exception as ex:
         e.results.accepted_domain_probe_error = str(ex)
-        ctx.out(f"PROBEDOM failed: {ex}", "ERROR", indent=4)
+        ctx.out(f"DOMAIN failed: {ex}", "ERROR", indent=4)
         return
     _stream_accepted_domain_probe_result(e)

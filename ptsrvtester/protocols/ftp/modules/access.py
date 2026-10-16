@@ -12,8 +12,8 @@ def run(ctx):
     creds = ensure_creds(ctx)
     if creds is None and not e.results.anonymous and not e.results.creds:
         ctx.out(
-            "ACCESS needs -A/--anonymous (working anon) or credentials (-u/-p), or -ts ANON first",
-            "ERROR",
+            e._missing_login_line(),
+            "WARNING",
             indent=4,
         )
         return

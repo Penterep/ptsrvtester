@@ -771,7 +771,7 @@ def _stream_rcpt_limit_result(e) -> None:
 def run(ctx):
     e = eng(ctx)
     if not ctx.json:
-        ctx.out(e._rcpt_limit_section_title(), "INFO", colortext=True)
+        e.ptprint(e._rcpt_limit_section_title(), Out.INFO)
     e._load_wordlist()
     try:
         e.results.rcpt_limit = test_rcpt_limit(e)

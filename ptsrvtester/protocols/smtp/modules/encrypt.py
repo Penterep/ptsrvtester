@@ -65,6 +65,7 @@ def test_encryption(e) -> EncryptionResult:
             try:
                 status, reply = smtp.connect(host, port)
                 e._smtp_vv_io('(connect)', f'{status} {e.bytes_to_str(reply) if reply else ""}')
+                e.end_if_blocked(status, reply)
                 if status == 220:
                     status, reply = smtp.docmd('EHLO', e.fqdn)
                     e._smtp_vv_io(f'EHLO {e.fqdn}', f'{status} {e.bytes_to_str(reply) if reply else ""}')
@@ -99,6 +100,7 @@ def test_encryption(e) -> EncryptionResult:
             try:
                 status, reply = smtp.connect(host, port)
                 e._smtp_vv_io('(connect cleartext)', f'{status} {e.bytes_to_str(reply) if reply else ""}')
+                e.end_if_blocked(status, reply)
                 if status == 220:
                     status, reply = smtp.docmd('EHLO', e.fqdn)
                     e._smtp_vv_io(f'EHLO {e.fqdn}', f'{status} {e.bytes_to_str(reply) if reply else ""}')
@@ -125,6 +127,7 @@ def test_encryption(e) -> EncryptionResult:
                 smtp.file = None
                 status, reply = smtp.getreply()
                 e._smtp_vv_io('(connect implicit TLS)', f'{status} {e.bytes_to_str(reply) if reply else ""}')
+                e.end_if_blocked(status, reply)
                 if status == 220:
                     status, reply = smtp.docmd('EHLO', e.fqdn)
                     e._smtp_vv_io(f'EHLO {e.fqdn}', f'{status} {e.bytes_to_str(reply) if reply else ""}')

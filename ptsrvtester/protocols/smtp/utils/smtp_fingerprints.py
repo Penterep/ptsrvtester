@@ -334,35 +334,32 @@ _LOW_LEAK_PLACEHOLDER_DOMAINS: Final[frozenset[str]] = frozenset(
         "mail.local",
     }
 )
-_LOW_LEAK_DOMAIN_SUFFIXES: Final[tuple[str, ...]] = (
-    ".local",
+# Private and special-use DNS names. Longest first, so .localdomain is not reported as .local.
+_LOCAL_DNS_SUFFIXES: Final[tuple[str, ...]] = (
+    ".home.arpa",
     ".localdomain",
-    ".lan",
-    ".corp",
-    ".internal",
+    ".localhost",
+    ".localnet",
     ".intranet",
+    ".internal",
     ".private",
+    ".local",
+    ".corp",
+    ".home",
+    ".node",
     ".priv",
     ".ads",
+    ".lan",
+    ".loc",
+)
+_LOW_LEAK_DOMAIN_SUFFIXES: Final[tuple[str, ...]] = _LOCAL_DNS_SUFFIXES + (
     ".test",
     ".invalid",
     ".example",
 )
 
 # TLS CN/SAN: non-routable / internal naming that should not appear on internet-facing SMTP
-_INTERNAL_INFRA_DNS_SUFFIXES: Final[tuple[str, ...]] = (
-    ".local",
-    ".localdomain",
-    ".lan",
-    ".internal",
-    ".intranet",
-    ".private",
-    ".priv",
-    ".ads",
-    ".home",
-    ".node",
-    ".corp",
-)
+_INTERNAL_INFRA_DNS_SUFFIXES: Final[tuple[str, ...]] = _LOCAL_DNS_SUFFIXES
 _INTERNAL_INFRA_HIGH_SUFFIXES: Final[frozenset[str]] = frozenset(
     {".internal", ".intranet", ".corp", ".private", ".priv", ".ads"}
 )
@@ -1040,6 +1037,28 @@ def _cert_covers_dname(cert_text: str, dns_name: str) -> bool:
     return False
 
 
+def _local_dns_suffix(name: str) -> str | None:
+    """Local suffix of a hostname, or None. ``.loc`` does not match ``.local``."""
+    low = name.lower().strip().rstrip(".")
+    for suf in _LOCAL_DNS_SUFFIXES:
+        if low.endswith(suf):
+            return suf
+    return None
+
+
+def _banner_local_suffix(banner: str | None) -> str | None:
+    """Local domain in the banner greeting, for example penterepmail.loc."""
+    if not banner or not banner.strip():
+        return None
+    first = (banner.split("\n")[0] if "\n" in banner else banner).strip().lower()
+    first = re.sub(r"^220[-\s]+", "", first)
+    for tok in re.findall(r"[a-z0-9][\w.-]*\.[a-z0-9][\w.-]*", first):
+        hit = _local_dns_suffix(tok.strip(".,;:"))
+        if hit:
+            return hit
+    return None
+
+
 def _hostname_from_banner(banner: str | None) -> str | None:
     """Extract hostname from banner first line (e.g. 'dc80.etius.jp ESMTP' -> dc80.etius.jp)."""
     if not banner or not banner.strip():
@@ -1479,27 +1498,12 @@ def identify_smtp_server(
         discrepancies.extend(
             check_banner_unknown_cmd_discrepancy(banner_claims, unk_product)
         )
-    # Internal domain disclosure: non-Internet suffixes in banner = internal topology leak
-    if banner:
-        first_line = (banner.split("\n")[0] if "\n" in banner else banner).strip().lower()
-        for suffix in (
-            ".local",
-            ".lan",
-            ".internal",
-            ".intranet",
-            ".private",
-            ".priv",
-            ".ads",
-            ".localdomain",
-            ".home",
-            ".node",
-            ".corp",
-        ):
-            if suffix in first_line:
-                discrepancies.append(
-                    f"Internal domain disclosure detected in banner ({suffix})"
-                )
-                break
+    # Internal domain disclosure: local suffixes in the banner leak internal names.
+    local_suffix = _banner_local_suffix(banner)
+    if local_suffix:
+        discrepancies.append(
+            f"Internal domain disclosure detected in banner ({local_suffix})"
+        )
     if discrepancies:
         anomalous_identity = True
         behavior_matches = behavior_matches or "EHLO mismatch"

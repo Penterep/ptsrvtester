@@ -67,20 +67,191 @@ RDP_TEST_ORDER = (
     "RDPENC",
     "CAPABIL",
     "VERSION",
+    "OSDETECT",
     "SSL",
     "NTLMINFO",
     "AUTH",
     "AUTHMETHODS",
     "USERENUM",
-    "BRUTEPROT",
+    "BRUTE",
     "RATELIMIT",
 )
 RDP_TEST_ALIASES = {"INFO": "NTLMINFO"}
 RDP_TEST_CHOICES = RDP_TEST_ORDER + tuple(RDP_TEST_ALIASES)
 IMPLEMENTED_TESTS = set(RDP_TEST_ORDER)
 RDP_EXPLICIT_ONLY_TESTS = frozenset(
-    {"AUTHMETHODS", "USERENUM", "BRUTEPROT", "RATELIMIT"}
+    {"AUTHMETHODS", "USERENUM", "BRUTE", "RATELIMIT"}
 )
+
+_RDP_TEST_HELP = {
+    "NLA": {
+        "description": "Check whether Network Level Authentication is required",
+        "detail": "Compare CredSSP negotiation with TLS and Standard RDP Security without NLA.",
+    },
+    "RDPSEC": {
+        "description": "Check legacy Standard RDP Security",
+        "detail": "Request Standard RDP Security and report whether the server accepts it.",
+    },
+    "CREDSSP": {
+        "description": "Check CredSSP protocol support",
+        "detail": "Negotiate CredSSP/NLA without submitting credentials.",
+    },
+    "RDPENC": {
+        "description": "Enumerate RDP security and encryption",
+        "detail": "Probe supported security protocols and legacy RDP encryption methods.",
+    },
+    "CAPABIL": {
+        "description": "Inspect RDP capabilities",
+        "detail": "Read Basic Settings and channel negotiation; credentials can expose additional session capabilities.",
+        "options": (
+            ["-u", "--user", "<name>", "Login for authenticated capability exchange"],
+            ["-p", "--password", "[password]", "Password for authenticated capability exchange"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "VERSION": {
+        "description": "Read the server's RDP protocol version",
+        "detail": "Read Server Core Data, with an authenticated fallback if credentials are supplied.",
+        "options": (
+            ["-u", "--user", "<name>", "Login for the authenticated fallback"],
+            ["-p", "--password", "[password]", "Password for the authenticated fallback"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "OSDETECT": {
+        "description": "Report typical Windows OS candidates",
+        "detail": "Use the advertised RDP family to report possible Windows releases; this does not uniquely identify the OS.",
+        "options": (
+            ["-u", "--user", "<name>", "Login for the authenticated fallback"],
+            ["-p", "--password", "[password]", "Password for the authenticated fallback"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+        "examples": ("ptsrvtester rdp -tg 192.168.1.10 -ts VERSION,OSDETECT",),
+    },
+    "SSL": {
+        "description": "Inspect RDP TLS configuration",
+        "detail": "Check TLS negotiation, protocol versions, selected cipher and server certificate.",
+    },
+    "NTLMINFO": {
+        "description": "Read pre-authentication NTLM information",
+        "detail": "Decode the CredSSP NTLM challenge for server and domain information without logging in.",
+    },
+    "AUTH": {
+        "description": "Try one CredSSP/NTLM login",
+        "detail": "Attempt one supplied username and password over CredSSP/NLA.",
+        "requires": ("-u/--user and -p/--password",),
+        "usage_args": " -u <name> -p <password>",
+        "options": (
+            ["-u", "--user", "<name>", "Username to authenticate"],
+            ["-p", "--password", "[password]", "Password to authenticate"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "AUTHMETHODS": {
+        "description": "Check NTLM and Kerberos password authentication",
+        "detail": "Probe CredSSP authentication methods; Kerberos needs valid credentials and domain settings.",
+        "requires": ("Kerberos: -u/--user, -p/--password, --realm, --kdc and --spn-host",),
+        "usage_args": " --auth-methods ntlm",
+        "options": (
+            ["", "--auth-methods", "<method>", "ntlm and/or kerberos (default: both)"],
+            ["-u", "--user", "<name>", "Username for a credentialed attempt"],
+            ["-p", "--password", "[password]", "Password for a credentialed attempt"],
+            ["", "--realm", "<realm>", "Kerberos realm/domain"],
+            ["", "--kdc", "<ip>", "Kerberos KDC IP address"],
+            ["", "--spn-host", "<host>", "Hostname for the RDP service SPN"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "USERENUM": {
+        "description": "Compare RDP responses for candidate usernames",
+        "detail": "Send wrong passwords for a known login and optional candidates; attempts can contribute to lockout.",
+        "requires": ("-u/--user (known valid username)", "--allow-auth-failures"),
+        "usage_args": " -u <known-user> --allow-auth-failures",
+        "options": (
+            ["-u", "--user", "<name>", "Known valid username for the baseline"],
+            ["-p", "--password", "[password]", "Optional valid password to verify the baseline"],
+            ["-U", "--users", "<wordlist>", "UTF-8 file with candidate usernames"],
+            ["", "--allow-auth-failures", "", "Allow intentional failed logins"],
+            ["", "--guess-delay-ms", "<ms>", "Delay between attempts (default: 100)"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "BRUTE": {
+        "description": "Check password-guessing protections",
+        "detail": "Without credentials, probe random nonexistent identities. With -u/-U and -p/-P, try bounded username/password pairs. --lockout-test keeps the disposable-account mode.",
+        "requires": ("--lockout-test: one known valid -u/--user and -p/--password pair for a disposable account",),
+        "usage_args": "",
+        "examples": (
+            "ptsrvtester rdp -tg 192.168.1.10 -ts BRUTE",
+            "ptsrvtester rdp -tg 192.168.1.10 -ts BRUTE -U users.txt -P passwords.txt",
+            "ptsrvtester rdp -tg 192.168.1.10 -ts BRUTE -u disposable -p test-pass --lockout-test",
+        ),
+        "options": (
+            ["", "--guess-attempts", "<count>", "Maximum attempts (default: 10; range: 2-100)"],
+            ["", "--guess-delay-ms", "<ms>", "Delay between attempts (default: 100)"],
+            ["-u", "--user", "<name> ...", "Username candidates"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "[password]", "One password candidate"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--lockout-test", "", "May lock the supplied disposable account; no wordlists"],
+            ["", "--lockout-attempts", "<count>", "Disposable-account attempts (default: 3; range: 1-20)"],
+            ["", "--insecure-auth", "", "Allow credentials with an unverified RDP TLS certificate"],
+        ),
+    },
+    "RATELIMIT": {
+        "description": "Check RDP connection limiting",
+        "detail": "Measure completed and/or held connection pressure and post-load recovery.",
+        "requires": ("--allow-load-test",),
+        "usage_args": " --allow-load-test",
+        "options": (
+            ["", "--allow-load-test", "", "Allow active connection load"],
+            ["", "--rate-mode", "<mode>", "completed, held or both (default: both)"],
+            ["", "--rate-count", "<count>", "Connections per scenario (default: 30; range: 5-200)"],
+            ["", "--rate-concurrency", "<count>", "Parallel connections (default: 10; range: 1-50)"],
+            ["", "--rate-hold-seconds", "<seconds>", "Held-connection duration (default: 3; range: 0-30)"],
+            ["", "--rate-cooldown-seconds", "<seconds>", "Recovery delay (default: 2; range: 0-60)"],
+        ),
+    },
+}
+
+
+def _rdp_test_help(codes: list[str]):
+    """Build the shared help printer's short guide for selected RDP tests."""
+    if not codes:
+        return None
+    selected = [code.strip().upper() for code in codes if code.strip().upper() != "ALL"]
+    if not selected:
+        return None
+    unknown = [code for code in selected if code not in RDP_TEST_CHOICES]
+    if unknown:
+        return [
+            {"unknown_test": [f"Unknown test: {', '.join(unknown)}"]},
+            {"available_tests": [f"ALL, {', '.join(RDP_TEST_CHOICES)}"]},
+        ]
+
+    help_data: list[dict] = []
+    seen: set[str] = set()
+    for requested in selected:
+        canonical = RDP_TEST_ALIASES.get(requested, requested)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        spec = _RDP_TEST_HELP[canonical]
+        name = f"{requested} (alias for {canonical})" if requested != canonical else canonical
+        help_data.append({"description": [f"{name}: {spec['description']}", spec["detail"]]})
+        if spec.get("requires"):
+            help_data.append({"requires": list(spec["requires"])})
+        if spec.get("options"):
+            help_data.append({"test_options": list(spec["options"])})
+        if any(row[0] == "-p" for row in spec.get("options", ())):
+            help_data.append({"note": [
+                "Use -p/--password without a value to supply an empty password."
+            ]})
+        usage_args = spec.get("usage_args", "")
+        help_data.append({"usage": [f"ptsrvtester rdp -ts {requested}{usage_args} -tg <host>"]})
+        if spec.get("examples"):
+            help_data.append({"usage_example": list(spec["examples"])})
+    return help_data
 
 
 def valid_target_rdp(target: str) -> Target:
@@ -99,6 +270,14 @@ def _valid_test_token(value: str) -> str:
             f"unknown RDP test(s): {bad}; choose from {', '.join(RDP_TEST_CHOICES)}"
         )
     return ",".join(codes)
+
+
+class _RDPUsersAction(argparse.Action):
+    """Keep one known login for existing checks and all guessing candidates."""
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        namespace.brute_users = tuple(values)
+        namespace.login = values[0] if len(values) == 1 else None
 
 
 def _bounded_int_parser(
@@ -156,7 +335,9 @@ class RDPArgs(BaseArgs):
     target: Target
     tests: list[str] | str | None
     login: str | None
+    brute_users: tuple[str, ...] | None
     password: str | None
+    passwords: str | None
     insecure_auth: bool
     timeout: int
     auth_methods: list[str] | None
@@ -180,41 +361,45 @@ class RDPArgs(BaseArgs):
     def get_help():
         return [
             {"description": ["RDP Testing Module"]},
-            {"usage": ["ptsrvtester rdp <target> <options>"]},
+            {"usage": ["ptsrvtester rdp -tg <host> <options>"]},
             {"usage_example": [
-                "ptsrvtester rdp 192.168.1.10 -ts NLA",
-                "ptsrvtester rdp 12.32.43.163 -ts NLA AUTH -l admin -p pass123",
-                "ptsrvtester rdp 192.168.1.10 -ts AUTHMETHODS --auth-methods ntlm",
-                "ptsrvtester rdp 192.168.1.10 -ts USERENUM -l test-user --allow-auth-failures",
-                "ptsrvtester rdp 192.168.1.10 -ts BRUTEPROT --allow-auth-failures --guess-attempts 10",
-                "ptsrvtester rdp 192.168.1.10 -ts BRUTEPROT -l disposable -p test-pass --allow-auth-failures --lockout-test",
-                "ptsrvtester rdp rdp.example.com -ts NLA",
+                "ptsrvtester rdp -tg 192.168.1.182",
+                "ptsrvtester rdp -tg 12.32.43.163 -ts NLA AUTH -u admin -p pass123",
+                "ptsrvtester rdp -tg 192.168.1.10 -ts AUTHMETHODS --auth-methods ntlm",
+                "ptsrvtester rdp -tg 192.168.1.10 -ts USERENUM -u test-user --allow-auth-failures",
+                "ptsrvtester rdp -tg 192.168.1.10 -ts BRUTE --guess-attempts 10",
+                "ptsrvtester rdp -tg 192.168.1.10 -ts BRUTE -U users.txt -P passwords.txt",
+                "ptsrvtester rdp -tg 192.168.1.10 -ts BRUTE -u disposable -p test-pass --lockout-test",
+                "ptsrvtester rdp -tg rdp.example.com -ts NLA",
             ]},
             {"options": [
-                ["-ts", "--tests", "<test>", "Specify one or more tests to perform"],
+                ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT] (default port: 3389)"],
+                ["-ts", "--tests", "<test>", "Specify tests; 'rdp -ts <TEST> -h' for test options"],
                 ["", "", "NLA", "Network Level Authentication requirement test"],
                 ["", "", "RDPSEC", "Legacy Standard RDP Security negotiation test"],
                 ["", "", "CREDSSP", "CredSSP protocol support test"],
                 ["", "", "RDPENC", "Security protocols and RDP encryption enumeration"],
                 ["", "", "CAPABIL", "RDP capability negotiation"],
                 ["", "", "VERSION", "RDP protocol version reported by the server"],
+                ["", "", "OSDETECT", "Typical Windows OS candidates from the RDP family"],
                 ["", "", "SSL", "TLS/RDP Security configuration test"],
                 ["", "", "NTLMINFO", "Pre-auth CredSSP/NTLM server information test"],
                 ["", "", "INFO", "Alias for NTLMINFO"],
                 ["", "", "AUTH", "Single CredSSP/NTLM authentication test"],
                 ["", "", "AUTHMETHODS", "NLA/CredSSP password authentication through NTLM and Kerberos"],
                 ["", "", "USERENUM", "Username enumeration test"],
-                ["", "", "BRUTEPROT", "Password-guessing protection test"],
+                ["", "", "BRUTE", "Password-guessing protection test"],
                 ["", "", "RATELIMIT", "RDP connection limiting test"],
-                ["-l", "--login", "<login>", "Login for account-based tests"],
-                ["-p", "--password", "<password>", "Password for account-based tests"],
-                ["-U", "--users", "<file>", "USERENUM candidate wordlist"],
+                ["-u", "--user", "<name> …", "Username(s) for account-based tests"],
+                ["-U", "--users", "<wordlist>", "Username wordlist for USERENUM or BRUTE"],
+                ["-p", "--password", "[password]", "Password; omit value for an empty password"],
+                ["-P", "--passwords", "<wordlist>", "Password wordlist for BRUTE"],
                 ["", "--auth-methods", "<method>", "AUTHMETHODS subset: ntlm kerberos"],
                 ["", "--realm", "<realm>", "Kerberos realm/domain"],
                 ["", "--kdc", "<ip>", "Kerberos KDC/domain-controller IP address"],
                 ["", "--spn-host", "<host>", "RDP service hostname for the Kerberos SPN"],
-                ["", "--allow-auth-failures", "", "Allow intentional failed login attempts"],
-                ["", "--guess-attempts", "<count>", "Bounded BRUTEPROT attempt count"],
+                ["", "--allow-auth-failures", "", "Allow USERENUM failed login attempts"],
+                ["", "--guess-attempts", "<count>", "Bounded BRUTE attempt count"],
                 ["", "--guess-delay-ms", "<ms>", "Delay between active authentication attempts"],
                 ["", "--lockout-test", "", "May lock the supplied disposable account"],
                 ["", "--lockout-attempts", "<count>", "Bounded disposable-account attempts"],
@@ -227,10 +412,11 @@ class RDPArgs(BaseArgs):
                 ["", "--insecure-auth", "", "Allow credentials with an untrusted RDP TLS certificate"],
                 ["-T", "--timeout", "<milliseconds>", "Network timeout (default 10000)"],
                 ["", "", "", ""],
-                ["-h", "--help", "", "Show this help message and exit"],
+                ["-h", "--help", "", "Show this help; 'rdp -ts <TEST> -h' for test options"],
                 ["-vv", "--verbose", "", "Enable verbose mode"],
             ]},
             {"note": [
+                "Use -p/--password without a value to supply an empty password.",
                 (
                     "When -ts/--tests is omitted, all safe pre-auth tests are "
                     "executed; AUTH is also executed when both credentials are "
@@ -238,11 +424,11 @@ class RDPArgs(BaseArgs):
                 ),
                 "AUTH performs one CredSSP/NTLM authentication attempt.",
                 (
-                    "AUTHMETHODS, USERENUM, BRUTEPROT and RATELIMIT are "
+                    "AUTHMETHODS, USERENUM, BRUTE and RATELIMIT are "
                     "explicit-only and are not implied by ALL."
                 ),
                 (
-                    "USERENUM and BRUTEPROT require --allow-auth-failures; "
+                    "USERENUM requires --allow-auth-failures; "
                     "RATELIMIT requires --allow-load-test."
                 ),
                 (
@@ -250,9 +436,11 @@ class RDPArgs(BaseArgs):
                     "tested candidate; these attempts can contribute to lockout."
                 ),
                 (
-                    "BRUTEPROT normally uses random nonexistent identities and "
-                    "observes source-wide behavior; --lockout-test may lock the "
-                    "supplied disposable account."
+                    "BRUTE without candidate credentials uses random nonexistent "
+                    "identities; with -u/-U and -p/-P it tries their combinations. "
+                    "--lockout-test with one known valid -u/-p pair keeps the "
+                    "disposable-account check and may lock that account. "
+                    "Credential attempts can lock real accounts."
                 ),
                 (
                     "Kerberos password authentication requires valid credentials, "
@@ -265,17 +453,23 @@ class RDPArgs(BaseArgs):
             ]},
         ]
 
+    @staticmethod
+    def get_test_help(codes):
+        """Per-test help object used by ``rdp -ts <TEST> -h``."""
+        return _rdp_test_help(codes)
+
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """example usage:
-  ptsrvtester rdp 192.168.1.10 -ts NLA
-  ptsrvtester rdp 192.168.1.10 -ts NLA NTLMINFO
-  ptsrvtester rdp 12.32.43.163 -ts NLA AUTH -l admin -p pass123
-  ptsrvtester rdp 192.168.1.10 -ts AUTHMETHODS --auth-methods ntlm
-  ptsrvtester rdp 192.168.1.10 -ts USERENUM -l known-user --allow-auth-failures
-  ptsrvtester rdp 192.168.1.10 -ts BRUTEPROT --allow-auth-failures --guess-attempts 10
-  ptsrvtester rdp 192.168.1.10 -ts BRUTEPROT -l disposable -p test-pass --allow-auth-failures --lockout-test
-  ptsrvtester rdp rdp.example.com -ts NLA
-  ptsrvtester rdp 192.168.1.10 -vv"""
+  ptsrvtester rdp -tg 192.168.1.182
+  ptsrvtester rdp -tg 192.168.1.10 -ts NLA NTLMINFO
+  ptsrvtester rdp -tg 12.32.43.163 -ts NLA AUTH -u admin -p pass123
+  ptsrvtester rdp -tg 192.168.1.10 -ts AUTHMETHODS --auth-methods ntlm
+  ptsrvtester rdp -tg 192.168.1.10 -ts USERENUM -u known-user --allow-auth-failures
+  ptsrvtester rdp -tg 192.168.1.10 -ts BRUTE --guess-attempts 10
+  ptsrvtester rdp -tg 192.168.1.10 -ts BRUTE -U users.txt -P passwords.txt
+  ptsrvtester rdp -tg 192.168.1.10 -ts BRUTE -u disposable -p test-pass --lockout-test
+  ptsrvtester rdp -tg rdp.example.com -ts NLA
+  ptsrvtester rdp -tg 192.168.1.10 -vv"""
 
         parser = subparsers.add_parser(
             name,
@@ -288,9 +482,12 @@ class RDPArgs(BaseArgs):
             raise TypeError
 
         parser.add_argument(
-            "target",
+            "-tg",
+            "--target",
             type=valid_target_rdp,
-            help="IP[:PORT] or HOST[:PORT] (default port: 3389)",
+            required=True,
+            metavar="<host>",
+            help="Target IP[:PORT] or HOST[:PORT] (default port: 3389)",
         )
         parser.add_argument(
             "-ts",
@@ -300,17 +497,42 @@ class RDPArgs(BaseArgs):
             metavar="TEST",
             help=(
                 "tests to run: NLA, RDPSEC, CREDSSP, RDPENC, CAPABIL, "
-                "VERSION, SSL, NTLMINFO, INFO, AUTH, AUTHMETHODS, USERENUM, "
-                "BRUTEPROT, RATELIMIT"
+                "VERSION, OSDETECT, SSL, NTLMINFO, INFO, AUTH, AUTHMETHODS, USERENUM, BRUTE, "
+                "RATELIMIT; use 'rdp -ts <TEST> -h' for details"
             ),
         )
-        parser.add_argument("-l", "--login", help="login for account-based tests")
-        parser.add_argument("-p", "--password", help="password for account-based tests")
+        parser.set_defaults(login=None)
+        parser.add_argument(
+            "-u", "--user",
+            nargs="+",
+            action=_RDPUsersAction,
+            metavar="NAME",
+            dest="brute_users",
+            help="username(s) for account-based tests",
+        )
+        parser.add_argument(
+            "-l", "--login",
+            nargs=1,
+            action=_RDPUsersAction,
+            dest="brute_users",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "-p", "--password",
+            nargs="?",
+            const="",
+            default=None,
+            help="password for account-based tests (omit value for an empty password)",
+        )
         parser.add_argument(
             "-U",
             "--users",
-            metavar="FILE",
-            help="UTF-8 USERENUM candidates; one wrong-password attempt per entry",
+            metavar="WORDLIST",
+            help="UTF-8 USERENUM or BRUTE username wordlist",
+        )
+        parser.add_argument(
+            "-P", "--passwords", metavar="WORDLIST",
+            help="UTF-8 BRUTE password wordlist",
         )
         parser.add_argument(
             "--auth-methods",
@@ -330,21 +552,21 @@ class RDPArgs(BaseArgs):
         parser.add_argument(
             "--allow-auth-failures",
             action="store_true",
-            help="allow intentional failed authentication attempts",
+            help="allow USERENUM failed authentication attempts",
         )
         parser.add_argument(
             "--guess-attempts",
             type=_GUESS_ATTEMPTS,
             default=10,
             metavar="COUNT",
-            help="failed attempts for BRUTEPROT (default: 10; range: 2-100)",
+            help="BRUTE attempt limit (default: 10; range: 2-100)",
         )
         parser.add_argument(
             "--guess-delay-ms",
             type=_GUESS_DELAY_MS,
             default=100,
             metavar="MILLISECONDS",
-            help="delay between USERENUM/BRUTEPROT attempts (default: 100; range: 0-60000)",
+            help="delay between USERENUM/BRUTE attempts (default: 100; range: 0-60000)",
         )
         parser.add_argument(
             "--lockout-test",

@@ -60,11 +60,13 @@ def test_bounce_replay(e) -> BounceReplayResult:
             smtp = smtplib.SMTP(timeout=timeout)
             smtp.sock = sock_ssl
             smtp.file = None
-            status, _ = smtp.getreply()
+            status, reply = smtp.getreply()
+            e.end_if_blocked(status, reply)
             return (smtp, status)
         smtp = smtplib.SMTP(timeout=timeout)
-        status, _ = smtp.connect(host, port)
+        status, reply = smtp.connect(host, port)
         if status != 220:
+            e.end_if_blocked(status, reply)
             return (smtp, status)
         if use_starttls:
             stls_status, _ = smtp.docmd('STARTTLS')

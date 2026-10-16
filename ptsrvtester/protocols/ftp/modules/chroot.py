@@ -12,7 +12,7 @@ def run(ctx):
     creds = ensure_creds(ctx)
     if creds is None:
         e.results.chroot_audit_error = (
-            "No credentials for chroot audit (use -A/--anonymous or -u/-p)"
+            e._missing_login_line()
         )
         e._stream_chroot_audit_result()
         return

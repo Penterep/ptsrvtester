@@ -12,7 +12,7 @@ def run(ctx):
     creds = ensure_creds(ctx)
     if creds is None:
         e.results.pasv_port_range_error = (
-            "No credentials for passive port audit (use -A/--anonymous or -u/-p)"
+            e._missing_login_line()
         )
         e._stream_pasv_port_range_result()
         return
@@ -22,6 +22,6 @@ def run(ctx):
         e.results.pasv_port_range = e.test_pasv_port_range_audit(creds, n, mxsp)
     except Exception as ex:
         e.results.pasv_port_range_error = str(ex)
-        ctx.out(f"PASVPORT failed: {ex}", "ERROR", indent=4)
+        ctx.out(f"Passive port range test failed: {ex}", "ERROR", indent=4)
         return
     e._stream_pasv_port_range_result()

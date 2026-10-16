@@ -11,17 +11,17 @@ def run(ctx) -> None:
     ctx.out(
         f"Port mappings: {count} across {len(results)} IGD services "
         f"({ctx.engine.port_mapping_status})",
-        "TEXT", indent=4,
+        "TEXT" if ctx.engine.port_mapping_status in ("complete", "no_services",) else "TITLE", indent=4,
     )
     for result in results:
         service = repr(result["serviceType"][:160])
-        category = "TEXT" if result["status"] == "complete" else "WARNING"
+        category = "TEXT" if result["status"] == "complete" else "TITLE"
         ctx.out(
             f"{service}  entries={len(result['entries'])}  status={result['status']}",
             category, indent=8,
         )
         if result.get("error"):
-            ctx.out(f"Error: {result['error'][:160]!r}", "WARNING", indent=12)
+            ctx.out(f"Error: {result['error'][:160]!r}", "TITLE", indent=12)
         for entry in result["entries"]:
             external = entry.get("NewExternalPort", "")[:32]
             protocol = entry.get("NewProtocol", "")[:32]
@@ -33,3 +33,4 @@ def run(ctx) -> None:
                 f"{internal!r}:{internal_port!r}  {description!r}",
                 "TEXT", indent=12,
             )
+        ctx.out()

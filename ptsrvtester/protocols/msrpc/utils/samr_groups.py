@@ -9,6 +9,7 @@ from impacket.nt_errors import (
     STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED,
 )
 
+from .samr_output import print_samr_authentication_failure
 from .samr_session import (
     ENUMERATION_PAGE_BYTES, MAX_ENUMERATION_PAGES, SamrDenied,
     enumeration_page, iter_samr_domains, samr_array, samr_session, samr_u32,
@@ -165,6 +166,8 @@ def _summarize(statuses, has_data=False):
 
 
 def _print_result(engine, result):
+    if print_samr_authentication_failure(engine, result):
+        return
     lines = [
         f"SAMR group enumeration status: {result['status']}",
         f"Groups and aliases returned: {result['returned']}",
@@ -175,11 +178,11 @@ def _print_result(engine, result):
     for domain in result["domains"]:
         lines.append(f"Domain: {domain['name']} ({domain['sid'] or 'SID unavailable'})")
         if domain["status"] != "complete":
-            lines.append(f"  Status: {domain['status']} ({domain['reason']})")
+            lines.append(f"    Status: {domain['status']} ({domain['reason']})")
         for group in domain["groups"]:
-            lines.append(f"  {group['kind']}: {group['name']} ({group['sid']})")
+            lines.append(f"    {group['kind']}: {group['name']} ({group['sid']})")
             lines.append(
-                f"    Direct members: {group['membersReturned']} of "
+                f"        Direct members: {group['membersReturned']} of "
                 f"{group['memberCount'] if group['memberCount'] is not None else 'unknown'}; "
                 f"status: {group['membersStatus']}"
                 + (f" ({group['membersReason']})" if group["membersReason"] else "")
@@ -187,7 +190,7 @@ def _print_result(engine, result):
             for member in group["members"]:
                 attributes = member.get("attributes")
                 lines.append(
-                    f"    {member['sid']}"
+                    f"        {member['sid']}"
                     + (f"; attributes: 0x{attributes:08x}" if attributes is not None else "")
                 )
             lines.append("")

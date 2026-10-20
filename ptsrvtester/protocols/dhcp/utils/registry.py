@@ -75,6 +75,12 @@ def is_valid_mac_address(mac_a: str) -> str:
         raise argparse.ArgumentError(None, "Invalid MAC address")
 
 
+def debug_packet(ctx, direction: str, packet) -> None:
+    ctx.debug(f"{direction} DHCP packet:", indent=12)
+    for line in packet.show(dump=True).splitlines():
+        ctx.debug(line, indent=16)
+
+
 def get_interface_ip(interface: str) -> str:
     return ni.ifaddresses(interface)[ni.AF_INET][0]['addr']
 

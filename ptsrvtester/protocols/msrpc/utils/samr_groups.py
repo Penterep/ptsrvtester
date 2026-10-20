@@ -11,7 +11,8 @@ from impacket.nt_errors import (
 
 from .samr_session import (
     ENUMERATION_PAGE_BYTES, MAX_ENUMERATION_PAGES, SamrDenied,
-    enumeration_page, iter_samr_domains, samr_array, samr_session, samr_u32,
+    enumeration_page, iter_samr_domains, samr_access_metadata, samr_array,
+    samr_session, samr_u32,
 )
 
 
@@ -201,7 +202,10 @@ def _print_result(engine, result):
         category = "TITLE" if index == 0 and result["status"] != "complete" else "TEXT"
         engine.ptprint(line, out=category)
     if getattr(engine.args, "output", None):
-        engine.write_to_file(lines)
+        try:
+            engine.write_to_file(lines)
+        except Exception as exc:
+            engine.record_module_error("SAMRGROUPS", f"{type(exc).__name__}: Cannot write SAMR output")
 
 
 def enumerate_samr_groups(engine) -> dict:
@@ -213,9 +217,10 @@ def enumerate_samr_groups(engine) -> dict:
         "status": "error", "reason": None, "limit": limit,
         "memberLimit": member_limit, "memberLimitScope": "per_group_output",
         "returned": 0, "truncated": False, "domains": [],
+        **samr_access_metadata(engine),
     }
     try:
-        with samr_session(engine) as (dce, server_handle):
+        with samr_session(engine, result) as (dce, server_handle):
             for name in iter_samr_domains(engine, dce, server_handle):
                 domain = {
                     "name": name, "sid": None, "status": "error", "reason": None,

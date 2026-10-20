@@ -25,6 +25,7 @@ from .samr_session import (
     SamrDenied,
     enumeration_page,
     iter_samr_domains,
+    samr_access_metadata,
     samr_array,
     samr_session,
     samr_u32,
@@ -265,13 +266,14 @@ def query_samr_user_info(engine) -> dict:
         "limit": limit, "returned": 0, "truncated": False,
         "selectedUser": selected_user, "selectedDomain": selected_domain,
         "domains": [],
+        **samr_access_metadata(engine),
     }
     if limit <= 0:
         result["reason"] = "invalid_user_limit"
         engine.record_module_error("SAMRUSERINFO", "SAMR user limit must be positive")
         return result
     try:
-        with samr_session(engine) as (dce, server_handle):
+        with samr_session(engine, result) as (dce, server_handle):
             for name in iter_samr_domains(engine, dce, server_handle):
                 if selected_domain and name.casefold() != selected_domain.casefold():
                     continue
@@ -359,7 +361,10 @@ def query_samr_user_info(engine) -> dict:
         category = "TITLE" if index == 0 and result["status"] != "complete" else "TEXT"
         engine.ptprint(line, out=category)
     if getattr(engine.args, "output", None):
-        engine.write_to_file(lines)
+        try:
+            engine.write_to_file(lines)
+        except Exception as exc:
+            engine.record_module_error("SAMRUSERINFO", f"{type(exc).__name__}: Cannot write SAMR output")
     return result
 
 

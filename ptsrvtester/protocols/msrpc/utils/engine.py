@@ -48,9 +48,11 @@ from impacket.smb3structs import SMB2_SESSION_FLAG_IS_NULL
 from ..._shared.utils.progress import CredentialProgress
 from .helpers import text_or_file
 from .samr_policy import format_interval, parse_lockout_policy, parse_password_policy
+from .samr_disclosure import samr_disclosure_finding
 from .samr_users import parse_samr_user, unavailable_samr_user
 from .samr_session import (
-    ENUMERATION_PAGE_BYTES, MAX_ENUMERATION_PAGES, enumeration_page, iter_samr_domains,
+    ENUMERATION_PAGE_BYTES, MAX_ENUMERATION_PAGES, authenticate_samr_session,
+    enumeration_page, iter_samr_domains, samr_access_metadata,
 )
 from .epm_inventory import EpmEnumerationLimit, MAX_EPM_ENTRIES, iter_epm_entries
 from .shares import enumerate_shares
@@ -121,6 +123,7 @@ class MSRPCResult:
     SamrUsers: dict | None = None
     SamrGroups: dict | None = None
     SamrUserInfo: dict | None = None
+    samr_checks: dict[str, dict] = field(default_factory=dict)
     SMB_Brute: list[Credential] | None = None
     TCP_Brute: list[Credential] | None = None
     HTTP_Brute: list[Credential] | None = None
@@ -845,6 +848,7 @@ class MsrpcEngine(_PrintMixin):
             "policyScope": "sam_domain",
             "effectiveUserPolicyChecked": False,
             "domains": [],
+            **samr_access_metadata(self),
         }
         smb = None
         dce = None
@@ -859,12 +863,7 @@ class MsrpcEngine(_PrintMixin):
                 timeout=self.connect_timeout,
             )
             try:
-                smb.login(
-                    self.args.username,
-                    self.args.password,
-                    getattr(self.args, "domain", "") or "",
-                    ntlmFallback=False,
-                )
+                authenticate_samr_session(self, smb, result)
                 logged_in = True
                 self.ptdebug("SMB login accepted; checking the SAMR session identity")
             except SessionError as exc:
@@ -872,12 +871,17 @@ class MsrpcEngine(_PrintMixin):
                     _AUTH_REJECTION_STATUSES | {STATUS_ACCESS_DENIED}
                 ):
                     result.update(status="denied", reason="authentication_denied")
-                    self.ptprint("SAMR authentication was denied", out=Out.TITLE)
+                    self.ptprint(
+                        "Anonymous SAMR access was denied"
+                        if result["accessMode"] == "anonymous"
+                        else "SAMR authentication was denied",
+                        out=Out.TITLE,
+                    )
                     return result
                 raise
 
-            identity = self._smb_session_identity(smb)
-            if identity != "authenticated":
+            identity = result["sessionType"]
+            if result["accessMode"] != "anonymous" and identity != "authenticated":
                 result.update(status="denied", reason=f"{identity}_session")
                 self.ptprint(
                     "SAMR policy was not queried because authentication mapped to Guest or anonymous",
@@ -1050,7 +1054,10 @@ class MsrpcEngine(_PrintMixin):
 
         output_lines = self._print_samr_policy(result)
         if getattr(self.args, "output", None) and output_lines:
-            self.write_to_file(output_lines)
+            try:
+                self.write_to_file(output_lines)
+            except Exception as exc:
+                self.record_module_error("SAMRPOLICY", f"{type(exc).__name__}: Cannot write SAMR output")
         return result
 
     def _enumerate_samr_domain_users(
@@ -1231,6 +1238,7 @@ class MsrpcEngine(_PrintMixin):
             "returned": 0,
             "truncated": False,
             "domains": [],
+            **samr_access_metadata(self),
         }
         smb = None
         dce = None
@@ -1245,12 +1253,7 @@ class MsrpcEngine(_PrintMixin):
                 timeout=self.connect_timeout,
             )
             try:
-                smb.login(
-                    self.args.username,
-                    self.args.password,
-                    getattr(self.args, "domain", "") or "",
-                    ntlmFallback=False,
-                )
+                authenticate_samr_session(self, smb, result)
                 logged_in = True
                 self.ptdebug("SMB login accepted; checking the SAMR session identity")
             except SessionError as exc:
@@ -1258,12 +1261,17 @@ class MsrpcEngine(_PrintMixin):
                     _AUTH_REJECTION_STATUSES | {STATUS_ACCESS_DENIED}
                 ):
                     result.update(status="denied", reason="authentication_denied")
-                    self.ptprint("SAMR authentication was denied", out=Out.TITLE)
+                    self.ptprint(
+                        "Anonymous SAMR access was denied"
+                        if result["accessMode"] == "anonymous"
+                        else "SAMR authentication was denied",
+                        out=Out.TITLE,
+                    )
                     return result
                 raise
 
-            identity = self._smb_session_identity(smb)
-            if identity != "authenticated":
+            identity = result["sessionType"]
+            if result["accessMode"] != "anonymous" and identity != "authenticated":
                 result.update(status="denied", reason=f"{identity}_session")
                 self.ptprint(
                     "SAMR users were not enumerated because authentication mapped to Guest or anonymous",
@@ -1440,7 +1448,10 @@ class MsrpcEngine(_PrintMixin):
 
         output_lines = self._print_samr_users(result)
         if getattr(self.args, "output", None) and output_lines:
-            self.write_to_file(output_lines)
+            try:
+                self.write_to_file(output_lines)
+            except Exception as exc:
+                self.record_module_error("SAMRUSERS", f"{type(exc).__name__}: Cannot write SAMR output")
         return result
 
     def _run_credential_attempts(self, code: str, attempt) -> list[Credential]:
@@ -1937,6 +1948,18 @@ class MsrpcEngine(_PrintMixin):
             ),
         }
 
+    def samr_disclosure_finding(self, code: str, result: dict | None) -> dict | None:
+        vulnerability = {
+            "SAMRPOLICY": VULNS.SamrPolicy,
+            "SAMRUSERS": VULNS.SamrUsers,
+            "SAMRGROUPS": VULNS.SamrGroups,
+            "SAMRUSERINFO": VULNS.SamrUserInfo,
+        }.get(code)
+        if vulnerability is None:
+            return None
+        return samr_disclosure_finding(
+            code, result, f"{self.args.ip}:{self.smb_port}", vulnerability.value,
+        )
 
     def output(self) -> None:
         properties = {
@@ -1966,6 +1989,8 @@ class MsrpcEngine(_PrintMixin):
         }
         if self.results.credential_checks:
             properties["credentialChecks"] = self.results.credential_checks
+        if self.results.samr_checks:
+            properties["samrChecks"] = self.results.samr_checks
         if self.results.module_errors:
             properties["moduleErrors"] = [
                 {"test": code, "error": error}
@@ -1996,6 +2021,22 @@ class MsrpcEngine(_PrintMixin):
         share_finding = self._anonymous_share_finding() if "SHARES" in selected else None
         if share_finding is not None:
             deferred_vulnerabilities.append(share_finding)
+        for code, result in (
+            ("SAMRPOLICY", self.results.SamrPolicy),
+            ("SAMRUSERS", self.results.SamrUsers),
+            ("SAMRGROUPS", self.results.SamrGroups),
+            ("SAMRUSERINFO", self.results.SamrUserInfo),
+        ):
+            if code in selected:
+                checks = self.results.samr_checks.get(code)
+                anonymous_result = (
+                    checks.get("anonymous") if isinstance(checks, dict)
+                    else result if samr_access_metadata(self)["accessMode"] == "anonymous"
+                    else None
+                )
+                finding = self.samr_disclosure_finding(code, anonymous_result)
+                if finding is not None:
+                    deferred_vulnerabilities.append(finding)
         selected_pipe = getattr(self.args, "pipe", None)
         pipe_description = f"named pipe {selected_pipe!r}" if selected_pipe else "selected named pipe"
         selected_interface = getattr(self.args, "uuid", None)

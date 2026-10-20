@@ -18,6 +18,7 @@ from .registry import (
 )
 
 _INTERFACE_VERSION = re.compile(r"^[0-9]+\.[0-9]+$")
+_SAMR_TESTS = frozenset({"SAMRPOLICY", "SAMRUSERS", "SAMRGROUPS", "SAMRUSERINFO"})
 
 
 def _bounded_threads(value: str) -> int:
@@ -155,7 +156,10 @@ class MSRPCArgs(BaseArgs):
             for code in MSRPC_TEST_ORDER
         ]
         return [
-            {"description": ["MSRPC Testing Module"]},
+            {"description": [
+                "MSRPC Testing Module",
+                "SAMR tests first check anonymous access. Optional -u/-p credentials add authenticated inventory; only anonymous disclosure creates a PTV finding.",
+            ]},
             {"usage": ["ptsrvtester msrpc -ts <test>[,<test>...] -tg <host> <options>"]},
             {"usage_example": [
                 "ptsrvtester msrpc -ts ENUMEPM -tg 192.168.1.1",
@@ -165,6 +169,7 @@ class MSRPCArgs(BaseArgs):
                 "ptsrvtester msrpc -ts BRUTESMB -tg 192.168.1.1 -u auditor -p",
                 'ptsrvtester msrpc -ts BRUTESMB -tg 192.168.1.1 -u auditor -p ""',
                 "ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.1 -u auditor -p secret",
+                "ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.1",
                 "ptsrvtester msrpc -ts SAMRUSERS -tg 192.168.1.1 -u auditor -p secret",
                 "ptsrvtester msrpc -ts SAMRGROUPS -tg 192.168.1.1 -u auditor -p secret",
                 "ptsrvtester msrpc -ts SAMRUSERINFO -tg 192.168.1.1 -u auditor -p secret --samr-user alice",
@@ -236,6 +241,14 @@ class MSRPCArgs(BaseArgs):
             if mode == "direct_required":
                 help_data.append({"requires": ["One -u/--user and -p/--password; credential wordlists are not accepted."]})
                 usage_args = " -u auditor -p secret"
+            elif mode == "direct_optional":
+                help_data.append({"authentication": [
+                    "Always check anonymous access first, using a separate connection without the supplied credentials.",
+                    "Without -u/-p, or with both values empty, run only the anonymous check.",
+                    "With one -u/--user and -p/--password, then run authenticated inventory in a separate connection; an empty password is valid for a named account.",
+                    "Only proven anonymous disclosure creates a PTV finding; authenticated inventory alone does not create a disclosure finding.",
+                    "Credential wordlists are not accepted.",
+                ]})
             options = set(selected_options.get(code, ()))
             if mode == "product_required":
                 options.update(brute_options)
@@ -262,7 +275,9 @@ class MSRPCArgs(BaseArgs):
             add_help=True,
             formatter_class=argparse.RawTextHelpFormatter,
             epilog=(
-                "Authenticated and credential tests marked explicit-only are never selected by ALL.\n"
+                "SAMR and credential tests marked explicit-only are never selected by ALL.\n"
+                "SAMR tests first check anonymous access; optional -u/-p credentials add authenticated inventory.\n"
+                "Only anonymous disclosure creates a PTV finding. Both credential values empty mean anonymous-only for SAMR selections.\n"
                 "An explicit target port is valid for one transport family at a time."
             ),
         )
@@ -331,6 +346,18 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
             "run each transport family separately",
         )
 
+    if (
+        set(selected) <= _SAMR_TESTS
+        and getattr(args, "usernames", None) == [""]
+        and getattr(args, "username", None) == ""
+        and getattr(args, "password", None) == ""
+        and not getattr(args, "username_file", None)
+        and not getattr(args, "password_file", None)
+    ):
+        args.username = None
+        args.usernames = None
+        args.password = None
+
     brute = tests_with_credential_mode(selected, "product_required")
     if brute:
         if not (
@@ -349,21 +376,28 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
                 None, f"{', '.join(sorted(brute))} requires -p/--password or -P/--passwords"
             )
 
-    direct = tests_with_credential_mode(selected, "direct_required")
+    required_direct = tests_with_credential_mode(selected, "direct_required")
+    direct = required_direct | tests_with_credential_mode(selected, "direct_optional")
     if direct:
         direct_names = ", ".join(sorted(direct))
-        if not getattr(args, "username", None) or not args.username.strip():
-            raise argparse.ArgumentError(
-                None, f"{direct_names} requires one direct -u/--user value"
-            )
-        if getattr(args, "password", None) is None:
-            raise argparse.ArgumentError(
-                None, f"{direct_names} requires one direct -p/--password value"
-            )
         if getattr(args, "username_file", None) or getattr(args, "password_file", None):
             raise argparse.ArgumentError(
                 None, f"{direct_names} does not accept credential wordlists; run it separately"
             )
+        has_credentials = (
+            getattr(args, "username", None) is not None
+            or bool(getattr(args, "usernames", None))
+            or getattr(args, "password", None) is not None
+        )
+        if required_direct or has_credentials:
+            if not getattr(args, "username", None) or not args.username.strip():
+                raise argparse.ArgumentError(
+                    None, f"{direct_names} requires one direct -u/--user value"
+                )
+            if getattr(args, "password", None) is None:
+                raise argparse.ArgumentError(
+                    None, f"{direct_names} requires one direct -p/--password value"
+                )
     if "BRUTEPIPE" in selected and not getattr(args, "pipe", None):
         raise argparse.ArgumentError(None, "BRUTEPIPE requires --pipe")
     if (getattr(args, "samr_user", None) or getattr(args, "samr_domain", None)) and "SAMRUSERINFO" not in selected:

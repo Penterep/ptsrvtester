@@ -36,7 +36,7 @@ ptsrvtester ntp -h"""
             raise TypeError
         
         parser.add_argument(
-            "target",
+            "-tg", "--target",
             type=valid_target_ntp,
             help="""IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 123 is default""",
         )

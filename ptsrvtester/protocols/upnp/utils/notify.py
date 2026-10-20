@@ -11,6 +11,7 @@ import math
 import re
 import socket
 import time
+from collections.abc import Callable
 from urllib.parse import urlsplit
 
 from .multicast import MULTICAST_ADDRESS, MULTICAST_PORT
@@ -182,10 +183,13 @@ def listen_ssdp_notify(
     duration_seconds: float,
     max_notifications: int = 100,
     max_datagrams: int = MAX_NOTIFY_DATAGRAMS,
+    *,
+    on_notification: Callable[[dict, int], None] | None = None,
 ) -> dict:
     """Receive SSDP multicast NOTIFY on one interface for one selected target.
 
     Socket setup errors propagate to the caller; no active SSDP or HTTP request is sent.
+    ``on_notification`` observes selected-target records during reception.
     """
     target_ip = _unicast_ipv4(target_ip, "target_ip")
     interface_ip = _unicast_ipv4(interface_ip, "interface_ip")
@@ -229,6 +233,8 @@ def listen_ssdp_notify(
             if source[0] != target_ip:
                 continue
             notifications.append(parse_ssdp_notify(packet, source))
+            if on_notification is not None:
+                on_notification(notifications[-1], len(notifications))
 
     truncated = len(notifications) >= max_notifications or received >= max_datagrams
     if truncated or any(not item["valid"] for item in notifications):

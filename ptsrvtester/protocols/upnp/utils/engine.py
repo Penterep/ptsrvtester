@@ -27,6 +27,7 @@ from .ipv6_ssdp import discover_ipv6_packets
 from .multicast import MULTICAST_ADDRESS, MULTICAST_PORT, build_multicast_msearch
 from .notify import listen_ssdp_notify
 from .notify_ipv6 import listen_ssdp_notify_ipv6
+from .output import ModuleContext
 from .scpd import parse_service_description
 
 MAX_DATAGRAM_BYTES = 8192
@@ -371,9 +372,35 @@ class UpnpEngine:
         self.soap_budget_exhausted = False
         self._unavailable_http_endpoints: dict[tuple, str] = {}
         self._failed_http_operations: dict[tuple, str] = {}
+        self._ctx = None
+
+    def bind_ctx(self, ctx) -> None:
+        self._ctx = ctx
+
+    def _debug_enabled(self) -> bool:
+        return (
+            bool(getattr(self.args, "debug", False))
+            and (self._ctx is not None or bool(getattr(self.args, "json", False)))
+        )
+
+    def _debug(self, message: str) -> None:
+        if self._debug_enabled():
+            ctx = self._ctx
+            if ctx is None:
+                ctx = ModuleContext(
+                    args=self.args, ptjsonlib=self.ptjsonlib,
+                    target=(self.target_ip, self.port),
+                )
+            ctx.debug(message)
+
+    def _notify_received(self, notification: dict, count: int) -> None:
+        state = "valid" if notification["valid"] else "invalid"
+        self._debug(f"SSDP NOTIFY received: {count} from selected target ({state})")
 
     def _error(self, test: str, error: Exception | str, **details) -> None:
         self.module_errors.append({"test": test, "error": str(error)[:300], **details})
+        # Exceptions may contain private URL paths, subscription IDs or XML.
+        self._debug(f"{test}: operation failed ({type(error).__name__})")
 
     def discover(self) -> list[dict]:
         if self.discovery_status != "not_run":
@@ -396,6 +423,11 @@ class UpnpEngine:
         timeout = float(self.args.timeout_seconds)
         if multicast:
             timeout = max(timeout, float(self.args.mx))
+        self._debug(
+            f"SSDP M-SEARCH: sending {'multicast' if multicast else 'unicast'} request "
+            f"for {self.target_ip}:{self.port}; response window {timeout:g}s, "
+            f"limit {max_responses}"
+        )
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.bind((interface_ip, 0))
@@ -406,6 +438,7 @@ class UpnpEngine:
                     )
                     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, self.args.ttl)
                 sock.sendto(payload, destination)
+                self._debug("SSDP M-SEARCH sent; waiting for responses")
                 deadline = time.monotonic() + timeout
                 while len(self.discoveries) < max_responses and received < receive_limit:
                     remaining = deadline - time.monotonic()
@@ -434,6 +467,11 @@ class UpnpEngine:
                     if key not in seen:
                         seen.add(key)
                         self.discoveries.append(response)
+                        state = "valid" if response["valid"] else "invalid"
+                        self._debug(
+                            f"SSDP response {len(self.discoveries)}/{max_responses} "
+                            f"({state})"
+                        )
                 self.discovery_truncated = (
                     len(self.discoveries) >= max_responses or received >= receive_limit
                 )
@@ -447,6 +485,7 @@ class UpnpEngine:
             self.discovery_status = "complete"
         else:
             self.discovery_status = "no_response"
+        self._debug(f"SSDP response window finished: {self.discovery_status}")
         return self.discoveries
 
     def _discover_ipv6(self) -> list[dict]:
@@ -454,6 +493,16 @@ class UpnpEngine:
         timeout = float(self.args.timeout_seconds)
         if multicast:
             timeout = max(timeout, float(self.args.mx))
+        self._debug(
+            f"IPv6 SSDP M-SEARCH: sending {'multicast' if multicast else 'unicast'} "
+            f"request; response window {timeout:g}s, limit {self.args.max_responses}"
+        )
+        debug_options = {
+            "on_response": lambda count: self._debug(
+                f"IPv6 SSDP response {count}/{self.args.max_responses} "
+                "received from selected target"
+            )
+        } if self._debug_enabled() else {}
         try:
             result = discover_ipv6_packets(
                 self.ipv6_target,
@@ -465,6 +514,7 @@ class UpnpEngine:
                 interface_ip=self.args.interface_ip,
                 mx=int(self.args.mx),
                 ttl=int(self.args.ttl),
+                **debug_options,
             )
         except (OSError, ValueError) as exc:
             self._error("DISCOVER", exc)
@@ -493,12 +543,20 @@ class UpnpEngine:
             self.discovery_status = "complete"
         else:
             self.discovery_status = "no_response"
+        self._debug(f"IPv6 SSDP response window finished: {self.discovery_status}")
         return self.discoveries
 
     def notify(self) -> list[dict]:
         """Observe SSDP advertisements from the selected host for a fixed time."""
         if self.notify_status != "not_run":
             return self.notifications
+        self._debug(
+            f"SSDP NOTIFY: listening for selected-target advertisements for "
+            f"{self.args.notify_seconds:g}s; limit {self.args.max_notifications}"
+        )
+        debug_options = {
+            "on_notification": self._notify_received,
+        } if self._debug_enabled() else {}
         try:
             if self.family == 6:
                 result = listen_ssdp_notify_ipv6(
@@ -507,6 +565,7 @@ class UpnpEngine:
                     int(self.args._upnp_interface_index),
                     float(self.args.notify_seconds),
                     int(self.args.max_notifications),
+                    **debug_options,
                 )
             else:
                 result = listen_ssdp_notify(
@@ -514,6 +573,7 @@ class UpnpEngine:
                     self.args.interface_ip,
                     float(self.args.notify_seconds),
                     int(self.args.max_notifications),
+                    **debug_options,
                 )
         except (OSError, ValueError) as exc:
             self._error("NOTIFY", exc)
@@ -523,6 +583,7 @@ class UpnpEngine:
         self.notify_status = result["status"]
         self.notify_truncated = result["truncated"]
         self.notify_received_datagrams = result["receivedDatagrams"]
+        self._debug(f"SSDP NOTIFY observation finished: {self.notify_status}")
         return self.notifications
 
     def _description_url(self, location: str):
@@ -599,17 +660,25 @@ class UpnpEngine:
             scheme, host, port, source_ip,
         )
         if endpoint in self._unavailable_http_endpoints:
+            self._debug(f"HTTP {method}: cached unavailable endpoint; connection skipped")
             raise ConnectionError(
                 f"HTTP endpoint {authority} is unavailable: "
                 f"{self._unavailable_http_endpoints[endpoint]}; further connections skipped"
             )
         operation = (endpoint, method, path)
         if operation in self._failed_http_operations:
+            self._debug(f"HTTP {method}: earlier request failure; retry skipped")
             raise ConnectionError(
                 f"HTTP {method} {url} failed before a response: "
                 f"{self._failed_http_operations[operation]}; further requests skipped"
             )
         timeout = float(self.args.timeout_seconds)
+        # Advertised paths, queries and HTTP headers may contain private values.
+        peer = f"[{self.target_ip}]" if self.family == 6 else self.target_ip
+        self._debug(
+            f"HTTP {method}: connecting to selected target {peer}:{port} "
+            f"over {scheme.upper()} (timeout {timeout:g}s)"
+        )
         source_address = (source_ip, 0) if source_ip else None
         if self.family == 6:
             ipv6_source = (
@@ -670,6 +739,7 @@ class UpnpEngine:
                 # this URL/method. Other paths and methods remain independent.
                 self._failed_http_operations[operation] = str(exc)[:300]
                 raise
+            self._debug(f"HTTP {method}: received status {response.status}; reading bounded response")
             encoding = (response.getheader("Content-Encoding") or "identity").lower()
             if encoding != "identity":
                 raise ValueError(f"unsupported Content-Encoding: {encoding}")
@@ -688,6 +758,7 @@ class UpnpEngine:
                 raise TimeoutError("HTTP request exceeded total timeout")
             if len(response_body) > max_bytes:
                 raise ResponseSizeExceeded(len(response_body))
+            self._debug(f"HTTP {method}: response complete ({len(response_body)} bytes)")
             if include_headers:
                 response_headers = response.getheaders()
                 if (
@@ -744,6 +815,10 @@ class UpnpEngine:
                 continue
             try:
                 fetched += 1
+                self._debug(
+                    f"Device description {fetched}/{min(len(locations), MAX_DESCRIPTION_FETCHES)}: "
+                    "requesting XML"
+                )
                 xml_bytes = self._fetch_description(location)
                 if self.description_bytes > MAX_TOTAL_DESCRIPTION_BYTES:
                     item["status"] = "skipped"
@@ -759,9 +834,11 @@ class UpnpEngine:
                     usn.split("::", 1)[0].lower() in known_udns
                     for usn in item["advertisedUsns"]
                 )
+                self._debug(f"Device description {fetched}: XML parsed; identity match {item['identityMatch']}")
             except OutOfScopeLocation as exc:
                 item["status"] = "skipped"
                 item["error"] = str(exc)
+                self._debug(f"Device description {fetched}: skipped by target-scope validation")
             except (OSError, ValueError, http.client.HTTPException) as exc:
                 item["error"] = str(exc)[:300]
                 self._error("DESCRIBE", exc, location=location)
@@ -912,6 +989,7 @@ class UpnpEngine:
                 break
 
             eligible += 1
+            self._debug(f"GENA service {eligible}/{MAX_EVENT_SERVICES}: starting callback listener")
             listener_options = {
                 "max_events": max_events - self.event_count,
                 "max_total_bytes": MAX_TOTAL_EVENT_BYTES - self.event_bytes,
@@ -928,6 +1006,7 @@ class UpnpEngine:
             sid: str | None = None
             try:
                 server.start()
+                self._debug("GENA callback listener ready; sending SUBSCRIBE")
                 status, _body, response_headers = self._request_target(
                     url, "SUBSCRIBE",
                     headers={
@@ -962,7 +1041,10 @@ class UpnpEngine:
                         else min(requested_seconds, float(timeout.split("-", 1)[1]))
                     )
                     result["observationSeconds"] = granted_seconds
+                    self._debug(f"GENA subscription accepted; observing events for {granted_seconds:g}s")
                     server.wait(granted_seconds)
+                    if self._debug_enabled():
+                        self._debug(f"GENA observation finished: {len(server.events)} events received")
                     if granted_seconds < requested_seconds:
                         result["status"] = "partial"
                         result["note"] = "subscription_timeout_shorter_than_observation"
@@ -979,6 +1061,7 @@ class UpnpEngine:
                 # A device may send its first event before SUBSCRIBE returns.
                 if sid is not None:
                     try:
+                        self._debug("GENA cleanup: sending UNSUBSCRIBE")
                         unsubscribe_status, _body = self._request_target(
                             url, "UNSUBSCRIBE", headers={"SID": sid},
                             max_bytes=4096, source_ip=self.args.interface_ip,
@@ -996,6 +1079,7 @@ class UpnpEngine:
                         ) else result["status"]
                         self._error("EVENTS", exc, eventSubUrl=url)
                 server.stop()
+                self._debug("GENA callback listener stopped")
                 result["events"] = server.events
                 result["receivedBytes"] = server.received_bytes
                 result["truncated"] = server.truncated
@@ -1048,6 +1132,9 @@ class UpnpEngine:
                 break
             try:
                 self.scpd_fetches += 1
+                self._debug(
+                    f"Service description {self.scpd_fetches}/{max_fetches}: requesting SCPD XML"
+                )
                 try:
                     status, body = self._request_target(
                         url, "GET",
@@ -1075,6 +1162,7 @@ class UpnpEngine:
                 else:
                     result["description"] = parse_service_description(body)
                     result["status"] = "described"
+                    self._debug(f"Service description {self.scpd_fetches}: SCPD XML parsed")
             except (OSError, ValueError, http.client.HTTPException) as exc:
                 result["status"] = "error"
                 result["error"] = str(exc)[:300]
@@ -1103,6 +1191,7 @@ class UpnpEngine:
             self.soap_budget_exhausted = True
             raise SoapBudgetExceeded("SOAP response byte budget reached")
         payload = build_soap_request(service_type, action, arguments)
+        self._debug(f"SOAP {action[:80]!r}: sending read-only action")
         try:
             status, response = self._request_target(
                 control_url,
@@ -1121,6 +1210,7 @@ class UpnpEngine:
                 self.soap_budget_exhausted = True
             raise
         self.soap_bytes += len(response)
+        self._debug(f"SOAP {action[:80]!r}: received HTTP {status} ({len(response)} bytes)")
         if self.soap_bytes > MAX_TOTAL_SOAP_BYTES:
             self.soap_budget_exhausted = True
             raise SoapBudgetExceeded("SOAP response byte budget reached")
@@ -1274,6 +1364,9 @@ class UpnpEngine:
             index = 0
             while remaining:
                 try:
+                    self._debug(
+                        f"Port mappings: querying index {index}; remaining entry budget {remaining}"
+                    )
                     values = self._soap_request(
                         service["serviceType"], control_url,
                         "GetGenericPortMappingEntry",

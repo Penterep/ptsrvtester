@@ -111,7 +111,8 @@ DHCP_TESTS: dict[str, dict] = {
             ["-l", "--lease", "", "Lease time to set in DHCP options"],
             ["-rn", "--renewal-time", "", "Renewal time to set in DHCP options"],
             ["-rb", "--rebinding-time", "", "Rebinding time to set in DHCP options"],
-            ["-sip", "--server-ip", "", "DHCP server IP to spoof the ACK packet from"]
+            ["-sip", "--server-ip", "", "DHCP server IP to spoof the ACK packet from"],
+            ["-giaddr", "--gateway-ip-address", "", "IP address of the gateway"]
         ],
         "usage": [
             "-i eth0 -ip 172.16.14.54 -cmac 99:88:77:66:55:44",

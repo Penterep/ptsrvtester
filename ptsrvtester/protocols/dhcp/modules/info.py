@@ -25,6 +25,12 @@ __MODULECODE__ = "info"
 __ORDER__ = 100
 
 
+def _debug_packet(ctx, direction: str, packet) -> None:
+    ctx.debug(f"{direction} DHCP packet:", indent=12)
+    for line in packet.show(dump=True).splitlines():
+        ctx.debug(line, indent=16)
+
+
 def _check_broadcast(res: PacketList) -> str:
     if res is None or len(res) == 0:
         return ""
@@ -70,6 +76,7 @@ def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
     try:
         def is_offer_packet(packet):
             if packet.haslayer(DHCP) and packet.haslayer(UDP) and packet[UDP].sport == 67:
+                _debug_packet(ctx, "Received", packet)
                 print_dhcp_options(ctx, packet[DHCP].options, 8)
                 return True
 
@@ -86,8 +93,9 @@ def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
         sniffer.start()
         time.sleep(0.05)
 
-        sendp(prepare_discover_packet_unicast(src_mac, gw_mac, if_ip, server_ip, xid), iface=ctx.interface,
-              verbose=False)
+        discover = prepare_discover_packet_unicast(src_mac, gw_mac, if_ip, server_ip, xid)
+        _debug_packet(ctx, "Sent", discover)
+        sendp(discover, iface=ctx.interface, verbose=False)
 
         sniffer.join()
         res = sniffer.results
@@ -108,6 +116,7 @@ def _get_server_info(ctx, src_mac: str, broadcast=False):
     try:
         def is_offer_packet(packet):
             if packet.haslayer(DHCP):
+                _debug_packet(ctx, "Received", packet)
                 offered_ip = packet[BOOTP].yiaddr if packet.haslayer(BOOTP) else None
                 options = packet[DHCP].options
                 delivery_method = _is_packet_broadcast(packet)
@@ -136,7 +145,9 @@ def _get_server_info(ctx, src_mac: str, broadcast=False):
         sniffer.start()
         time.sleep(0.05)
 
-        sendp(prepare_discover_packet(src_mac, transaction_id, broadcast=broadcast), ctx.interface, verbose=False)
+        discover = prepare_discover_packet(src_mac, transaction_id, broadcast=broadcast)
+        _debug_packet(ctx, "Sent", discover)
+        sendp(discover, ctx.interface, verbose=False)
 
         sniffer.join()
         res = sniffer.results

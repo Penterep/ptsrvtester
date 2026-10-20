@@ -15,7 +15,8 @@ from ptsrvtester.protocols.dhcp.utils.registry import (
     prepare_nack_packet,
     prepare_ack_packet,
     DHCPTypes,
-    get_interface_ip
+    get_interface_ip,
+    debug_packet
 )
 
 from ptlibs.ptprinthelper import ptprint
@@ -53,13 +54,16 @@ def _spoof_dhcp(ctx):
         xid = packet[BOOTP].xid
         dst_mac = packet[Ether].src
 
+        nack_packet = prepare_nack_packet(
+                        src_mac=src_mac,
+                        dst_mac=dst_mac,
+                        server_ip=get_interface_ip(ctx.interface),
+                        transaction_id=xid
+        )
+        debug_packet(ctx, "Sent", nack_packet)
+        
         sendp(
-            prepare_nack_packet(
-                src_mac=src_mac,
-                dst_mac=dst_mac,
-                server_ip=get_interface_ip(ctx.interface),
-                transaction_id=xid
-            ),
+            nack_packet,
             iface=ctx.interface,
             verbose=False
         )
@@ -69,19 +73,22 @@ def _spoof_dhcp(ctx):
         xid = packet[BOOTP].xid
         dst_mac = packet[Ether].src
 
+        ack_pkt = prepare_ack_packet(
+                        src_mac,
+                        dst_mac,
+                        xid,
+                        ctx.client_ip,
+                        ctx.netmask,
+                        ctx.giaddr,
+                        ctx.server_ip,
+                        ctx.lease,
+                        ctx.renewal_time,
+                        ctx.rebinding_time
+        )
+        debug_packet(ctx, "Sent", ack_pkt)
+        
         sendp(
-            prepare_ack_packet(
-                src_mac,
-                dst_mac,
-                xid,
-                ctx.client_ip,
-                ctx.netmask,
-                ctx.giaddr,
-                ctx.server_ip,
-                ctx.lease,
-                ctx.renewal_time,
-                ctx.rebinding_time
-            ),
+            ack_pkt,
             iface=ctx.interace,
             verbose=False
         )
@@ -92,19 +99,22 @@ def _spoof_dhcp(ctx):
         dst_mac = packet[Ether].src
         _offered_clients[dst_mac] = (ctx.client_ip, time.time() + OFFER_TTL)
 
+        offer_pkt = prepare_offer_packet(
+                        src_mac=src_mac,
+                        dst_mac=dst_mac,
+                        transaction_id=xid,
+                        offered_ip=ctx.client_ip,
+                        netmask=ctx.netmask,
+                        gateway=ctx.giaddr,
+                        lease=ctx.lease,
+                        renew=ctx.renewal_time,
+                        rebind=ctx.rebinding_time,
+                        server_ip=get_interface_ip(ctx.interface)
+        )
+        debug_packet(ctx, "Sent", offer_pkt)
+        
         sendp(
-            prepare_offer_packet(
-                src_mac=src_mac,
-                dst_mac=dst_mac,
-                transaction_id=xid,
-                offered_ip=ctx.client_ip,
-                netmask=ctx.netmask,
-                gateway=ctx.giaddr,
-                lease=ctx.lease,
-                renew=ctx.renewal_time,
-                rebind=ctx.rebinding_time,
-                server_ip=get_interface_ip(ctx.interface)
-            ),
+            offer_pkt,
             iface=ctx.interface,
             verbose=False
         )
@@ -113,6 +123,7 @@ def _spoof_dhcp(ctx):
     try:
         def handle_packet(packet):
             if packet.haslayer(DHCP):
+                debug_packet(ctx, "Received", packet)
                 stats.captured_packets += 1
                 if _is_packet_type(packet, DHCPTypes.DISCOVER):
                     ptprint(f"Received a DHCP DISCOVER packet from {packet[Ether].src}", "INFO", indent=8)

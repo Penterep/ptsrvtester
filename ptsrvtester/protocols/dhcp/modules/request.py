@@ -8,7 +8,8 @@ from ptsrvtester.protocols.dhcp.utils.registry import (
     sendp,
     DHCP,
     print_dhcp_options,
-    DHCPTypes
+    DHCPTypes,
+    debug_packet
 )
 
 from scapy.sendrecv import AsyncSniffer
@@ -27,6 +28,7 @@ def _request(ctx):
         def is_ack_packet(packet):
             if packet.haslayer(DHCP):
                 for opt in packet[DHCP].options:
+                    debug_packet(ctx, "Received", packet)
                     if isinstance(opt, tuple) and opt[0] == "message-type":
                         msg_type = opt[1]
 
@@ -60,8 +62,10 @@ def _request(ctx):
 
         sniffer.start()
         time.sleep(0.05)
-
-        sendp(prepare_request_packet(src_mac, transaction_id, ctx.requested_ip), iface=ctx.interface,
+        
+        req_pkt = prepare_request_packet(src_mac, transaction_id, ctx.requested_ip)
+        debug_packet(ctx, "Sent", req_pkt)
+        sendp(req_pkt, iface=ctx.interface,
               verbose=False)
 
         sniffer.join()

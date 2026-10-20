@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import uuid as stdlib_uuid
 
@@ -18,7 +19,39 @@ from .registry import (
 )
 
 _INTERFACE_VERSION = re.compile(r"^[0-9]+\.[0-9]+$")
+_GUESS_TESTS = frozenset({"NTLMGUESS", "CHGUESS"})
 _SAMR_TESTS = frozenset({"SAMRPOLICY", "SAMRUSERS", "SAMRGROUPS", "SAMRUSERINFO"})
+_EPM_INTERFACE = "e1af8308-5d1f-11c9-91a4-08002b14a0fa:3.0"
+
+
+def _bounded_guess_attempts(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("guess attempts must be an integer") from exc
+    if not 1 <= parsed <= 100:
+        raise argparse.ArgumentTypeError("guess attempts must be between 1 and 100")
+    return parsed
+
+
+def _bounded_guess_delay(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("guess delay must be a number") from exc
+    if not math.isfinite(parsed) or not 0 <= parsed <= 60:
+        raise argparse.ArgumentTypeError("guess delay must be between 0 and 60 seconds")
+    return parsed
+
+
+def _bounded_guess_window(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("guess window must be a number") from exc
+    if not math.isfinite(parsed) or not 1 <= parsed <= 600:
+        raise argparse.ArgumentTypeError("guess window must be between 1 and 600 seconds")
+    return parsed
 
 
 def _bounded_threads(value: str) -> int:
@@ -97,6 +130,14 @@ def _pipe_names(value: str) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def _credential_identity(username: str, domain: str | None) -> tuple[str, str]:
+    if "\\" in username:
+        domain, username = username.split("\\", 1)
+    elif "@" in username:
+        username, domain = username.rsplit("@", 1)
+    return (domain or "").strip().casefold(), username.strip().casefold()
+
+
 def normalize_interface_uuid(value: str) -> str:
     """Validate ``UUID[:major.minor]`` and return its canonical spelling."""
     raw = value.strip()
@@ -145,6 +186,13 @@ class MSRPCArgs(BaseArgs):
     samr_domain: str | None
     timeout_seconds: float
     module_threads: int
+    guess_attempts: int
+    guess_delay: float
+    guess_window: float
+    expect_lockout_after: int | None
+    observer_user: str | None
+    observer_password: str | None
+    observer_domain: str | None
     debug: bool
     json: bool
 
@@ -175,6 +223,8 @@ class MSRPCArgs(BaseArgs):
                 "ptsrvtester msrpc -ts SAMRUSERINFO -tg 192.168.1.1 -u auditor -p secret --samr-user alice",
                 "ptsrvtester msrpc -ts BRUTEPIPE -tg 192.168.1.1 --pipe svcctl -U users.txt -P passwords.txt",
                 "ptsrvtester msrpc -ts BRUTETCP -tg 192.168.1.1:49154 --uuid 12345778-1234-abcd-ef00-0123456789ac:1.0 -u auditor -p secret",
+                "ptsrvtester msrpc -ts NTLMGUESS -tg 192.168.1.1 -u test-account -p secret --guess-attempts 5",
+                "ptsrvtester msrpc -ts CHGUESS -tg proxy.example.test -u test-account -p secret --guess-attempts 5",
             ]},
             {"options": [
                 ["-ts", "--tests", "<test>", "One or more tests, comma-separated; ALL/default runs the safe suite"],
@@ -184,13 +234,20 @@ class MSRPCArgs(BaseArgs):
                 ["", "--pipe", "<name>", "BRUTEPIPE: pipe to open after SMB login; no RPC bind/call"],
                 ["", "--pipes", "<names>", "ENUMPIPES: names to try opening; not a complete pipe inventory"],
                 ["-d", "--domain", "<domain>", "Authentication domain"],
-                ["", "--uuid", "<uuid[:ver]>", "BRUTETCP: supported EPM/MGMT/SAMR/LSAD interface UUID and version"],
-                ["-u", "--user", "<name> ...", "Username(s); one for SAMR/ENUMPIPES"],
+                ["", "--uuid", "<uuid[:ver]>", "BRUTETCP/NTLMGUESS: supported EPM/MGMT/SAMR/LSAD interface; NTLMGUESS defaults to EPM 3.0"],
+                ["-u", "--user", "<name> ...", "Username(s); one for SAMR/ENUMPIPES/guessing-protection tests"],
                 ["-U", "--users", "<wordlist>", "Username wordlist"],
                 ["-p", "--password", "[<password>]", "Password; omit the value for an empty password"],
                 ["-P", "--passwords", "<wordlist>", "Password wordlist"],
                 ["", "--threads", "<1-100>", "Credential-test concurrency across accounts (default 10; one active attempt per account)"],
                 ["", "--max-attempts", "<1-100000>", "Maximum credential product per test (default 1000); confirmed lockout stops further attempts for that account"],
+                ["", "--guess-attempts", "<1-100>", "NTLMGUESS/CHGUESS: maximum generated invalid-password attempts (default 5; serial)"],
+                ["", "--guess-delay", "<0-60>", "NTLMGUESS/CHGUESS: seconds between invalid attempts (default 0.2)"],
+                ["", "--guess-window", "<1-600>", "NTLMGUESS/CHGUESS: maximum invalid-attempt burst duration in seconds (default 60)"],
+                ["", "--expect-lockout-after", "<1-100>", "Expected lockout by this many invalid attempts, persisting through the post-burst control; limits the burst budget"],
+                ["", "--observer-user", "<name>", "NTLMGUESS only: independent SMB/SAMR account observing the tested account's lockout state and failed-logon counter"],
+                ["", "--observer-password", "[<password>]", "Observer account password; omit the value for an empty password"],
+                ["", "--observer-domain", "<domain>", "Observer authentication domain (defaults to --domain)"],
                 ["", "--samr-max-users", "<1-10000>", "SAMRUSERS/SAMRUSERINFO: global user limit (default 1000)"],
                 ["", "--samr-max-groups", "<1-10000>", "SAMRGROUPS: global group/alias limit (default 1000)"],
                 ["", "--samr-max-members", "<1-10000>", "SAMRGROUPS: returned members per group (default 1000; server response is not paginated)"],
@@ -225,6 +282,11 @@ class MSRPCArgs(BaseArgs):
             "SAMRUSERINFO": {"--user", "--password", "--domain", "--samr-max-users", "--samr-user", "--samr-domain"},
         }
         brute_options = {"--user", "--users", "--password", "--passwords", "--domain", "--threads", "--max-attempts"}
+        guess_options = {
+            "--user", "--password", "--domain", "--guess-attempts", "--guess-delay",
+            "--guess-window", "--expect-lockout-after", "--observer-user",
+            "--observer-password", "--observer-domain",
+        }
         help_data = []
         for code in selected:
             if code == "ALL":
@@ -261,12 +323,39 @@ class MSRPCArgs(BaseArgs):
             if code == "BRUTETCP":
                 options.add("--uuid")
                 usage_args += " --uuid 12345778-1234-abcd-ef00-0123456789ac:1.0"
-                help_data.append({"requires": ["--uuid for a supported EPM/MGMT/SAMR/LSAD interface; success requires a confirmed read-only RPC call."]})
+                help_data.append({"requires": ["An explicit endpoint port in -tg HOST:PORT and --uuid for a supported EPM/MGMT/SAMR/LSAD interface; success requires a confirmed read-only RPC call."]})
             if code == "BRUTEHTTP":
                 help_data.append({"requires": ["An HTTPS RPC Proxy with an EPM backend; success requires a confirmed read-only RPC call."]})
+            if code in _GUESS_TESTS:
+                options.update(guess_options)
+                help_data.append({"method": [
+                    "Use one known-valid account and password to confirm a signed read-only RPC baseline, then send a bounded serial burst of generated invalid passwords.",
+                    "This test can lock the account. No successful logon for that account is interleaved with the invalid-password burst.",
+                    "A successful control is checked after the burst. Generic authentication errors, RPC faults and timeouts do not prove account lockout.",
+                    "Without --expect-lockout-after, a finite burst only reports observations; it does not create a missing-protection vulnerability.",
+                    "With --expect-lockout-after N, the invalid-attempt budget is limited to N. The requirement is that account lockout persists through the single post-burst valid-credential control.",
+                    "A vulnerability requires evidence that this specific account-lockout criterion was not met; no universal threshold is assumed.",
+                    "This account-lockout criterion does not establish absence of other throttling or guessing protections.",
+                    "Passwords are not printed.",
+                ]})
+            if code == "NTLMGUESS":
+                options.add("--uuid")
+                help_data.append({"requires": [
+                    "Defaults to EPM 3.0 on TCP port 135. A different explicit endpoint port requires --uuid for a supported read-only confirmation call.",
+                    "An independent --observer-user/--observer-password account can read SAMR evidence from the target host through SMB on port 445.",
+                    "Specify --domain or a domain-qualified tested username to match observer evidence to the actual SAM domain.",
+                ]})
+            if code == "CHGUESS":
+                options.difference_update({"--observer-user", "--observer-password", "--observer-domain"})
+                help_data.append({"requires": [
+                    "A working HTTP/HTTPS RPC Proxy on port 80/443 and an EPM backend; HTTP reachability or an opened tunnel alone does not establish a valid baseline.",
+                    "One logical attempt may authenticate HTTP channels and the RPC backend; it is not an exact count of Windows failed logons.",
+                    "Observer options are not supported: the RPC Proxy host's SMB accounts cannot be assumed to belong to the RPC backend.",
+                ]})
             options.update({"--target", "--timeout-seconds", "--output", "--json", "--verbose", "--help"})
             help_data.append({"test_options": [row for row in common_options if row[1] in options]})
-            help_data.append({"usage": [f"ptsrvtester msrpc -ts {code} -tg <host>{usage_args}"]})
+            target = "<host>:<port>" if code == "BRUTETCP" else "<host>"
+            help_data.append({"usage": [f"ptsrvtester msrpc -ts {code} -tg {target}{usage_args}"]})
         return help_data
 
     def add_subparser(self, name, subparsers):
@@ -307,6 +396,13 @@ class MSRPCArgs(BaseArgs):
 
         parser.add_argument("--threads", type=_bounded_threads, default=10)
         parser.add_argument("--max-attempts", type=_bounded_attempts, default=1000)
+        parser.add_argument("--guess-attempts", type=_bounded_guess_attempts, default=5)
+        parser.add_argument("--guess-delay", type=_bounded_guess_delay, default=0.2)
+        parser.add_argument("--guess-window", type=_bounded_guess_window, default=60.0)
+        parser.add_argument("--expect-lockout-after", type=_bounded_guess_attempts, default=None)
+        parser.add_argument("--observer-user", type=_samr_name, default=None)
+        parser.add_argument("--observer-password", nargs="?", const="", default=None)
+        parser.add_argument("--observer-domain", type=_samr_name, default=None)
         parser.add_argument(
             "--samr-max-users",
             type=_bounded_samr_users,
@@ -400,6 +496,43 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
                 )
     if "BRUTEPIPE" in selected and not getattr(args, "pipe", None):
         raise argparse.ArgumentError(None, "BRUTEPIPE requires --pipe")
+    guessing = _GUESS_TESTS.intersection(selected)
+    expectation = getattr(args, "expect_lockout_after", None)
+    observer_user = getattr(args, "observer_user", None)
+    observer_password = getattr(args, "observer_password", None)
+    observer_domain = getattr(args, "observer_domain", None)
+    if not guessing and (
+        expectation is not None or observer_user is not None
+        or observer_password is not None or observer_domain is not None
+    ):
+        raise argparse.ArgumentError(
+            None, "--expect-lockout-after and observer options require NTLMGUESS or CHGUESS"
+        )
+    if guessing:
+        if expectation is not None and expectation > getattr(args, "guess_attempts", 5):
+            raise argparse.ArgumentError(
+                None, "--expect-lockout-after cannot exceed --guess-attempts"
+            )
+        if (observer_user is None) != (observer_password is None):
+            raise argparse.ArgumentError(
+                None, "--observer-user and --observer-password must be provided together"
+            )
+        if observer_domain is not None and observer_user is None:
+            raise argparse.ArgumentError(None, "--observer-domain requires --observer-user")
+        if "CHGUESS" in guessing and observer_user is not None:
+            raise argparse.ArgumentError(
+                None, "Observer options are only supported by NTLMGUESS; the CHGUESS proxy host is not a verified RPC backend"
+            )
+        if observer_user is not None:
+            tested_identity = _credential_identity(args.username, getattr(args, "domain", ""))
+            observer_identity = _credential_identity(
+                observer_user,
+                observer_domain if observer_domain is not None else getattr(args, "domain", ""),
+            )
+            if observer_identity[1] == tested_identity[1]:
+                raise argparse.ArgumentError(
+                    None, "--observer-user must be a different account from the tested user"
+                )
     if (getattr(args, "samr_user", None) or getattr(args, "samr_domain", None)) and "SAMRUSERINFO" not in selected:
         raise argparse.ArgumentError(None, "--samr-user and --samr-domain require SAMRUSERINFO")
     if "BRUTETCP" in selected:
@@ -420,9 +553,27 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
                 "BRUTETCP endpoint port cannot also be used by "
                 f"{', '.join(other_rpc_tests)}; run BRUTETCP separately",
             )
+    if "NTLMGUESS" in selected:
+        if getattr(target, "port", 0) not in (0, 135) and not getattr(args, "uuid", None):
+            raise argparse.ArgumentError(
+                None, "NTLMGUESS requires --uuid when an endpoint other than TCP 135 is selected"
+            )
+        other_rpc_tests = [
+            code for code in selected
+            if code != "NTLMGUESS" and MSRPC_TESTS[code]["family"] == "rpc"
+        ]
+        if other_rpc_tests and (
+            getattr(target, "port", 0) not in (0, 135)
+            or (getattr(args, "uuid", None) or _EPM_INTERFACE).lower() != _EPM_INTERFACE
+        ):
+            raise argparse.ArgumentError(
+                None, "Run a custom NTLMGUESS endpoint separately from other RPC tests"
+            )
+    rpc_probe_tests = set(selected).intersection({"BRUTETCP", "NTLMGUESS"})
+    if rpc_probe_tests:
         from impacket import uuid
         from .rpc_auth import SUPPORTED_RPC_PROBES
-        normalized = normalize_interface_uuid(args.uuid)
+        normalized = normalize_interface_uuid(getattr(args, "uuid", None) or _EPM_INTERFACE)
         interface_uuid, version = normalized.rsplit(":", 1)
         if uuid.uuidtup_to_bin((interface_uuid, version)) not in SUPPORTED_RPC_PROBES:
             supported = ", ".join(
@@ -430,11 +581,12 @@ def validate_msrpc_selection(args: MSRPCArgs) -> list[str]:
                 for interface, ver in (uuid.bin_to_uuidtup(value) for value in SUPPORTED_RPC_PROBES)
             )
             raise argparse.ArgumentError(
-                None, f"BRUTETCP has no read-only confirmation call for {normalized}. Supported: {supported}",
+                None, f"{', '.join(sorted(rpc_probe_tests))} has no read-only confirmation call for {normalized}. Supported: {supported}",
             )
-    if "BRUTEHTTP" in selected and getattr(target, "port", 0) not in (0, 80, 443):
+    http_probe_tests = set(selected).intersection({"BRUTEHTTP", "CHGUESS"})
+    if http_probe_tests and getattr(target, "port", 0) not in (0, 80, 443):
         raise argparse.ArgumentError(
-            None, "BRUTEHTTP RPC Proxy transport supports only HTTP port 80 or HTTPS port 443"
+            None, f"{', '.join(sorted(http_probe_tests))} RPC Proxy transport supports only HTTP port 80 or HTTPS port 443"
         )
     if (
         "ENUMPIPES" in selected

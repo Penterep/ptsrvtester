@@ -10,7 +10,11 @@ from impacket.dcerpc.v5.rpch import RPCProxyClientException
 
 
 def is_http_auth_rejection(exc: Exception) -> bool:
-    return bool(re.search(r"HTTP/\d(?:\.\d)?\s+401\b", str(exc), re.IGNORECASE))
+    # Impacket prefixes the received status line with its operation label.
+    # A later status-like string in the reason phrase must not override it.
+    first_line = str(exc).splitlines()[0] if str(exc) else ""
+    status = re.search(r"\bHTTP/\d(?:\.\d)?[ \t]+([0-9]{3})\b", first_line, re.IGNORECASE)
+    return status is not None and status.group(1) == "401"
 
 
 class _ProxyReadBudget:

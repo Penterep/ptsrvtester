@@ -59,7 +59,8 @@ from .shares import enumerate_shares
 from .credential_attempts import iter_credential_attempts
 from .registry import MSRPC_TESTS, expand_msrpc_selection
 from .rpc_auth import (
-    VerifiedDCERPC, SUPPORTED_RPC_PROBES, UnsupportedRpcProbe, confirm_rpc_access,
+    VerifiedDCERPC, SUPPORTED_RPC_PROBES, UnsupportedRpcProbe, RpcAuthenticationUnconfirmed,
+    confirm_rpc_access,
 )
 from .rpc_proxy import ObservedRPCProxyTransport, is_http_auth_rejection
 
@@ -82,6 +83,8 @@ class VULNS(Enum):
     WeakCreds_SMB = "PTV-SVC-MSRPC-WEAKSMBCREDS"
     WeakCreds_TCP = "PTV-SVC-MSRPC-WEAKRPCCREDS"
     WeakCreds_HTTP = "PTV-SVC-MSRPC-WEAKHTTPCREDS"
+    NtlmGuess = "PTV-SVC-MSRPC-NTLMGUESS"
+    ChannelGuess = "PTV-SVC-MSRPC-CHGUESS"
 
     RpcInterfaces = "PTV-SVC-MSRPC-INTER"
     ManagementInterfaces = "PTV-SVC-MSRPC-MNG"
@@ -127,6 +130,8 @@ class MSRPCResult:
     SMB_Brute: list[Credential] | None = None
     TCP_Brute: list[Credential] | None = None
     HTTP_Brute: list[Credential] | None = None
+    NtlmGuess: dict | None = None
+    ChannelGuess: dict | None = None
     credential_checks: dict[str, list[dict]] = field(default_factory=dict)
     module_errors: dict[str, str] = field(default_factory=dict)
 
@@ -1798,7 +1803,14 @@ class MsrpcEngine(_PrintMixin):
         except Exception as exc:
             # Access denied can mean method authorization rather than a wrong
             # password. Only explicit logon rejection statuses classify as such.
-            rejected = self._samr_error_code(exc) in _AUTH_REJECTION_STATUSES
+            status = self._samr_error_code(exc)
+            rejected = status in _AUTH_REJECTION_STATUSES
+            if status is not None:
+                evidence["statusCode"] = status
+                evidence["authenticationStatusVerified"] = (
+                    stage == "rpcCall" and isinstance(exc, DCERPCException)
+                    and not isinstance(exc, RpcAuthenticationUnconfirmed)
+                )
             evidence[stage] = "denied" if rejected else "unconfirmed"
             evidence["reason"] = "authentication_denied" if rejected else ("unsupported_interface" if isinstance(exc, UnsupportedRpcProbe) else "rpc_access_unconfirmed")
             return _AttemptResult(credential, rejected=rejected, error=None if rejected else exc, evidence=evidence,
@@ -1874,11 +1886,19 @@ class MsrpcEngine(_PrintMixin):
             return _AttemptResult(credential, accepted=True, evidence=evidence)
         except Exception as exc:
             proxy_rejected = isinstance(exc, RPCProxyClientException) and is_http_auth_rejection(exc)
-            rejected = proxy_rejected or self._samr_error_code(exc) in _AUTH_REJECTION_STATUSES
+            status = self._samr_error_code(exc)
+            verified_status = (
+                stage == "rpcCall" and isinstance(exc, DCERPCException)
+                and not isinstance(exc, (RPCProxyClientException, RpcAuthenticationUnconfirmed))
+            )
+            rejected = proxy_rejected or (verified_status and status in _AUTH_REJECTION_STATUSES)
+            if status is not None:
+                evidence["statusCode"] = status
+                evidence["authenticationStatusVerified"] = verified_status
             evidence[stage] = "denied" if rejected else "unconfirmed"
             evidence["reason"] = "proxy_authentication_denied" if proxy_rejected else ("authentication_denied" if rejected else "proxy_or_backend_access_unconfirmed")
             return _AttemptResult(credential, rejected=rejected, error=None if rejected else exc, evidence=evidence,
-                                  stop_account=self._samr_error_code(exc) == STATUS_ACCOUNT_LOCKED_OUT)
+                                  stop_account=verified_status and status == STATUS_ACCOUNT_LOCKED_OUT)
         finally:
             if rpc_transport is not None:
                 evidence["proxyChannels"] = dict(rpc_transport.channel_status)
@@ -1891,6 +1911,175 @@ class MsrpcEngine(_PrintMixin):
         )
         return self._run_credential_attempts("BRUTEHTTP", self._http_attempt)
 
+    def ntlm_guess_protection(self) -> dict:
+        return self._guess_protection("NTLMGUESS")
+
+    def channel_guess_protection(self) -> dict:
+        return self._guess_protection("CHGUESS")
+
+    def _guess_protection(self, code: str) -> dict:
+        from .guess_protection import run_guess_protection
+        from .guess_observer import normalize_guess_identity, observe_guess_account
+
+        if code not in {"NTLMGUESS", "CHGUESS"}:
+            raise ValueError("Unknown guessing-protection test")
+        username = getattr(self.args, "username", None)
+        password = getattr(self.args, "password", None)
+        if not username or password is None:
+            raise argparse.ArgumentError(None, f"{code} requires one known-valid -u/-p combination")
+        identity = normalize_guess_identity(username, getattr(self.args, "domain", "") or "")
+        if identity is None:
+            raise argparse.ArgumentError(None, f"{code} requires a valid NTLM account name")
+        account, domain = identity
+        interface = getattr(self.args, "uuid", None) or "e1af8308-5d1f-11c9-91a4-08002b14a0fa:3.0"
+        count = int(getattr(self.args, "guess_attempts", 5))
+        expectation = getattr(self.args, "expect_lockout_after", None)
+        planned = min(count, expectation) if expectation is not None else count
+        progress = CredentialProgress(code, planned, enabled=not self.use_json)
+        context = getattr(self, "_ctx", None)
+
+        def report_progress(event):
+            stage = event.get("stage")
+            if stage == "attempt":
+                completed = int(event.get("completed", 0))
+                status = str(event.get("outcome", "testing"))
+                progress.update(completed, username=username, status=status)
+                if context is not None:
+                    percent = completed * 100 // planned
+                    context.log(
+                        f"{code} Progress: {completed}/{planned} ({percent}%) | "
+                        f"User: {username!r} - {status}", indent=4,
+                    )
+            elif stage in {"baseline", "control"}:
+                progress.finish()
+                self.ptdebug(
+                    f"{code}: {stage} authentication {event.get('outcome', 'running')}; "
+                    "requiring a signed read-only RPC response"
+                )
+
+        def attempt(candidate_password):
+            credential = Credential(account, candidate_password)
+            if code == "NTLMGUESS":
+                response = self._tcp_attempt(self.args.ip, self.rpc_port, credential, interface, domain)
+            else:
+                # The HTTP adapter takes its domain from args.
+                from copy import copy
+                adapter = copy(self)
+                adapter.args = copy(self.args)
+                adapter.args.domain = domain
+                response = adapter._http_attempt(credential)
+            evidence = response.evidence or {}
+            proxy_rejection = evidence.get("reason") == "proxy_authentication_denied"
+            verified_status = evidence.get("authenticationStatusVerified") is True
+            if ((response.stop_account and not verified_status)
+                    or (response.rejected and not response.stop_account
+                        and not proxy_rejection
+                        and (not verified_status or evidence.get("statusCode") not in {
+                            STATUS_LOGON_FAILURE, STATUS_WRONG_PASSWORD, STATUS_WRONG_PASSWORD_CORE,
+                        }))):
+                # Disabled/expired/nonexistent accounts do not establish counted
+                # bad-password logons, even though the credential tests reject them.
+                return _AttemptResult(credential, evidence=evidence)
+            return response
+
+        observer = None
+        if getattr(self.args, "observer_user", None):
+            if code == "CHGUESS":
+                raise argparse.ArgumentError(None, "CHGUESS cannot verify that a SAMR observer targets its RPC backend")
+            observer = lambda: observe_guess_account(self, Credential(username, password))
+        self.ptprint(
+            f"Testing at most {count} incorrect-password attempts for {username!r}; "
+            "the known-valid password is used only before and after the burst",
+        )
+        self.ptdebug(
+            f"{code}: burst window {getattr(self.args, 'guess_window', 60):g} s; "
+            f"delay {getattr(self.args, 'guess_delay', 0.2):g} s; "
+            "unsigned RPC faults and timeouts do not prove authentication rejection or lockout"
+        )
+        try:
+            result = run_guess_protection(
+                username=username, password=password, attempts=count,
+                delay_seconds=float(getattr(self.args, "guess_delay", 0.2)),
+                window_seconds=float(getattr(self.args, "guess_window", 60)),
+                expect_lockout_after=expectation,
+                attempt=attempt, observe=observer, progress=report_progress,
+            )
+        finally:
+            progress.finish()
+        result["test"] = code
+        result["transport"] = "rpc_tcp" if code == "NTLMGUESS" else "rpc_proxy"
+        result["endpoint"] = f"{self.args.ip}:{self.rpc_port if code == 'NTLMGUESS' else self.http_port}"
+        result["domain"] = domain
+        if code == "NTLMGUESS":
+            result["interface"] = interface
+        outcome = result.get("outcome")
+        if outcome == "protection_observed":
+            self.ptprint("Account lockout was observed; further incorrect-password attempts stopped", Out.NOTVULN)
+        elif outcome == "criterion_not_met":
+            self.ptprint(
+                f"The configured account-lockout requirement was not met "
+                f"({result.get('expectedLockoutAfter')} rejected attempts)", Out.VULN,
+            )
+        elif outcome == "no_blocking_observed":
+            self.ptprint("No account lockout was observed within the tested range; no vulnerability inferred", Out.TITLE)
+        else:
+            self.ptprint("Guessing protection could not be determined", Out.TITLE)
+        self.ptprint(
+            f"Completed: {result.get('completedAttempts', 0)}/{planned}; "
+            f"confirmed rejections: {result.get('confirmedRejections', 0)}; "
+            f"ambiguous: {result.get('ambiguousAttempts', 0)}; "
+            f"elapsed: {result.get('elapsedSeconds', 0):.2f} s",
+        )
+        self.ptprint(f"Reason: {result.get('reason', 'unknown')}")
+        return result
+
+    @staticmethod
+    def _guess_finding(code: str, result: dict | None) -> dict | None:
+        if not isinstance(result, dict) or result.get("outcome") != "criterion_not_met":
+            return None
+        expected = result.get("expectedLockoutAfter")
+        if (
+            type(expected) is not int or expected < 1
+            or result.get("confirmedRejectionsWithinWindow", 0) < expected
+            or result.get("ambiguousAttempts", 0) != 0
+            or result.get("confirmedRejections") != result.get("completedAttempts")
+            or result.get("baseline", {}).get("evidence", {}).get("rpcCall") != "confirmed"
+            or result.get("control", {}).get("evidence", {}).get("rpcCall") != "confirmed"
+            or not result.get("baseline", {}).get("accepted")
+            or not result.get("control", {}).get("accepted")
+        ):
+            return None
+        vulnerability = {"NTLMGUESS": VULNS.NtlmGuess, "CHGUESS": VULNS.ChannelGuess}.get(code)
+        if vulnerability is None:
+            return None
+        endpoint = result.get("endpoint", "unknown")
+        rejected = result["confirmedRejections"]
+        window = result.get("windowSeconds")
+        response = (
+            f"{rejected} confirmed authentication rejections; configured lockout threshold "
+            f"{expected}; burst window {window} seconds; subsequent valid authentication confirmed"
+        )
+        return {
+            "vuln_code": vulnerability.value,
+            "vuln_request": f"{code}: bounded incorrect-password burst for {result.get('username')!r}",
+            "vuln_response": response,
+            "poc": (
+                f"The tested endpoint {endpoint} confirmed the known-valid credentials "
+                "using a signed read-only RPC response before the test. "
+                f"For account {result.get('username')!r} in domain {result.get('domain')!r}, "
+                f"{rejected} incorrect-password attempts were explicitly rejected within "
+                f"the configured {window}-second burst window. The supplied requirement "
+                f"was account lockout after {expected} rejected attempts. A subsequent "
+                "login with the original valid password again completed the signed RPC "
+                "call, demonstrating that the account was usable at the post-series "
+                "control. The supplied criterion required it to remain locked at this "
+                "control. This finding concerns that configured account-lockout criterion; "
+                "it does not establish the absence of delays, other throttling, or "
+                "short-lived lockouts between probes or protections outside the tested range. "
+                + ("A logical RPC Proxy attempt may include multiple HTTP/backend authentications."
+                   if code == "CHGUESS" else "")
+            ),
+        }
 
     @staticmethod
     def _credentials_to_string(credentials: list[Credential] | None) -> str | None:
@@ -1986,6 +2175,8 @@ class MsrpcEngine(_PrintMixin):
             "smbBrute": self._credentials_to_string(self.results.SMB_Brute),
             "tcpBrute": self._credentials_to_string(self.results.TCP_Brute),
             "httpBrute": self._credentials_to_string(self.results.HTTP_Brute),
+            "ntlmGuess": self.results.NtlmGuess,
+            "channelGuess": self.results.ChannelGuess,
         }
         if self.results.credential_checks:
             properties["credentialChecks"] = self.results.credential_checks
@@ -1999,6 +2190,14 @@ class MsrpcEngine(_PrintMixin):
 
         deferred_vulnerabilities: list[dict[str, str]] = []
         selected = set(expand_msrpc_selection(getattr(self.args, "tests", None)))
+        for code, result in (
+            ("NTLMGUESS", self.results.NtlmGuess),
+            ("CHGUESS", self.results.ChannelGuess),
+        ):
+            if code in selected:
+                finding = self._guess_finding(code, result)
+                if finding is not None:
+                    deferred_vulnerabilities.append(finding)
         if "ANONSMB" in selected and self.results.Anonymous and self.results.Anonymous[0] == "True":
             access = self.results.AnonymousAccess or {}
             ipc = access.get("ipcAccess") or {

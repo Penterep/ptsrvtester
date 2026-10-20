@@ -76,12 +76,26 @@ MSRPC_TESTS: dict[str, dict[str, object]] = {
         "explicit_only": True,
         "credential_mode": "product_required",
     },
+    "NTLMGUESS": {
+        "description": "Measure account-lockout protection using bounded invalid RPC/TCP logons",
+        "family": "rpc",
+        "order": 75,
+        "explicit_only": True,
+        "credential_mode": "direct_required",
+    },
     "BRUTEHTTP": {
         "description": "Test RPC Proxy access and confirm an RPC backend read-only call",
         "family": "http",
         "order": 80,
         "explicit_only": True,
         "credential_mode": "product_required",
+    },
+    "CHGUESS": {
+        "description": "Measure account-lockout protection through an RPC Proxy and backend",
+        "family": "http",
+        "order": 85,
+        "explicit_only": True,
+        "credential_mode": "direct_required",
     },
 }
 

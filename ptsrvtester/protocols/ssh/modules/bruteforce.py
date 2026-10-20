@@ -30,6 +30,10 @@ def run(ctx):
         ctx.out("No credentials to try (empty user/secret list)", "WARNING", indent=4)
         return
 
+    ctx.debug(
+        f"trying {len(creds)} credential(s) against {ip}:{port} "
+        f"with {a.threads} thread(s)"
+    )
     err = StringIO("")
     old_write = sys.stderr.write
     sys.stderr.write = err.write
@@ -37,11 +41,9 @@ def run(ctx):
         found = threaded_bruteforce(creds, lambda c: try_login(ip, port, c), a.threads)
     finally:
         sys.stderr.write = old_write
+    ctx.debug(f"bruteforce finished: {len(found)} valid credential(s) found")
     errors = len(err.getvalue()) > 0
     err.close()
-
-    with ctx.results_lock:
-        ctx.properties["bruteStatus"] = "errors" if errors else "ok"
 
     if errors:
         ctx.out(

@@ -251,11 +251,14 @@ def run(ctx):
     ctx.out("aggressive test — uploads bounded test files (all cleaned up afterwards)",
             "WARNING", indent=4)
 
+    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
+    ctx.debug("login succeeded" if client is not None
+              else "login failed with the supplied secret(s)")
 
     obs = SftpDataObservations()
     if client is None:
@@ -299,15 +302,9 @@ def _render(ctx, r):
         ctx.out(f"SFTPDATA: NOT TESTED — could not authenticate as '{r.account}'", "WARNING", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["sftpdataAccount"] = r.account
-            ctx.properties["sftpdataVerdict"] = "no-auth"
         return
     if not obs.sftp_available:
         ctx.out("SFTP subsystem not available — nothing to upload", "OK", indent=4)
-        with ctx.results_lock:
-            ctx.properties["sftpdataAccount"] = r.account
-            ctx.properties["sftpdataVerdict"] = "no-sftp"
         return
 
     # Antivirus
@@ -349,15 +346,6 @@ def _render(ctx, r):
         ctx.debug(n)
 
     with ctx.results_lock:
-        ctx.properties["sftpdataAccount"] = r.account
-        ctx.properties["sftpdataEicarPersisted"] = obs.eicar_persisted_intact
-        ctx.properties["sftpdataProcessingSuspected"] = r.processing_suspected
-        ctx.properties["sftpdataBaselineSeconds"] = obs.baseline_seconds
-        ctx.properties["sftpdataBombSeconds"] = obs.bomb_seconds
-        ctx.properties["sftpdataSizeLimitHit"] = obs.size_limit_hit
-        ctx.properties["sftpdataCountLimitHit"] = obs.count_limit_hit
-        ctx.properties["sftpdataMbWritten"] = obs.mb_written
-        ctx.properties["sftpdataFilesCreated"] = obs.files_created
         _push_vulns(ctx, r)
 
 

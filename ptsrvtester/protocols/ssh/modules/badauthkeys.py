@@ -15,6 +15,7 @@ def run(ctx):
         return
 
     ip, port = ctx.target
+    ctx.debug(f"trying known-bad private user keys from {path} against {ip}:{port}")
     try:
         keys = check_bad_authkeys(ip, port, path)
     except OSError as e:

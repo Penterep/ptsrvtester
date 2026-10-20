@@ -211,11 +211,14 @@ def run(ctx):
     ctx.out(f"Testing forwarding capabilities for '{account}' on {ip}:{port} "
             f"({len(creds)} secret(s))", "INFO", colortext=True, indent=4)
 
+    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
+    ctx.debug("login succeeded" if client is not None
+              else "login failed with the supplied secret(s)")
 
     if client is None:
         _render(ctx, assess_forwarding(account=account, authenticated=False))
@@ -278,9 +281,6 @@ def _render(ctx, r):
                 "WARNING", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["forwardAccount"] = r.account
-            ctx.properties["forwardVerdict"] = "no-auth"
         return
 
     # TCP forwarding (local / dynamic-SOCKS / remote) + PermitOpen + GatewayPorts
@@ -324,16 +324,6 @@ def _render(ctx, r):
         ctx.out(n, "TEXT", indent=8)
 
     with ctx.results_lock:
-        ctx.properties["forwardAccount"] = r.account
-        ctx.properties["forwardLocal"] = r.local.value
-        ctx.properties["forwardRemote"] = r.remote.value
-        ctx.properties["forwardDynamicSocks"] = r.dynamic.value
-        ctx.properties["forwardGateway"] = r.gateway.value
-        ctx.properties["forwardPermitOpenRestricted"] = r.permitopen_restricted
-        ctx.properties["forwardAgent"] = r.agent.value
-        ctx.properties["forwardX11"] = r.x11.value
-        ctx.properties["forwardPty"] = r.pty.value
-
         _push_vulns(ctx, r)
 
 

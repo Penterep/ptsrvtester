@@ -9,20 +9,18 @@ __ORDER__ = 30
 
 def run(ctx):
     ip, port = ctx.target
+    ctx.debug(f"querying the authentication methods offered by {ip}:{port}")
     try:
         methods = get_auth_methods(ip, port)
     except Exception as e:
         ctx.out(f"Failed to query authentication methods from {ip}:{port}: {e}", "VULN", indent=4)
-        with ctx.results_lock:
-            ctx.properties["authMethodsError"] = str(e)
         return
 
     if not methods:
         ctx.out("Server did not report authentication methods", "NOTVULN", indent=4)
         return
 
-    with ctx.results_lock:
-        ctx.properties["authMethods"] = methods
+    ctx.debug(f"server offers: {', '.join(methods)}")
 
     has_kb_interactive = False
     for method in methods:

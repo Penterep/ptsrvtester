@@ -18,21 +18,19 @@ __ORDER__ = 45
 
 def run(ctx):
     ip, port = ctx.target
+    ctx.debug(f"reading the server KEXINIT from {ip}:{port} (pre-auth)")
     try:
         kexinit = read_kexinit(ip, port)
     except Exception as e:
         ctx.out(f"Could not read KEXINIT from {ip}:{port}: {e}", "WARNING", indent=4)
-        with ctx.results_lock:
-            ctx.properties["terrapinStatus"] = str(e)
         return
 
+    ctx.debug("evaluating Terrapin exposure from the offered cipher modes and strict-kex")
     r = assess_terrapin(kexinit)
     if not r.readable:
         ctx.out("Terrapin: could not evaluate (no SSH-2 KEXINIT)", "WARNING", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["terrapinStatus"] = "unreadable"
         return
 
     ctx.out(f"strict kex (kex-strict-s-v00@openssh.com): "
@@ -53,11 +51,8 @@ def run(ctx):
     for n in r.notes:
         ctx.out(n, "TEXT", indent=8)
 
-    with ctx.results_lock:
-        ctx.properties["terrapinVulnerable"] = bool(r.vulnerable)
-        ctx.properties["terrapinStrictKex"] = bool(r.strict_kex)
-        ctx.properties["terrapinModes"] = r.vulnerable_modes
-        if r.is_finding:
+    if r.is_finding:
+        with ctx.results_lock:
             ctx.deferred_vulns.append({
                 "vuln_code": VULNS.Terrapin.value,
                 "vuln_request": "read server KEXINIT (kex/enc/mac name-lists)",

@@ -71,6 +71,7 @@ def run(ctx):
         "WARNING", indent=4,
     )
 
+    ctx.debug(f"launching ssh-audit --dheat against {ip}:{port} for ~{duration:.0f}s")
     show_progress = not ctx.json and sys.stdout.isatty()
     stop_event = threading.Event()
     spinner = None
@@ -84,10 +85,9 @@ def run(ctx):
             stop_event.set()
             spinner.join()
 
+    ctx.debug("DHEat attack finished; parsing the verdict and statistics")
     if not result.ok:
         ctx.out(f"DHEat test did not run: {result.error}", "WARNING", indent=4)
-        with ctx.results_lock:
-            ctx.properties["dheatStatus"] = result.error or "error"
         return
 
     if result.vulnerable is True:
@@ -100,13 +100,8 @@ def run(ctx):
     for line in result.stats:
         ctx.out(line, "TEXT", indent=8)
 
-    with ctx.results_lock:
-        ctx.properties["dheatStatus"] = (
-            "vulnerable" if result.vulnerable is True
-            else "safe" if result.vulnerable is False
-            else "inconclusive"
-        )
-        if result.vulnerable is True:
+    if result.vulnerable is True:
+        with ctx.results_lock:
             ctx.deferred_vulns.append({
                 "vuln_code": VULNS.DHEat.value,
                 "vuln_request": f"ssh-audit --dheat against {ip}:{port}",

@@ -168,6 +168,10 @@ def run(ctx):
             "TEXT", indent=4,
         )
 
+    ctx.debug(
+        f"lockout probe on {ip}:{port} as '{user}': {attempts} failed attempt(s), "
+        f"cooldown {cooldown:.0f}s, account-lockout {'enabled' if valid_password else 'skipped'}"
+    )
     # Heads-up if the server does not offer password auth (failed passwords may
     # not register the way the test assumes).
     try:
@@ -212,8 +216,6 @@ def _render(ctx, r, user):
         ctx.out("Lockout test inconclusive", "WARNING", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["lockoutStatus"] = "inconclusive"
         return
 
     ctx.debug(f"attempts made: {r.attempts_made}; outcomes: "
@@ -255,18 +257,8 @@ def _render(ctx, r, user):
     for n in r.notes:
         ctx.out(n, "TEXT", indent=8)
 
-    # --- JSON node properties + vulns (absence of protection is the finding) ---
+    # --- JSON vulns (absence of protection is the finding) ---
     with ctx.results_lock:
-        ctx.properties["lockoutStatus"] = "tested"
-        ctx.properties["lockoutAttempts"] = r.attempts_made
-        if r.account_tested:
-            ctx.properties["accountLockout"] = bool(r.account_lockout_detected)
-        ctx.properties["ipBlocking"] = (
-            None if r.ip_block_detected is None else bool(r.ip_block_detected)
-        )
-        if r.ip_block_after is not None:
-            ctx.properties["ipBlockAfterAttempts"] = r.ip_block_after
-
         if r.account_tested and r.account_lockout_detected is False:
             ctx.deferred_vulns.append({
                 "vuln_code": VULNS.NoAccountLockout.value,

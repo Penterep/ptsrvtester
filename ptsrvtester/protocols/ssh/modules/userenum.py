@@ -192,6 +192,10 @@ def run(ctx):
         "TEXT", indent=4,
     )
 
+    ctx.debug(
+        f"calibrating the timing oracle on '{valid_user}' vs {baseline_n} random "
+        f"names, {samples} samples each (sigma {sigma})"
+    )
     # Password auth is the measured path; warn early if the server does not offer it.
     try:
         methods = ssh_helpers.get_auth_methods(ip, port)
@@ -244,8 +248,6 @@ def _render(ctx, result, valid_user, candidates):
                 "WARNING", indent=4)
         for n in cal.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["userEnumStatus"] = "inconclusive"
         return
 
     gap_ms = abs(cal.gap) * 1000
@@ -264,9 +266,6 @@ def _render(ctx, result, valid_user, candidates):
         )
         for n in cal.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["userEnumStatus"] = "not-possible"
-            ctx.properties["userEnumTimingGapMs"] = round(gap_ms, 1)
         return
 
     slower = "slower" if cal.direction > 0 else "faster"
@@ -279,10 +278,6 @@ def _render(ctx, result, valid_user, candidates):
         ctx.out(n, "TEXT", indent=8)
 
     with ctx.results_lock:
-        ctx.properties["userEnumStatus"] = "possible"
-        ctx.properties["userEnumValidUser"] = valid_user
-        ctx.properties["userEnumTimingGapMs"] = round(gap_ms, 1)
-        ctx.properties["userEnumSigma"] = round(cal.observed_sigma, 1)
         ctx.deferred_vulns.append({
             "vuln_code": VULNS.UserEnum.value,
             "vuln_request": f"known-valid login: {valid_user}\n"
@@ -314,10 +309,8 @@ def _render(ctx, result, valid_user, candidates):
         ctx.out(f"{len(unmeasured)} name(s) could not be measured: {', '.join(unmeasured[:10])}"
                 + (" …" if len(unmeasured) > 10 else ""), "TEXT", indent=8)
 
-    with ctx.results_lock:
-        ctx.properties["userEnumFound"] = list(result.found)
-        ctx.properties["userEnumCandidates"] = len(candidates)
-        if result.found:
+    if result.found:
+        with ctx.results_lock:
             ctx.deferred_vulns.append({
                 "vuln_code": VULNS.UserEnum.value,
                 "vuln_request": f"candidate list: {len(candidates)} names (-U)",

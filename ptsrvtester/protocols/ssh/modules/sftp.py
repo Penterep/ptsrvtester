@@ -267,11 +267,14 @@ def run(ctx):
     ctx.out(f"Testing SFTP confinement for '{account}' on {ip}:{port} "
             f"({len(creds)} secret(s))", "INFO", colortext=True, indent=4)
 
+    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
+    ctx.debug("login succeeded" if client is not None
+              else "login failed with the supplied secret(s)")
 
     obs = SftpObservations()
     if client is None:
@@ -319,9 +322,6 @@ def _render(ctx, r):
         ctx.out(f"SFTP: NOT TESTED — could not authenticate as '{r.account}'", "WARNING", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["sftpAccount"] = r.account
-            ctx.properties["sftpVerdict"] = "no-auth"
         return
 
     # A. availability
@@ -337,10 +337,6 @@ def _render(ctx, r):
     if not obs.sftp_available:
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["sftpAccount"] = r.account
-            ctx.properties["sftpAvailable"] = False
-            ctx.properties["sftpVerdict"] = "no-sftp"
         return
 
     # B. confinement
@@ -391,15 +387,6 @@ def _render(ctx, r):
         ctx.debug(n)
 
     with ctx.results_lock:
-        ctx.properties["sftpAccount"] = r.account
-        ctx.properties["sftpAvailable"] = True
-        ctx.properties["sftpConfined"] = obs.confined
-        ctx.properties["sftpHome"] = obs.home
-        ctx.properties["sftpSystemReadable"] = obs.system_readable
-        ctx.properties["sftpSystemWritable"] = obs.system_writable
-        ctx.properties["sftpSymlinkEscape"] = obs.symlink_escape
-        ctx.properties["sftpExtraCapabilities"] = caps
-        ctx.properties["sftpAdsWritable"] = obs.ads_supported
         _push_vulns(ctx, r)
 
 

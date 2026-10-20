@@ -138,11 +138,14 @@ def run(ctx):
     ctx.out(f"Enumerating privileges for '{account}' on {ip}:{port} "
             f"({len(creds)} secret(s))", "INFO", colortext=True, indent=4)
 
+    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
+    ctx.debug("login succeeded" if client is not None
+              else "login failed with the supplied secret(s)")
 
     have_password = bool(getattr(a, "password", None) or getattr(a, "passwords", None))
 
@@ -191,9 +194,6 @@ def _render(ctx, r):
                 "WARNING", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["privAccount"] = r.account
-            ctx.properties["privVerdict"] = "no-auth"
         return
 
     who = r.username or r.account
@@ -205,9 +205,6 @@ def _render(ctx, r):
                 "(nologin / SFTP-only / forced command)", "OK", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["privAccount"] = r.account
-            ctx.properties["privVerdict"] = "restricted"
         return
 
     _render_groups(ctx, r)
@@ -219,17 +216,6 @@ def _render(ctx, r):
         ctx.debug(n)
 
     with ctx.results_lock:
-        ctx.properties["privAccount"] = r.account
-        ctx.properties["privUsername"] = r.username
-        ctx.properties["privUid"] = r.uid
-        ctx.properties["privGroups"] = r.groups
-        ctx.properties["privPrivilegedGroups"] = r.privileged_groups + r.root_equivalent_groups
-        ctx.properties["privWritableSensitive"] = [p.path for p in r.writable_sensitive]
-        ctx.properties["privReadableSensitive"] = [p.path for p in r.readable_sensitive]
-        ctx.properties["privWritablePathDirs"] = r.writable_path_dirs
-        ctx.properties["privAdminCommands"] = r.admin_commands
-        ctx.properties["privSudoState"] = r.sudo_state.value
-
         _push_group_vuln(ctx, r)
         _push_files_vuln(ctx, r)
         _push_sudo_vuln(ctx, r)

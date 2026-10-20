@@ -136,6 +136,7 @@ def _spoof_dhcp(ctx):
 
                     ptprint(f"Received a DHCP REQUEST from {packet[Ether].src}", "INFO", indent=8)
                     _send_ack(packet)
+                    ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-NET-MISCONF-RGDHCP4")
                     del _offered_clients[mac]
 
 

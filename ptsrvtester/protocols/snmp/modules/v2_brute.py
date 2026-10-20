@@ -46,6 +46,7 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
 
     if valid_communities:
         #self.ptprint("\n")
+        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-BRUTE")
         ctx.out(f"Valid communities:", "INFO", indent=4)
         for community in valid_communities:
             ctx.out(community, "VULN", indent=8)

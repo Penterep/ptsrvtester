@@ -68,7 +68,9 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
         
         for varBind in varBinds:
             res += ' = '.join([x.prettyPrint() for x in varBind])
-            
+        
+        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-OLDVER", poc=res)
+        
         ctx.debug(f"Sent: {obj_type}", indent=8)
         ctx.debug(f"Received: {res}", indent=8)
 
@@ -108,7 +110,7 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
         ctx.debug(f"SNMPv2c detection success", indent=4)
         for varBind in varBinds:
             res += ' = '.join([x.prettyPrint() for x in varBind])
-            
+        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-OLDVER", poc=res)
         ctx.debug(f"Sent: {obj_type}", indent=8)
         ctx.debug(f"Received: {res}", indent=8)
 

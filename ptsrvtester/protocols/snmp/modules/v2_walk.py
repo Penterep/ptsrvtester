@@ -97,6 +97,7 @@ async def _getBulk_SNMPv2(ctx) -> str:
             # Stop the loop if results are found
             if results:
                 node = ctx.ptjsonlib.create_node_object("snmpv2_walk_results", properties=oids)
+                ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-WALK", properites=oids)
                 ctx.ptjsonlib.add_node(node)
                 ctx.out(f"Results found with community '{community}', stopping further attempts.", "VULN",
                         indent=8)

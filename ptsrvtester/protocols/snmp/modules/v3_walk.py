@@ -136,7 +136,7 @@ async def getBulk_SNMPv3(ctx) -> list:
     if results:
         node = ctx.ptjsonlib.create_node_object("snmpv3_walk_results", properties=oids)
         ctx.ptjsonlib.add_node(node)
-        ctx.ptjsonlib.add_vulnerability("PTV-SNMP-V3-WALK")
+        ctx.ptjsonlib.add_vulnerability("PTV-SNMP-V3-WALK", poc=oids)
 
     return results
 

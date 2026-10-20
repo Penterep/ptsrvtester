@@ -97,9 +97,28 @@ class ModuleContext:
         ptprint(string, category, cond, colortext=colortext, indent=indent)
 
     def debug(self, string="", *, indent=4):
-        """Buffer a verbose-only line (``-vv``); suppressed in JSON mode."""
+        """Verbose breadcrumb: record it in the JSON log AND print it under ``-vv``.
+
+        Modules call this with a short note of what they are doing right now. The
+        note always lands in ``results.log`` (so the structured output keeps the
+        run trace regardless of ``-vv`` / ``-j``) and is also printed live, as a
+        grey ``[*]`` line, only with ``-vv`` and not in JSON mode. This is what
+        feeds the ``-vv`` switch.
+        """
+        if string != "":
+            self.log(string)
         if self.verbose and not self.json:
             ptprint(string, "ADDITIONS", True, colortext=True, indent=indent)
+
+    def log(self, message="") -> None:
+        """Append one entry to the JSON ``results.log`` via ptlibs ``add_to_log``.
+
+        Unlike :meth:`out` (which prints to the terminal), this records a line in
+        the structured output regardless of ``-j`` / ``-vv``. Entries are kept in
+        order and separated by ``\\r\\n`` by ptlibs. :meth:`debug` routes through
+        here, so a module's breadcrumbs are always captured in the log.
+        """
+        self.ptjsonlib.add_to_log(str(message))
 
 
 class _DiscoveredModule:

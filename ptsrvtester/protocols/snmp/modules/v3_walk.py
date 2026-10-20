@@ -74,6 +74,14 @@ async def getBulk_SNMPv3(ctx) -> list:
     # self.drawDoubleLine()
     results = None
     oids = {}
+    probe = ObjectType(ObjectIdentity(ctx.oid))
+    ctx.debug(
+        f"SNMPv3 walk using user {ctx.single_username!r} "
+        f"({PROTOCOL_NAMES.get(Protocols.auth_protocols, 'Unknown Protocol')}, "
+        f"{PROTOCOL_NAMES.get(Protocols.priv_protocols, 'Unknown Protocol')})",
+        indent=4,
+    )
+    ctx.debug(f"Sent: walk starting at OID {ctx.oid}", indent=8)
 
     objects = walk_cmd(
         SnmpEngine(),
@@ -81,11 +89,16 @@ async def getBulk_SNMPv3(ctx) -> list:
                     privProtocol=Protocols.priv_protocols),
         await UdpTransportTarget.create((ctx.ip, ctx.port)),
         ContextData(),
-        ObjectType(ObjectIdentity(ctx.oid))
+        probe
     )
 
     # Iterate over the returned OID-value pairs
     async for errorIndication, errorStatus, errorIndex, varBinds in objects:
+        received = errorIndication or (
+            f"{errorStatus.prettyPrint()} at {errorIndex}" if errorStatus else
+            ", ".join(" = ".join(part.prettyPrint() for part in varBind) for varBind in varBinds)
+        )
+        ctx.debug(f"Received: {received}", indent=8)
         if errorIndication:
             ctx.out(f"Error: {errorIndication}", "ERROR",  indent=4)
             break

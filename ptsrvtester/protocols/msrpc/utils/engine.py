@@ -55,7 +55,7 @@ from .samr_session import (
 from .epm_inventory import EpmEnumerationLimit, MAX_EPM_ENTRIES, iter_epm_entries
 from .shares import enumerate_shares
 from .credential_attempts import iter_credential_attempts
-from .registry import MSRPC_TESTS
+from .registry import MSRPC_TESTS, expand_msrpc_selection
 from .rpc_auth import (
     VerifiedDCERPC, SUPPORTED_RPC_PROBES, UnsupportedRpcProbe, confirm_rpc_access,
 )
@@ -116,6 +116,7 @@ class MSRPCResult:
     PipesCreds: list[Credential] | None = None
     Anonymous: list[str] | None = None
     AnonymousAccess: dict | None = None
+    AnonymousSharesAccess: dict | None = None
     SamrPolicy: dict | None = None
     SamrUsers: dict | None = None
     SamrGroups: dict | None = None
@@ -1574,6 +1575,14 @@ class MsrpcEngine(_PrintMixin):
         )
 
     def Anonymous_smb(self) -> list[str]:
+        legacy, _ = self._anonymous_smb_access("ANONSMB", enumerate_share_names=False)
+        return legacy
+
+    def Anonymous_shares(self) -> dict:
+        _, evidence = self._anonymous_smb_access("SHARES", enumerate_share_names=True)
+        return evidence
+
+    def _anonymous_smb_access(self, code: str, *, enumerate_share_names: bool) -> tuple[list[str], dict]:
         smb = None
         logged_in = False
         legacy: list[str] = []
@@ -1583,7 +1592,10 @@ class MsrpcEngine(_PrintMixin):
             "login": "not_tested", "ipcAccess": "not_tested",
             "shareEnumeration": "not_tested", "shares": [],
         }
-        self.results.AnonymousAccess = evidence
+        if enumerate_share_names:
+            self.results.AnonymousSharesAccess = evidence
+        else:
+            self.results.AnonymousAccess = evidence
         try:
             self.ptdebug(f"Opening an anonymous SMB session at {self.args.ip}:{self.smb_port}")
             smb = SMBConnection(
@@ -1600,7 +1612,7 @@ class MsrpcEngine(_PrintMixin):
                 if exc.getErrorCode() in _AUTH_REJECTION_STATUSES | {STATUS_ACCESS_DENIED}:
                     evidence.update(status="denied", reason="authentication_denied", login="denied")
                     self.ptprint("Anonymous SMB login is denied", out=Out.NOTVULN)
-                    return []
+                    return [], evidence
                 raise
 
             guest = bool(smb.isGuestSession())
@@ -1609,7 +1621,7 @@ class MsrpcEngine(_PrintMixin):
                 legacy = ["True", "Unknown"]
             self.ptprint(
                 "Empty SMB credentials mapped to Guest" if guest else "SMB null session accepted",
-                out=Out.INFO if guest else Out.VULN,
+                out=Out.INFO if guest or enumerate_share_names else Out.VULN,
             )
             stage = "ipcAccess"
             self.ptdebug("Connecting the anonymous SMB session to IPC$")
@@ -1622,12 +1634,15 @@ class MsrpcEngine(_PrintMixin):
                 if legacy:
                     legacy[1] = "False"
                 self.ptprint("IPC$ access is denied", out=Out.TITLE)
-                return legacy
+                return legacy, evidence
 
             evidence["ipcAccess"] = "allowed"
             if legacy:
                 legacy[1] = "True"
             self.ptprint("IPC$ access is allowed", out=Out.INFO)
+            if not enumerate_share_names:
+                evidence.update(status="complete", reason=None)
+                return legacy, evidence
             stage = "shareEnumeration"
             inventory = enumerate_shares(smb, debug=self.ptdebug)
             evidence["shares"] = inventory["shares"]
@@ -1639,20 +1654,25 @@ class MsrpcEngine(_PrintMixin):
                 status=inventory["status"] if inventory["status"] in {"complete", "error"} else "partial",
                 reason=inventory["reason"],
             )
+            if inventory["shares"] and inventory["status"] in {"complete", "partial"}:
+                self.ptprint(
+                    f"Anonymous SMB share enumeration returned {len(inventory['shares'])} share name(s)",
+                    out=Out.VULN,
+                )
             for share in inventory["shares"]:
                 self.ptprint(f"Share: {share['name']}")
             if inventory["error"] is not None:
-                self.record_module_error("ANONSMB", self._sanitized_samr_error(inventory["error"]), transport_error=inventory["error"])
+                self.record_module_error(code, self._sanitized_samr_error(inventory["error"]), transport_error=inventory["error"])
             if inventory["reason"]:
                 self.ptprint(f"Share enumeration: {inventory['reason']}", out=Out.TITLE)
-            return legacy
+            return legacy, evidence
         except Exception as exc:
             evidence.update(status="error", reason="operational_error")
             evidence[stage] = "error"
             safe_error = self._sanitized_samr_error(exc)
-            self.record_module_error("ANONSMB", safe_error, transport_error=exc)
+            self.record_module_error(code, safe_error, transport_error=exc)
             self.ptprint(f"SMB anonymous access check failed: {safe_error}", out=Out.TITLE)
-            return legacy
+            return legacy, evidence
         finally:
             if smb is not None and logged_in:
                 self._close_smb(smb)
@@ -1664,7 +1684,6 @@ class MsrpcEngine(_PrintMixin):
                         close()
                     except Exception:
                         pass
-
 
     def _smb_attempt(self, credential: Credential) -> _AttemptResult:
         smb = None
@@ -1886,6 +1905,38 @@ class MsrpcEngine(_PrintMixin):
             "by itself establish the password policy or the absence of guessing protection."
         )
 
+    def _anonymous_share_finding(self) -> dict[str, str] | None:
+        access = self.results.AnonymousSharesAccess or {}
+        if (
+            access.get("login") != "accepted"
+            or access.get("sessionType") not in {"null", "guest"}
+            or access.get("ipcAccess") != "allowed"
+            or access.get("shareEnumeration") not in {"complete", "partial"}
+        ):
+            return None
+        names = [
+            share["name"] for share in access.get("shares", [])
+            if isinstance(share, dict) and isinstance(share.get("name"), str) and share["name"]
+        ]
+        if not names:
+            return None
+        session = access["sessionType"]
+        listing = ", ".join(repr(name) for name in names)
+        return {
+            "vuln_code": VULNS.AnonymousShares.value,
+            "vuln_request": "SRVS NetrShareEnum over an SMB session with empty credentials",
+            "vuln_response": f"Session: {session}; returned share names: {listing}",
+            "poc": (
+                f"An SMB login with an empty username and password at "
+                f"{self.args.ip}:{self.smb_port} established a {session} session, "
+                f"without an authenticated user. IPC$ access succeeded and the SRVS "
+                f"NetrShareEnum call returned {len(names)} share name(s): {listing}. "
+                "This confirms that share names are available to unauthenticated clients. "
+                f"Enumeration status: {access['shareEnumeration']}; the finding covers "
+                "the returned names only, not read or write access to share contents."
+            ),
+        }
+
 
     def output(self) -> None:
         properties = {
@@ -1907,6 +1958,7 @@ class MsrpcEngine(_PrintMixin):
             "samrGroups": self.results.SamrGroups,
             "samrUserInfo": self.results.SamrUserInfo,
             "anonymousAccess": self.results.AnonymousAccess,
+            "anonymousShares": self.results.AnonymousSharesAccess,
             "pipesCreds": self._credentials_to_string(self.results.PipesCreds),
             "smbBrute": self._credentials_to_string(self.results.SMB_Brute),
             "tcpBrute": self._credentials_to_string(self.results.TCP_Brute),
@@ -1921,7 +1973,8 @@ class MsrpcEngine(_PrintMixin):
             ]
 
         deferred_vulnerabilities: list[dict[str, str]] = []
-        if self.results.Anonymous and self.results.Anonymous[0] == "True":
+        selected = set(expand_msrpc_selection(getattr(self.args, "tests", None)))
+        if "ANONSMB" in selected and self.results.Anonymous and self.results.Anonymous[0] == "True":
             access = self.results.AnonymousAccess or {}
             ipc = access.get("ipcAccess") or {
                 "True": "allowed", "False": "denied", "Unknown": "not tested",
@@ -1940,6 +1993,9 @@ class MsrpcEngine(_PrintMixin):
                     ),
                 }
             )
+        share_finding = self._anonymous_share_finding() if "SHARES" in selected else None
+        if share_finding is not None:
+            deferred_vulnerabilities.append(share_finding)
         selected_pipe = getattr(self.args, "pipe", None)
         pipe_description = f"named pipe {selected_pipe!r}" if selected_pipe else "selected named pipe"
         selected_interface = getattr(self.args, "uuid", None)

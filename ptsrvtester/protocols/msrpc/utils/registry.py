@@ -18,9 +18,14 @@ MSRPC_TESTS: dict[str, dict[str, object]] = {
         "order": 30,
     },
     "ANONSMB": {
-        "description": "Check anonymous SMB login and share enumeration",
+        "description": "Check SMB null-session login and IPC$ access",
         "family": "smb",
         "order": 40,
+    },
+    "SHARES": {
+        "description": "Enumerate SMB share names under a null or Guest session",
+        "family": "smb",
+        "order": 41,
     },
     "SAMRPOLICY": {
         "description": "Read SAM password and account-lockout policy",

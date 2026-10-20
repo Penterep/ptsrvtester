@@ -161,6 +161,7 @@ class MSRPCArgs(BaseArgs):
                 "ptsrvtester msrpc -ts ENUMEPM -tg 192.168.1.1",
                 "ptsrvtester msrpc -ts ALL -tg server.example.test",
                 "ptsrvtester msrpc -ts ENUMPIPES -tg 192.168.1.1 -u auditor -p secret",
+                "ptsrvtester msrpc -ts ANONSMB,SHARES -tg 192.168.1.1",
                 "ptsrvtester msrpc -ts BRUTESMB -tg 192.168.1.1 -u auditor -p",
                 'ptsrvtester msrpc -ts BRUTESMB -tg 192.168.1.1 -u auditor -p ""',
                 "ptsrvtester msrpc -ts SAMRPOLICY -tg 192.168.1.1 -u auditor -p secret",

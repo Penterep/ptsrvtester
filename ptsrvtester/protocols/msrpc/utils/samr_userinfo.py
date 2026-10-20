@@ -138,11 +138,14 @@ def _record_error(engine, exc: Exception) -> None:
 def _query_section(engine, dce, domain_handle, rid: int, access: int, fields) -> dict:
     handle = None
     try:
+        section = "account" if access == samr.USER_READ_ACCOUNT else "logon"
+        engine.ptdebug(f"Requesting SAMR {section} information for RID {rid}")
         handle = samr.hSamrOpenUser(dce, domain_handle, desiredAccess=access, userId=rid)["UserHandle"]
         response = samr.hSamrQueryInformationUser(
             dce, handle,
             userInformationClass=samr.USER_INFORMATION_CLASS.UserAllInformation,
         )
+        engine.ptdebug(f"Received SAMR {section} information for RID {rid}")
         result = parse_user_information(response["Buffer"]["All"], fields)
         if any(result[key]["status"] == "error" for key, *_ in fields):
             engine.record_module_error("SAMRUSERINFO", "Malformed SAMR user information field")
@@ -184,7 +187,8 @@ def _enumerate_users(engine, dce, handle, domain: dict, limit: int) -> bool:
     context = 0
     contexts: set[int] = set()
     seen: dict[int, str] = {}
-    for _ in range(MAX_ENUMERATION_PAGES):
+    for page in range(1, MAX_ENUMERATION_PAGES + 1):
+        engine.ptdebug(f"Requesting SAMR user page {page}")
         try:
             response = samr.hSamrEnumerateUsersInDomain(
                 dce, handle, userAccountControl=samr.USER_NORMAL_ACCOUNT,
@@ -198,6 +202,7 @@ def _enumerate_users(engine, dce, handle, domain: dict, limit: int) -> bool:
                 raise
             response = exc.get_packet()
         entries, next_context, more = enumeration_page(response)
+        engine.ptdebug(f"Received SAMR user page {page}: {len(entries)} entries")
         added = 0
         for item in entries:
             name, rid = _entry(item)
@@ -222,6 +227,7 @@ def _enumerate_users(engine, dce, handle, domain: dict, limit: int) -> bool:
 
 
 def _lookup_user(engine, dce, handle, domain: dict, name: str) -> None:
+    engine.ptdebug("Looking up the selected SAMR account")
     try:
         response = samr.hSamrLookupNamesInDomain(dce, handle, [name])
     except samr.DCERPCSessionError as exc:

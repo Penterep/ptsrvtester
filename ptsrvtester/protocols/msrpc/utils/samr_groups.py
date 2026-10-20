@@ -45,6 +45,7 @@ def _require_success(response):
 def _read_members(engine, dce, domain_handle, domain_sid, group, limit):
     handle = None
     try:
+        engine.ptdebug(f"Requesting direct members of SAMR {group['kind']} RID {group['rid']}")
         if group["kind"] == "group":
             opened = samr.hSamrOpenGroup(
                 dce, domain_handle, desiredAccess=samr.GROUP_LIST_MEMBERS,
@@ -81,6 +82,7 @@ def _read_members(engine, dce, domain_handle, domain_sid, group, limit):
         # SAMR GetMembers calls have no pagination or server-side count bound.
         # This cap bounds retained output, not the RPC response's wire size.
         group["membersTruncated"] = count > limit
+        engine.ptdebug(f"Received SAMR member response: {count} members")
         group.update(
             membersStatus="partial" if count > limit else "complete",
             membersReason="member_limit_reached" if count > limit else None,
@@ -107,7 +109,8 @@ def _enumerate_kind(engine, dce, handle, domain, kind, remaining, member_limit):
     seen_rids = set()
     start = len(domain["groups"])
     try:
-        for _ in range(MAX_ENUMERATION_PAGES):
+        for page in range(1, MAX_ENUMERATION_PAGES + 1):
+            engine.ptdebug(f"Requesting SAMR {kind} page {page}")
             try:
                 response = enumerate_rpc(
                     dce, handle, enumerationContext=context,
@@ -120,6 +123,7 @@ def _enumerate_kind(engine, dce, handle, domain, kind, remaining, member_limit):
                     raise
                 response = exc.get_packet()
             entries, next_context, more = enumeration_page(response)
+            engine.ptdebug(f"Received SAMR {kind} page {page}: {len(entries)} entries")
             for entry in entries:
                 rid = samr_u32(entry["RelativeId"], "group RID")
                 name = str(entry["Name"]).rstrip("\x00")

@@ -162,9 +162,3 @@ def run(ctx: ModuleContext) -> None:
                 condition=output.dns_domain_name != output.dns_hostname and output.dns_domain_name.lower() != "unknown")
     # ctx.out(f"Lowest dialect version:  {output.used_dialect}",
     #             "VULN" if output.used_dialect == "SMBv1" else "NOTVULN", indent=4)
-    ctx.out(f"Login required:          {output.is_login_required}",
-                "WARNING" if not output.is_login_required else "OK", indent=4)
-    ctx.out(f"Signing required:        {output.is_signing_required}",
-                "WARNING" if not output.is_signing_required else "OK", indent=4)
-    ctx.out(f"NTLMv2 supported:        {output.does_support_NTLMv2}",
-            "WARNING" if not output.does_support_NTLMv2 else "OK", indent=4)

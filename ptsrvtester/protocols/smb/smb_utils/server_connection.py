@@ -100,14 +100,27 @@ class ServerConnection():
                 preferredDialect=self.dial_str_converter(nm_dialects[0]), # lowest accepted dialect
                 timeout=timeout
             )
+
+            # TODO: implement login interaction
             try:
                 self.ctx.debug("Trying empty login to get more info" if empty_login else "Trying login")
-                # TODO: implement login interaction
-                smb_client.login(username, password)
-            except Exception:
-                if not empty_login:
-                    self.ctx.debug("Login failed")
-                pass
+                smb_client.login(username, password)  # if login fails, the code continues in the exception
+
+                self.ctx.debug("Login successful")
+                output.successful_login = True
+                
+                output.guest_session = bool(smb_client.isGuestSession())
+
+                # TODO: Add ability to connect to specific folder
+                self.ctx.debug("Attempting to connect to IPC$ (should usually be available with access)")
+                try:
+                    tree_id = smb_client.connectTree("IPC$")
+                    self.ctx.debug("Tree connection success: " + str(tree_id))
+                except Exception as e:
+                    self.ctx.debug("Tree connection failed: " + str(e))
+
+            except Exception as e:
+                self.ctx.debug("Login failed: " + str(e))
             smb_client.close()
         except Exception as e:
             self.ctx.debug("Ran into an error: " + str(e))
@@ -152,6 +165,7 @@ class ServerConnection():
         else:
             security_mode = smb_client._SMBConnection._Connection.get('ServerSecurityMode', None)
             capabilities = smb_client._SMBConnection._Connection.get('ServerCapabilities', None)
-            output.v23_flags = (security_mode, capabilities)
+            session_flags = smb_client._SMBConnection._Session.get('SessionFlags', None)
+            output.v23_flags = (security_mode, capabilities, session_flags)
             
         self.ctx.debug("Server connection done")

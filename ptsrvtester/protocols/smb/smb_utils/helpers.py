@@ -98,7 +98,7 @@ class SMBResults:
     has_ran: bool = False
     had_error: bool = False
     error_info: str = ""
-    nmap_status = str = ""
+    nmap_status: str = ""
     used_dialect: str = ""
     server_name: str = ""
     client_name: str = ""
@@ -121,6 +121,8 @@ class SMBResults:
             "SMBv3.0.2":    False,
             "SMBv3.1.1":    False,
         }
+    successful_login: bool = False
+    guest_session: bool = False
     v30_encryption: str = ""
     v311_encryption: str = ""
     v1_flags: tuple | None = None

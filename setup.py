@@ -50,7 +50,8 @@ setuptools.setup(
     "pynput>=1.8.0",
     "XWindows>=0.0.7",
     "netifaces>=0.11.0",
-    "ptthreads"
+    "ptthreads",
+    "icmplib>=3.0.4"
 ],
     entry_points={"console_scripts": ["ptsrvtester = ptsrvtester.ptsrvtester:main"]},
     include_package_data=True,

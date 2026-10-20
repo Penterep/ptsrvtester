@@ -53,13 +53,18 @@ def get_ntp_time(server: str = "pool.ntp.org", port: int = 123, timeout: float =
     finally:
         sock.close()
 
+
+from ptsrvtester.protocols._base import ModuleContext
+
 # TODO: Add variable timeout, retry count, maybe sleep between retries?
-def gather_info(ip: str, port: int, results: NTPResults) -> None:
+def gather_info(ip: str, port: int, ctx: ModuleContext) -> None:
+    results: NTPResults = ctx.results
     results.has_ran = True
     data = None
     
     # ------------------------------------------ First test using regular mode 3 ------------------------------------------
 
+    ctx.debug("Attempting direct mode 3 communication")
     # Sending multiple requests is not ideal, but some servers reply only to repeats
     for _ in range(3):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # opens an IPv4 socket for UDP
@@ -71,19 +76,23 @@ def gather_info(ip: str, port: int, results: NTPResults) -> None:
             data, _ = sock.recvfrom(1024)  # server address and port are discarded
             break
         except Exception as e:
+            ctx.debug(f"An error occured on attempt {results.query_attempts}: {str(e)}")
             results.error_info = str(e)
         finally:
             sock.close()
 
     if results.query_attempts == 3:
         results.error = True
+        ctx.debug("Mode 3 communication failed")
     else:
+        ctx.debug("Mode 3 communication successful")
         results.error_info = ""
 
 
     # -------------------------------------- nmap test to gather more info (mode 6) ---------------------------------------
     # TODO: version parsing needs testing (couldn't find server with lower version than 4.2.0)
 
+    ctx.debug("Attempting mode 6 communication through nmap")
     fullver, processor, system_os = "", "", ""
     nmap_worked = False
     nm = nmap.PortScanner()
@@ -106,12 +115,20 @@ def gather_info(ip: str, port: int, results: NTPResults) -> None:
             processor = nm_out[1][11:]
             system_os = nm_out[2][8:]
             results.accepts_mode_6 = True
+            nmap_worked = True
             break
-        except:
-            pass
+        except Exception as e:
+            ctx.debug(f"An error occured on attempt {results.control_attempts}: {str(e)}")
+    
+    if nmap_worked:
+        ctx.debug("Mode 6 communication successful")
+    else:
+        ctx.debug("Mode 6 communication failed")
 
 
     # --------------------------------------------- Parsing data into results ---------------------------------------------
+
+    ctx.debug("Parsing results")
 
     ntp = NTP(data)
     

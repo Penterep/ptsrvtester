@@ -43,18 +43,19 @@ __ORDER__ = 11
 
 from ptsrvtester.protocols.ntp.ntp_utils.ntp_classes import NTPResults
 from ptsrvtester.protocols.ntp.ntp_utils.connection import gather_info
+from ptsrvtester.protocols._base import ModuleContext
 
-def run(ctx):
+def run(ctx: ModuleContext):
+    ctx.debug("Running test: " + __MODULECODE__)
+    ip, port = ctx.target
+    results: NTPResults = ctx.results
     
     # -------------------------------------------- Getting results from server --------------------------------------------
 
-    ip, port = ctx.target
     if not ctx.results.has_ran:
-        gather_info(ip, port, ctx.results)
-        results = ctx.results
-        ctx.results = results
-    else:
-        results = ctx.results
+        ctx.out(f"IP:                   {ip}", "INFO", indent=4)
+        ctx.out(f"Port:                 {port}", "INFO", indent=4)
+        gather_info(ip, port, ctx)
     if results.error:
         ctx.out(f"An error occured while trying to connect to server: {results.error_info}", "ERROR", indent=4)
         ctx.out(f"It is possible the server accepts only a specific IP range or needs authentication", "ERROR", indent=4)
@@ -68,6 +69,7 @@ def run(ctx):
     # up to (excluding) 4.2.7p26 - CVE-2013-5211 (traffic amplification through monlist)
 
     # TODO: check monlist availability
+    ctx.debug("Processing version and detecting vulnerabilities")
     
     
     # ------------------------------------------ Short version format processing ------------------------------------------

@@ -39,6 +39,7 @@ def get_flag(source: int, mask: int) -> bool:
 
 
 def run(ctx: ModuleContext) -> None:
+    ctx.debug("Running test: " + __MODULECODE__)
     ip, port = ctx.target
     output: SMBResults = ctx.output
 
@@ -63,6 +64,7 @@ def run(ctx: ModuleContext) -> None:
     ctx.out(f"Used dialect:            {output.used_dialect}", category, indent=4)
 
     if output.used_dialect == "SMBv1" and output.v1_flags:
+        ctx.debug("Reading SMBv1 flags")
         flags1, flags2, security_mode, capabilities = output.v1_flags
 
         signing_support: bool = get_flag(flags2, SMBv1Flags.FLAGS2_SMB_SECURITY_SIGNATURE)
@@ -103,11 +105,12 @@ def run(ctx: ModuleContext) -> None:
             category = "WARNING"
             msg = "Signing is available but optional"
         else:
-            category = "WARNING"
+            category = "VULN"
             msg = "Signing is unsupported"
         ctx.out(f"Message signing:         {msg}", category, indent=4)
         
     elif output.used_dialect != "SMBv1" and output.v23_flags:
+        ctx.debug("Reading SMBv2+ flags")
         security_mode, capabilities = output.v23_flags
 
         signing_support: bool = get_flag(security_mode, SMBv23Flags.SMB2_NEGOTIATE_SIGNING_ENABLED)
@@ -120,7 +123,7 @@ def run(ctx: ModuleContext) -> None:
             category = "WARNING"
             msg = "Signing is available but optional"
         else:
-            category = "WARNING"
+            category = "VULN"
             msg = "Signing is unsupported"
         ctx.out(f"Message signing:         {msg}", category, indent=4)
         

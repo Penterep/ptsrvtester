@@ -64,12 +64,14 @@ class ServerConnection():
             return None
 
     def connect(self, username = "", password = "", timeout = 3) -> None:
+        empty_login: bool = username == password and username == ""
         output: SMBResults = SMBResults()
         smb_client: SMBConnection
         output = self.ctx.output
         output.has_ran = True
         ip, port = self.ctx.target
         
+        self.ctx.debug("Running nmap scan to determine supported dialects")
         nm_dialects = []
         nm = nmap.PortScanner()
         try:
@@ -78,13 +80,17 @@ class ServerConnection():
             nm_dialects = str(nm._scan_result['scan'][ip]['hostscript'][0]['output']).split("\n    ")[1:]
 
         except Exception as e:
+            self.ctx.debug("Ran into an error: " + str(e))
             output.had_error = True
             output.error_info = "error during dialect scan: " + str(e)
             return
 
+        self.ctx.debug("Found supported dialects")
+
         for dialect in nm_dialects:
             output.open_dialects[self.nm_to_std[dialect]] = True
-        
+
+        self.ctx.debug("Communicating with server")
         try:
             smb_client = SMBConnection(
                 remoteName="*SMBSERVER",
@@ -95,15 +101,21 @@ class ServerConnection():
                 timeout=timeout
             )
             try:
+                self.ctx.debug("Trying empty login to get more info" if empty_login else "Trying login")
                 # TODO: implement login interaction
                 smb_client.login(username, password)
             except Exception:
+                if not empty_login:
+                    self.ctx.debug("Login failed")
                 pass
             smb_client.close()
         except Exception as e:
+            self.ctx.debug("Ran into an error: " + str(e))
             output.had_error = True
             output.error_info = str(e) + " (main scan)"
             return
+        
+        self.ctx.debug("Server communication successful")
         
         getters = {
             # "SMBServer_object":         smb_client.getSMBServer,
@@ -125,6 +137,8 @@ class ServerConnection():
             # "IO_capabilities":          smb_client.getIOCapabilities,
         }
 
+        self.ctx.debug("Parsing found server info")
+
         for name, getter in getters.items():
             setattr(output, name, get_if_available(getter))
 
@@ -139,3 +153,5 @@ class ServerConnection():
             security_mode = smb_client._SMBConnection._Connection.get('ServerSecurityMode', None)
             capabilities = smb_client._SMBConnection._Connection.get('ServerCapabilities', None)
             output.v23_flags = (security_mode, capabilities)
+            
+        self.ctx.debug("Server connection done")

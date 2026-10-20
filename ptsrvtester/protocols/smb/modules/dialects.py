@@ -35,6 +35,7 @@ from ptsrvtester.protocols._base import ModuleContext
 
 
 def run(ctx: ModuleContext) -> None:
+    ctx.debug("Running test: " + __MODULECODE__)
     ip, port = ctx.target
     output: SMBResults = ctx.output
 

@@ -112,6 +112,7 @@ def win_version_translate(ver: str) -> str:
 
 
 def run(ctx: ModuleContext) -> None:
+    ctx.debug("Running test: " + __MODULECODE__)
     ip, port = ctx.target
     output: SMBResults = ctx.output
 
@@ -126,6 +127,8 @@ def run(ctx: ModuleContext) -> None:
         ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
         return
 
+
+    ctx.debug("Parsing received OS version into one string")
     # OS version parsing
     os_info = [output.server_OS_major, output.server_OS_minor, output.server_OS_build]
     
@@ -141,12 +144,15 @@ def run(ctx: ModuleContext) -> None:
         os_version = "unknown"
     else:
         os_version = os_version[1:]
+        ctx.debug("Translating version number into Windows version")
         os_ver_name = win_version_translate(os_version)
         
     os_ver_name = output.server_OS if output.server_OS != "unknown" and os_version == "unknown" else os_ver_name
     
     output.server_OS = f"{os_ver_name} (build: {os_version})" if os_version != "unknown" else os_ver_name
     
+    
+    ctx.debug("Printing:")
     # Printing
     # ctx.out("SMB server info:")
     ctx.out(f"Server name:             {output.server_name}", "INFO", indent=4)

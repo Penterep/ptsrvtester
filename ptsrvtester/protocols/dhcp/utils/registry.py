@@ -220,6 +220,7 @@ def print_dhcp_options(ctx, options, base_indent) -> None:
             key, value_str = str(option), ""
 
         if key == "lease_time" and check_lease(value_str):
+            ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-DHCP-LEASE", poc=f"lease_time: {value_str}")
             b_type = "WARN"
 
         option_num = get_option_number(key)

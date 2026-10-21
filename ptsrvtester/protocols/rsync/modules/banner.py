@@ -1,5 +1,7 @@
 import socket
 
+from ptsrvtester.protocols.rsync.utils.registry import rsync_debug
+
 
 __MODULELABEL__ = "Rsync version detection module"
 __MODULECODE__ = "banner"
@@ -15,24 +17,24 @@ def _parse_greeting(greeting):
 
 
 def get_supported_digests(ctx):
-    ctx.debug(f"Sent: TCP connection to rsync service at {ctx.ip}:{ctx.port}", indent=4)
+    rsync_debug(ctx, f"Sent: TCP connection to rsync service at {ctx.ip}:{ctx.port}", indent=4)
     with socket.create_connection((ctx.ip, ctx.port), timeout=ctx.timeout) as sock:
         with sock.makefile("rb") as reader:
             greeting = reader.readline().decode(errors="replace").strip()
-    ctx.debug(f"Received: {greeting or '<empty response>'}", indent=8)
+    rsync_debug(ctx, f"Received: {greeting or '<empty response>'}", indent=8)
     digests = _parse_greeting(greeting)[1:]
-    ctx.debug(f"Received supported digest algorithms: {', '.join(digests) or '<none>'}", indent=8)
+    rsync_debug(ctx, f"Received supported digest algorithms: {', '.join(digests) or '<none>'}", indent=8)
     return digests
 
 
 def _rsync_grab_banner(ctx):
     motd = []
     try:
-        ctx.debug(f"Sent: TCP connection to rsync service at {ctx.ip}:{ctx.port}", indent=4)
+        rsync_debug(ctx, f"Sent: TCP connection to rsync service at {ctx.ip}:{ctx.port}", indent=4)
         with socket.create_connection((ctx.ip, ctx.port), timeout=ctx.timeout) as sock:
             with sock.makefile("rb") as reader:
                 greeting = reader.readline().decode(errors="replace").strip()
-                ctx.debug(f"Received: {greeting or '<empty response>'}", indent=8)
+                rsync_debug(ctx, f"Received: {greeting or '<empty response>'}", indent=8)
                 greeting_fields = _parse_greeting(greeting)
                 ctx.supported_digests.extend(greeting_fields[1:])
                 version = greeting_fields[0] if greeting_fields else ""
@@ -48,7 +50,7 @@ def _rsync_grab_banner(ctx):
                         break
                     motd.append(raw_line.decode(errors="replace").rstrip("\r\n"))
 
-        ctx.debug(f"Received MOTD: {' | '.join(motd) if motd else '<none>'}", indent=8)
+        rsync_debug(ctx, f"Received MOTD: {' | '.join(motd) if motd else '<none>'}", indent=8)
         if motd:
             motd_text = "\n".join(motd)
             ctx.out(f"Grabbed Rsync server MOTD:\n{motd_text}", "VULN", indent=4)

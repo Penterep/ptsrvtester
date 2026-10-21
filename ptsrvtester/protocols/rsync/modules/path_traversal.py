@@ -2,7 +2,7 @@ import os
 import subprocess
 import tempfile
 import uuid
-from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
+from ptsrvtester.protocols.rsync.utils.registry import rsync_debug, rsync_env, rsync_url
 
 
 __MODULELABEL__ = "Rsync path traversal detection"
@@ -36,7 +36,7 @@ def _try_path_traversal_write(ctx):
         with open(local_path, "w", encoding="utf-8") as marker:
             marker.write("Temporary rsync path traversal probe.\n")
 
-        ctx.debug(f"Created local temporary path traversal probe at {local_path}", indent=4)
+        rsync_debug(ctx, f"Created local temporary path traversal probe at {local_path}", indent=4)
         
         try:
             command = [
@@ -47,7 +47,7 @@ def _try_path_traversal_write(ctx):
                 rsync_url(ctx, f"{traversal_dir}/{marker_name}"),
             ]
             
-            ctx.debug(f"Running command \"{' '.join(command)}\"", indent=4)
+            rsync_debug(ctx, f"Running command \"{' '.join(command)}\"", indent=4)
             
             upload = subprocess.run(
                 command,
@@ -64,8 +64,8 @@ def _try_path_traversal_write(ctx):
             ctx.out("rsync client binary not found on this machine", "ERROR", indent=4)
             return
 
-        ctx.debug(f"Received stdout: {upload.stdout.rstrip}", indent=4)
-        ctx.debug(f"Received stderr: {upload.stderr.rstrip}", indent=4)
+        rsync_debug(ctx, f"Received stdout: {upload.stdout.rstrip}", indent=4)
+        rsync_debug(ctx, f"Received stderr: {upload.stderr.rstrip}", indent=4)
         
         if upload.returncode != 0:
             error = upload.stderr.strip().splitlines()
@@ -108,7 +108,7 @@ def _try_path_traversal_write(ctx):
 
         if cleanup.returncode != 0:
             ctx.out("Could not remove the temporary traversal marker", "WARN", indent=4)
-            ctx.debug(f"Path traversal marker cleanup failed: {cleanup.stderr.strip()}")
+            rsync_debug(ctx, f"Path traversal marker cleanup failed: {cleanup.stderr.strip()}")
 
 
 def run(ctx):

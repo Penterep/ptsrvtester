@@ -2,7 +2,7 @@ import re
 import subprocess
 from ptthreads.ptthreads import ptthreads
 from ptsrvtester.protocols.rsync.modules.grab_modules import rsync_grab_modules
-from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
+from ptsrvtester.protocols.rsync.utils.registry import rsync_debug, rsync_env, rsync_url
 
 __MODULELABEL__ = "Rsync module authentication enumeration"
 __MODULECODE__ = "module_auth"
@@ -22,7 +22,7 @@ def _check_module(module):
         rsync_url(ctx, f"{module_name}/"),
     ]
 
-    ctx.debug(f"Running command \"{' '.join(command)}\"", indent=4)
+    rsync_debug(ctx, f"Running command \"{' '.join(command)}\"", indent=4)
     
     try:
         result = subprocess.run(
@@ -42,8 +42,8 @@ def _check_module(module):
 
     output = f"{result.stdout}\n{result.stderr}"
     
-    ctx.debug(f"Received stdout: {result.stdout.rstrip()}", indent=4)
-    ctx.debug(f"Received stderr: {result.stderr.rstrip()}", indent=4)
+    rsync_debug(ctx, f"Received stdout: {result.stdout.rstrip()}", indent=4)
+    rsync_debug(ctx, f"Received stderr: {result.stderr.rstrip()}", indent=4)
     
     if re.search(
         r"@RSYNCD:\s*AUTHREQD|auth(?:entication)?\s+(?:is\s+)?(?:required|failed)|password\s*:",

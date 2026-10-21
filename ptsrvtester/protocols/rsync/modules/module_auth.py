@@ -22,6 +22,8 @@ def _check_module(module):
         rsync_url(ctx, f"{module_name}/"),
     ]
 
+    ctx.debug(f"Running command \"{' '.join(command)}\"", indent=4)
+    
     try:
         result = subprocess.run(
             command,
@@ -39,6 +41,10 @@ def _check_module(module):
         return
 
     output = f"{result.stdout}\n{result.stderr}"
+    
+    ctx.debug(f"Received stdout: {result.stdout.rstrip()}", indent=4)
+    ctx.debug(f"Received stderr: {result.stderr.rstrip()}", indent=4)
+    
     if re.search(
         r"@RSYNCD:\s*AUTHREQD|auth(?:entication)?\s+(?:is\s+)?(?:required|failed)|password\s*:",
         output,
@@ -56,6 +62,11 @@ def _check_module(module):
             ctx.out(f"The '{module_name}' module is accessible with the supplied credentials", "INFO", indent=4)
         else:
             ctx.out(f"The '{module_name}' module does not require authentication", "VULN", indent=4)
+            ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-ANON", poc={"command": ' '.join(command), 
+                                                                       "return_code": result.returncode,
+                                                                       "stdout": result.stdout.rstrip(),
+                                                                       "stderr": result.stderr.rstrip()
+                                                                       })
     else:
         detail = result.stderr.strip() or result.stdout.strip() or f"rsync exited with status {result.returncode}"
         ctx.out(f"Error checking '{module_name}' authentication: {detail}", "ERROR", indent=4)

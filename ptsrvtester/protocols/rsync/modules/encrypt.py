@@ -1,8 +1,7 @@
 import socket
-from ptsrvtester.protocols.ssh.modules.authmethods import get_auth_methods
 from ptsrvtester.protocols.rsync.modules.banner import get_supported_digests
 
-__MODULELABEL__ = "Rsync SSH and authentication method detection"
+__MODULELABEL__ = "Rsync daemon and digest detection"
 __MODULECODE__ = "encrypt"
 __ORDER__ = 80
 
@@ -14,21 +13,21 @@ DIGEST_SECURITY_MAPPING = {
     "sha512": "OK",
 }
 
-def _rsync_try_ssh(ctx):
+def _rsync_try_daemon(ctx):
     try:
-        with socket.create_connection((ctx.ip, 22), timeout=ctx.timeout) as s:
-            ctx.out(f"The host supports SSH", "INFO", indent=4)
-
-            try:
-                auth_m = get_auth_methods(ctx.ip, 22)
-                if auth_m:
-                    ctx.out(f"Supported authentication methods: {', '.join(auth_m)}", "INFO", indent=8)
-                else:
-                    ctx.out(f"No authentication methods found", "INFO", indent=8)
-            except Exception as e:
-                ctx.out(f"Error occurred while fetching authentication methods: {e}", "ERROR", indent=4)
+        ctx.debug(f"Sent: TCP connection to rsync daemon at {ctx.ip}:{ctx.port}", indent=4)
+        with socket.create_connection((ctx.ip, ctx.port), timeout=ctx.timeout) as sock:
+            with sock.makefile("rb") as reader:
+                greeting = reader.readline().decode(errors="replace").strip()
+        ctx.debug(f"Received: {greeting or '<empty response>'}", indent=8)
+        if greeting.startswith("@RSYNCD:"):
+            ctx.out("The host supports the rsync daemon", "INFO", indent=4)
+            ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-RUNTYPE", 
+                                            poc=f"Succesfully connected to {ctx.ip}:{ctx.port} and received greeting {greeting}")
+        else:
+            ctx.out("The host does not support the rsync daemon", "INFO", indent=4)
     except (socket.timeout, ConnectionRefusedError, OSError) as e:
-        ctx.out(f"The host does not support SSH: {e}", "INFO", indent=4)
+        ctx.out(f"The host does not support the rsync daemon: {e}", "INFO", indent=4)
 
 def run(ctx):
     supported_digests = list(ctx.supported_digests)
@@ -42,7 +41,17 @@ def run(ctx):
                 indent=4,
             )
 
+    ctx.debug(
+        f"Received supported rsync digest algorithms: "
+        f"{', '.join(supported_digests) if supported_digests else '<none>'}",
+        indent=4,
+    )
     ctx.out(f"Supported hash digest algorithms:", "INFO", indent=4)
+    vuln_digests = []
     for hd in supported_digests:
         ctx.out(f"{hd}", DIGEST_SECURITY_MAPPING.get(hd, "INFO"), indent=8)
-    _rsync_try_ssh(ctx)
+        if DIGEST_SECURITY_MAPPING.get(hd) in ["VULN", "WARN"]:
+            vuln_digests.append(hd)
+    if vuln_digests:
+        ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-AUTH", poc={"vulnerable_digests": vuln_digests})
+    _rsync_try_daemon(ctx)

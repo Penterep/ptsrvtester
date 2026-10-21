@@ -4,6 +4,7 @@ from ptsrvtester.protocols.dhcp.utils.registry import (
     random_mac,
     sendp,
     prepare_ack_packet,
+    debug_packet
 )
 
 from icmplib import ping
@@ -39,20 +40,23 @@ def _spoof_ack(ctx):
     src_mac = ctx.mac or random_mac()
     transaction_id = ctx.xid or random_xid()
 
+    ack_packet = prepare_ack_packet(
+                src_mac,
+                ctx.client_mac,
+                transaction_id,
+                ctx.client_ip,
+                ctx.netmask,
+                ctx.giaddr,
+                ctx.server_ip,
+                ctx.lease,
+                ctx.renewal_time,
+                ctx.rebinding_time
+            )
+    
+    debug_packet(ctx, "Sent", ack_packet)
     sendp(
-        prepare_ack_packet(
-            src_mac,
-            ctx.client_mac,
-            transaction_id,
-            ctx.client_ip,
-            ctx.netmask,
-            ctx.giaddr,
-            ctx.server_ip,
-            ctx.lease,
-            ctx.renewal_time,
-            ctx.rebinding_time
-        ),
-        iface=ctx.interace,
+        ack_packet,
+        iface=ctx.interface,
         verbose=False
     )
 
@@ -65,6 +69,7 @@ def _spoof_ack(ctx):
     )
 
     if ping_res.is_alive:
+        ctx.debug(f"{ping_res}", indent=12)
         ctx.out(f"Successfully changed the clients IP to {ctx.client_ip}", "VULN", indent=4)
         ctx.ptjsonlib.add_vulnerability("PTV-DHCP-ACK-SPOOFING")
     else:

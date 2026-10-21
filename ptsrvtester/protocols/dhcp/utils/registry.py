@@ -75,6 +75,12 @@ def is_valid_mac_address(mac_a: str) -> str:
         raise argparse.ArgumentError(None, "Invalid MAC address")
 
 
+def debug_packet(ctx, direction: str, packet) -> None:
+    ctx.debug(f"{direction} DHCP packet:", indent=12)
+    for line in packet.show(dump=True).splitlines():
+        ctx.debug(line, indent=16)
+
+
 def get_interface_ip(interface: str) -> str:
     return ni.ifaddresses(interface)[ni.AF_INET][0]['addr']
 
@@ -220,6 +226,7 @@ def print_dhcp_options(ctx, options, base_indent) -> None:
             key, value_str = str(option), ""
 
         if key == "lease_time" and check_lease(value_str):
+            ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-DHCP-LEASE", poc=f"lease_time: {value_str}")
             b_type = "WARN"
 
         option_num = get_option_number(key)

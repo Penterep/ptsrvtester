@@ -20,14 +20,23 @@ async def user_enum(ctx) -> list[str]:
 
     for username in users:
         try:
+            user_data = UsmUserData(username, "userenumeration", authProtocol=None, privProtocol=None)
+            probe = ObjectType(ObjectIdentity("SNMPv2-MIB", "sysDescr", 0))
+            ctx.debug(f"SNMPv3 username enumeration for {username!r}", indent=4)
+            ctx.debug(f"Sent: {probe}", indent=8)
             iterator = get_cmd(
                 SnmpEngine(),
-                UsmUserData(username, "userenumeration", authProtocol=None, privProtocol=None),
+                user_data,
                 await UdpTransportTarget.create((ctx.ip, ctx.port)),
                 ContextData(),
-                ObjectType(ObjectIdentity("SNMPv2-MIB", "sysDescr", 0)),
+                probe,
             )
             errorIndication, errorStatus, errorIndex, varBinds = await iterator
+            received = errorIndication or (
+                f"{errorStatus.prettyPrint()} at {errorIndex}" if errorStatus else
+                ", ".join(" = ".join(part.prettyPrint() for part in varBind) for varBind in varBinds)
+            )
+            ctx.debug(f"Received: {received}", indent=8)
 
             if not errorIndication and not errorStatus:
                 ctx.out(f"Valid username found: {username}", "VULN",  indent=4)

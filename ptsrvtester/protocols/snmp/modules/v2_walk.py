@@ -42,18 +42,26 @@ async def _getBulk_SNMPv2(ctx) -> str:
         ctx.out(f"Trying community: {community}", "INFO", indent=4)
         try:
             # Use walk_cmd to traverse the MIB
+            probe = ObjectType(ObjectIdentity(ctx.oid))
+            ctx.debug(f"SNMPv2 walk using community {community!r}", indent=4)
+            ctx.debug(f"Sent: walk starting at OID {ctx.oid}", indent=8)
             objects = walk_cmd(
                 SnmpEngine(),
                 CommunityData(community),
                 await UdpTransportTarget.create((ctx.ip, ctx.port)),
                 ContextData(),
-                ObjectType(ObjectIdentity(ctx.oid))
+                probe
             )
 
             oids = {}
 
             # Iterate over the returned OID-value pairs
             async for errorIndication, errorStatus, errorIndex, varBinds in objects:
+                received = errorIndication or (
+                    f"{errorStatus.prettyPrint()} at {errorIndex}" if errorStatus else
+                    ", ".join(" = ".join(part.prettyPrint() for part in varBind) for varBind in varBinds)
+                )
+                ctx.debug(f"Received: {received}", indent=8)
                 if errorIndication:
                     ctx.out(f"Error: {errorIndication}", "ERROR", indent=8)
                     break
@@ -89,6 +97,7 @@ async def _getBulk_SNMPv2(ctx) -> str:
             # Stop the loop if results are found
             if results:
                 node = ctx.ptjsonlib.create_node_object("snmpv2_walk_results", properties=oids)
+                ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-WALK", poc=oids)
                 ctx.ptjsonlib.add_node(node)
                 ctx.out(f"Results found with community '{community}', stopping further attempts.", "VULN",
                         indent=8)

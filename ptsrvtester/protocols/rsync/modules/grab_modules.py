@@ -54,10 +54,14 @@ def list_module_contents(ctx, host, module, recursive=False, timeout=15):
         timeout += 10
     cmd.append(url)
 
+    ctx.debug(f"Running rsync command: \"{''.join(cmd)}\"", indent=4)
+    
     result = subprocess.run(
         cmd, capture_output=True, text=True, input="", env=rsync_env(ctx), timeout=timeout
     )
     output = f"{result.stdout}\n{result.stderr}"
+    ctx.debug(f"Received stdout: {result.stdout.rstirp()}", indent=4)
+    ctx.debug(f"Received stderr: {result.stderr.rstrip()}", indent=4)
     if re.search(
         r"password\s*:|@RSYNCD:\s*AUTHREQD|auth(?:entication)?\s+(?:is\s+)?(?:required|failed)",
         output,

@@ -11,7 +11,8 @@ from ptsrvtester.protocols.dhcp.utils.registry import (
     get_interface_ip,
     get_interface_mac,
     print_dhcp_options,
-    get_option
+    get_option,
+    debug_packet
 )
 
 from scapy.sendrecv import AsyncSniffer
@@ -23,6 +24,7 @@ from scapy.all import PacketList
 __MODULELABEL__ = "DHCP server information enumeration"
 __MODULECODE__ = "info"
 __ORDER__ = 100
+
 
 
 def _check_broadcast(res: PacketList) -> str:
@@ -70,6 +72,7 @@ def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
     try:
         def is_offer_packet(packet):
             if packet.haslayer(DHCP) and packet.haslayer(UDP) and packet[UDP].sport == 67:
+                debug_packet(ctx, "Received", packet)
                 print_dhcp_options(ctx, packet[DHCP].options, 8)
                 return True
 
@@ -86,8 +89,9 @@ def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
         sniffer.start()
         time.sleep(0.05)
 
-        sendp(prepare_discover_packet_unicast(src_mac, gw_mac, if_ip, server_ip, xid), iface=ctx.interface,
-              verbose=False)
+        discover = prepare_discover_packet_unicast(src_mac, gw_mac, if_ip, server_ip, xid)
+        debug_packet(ctx, "Sent", discover)
+        sendp(discover, iface=ctx.interface, verbose=False)
 
         sniffer.join()
         res = sniffer.results
@@ -108,6 +112,7 @@ def _get_server_info(ctx, src_mac: str, broadcast=False):
     try:
         def is_offer_packet(packet):
             if packet.haslayer(DHCP):
+                debug_packet(ctx, "Received", packet)
                 offered_ip = packet[BOOTP].yiaddr if packet.haslayer(BOOTP) else None
                 options = packet[DHCP].options
                 delivery_method = _is_packet_broadcast(packet)
@@ -118,6 +123,7 @@ def _get_server_info(ctx, src_mac: str, broadcast=False):
                 if server_ip := get_option(options, "server_id"):   # Check if the server is a relay
                     if _is_relay(offered_ip, server_ip, get_option(options, "subnet_mask")):
                         ctx.out(f"DHCP relay detected", "INFO", indent=16)
+                        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-DHCP-RELAY", poc=f"Offered IP {offered_ip} in not on the server network {server_ip}")
                         _contact_server(ctx, src_mac, get_option(options, "router"),
                                         get_option(options, "server_id"), transaction_id)
                 
@@ -136,7 +142,9 @@ def _get_server_info(ctx, src_mac: str, broadcast=False):
         sniffer.start()
         time.sleep(0.05)
 
-        sendp(prepare_discover_packet(src_mac, transaction_id, broadcast=broadcast), ctx.interface, verbose=False)
+        discover = prepare_discover_packet(src_mac, transaction_id, broadcast=broadcast)
+        debug_packet(ctx, "Sent", discover)
+        sendp(discover, ctx.interface, verbose=False)
 
         sniffer.join()
         res = sniffer.results
@@ -162,3 +170,5 @@ def run(ctx):
     if mac := _check_broadcast(res):
         ctx.out(f"Trying to contact DHCP server using the fake/provided MAC address and broadcast flag set", "INFO", indent=4)
         _get_server_info(ctx, mac, True)
+    else:
+        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-DHCP-BROADC")

@@ -37,6 +37,7 @@ def _fill_module(ctx, module):
                     probe.write(os.urandom(chunk_size))
 
                 try:
+                    ctx.debug(f"Uploading {chunk_size} bytes to {rsync_url(ctx, f"{module}/{probe_name}")}", indent=4)
                     upload = subprocess.run(
                         [
                             "rsync",
@@ -108,10 +109,10 @@ def _fill_module(ctx, module):
                 )
 
     if uploaded_bytes:
-        return "filled"
+        return "filled", uploaded_bytes
     if first_upload:
-        return "not_writable"
-    return "stopped"
+        return "not_writable", None
+    return "stopped", None
 
 
 def run(ctx):
@@ -125,8 +126,10 @@ def run(ctx):
         return
 
     for module in modules:
-        result = _fill_module(ctx, module)
+        result, n_bytes = _fill_module(ctx, module)
+        
         if result == "filled":
+            ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-SIZE", poc={"uploaded_bytes": n_bytes})
             return
         if result == "stopped" or result == "error":
             return

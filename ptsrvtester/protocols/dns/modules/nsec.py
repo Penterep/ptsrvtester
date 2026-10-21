@@ -71,6 +71,3 @@ def run(ctx):
                     "vuln_request": f"NSEC3 parameters for {domain}",
                     "vuln_response": f"iterations={info.nsec3_iterations}, salt={salt}",
                 })
-
-    with ctx.results_lock:
-        ctx.properties["nsec"] = summary

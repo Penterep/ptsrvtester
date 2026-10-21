@@ -29,7 +29,3 @@ def run(ctx):
         for line in text.strip().splitlines():
             ctx.out(line, "TEXT", indent=8)
         collected[domain] = text.strip()
-
-    with ctx.results_lock:
-        if collected:
-            ctx.properties["whois"] = {d: t[:2000] for d, t in collected.items()}

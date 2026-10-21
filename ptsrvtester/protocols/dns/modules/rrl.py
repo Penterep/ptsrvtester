@@ -45,14 +45,11 @@ def run(ctx):
         ctx.out(f"Sent {res.sent}, received {res.received} (truncated/slip {res.truncated}).", "TEXT", indent=8)
         if res.rrl_detected:
             ctx.out("Response Rate Limiting appears active (drops / TC-slip observed).", "OK", indent=8)
-            with ctx.results_lock:
-                ctx.properties.setdefault("rrl", {})[domain] = "active"
             continue
 
         ctx.out("No RRL observed at this rate — server answered the whole burst "
                 "(weaker against amplification/reflection abuse).", "VULN", indent=8)
         with ctx.results_lock:
-            ctx.properties.setdefault("rrl", {})[domain] = "not observed"
             ctx.deferred_vulns.append({
                 "vuln_code": VULNS.NoRrl.value,
                 "vuln_request": f"burst of {res.sent} identical A queries for {domain}",

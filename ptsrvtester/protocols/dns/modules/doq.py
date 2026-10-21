@@ -29,8 +29,6 @@ def run(ctx):
     have_quic = getattr(getattr(dns, "quic", None), "have_quic", False)
     if not have_quic:
         ctx.out("DoQ not tested — the optional 'aioquic' package is not installed.", "WARNING", indent=4)
-        with ctx.results_lock:
-            ctx.properties["doq"] = "not tested (aioquic missing)"
         return
 
     try:
@@ -40,9 +38,5 @@ def run(ctx):
         if tt.is_ip(host):
             ctx.out("Target is an IP address — pass the full hostname (-tg <fqdn>) to validate the "
                     "certificate name.", "TEXT", indent=4)
-        with ctx.results_lock:
-            ctx.properties["doq"] = "available (TLS 1.3 / QUIC)"
     except Exception as e:
         ctx.out(f"DoQ/853 not available ({type(e).__name__}).", "TEXT", indent=4)
-        with ctx.results_lock:
-            ctx.properties["doq"] = "unavailable"

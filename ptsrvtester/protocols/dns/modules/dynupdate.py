@@ -62,7 +62,6 @@ def run(ctx):
             ctx.out(f"Unauthenticated UPDATE ACCEPTED on {ip} — injected {name} (then deleted; "
                     f"cleanup {'ok' if cleaned else 'FAILED — remove manually'}).", "VULN", indent=8)
             with ctx.results_lock:
-                ctx.properties.setdefault("dynupdate", {})[domain] = "unauthenticated update allowed"
                 ctx.deferred_vulns.append({
                     "vuln_code": VULNS.DynUpdate.value,
                     "vuln_request": f"RFC 2136 UPDATE add {name} TXT (no auth) to {ip}",

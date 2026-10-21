@@ -36,13 +36,10 @@ def run(ctx):
 
     if not is_open:
         ctx.out("Recursion is not open to this client (server does not resolve external names).", "OK", indent=4)
-        with ctx.results_lock:
-            ctx.properties["open_recursion"] = False
         return
 
     ctx.out("Open recursion: the server resolves arbitrary external names for this client.", "VULN", indent=4)
     with ctx.results_lock:
-        ctx.properties["open_recursion"] = True
         ctx.deferred_vulns.append({
             "vuln_code": VULNS.OpenRecursion.value,
             "vuln_request": "RD=1 queries for external names (" + ", ".join(rc.EXTERNAL_NAMES[:3]) + ", …)",

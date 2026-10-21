@@ -85,7 +85,6 @@ def run(ctx):
             for n in writable:
                 ctx.out(f"    {n}", "TEXT", indent=8)
             with ctx.results_lock:
-                ctx.properties.setdefault("tsig_acl", {})[domain] = "unrestricted"
                 ctx.deferred_vulns.append({
                     "vuln_code": VULNS.TsigAcl.value,
                     "vuln_request": f"TSIG-signed UPDATE of arbitrary names in {domain}",
@@ -93,5 +92,3 @@ def run(ctx):
                 })
         else:
             ctx.out("Key could not write the arbitrary probe names — update policy appears scoped.", "OK", indent=8)
-            with ctx.results_lock:
-                ctx.properties.setdefault("tsig_acl", {})[domain] = "scoped"

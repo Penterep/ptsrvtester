@@ -40,6 +40,3 @@ def run(ctx):
                     "vuln_request": f"CAA {domain}",
                     "vuln_response": "no CAA record set",
                 })
-
-    with ctx.results_lock:
-        ctx.properties["caa"] = {d: r for d, r in summary.items()}

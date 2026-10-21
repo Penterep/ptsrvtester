@@ -54,6 +54,3 @@ def run(ctx):
 
         ctx.out("GSS-TSIG (RFC 3645) is the AD/Kerberos secure-update mechanism. Confirming it, "
                 "and any authenticated update test, needs AD domain credentials — not performed here.", "TEXT", indent=8)
-
-        with ctx.results_lock:
-            ctx.properties.setdefault("secure_update", {})[domain] = rtext

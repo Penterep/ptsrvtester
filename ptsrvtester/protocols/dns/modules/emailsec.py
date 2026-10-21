@@ -75,6 +75,3 @@ def run(ctx):
         }
         with ctx.results_lock:
             ctx.deferred_vulns.extend(vulns)
-
-    with ctx.results_lock:
-        ctx.properties["email_security"] = summary

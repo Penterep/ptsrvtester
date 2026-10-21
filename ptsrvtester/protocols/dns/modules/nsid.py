@@ -32,7 +32,6 @@ def run(ctx):
     ctx.out("Server reveals its instance identity via NSID.", "VULN", indent=4)
 
     with ctx.results_lock:
-        ctx.properties["nsid"] = ascii_val
         ctx.deferred_vulns.append({
             "vuln_code": VULNS.NsidDisclosure.value,
             "vuln_request": "EDNS OPT with NSID (option 3)",

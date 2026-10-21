@@ -31,8 +31,6 @@ def run(ctx):
 
     if info.get("server_cookie"):
         ctx.out(f"DNS cookies supported — server cookie returned ({info['length']} bytes).", "OK", indent=4)
-        with ctx.results_lock:
-            ctx.properties["dns_cookies"] = "supported"
         return
 
     if info.get("present"):
@@ -42,7 +40,6 @@ def run(ctx):
     ctx.out("Upstream cookie use toward authoritative servers is separate and not observable here.", "TEXT", indent=4)
 
     with ctx.results_lock:
-        ctx.properties["dns_cookies"] = "not supported (client-facing)"
         ctx.deferred_vulns.append({
             "vuln_code": VULNS.NoCookie.value,
             "vuln_request": "EDNS COOKIE (8-byte client cookie)",

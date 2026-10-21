@@ -58,6 +58,3 @@ def run(ctx):
                     "vuln_request": f"validate DNSKEY RRSIG for {domain}",
                     "vuln_response": keys.error or "signature validation failed",
                 })
-
-    with ctx.results_lock:
-        ctx.properties["dnssec"] = summary

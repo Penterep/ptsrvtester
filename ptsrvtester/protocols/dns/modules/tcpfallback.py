@@ -46,13 +46,10 @@ def run(ctx):
 
         if res.tcp_ok:
             ctx.out("TCP/53 answers — TCP fallback works.", "OK", indent=8)
-            with ctx.results_lock:
-                ctx.properties.setdefault("tcp_fallback", {})[domain] = "ok"
         else:
             ctx.out(f"TCP/53 does NOT answer ({res.tcp_error or 'no reply'}) — large answers & DNSSEC break, "
                     "and UDP-only is more amplifiable.", "VULN", indent=8)
             with ctx.results_lock:
-                ctx.properties.setdefault("tcp_fallback", {})[domain] = "broken"
                 ctx.deferred_vulns.append({
                     "vuln_code": VULNS.TcpFallback.value,
                     "vuln_request": f"SOA {domain} over TCP/53",

@@ -48,6 +48,3 @@ def run(ctx):
                 "vuln_request": f"random-label probe under {domain}",
                 "vuln_response": ", ".join(sorted(wc.a | wc.aaaa | wc.cname)) or "resolves",
             })
-
-    with ctx.results_lock:
-        ctx.properties["wildcard"] = summary

@@ -43,7 +43,6 @@ def run(ctx):
 
         if lame:
             with ctx.results_lock:
-                ctx.properties.setdefault("lame_delegation", {})[domain] = [f"{r.ns}: {r.status}" for r in lame]
                 ctx.deferred_vulns.append({
                     "vuln_code": VULNS.LameDelegation.value,
                     "vuln_request": f"per-NS authoritative check (RD=0 SOA) for {domain}",

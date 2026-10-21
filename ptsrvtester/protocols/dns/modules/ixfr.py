@@ -55,7 +55,6 @@ def run(ctx):
         return
 
     with ctx.results_lock:
-        ctx.properties["ixfr_allowed"] = exposed
         ctx.deferred_vulns.append({
             "vuln_code": VULNS.IncrementalTransfer.value,
             "vuln_request": "IXFR (incremental zone transfer) over TCP",

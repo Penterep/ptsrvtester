@@ -54,6 +54,3 @@ def run(ctx):
                     "vuln_request": f"DNSKEY algorithms for {domain}",
                     "vuln_response": ", ".join(deprecated),
                 })
-
-    with ctx.results_lock:
-        ctx.properties["dnssec_algorithms"] = summary

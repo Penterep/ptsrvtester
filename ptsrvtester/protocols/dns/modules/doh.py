@@ -27,8 +27,6 @@ def run(ctx):
     probe = tt.tls_probe(ip, 443, host, alpn=["h2", "http/1.1"])
     if not probe.connected:
         ctx.out(f"DoH/443 not available ({probe.error}).", "TEXT", indent=4)
-        with ctx.results_lock:
-            ctx.properties["doh"] = "unavailable"
         return
 
     http2 = probe.alpn == "h2"
@@ -44,5 +42,3 @@ def run(ctx):
         ctx.out(f"TLS works but DoH query to /dns-query failed: {type(e).__name__}", "WARNING", indent=4)
 
     tt.report_tls(ctx, "DoH", host, probe)
-    with ctx.results_lock:
-        ctx.properties["doh"] = f"{probe.tls_version}, HTTP/2 {'yes' if http2 else 'no'}, cert {'valid' if probe.verify_ok else 'invalid'}"

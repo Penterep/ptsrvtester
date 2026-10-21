@@ -35,6 +35,3 @@ def run(ctx):
             ctx.out(f"{name:<10} not available ({res.detail})", "TEXT", indent=4)
         else:
             ctx.out(f"{name:<10} not tested ({res.detail})", "WARNING", indent=4)
-
-    with ctx.results_lock:
-        ctx.properties["transports"] = ", ".join(supported) if supported else None

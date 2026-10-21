@@ -37,6 +37,3 @@ def run(ctx):
         if not any_found:
             ctx.out("No records resolved (domain may not exist or is empty).", "WARNING", indent=8)
         all_records[domain] = {rt: v for rt, v in records.items() if v}
-
-    with ctx.results_lock:
-        ctx.properties["records"] = {d: r for d, r in all_records.items() if r}

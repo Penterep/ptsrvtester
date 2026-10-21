@@ -58,7 +58,6 @@ def run(ctx):
             ctx.out(f"Enumerated {len(names)} name(s) via NSEC walking{tail}.", "VULN", indent=8)
             summary[domain] = {"method": "NSEC", "count": len(names)}
             with ctx.results_lock:
-                ctx.properties.setdefault("zonewalk", {})[domain] = names
                 ctx.deferred_vulns.append({
                     "vuln_code": VULNS.ZoneWalk.value,
                     "vuln_request": f"NSEC chain walk of {domain}",
@@ -81,6 +80,3 @@ def run(ctx):
                 "vuln_request": f"NSEC3 hash collection of {domain}",
                 "vuln_response": f"{len(hashes)} NSEC3 hashes (iterations {params.iterations}, salt {params.salt_hex})",
             })
-
-    with ctx.results_lock:
-        ctx.properties["zonewalk_summary"] = summary

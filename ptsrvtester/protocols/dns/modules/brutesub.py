@@ -56,7 +56,6 @@ def run(ctx):
     if not discovered:
         return
     with ctx.results_lock:
-        ctx.properties["subdomains"] = discovered
         flat = [s for subs in discovered.values() for s in subs]
         ctx.deferred_vulns.append({
             "vuln_code": VULNS.Subdomains.value,

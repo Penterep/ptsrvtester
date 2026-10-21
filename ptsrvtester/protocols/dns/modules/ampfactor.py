@@ -54,14 +54,11 @@ def run(ctx):
         best = dos.best_factor(measures)
         if best is None or best.factor < AMP_THRESHOLD:
             ctx.out(f"Max amplification factor is low (x{best.factor if best else 0}).", "OK", indent=8)
-            with ctx.results_lock:
-                ctx.properties.setdefault("amp_factor", {})[domain] = best.factor if best else 0
             continue
 
         ctx.out(f"High amplification: {best.rtype} gives x{best.factor} "
                 f"({best.request_size}→{best.response_size} B) — usable as a reflector/amplifier.", "VULN", indent=8)
         with ctx.results_lock:
-            ctx.properties.setdefault("amp_factor", {})[domain] = best.factor
             ctx.deferred_vulns.append({
                 "vuln_code": VULNS.AmpFactor.value,
                 "vuln_request": f"{best.rtype} {domain} ({best.request_size} B)",

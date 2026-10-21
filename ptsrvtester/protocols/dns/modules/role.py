@@ -46,6 +46,3 @@ def run(ctx):
     else:
         role = "Authoritative-only / recursion not available"
         ctx.out(role, "OK", indent=4)
-
-    with ctx.results_lock:
-        ctx.properties["role"] = role

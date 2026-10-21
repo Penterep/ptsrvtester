@@ -35,13 +35,10 @@ def run(ctx):
 
     if not cached:
         ctx.out("No cache contents disclosed via RD=0 (cache snooping not possible here).", "OK", indent=4)
-        with ctx.results_lock:
-            ctx.properties["cache_snoop"] = False
         return
 
     ctx.out(f"Cache snooping possible: {len(cached)} name(s) answered from cache to a non-recursive query.", "VULN", indent=4)
     with ctx.results_lock:
-        ctx.properties["cache_snoop"] = {r.name: r.ttl for r in cached}
         ctx.deferred_vulns.append({
             "vuln_code": VULNS.CacheSnoop.value,
             "vuln_request": "RD=0 (non-recursive) queries for popular names",

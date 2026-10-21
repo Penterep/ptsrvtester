@@ -30,13 +30,6 @@ class DNS(BaseMain):
 
     def __init__(self, args: BaseArgs, ptjsonlib: PtJsonLib) -> None:
         super().__init__(args, ptjsonlib)
-        self._properties: dict = {
-            "software_type": None,
-            "name": "dns",
-            "version": None,
-            "vendor": None,
-            "description": None,
-        }
         self._deferred_vulns: list[dict] = []
         self._results_lock = threading.Lock()
 
@@ -74,16 +67,15 @@ class DNS(BaseMain):
     def build_context(self) -> dict:
         """Handles every DNS module receives on ``ctx`` (besides the core fields).
 
-        ``properties`` / ``deferred_vulns`` are the shared JSON accumulators and
-        ``results_lock`` guards them; modules read connection info as
-        ``ctx.host`` / ``ctx.ip`` / ``ctx.port`` (any may be ``None`` when no
-        ``-tg`` server was given).
+        ``deferred_vulns`` is the shared findings accumulator and ``results_lock``
+        guards it; modules read connection info as ``ctx.host`` / ``ctx.ip`` /
+        ``ctx.port`` (any may be ``None`` when no ``-tg`` server was given). No
+        ``properties`` handle is exposed — the JSON ``properties`` object stays empty.
         """
         return {
             "host": self.target_host,
             "ip": self.target[0],
             "port": self.target[1],
-            "properties": self._properties,
             "deferred_vulns": self._deferred_vulns,
             "results_lock": self._results_lock,
         }

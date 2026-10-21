@@ -52,7 +52,6 @@ def run(ctx):
 
     if findings:
         with ctx.results_lock:
-            ctx.properties["takeover"] = findings
             ctx.deferred_vulns.append({
                 "vuln_code": VULNS.Takeover.value,
                 "vuln_request": "CNAME/target check against takeover fingerprints",

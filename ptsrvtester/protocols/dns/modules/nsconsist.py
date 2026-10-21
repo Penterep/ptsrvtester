@@ -40,14 +40,11 @@ def run(ctx):
 
         if consistent:
             ctx.out("All name servers agree on SOA serial and NS set.", "OK", indent=8)
-            with ctx.results_lock:
-                ctx.properties.setdefault("ns_consistency", {})[domain] = "consistent"
             continue
 
         for n in notes:
             ctx.out(n, "VULN", indent=8)
         with ctx.results_lock:
-            ctx.properties.setdefault("ns_consistency", {})[domain] = notes
             ctx.deferred_vulns.append({
                 "vuln_code": VULNS.NsInconsistent.value,
                 "vuln_request": f"per-NS SOA/NS comparison for {domain}",

@@ -9,8 +9,7 @@ Modules append finding dicts (each carrying at least ``vuln_code``) to
 ``ctx.deferred_vulns``, guarded by ``ctx.results_lock``. :meth:`DNS.output` then
 emits one ``{"vulnCode": ...}`` entry per distinct code (ptlibs de-duplicates),
 mirroring ``ssh/main.py`` — no ``software`` node or ``properties`` are written.
-The ``ctx.properties`` dict is still provided for modules that populate it, but
-it no longer appears in the JSON output.
+There is no ``ctx.properties`` handle: the JSON ``properties`` object stays empty.
 """
 from enum import Enum
 

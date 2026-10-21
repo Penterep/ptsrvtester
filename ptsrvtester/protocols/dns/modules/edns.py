@@ -27,8 +27,6 @@ def run(ctx):
         return
     if not info.supported:
         ctx.out("Server does not support EDNS(0).", "TEXT", indent=4)
-        with ctx.results_lock:
-            ctx.properties["edns"] = "unsupported"
         return
 
     ctx.out(f"{'EDNS version':<18} {info.version}", "OK", indent=4)
@@ -38,6 +36,3 @@ def run(ctx):
         "OK" if info.cookie else "TEXT",
         indent=4,
     )
-
-    with ctx.results_lock:
-        ctx.properties["edns"] = f"v{info.version}, payload {info.udp_payload}, cookies {'yes' if info.cookie else 'no'}"

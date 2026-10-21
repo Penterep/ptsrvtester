@@ -65,7 +65,7 @@ def list_module_contents(ctx, host, module, recursive=False, timeout=15):
         cmd, capture_output=True, text=True, input="", env=rsync_env(ctx), timeout=timeout
     )
     output = f"{result.stdout}\n{result.stderr}"
-    rsync_debug(ctx, f"Received stdout: {result.stdout.rstirp()}", indent=4)
+    rsync_debug(ctx, f"Received stdout: {result.stdout.rstrip()}", indent=4)
     rsync_debug(ctx, f"Received stderr: {result.stderr.rstrip()}", indent=4)
     if re.search(
         r"password\s*:|@RSYNCD:\s*AUTHREQD|auth(?:entication)?\s+(?:is\s+)?(?:required|failed)",

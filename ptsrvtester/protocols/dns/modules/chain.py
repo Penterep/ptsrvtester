@@ -23,9 +23,11 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
+    ctx.debug(f"validating the DNSSEC chain of trust (parent DS ↔ child DNSKEY) for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"fetching DNSKEY for {domain} and DS from its parent, then matching digests")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         keys = dc.get_dnskey(servers, domain) if servers else None
         dnskey = keys.dnskey if keys else None

@@ -32,9 +32,11 @@ def run(ctx):
         wordlist_note = f"built-in {len(labels)} common labels (use -sub for more)"
 
     resolver = ec.resolver_for(ctx)
+    ctx.debug(f"attempting offline NSEC3 hash cracking for {len(domains)} domain(s) using {wordlist_note}")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"collecting NSEC3 hashes and parameters for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
@@ -47,6 +49,7 @@ def run(ctx):
 
         ctx.out(f"NSEC3 alg {params.algorithm}, iterations {params.iterations}, salt {params.salt_hex}; "
                 f"{len(hashes)} hashes collected; trying {wordlist_note}.", "TEXT", indent=8)
+        ctx.debug(f"hashing {len(labels)} candidate label(s) with the zone's NSEC3 parameters and matching against {len(hashes)} collected hash(es)")
         revealed = zw.crack_nsec3(hashes, params, domain, labels)
 
         if not revealed:

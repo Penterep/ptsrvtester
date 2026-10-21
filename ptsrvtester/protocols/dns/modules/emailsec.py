@@ -24,9 +24,11 @@ def run(ctx):
     selectors = getattr(ctx.args, "dkim_selectors", None) or ec.DEFAULT_DKIM_SELECTORS
     resolver = ec.resolver_for(ctx)
     summary: dict[str, dict] = {}
+    ctx.debug(f"checking email security for {len(domains)} domain(s); DKIM selectors tried: {', '.join(selectors)}")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"querying SPF (TXT), DMARC (_dmarc TXT) and DKIM selectors for {domain}")
         info = ec.email_security(resolver, domain, selectors)
         vulns: list[dict] = []
 

@@ -28,10 +28,12 @@ def run(ctx):
         labels = [l.strip() for l in text_or_file(None, ctx.args.subdomains) if l.strip()]
 
     resolver = ec.resolver_for(ctx)
+    ctx.debug(f"following CNAME chains for {len(domains)} domain(s)" + (f" plus {len(labels)} sub-label(s)" if labels else ""))
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
         names = [domain] + [f"{l}.{domain.rstrip('.')}" for l in labels]
+        ctx.debug(f"following the CNAME chain for {len(names)} name(s) under {domain}")
         for name in names:
             res = ig.cname_chain(resolver, name)
             hops = len(res.chain) - 1

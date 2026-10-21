@@ -21,7 +21,9 @@ def run(ctx):
         return
     ip, port = target
 
+    ctx.debug(f"sending a recursive (RD=1) probe for an external name to {ip}:{port} to classify the server role")
     info = fp.role_probe(ip, port)
+    ctx.debug("role probe complete; reading RA/AA flags and the answer")
     if info.error:
         ctx.out(f"Role probe failed: {info.error}", "WARNING", indent=4)
         return

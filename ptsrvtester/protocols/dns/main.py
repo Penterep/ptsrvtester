@@ -3,9 +3,10 @@
 All the generic machinery (module discovery, ``-ts`` selection, parallel
 execution, ordered output, the ``ctx`` object) lives in :class:`BaseMain` in
 ``protocols/_base.py``. This file declares only what is specific to DNS plus a
-small :meth:`output` override so every module contributes to a single shared
-``software`` node in JSON output (all DNS findings bind to one node). Mirrors
-``ssh/main.py``.
+small :meth:`output` override: the JSON carries nothing but the run ``log`` and
+``vulnerabilities``, where every distinct finding code a module reported becomes
+its own ``{"vulnCode": ...}`` entry. No ``software`` node and no ``properties``
+are emitted. Mirrors ``ssh/main.py``.
 """
 import argparse
 import socket
@@ -88,12 +89,16 @@ class DNS(BaseMain):
         }
 
     def output(self) -> None:
-        """Build the single shared ``software`` node and bind every module's vulns."""
-        dns_node = self.ptjsonlib.create_node_object("software", None, None, self._properties)
-        self.ptjsonlib.add_node(dns_node)
-        node_key = dns_node["key"]
+        """Emit one vulnerability object per finding code, like ``ssh/main.py``.
+
+        Each code a module appended to ``ctx.deferred_vulns`` becomes its own
+        ``{"vulnCode": ...}`` entry in ``results.vulnerabilities`` via ptlibs
+        ``add_vulnerability`` (which de-duplicates by code, so the same code seen
+        for several domains collapses to one entry). No ``software`` node and no
+        ``properties`` are written; besides the log, nothing else goes into the JSON.
+        """
         for v in self._deferred_vulns:
-            self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
+            self.ptjsonlib.add_vulnerability(vuln_code=v["vuln_code"])
 
         self.ptjsonlib.set_status("finished", "")
         if self.use_json:

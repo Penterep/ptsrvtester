@@ -33,14 +33,17 @@ def run(ctx):
     resolver = ec.resolver_for(ctx)
     threads = getattr(ctx.args, "threads", 10) or 10
     discovered: dict[str, list[str]] = {}
+    ctx.debug(f"brute-forcing {len(labels)} label(s) against {len(domains)} domain(s) with {threads} thread(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"detecting a wildcard for {domain} before brute forcing")
         wildcard = ec.wildcard_detect(resolver, domain)
         if wildcard.present:
             baseline = ", ".join(sorted(wildcard.a | wildcard.aaaa | wildcard.cname)) or "?"
             ctx.out(f"Wildcard detected ({baseline}); matching hits are filtered out.", "WARNING", indent=8)
 
+        ctx.debug(f"resolving {len(labels)} candidate label(s) under {domain}")
         found, filtered = ec.brute_subdomains(resolver, domain, labels, threads, wildcard)
         for fqdn, recs in found:
             summary = ", ".join(f"{rt}={','.join(v)}" for rt, v in recs.items() if v)

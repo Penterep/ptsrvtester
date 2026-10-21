@@ -23,9 +23,11 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, list[str]] = {}
+    ctx.debug(f"inspecting DNSKEY algorithms for {len(domains)} domain(s) and flagging deprecated ones")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"fetching DNSKEY algorithms for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         keys = dc.get_dnskey(servers, domain) if servers else None
         if not keys or keys.dnskey is None:

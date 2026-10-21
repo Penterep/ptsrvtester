@@ -28,9 +28,11 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, object] = {}
+    ctx.debug(f"attempting zone walking via NSEC/NSEC3 for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"finding authoritative servers for {domain} and detecting the authenticated-denial type")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
@@ -46,6 +48,7 @@ def run(ctx):
                 ctx.out("Minimal-covering NSEC ('black lies') — the zone is NOT walkable.", "OK", indent=8)
                 summary[domain] = "NSEC (not walkable)"
                 continue
+            ctx.debug(f"walking the NSEC next-chain from the apex of {domain}")
             names, truncated = zw.walk_nsec(servers, domain)
             for n in names[:SAMPLE]:
                 ctx.out(n, "TEXT", indent=8)

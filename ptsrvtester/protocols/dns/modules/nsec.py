@@ -24,9 +24,11 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, str] = {}
+    ctx.debug(f"querying a random non-existent name per domain to inspect NSEC/NSEC3 authenticated denial ({len(domains)} domain(s))")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"requesting authenticated-denial records for a bogus name under {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         info = dc.denial_of_existence(servers, domain) if servers else dc.DenialInfo(error="no authoritative servers")
 

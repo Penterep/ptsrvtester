@@ -21,6 +21,7 @@ def run(ctx):
         return
     ip, port = target
 
+    ctx.debug(f"reading version.bind (CHAOS TXT) from {ip}:{port} to match against the known-CVE table")
     values = fp.chaos_txt(ip, port, "version.bind")
     version_string = values[0] if values else None
     if not version_string:
@@ -37,6 +38,7 @@ def run(ctx):
         ctx.out("Could not identify product/version from the banner — no CVE match attempted.", "WARNING", indent=4)
         return
 
+    ctx.debug(f"checking {product} {'.'.join(str(p) for p in version)} against the seed CVE table")
     matches = fp.match_cves(product, version)
     if not matches:
         ctx.out("No seed-table CVE matches the advertised version (table is not exhaustive).", "OK", indent=4)

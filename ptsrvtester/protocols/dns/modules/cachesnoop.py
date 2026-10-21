@@ -20,8 +20,10 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
+    ctx.debug(f"sending RD=0 (non-recursive) queries for popular names to {ip}:{port} to detect cached entries")
     results = rc.cache_snoop(ip, port)
     cached = [r for r in results if r.cached]
+    ctx.debug(f"cache-snoop probe complete; {len(cached)} of {len(results)} name(s) answered from cache")
 
     for r in results:
         if r.cached:

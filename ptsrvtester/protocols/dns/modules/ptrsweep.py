@@ -28,7 +28,9 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     threads = getattr(ctx.args, "threads", 10) or 10
+    ctx.debug(f"reverse-resolving {len(addrs)} address(es) with {threads} thread(s)")
     results = ec.ptr_sweep(resolver, addrs, threads)
+    ctx.debug(f"PTR sweep complete; {len(results)} address(es) have a PTR record")
 
     if not results:
         ctx.out(f"No PTR records found across {len(addrs)} address(es).", "OK", indent=4)

@@ -19,8 +19,10 @@ def run(ctx):
         return
     ip, port = target
 
+    ctx.debug(f"querying CHAOS-class TXT records ({', '.join(fp.CHAOS_NAMES)}) on {ip}:{port}")
     chaos = fp.collect_chaos(ip, port)
     disclosed = {name: vals for name, vals in chaos.items() if vals}
+    ctx.debug(f"CHAOS query complete; {len(disclosed)} of {len(fp.CHAOS_NAMES)} name(s) disclosed information")
 
     for name in fp.CHAOS_NAMES:
         vals = chaos.get(name)

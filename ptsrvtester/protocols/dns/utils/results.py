@@ -5,9 +5,12 @@ the absolute path (the modules are loaded dynamically by :class:`BaseMain` and
 have no package parent, so relative imports would fail). Mirrors
 ``ssh/utils/results.py``.
 
-Modules accumulate findings onto the shared ``ctx.properties`` dict and append
-finding dicts to ``ctx.deferred_vulns`` (both guarded by ``ctx.results_lock``);
-:meth:`DNS.output` then binds them all to a single ``software`` node.
+Modules append finding dicts (each carrying at least ``vuln_code``) to
+``ctx.deferred_vulns``, guarded by ``ctx.results_lock``. :meth:`DNS.output` then
+emits one ``{"vulnCode": ...}`` entry per distinct code (ptlibs de-duplicates),
+mirroring ``ssh/main.py`` — no ``software`` node or ``properties`` are written.
+The ``ctx.properties`` dict is still provided for modules that populate it, but
+it no longer appears in the JSON output.
 """
 from enum import Enum
 

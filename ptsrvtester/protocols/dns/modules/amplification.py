@@ -24,7 +24,9 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
+    ctx.debug(f"sending small RD=1 queries (TXT/DNSKEY/ANY) for out-of-zone names to {ip}:{port} and measuring response size")
     results = rc.amplification(ip, port)
+    ctx.debug(f"amplification probe complete; {len(results)} response(s) received")
     if not results:
         ctx.out("No response to any amplification probe.", "OK", indent=4)
         return

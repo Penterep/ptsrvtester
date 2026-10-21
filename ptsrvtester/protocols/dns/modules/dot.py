@@ -24,6 +24,7 @@ def run(ctx):
         return
     host = getattr(ctx, "host", None) or ip
 
+    ctx.debug(f"handshaking TLS to {ip}:853 (ALPN dot) to read the negotiated version, cipher and certificate")
     probe = tt.tls_probe(ip, 853, host, alpn=["dot"])
     if not probe.connected:
         ctx.out(f"DoT/853 not available ({probe.error}).", "TEXT", indent=4)
@@ -34,6 +35,7 @@ def run(ctx):
     ctx.out(f"DoT/853 available — {probe.tls_version}, {probe.cipher} ({probe.cipher_bits}-bit)"
             + (f", ALPN {probe.alpn}" if probe.alpn else ""), "OK", indent=4)
 
+    ctx.debug("confirming the server actually answers a DNS query over TLS")
     try:
         dns.query.tls(dns.message.make_query(host if "." in host else "example.com", dns.rdatatype.A),
                       ip, port=853, timeout=6, server_hostname=host)

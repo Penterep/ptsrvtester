@@ -25,6 +25,7 @@ def run(ctx):
         return
     host = getattr(ctx, "host", None) or ip
 
+    ctx.debug(f"attempting a DNS-over-QUIC query to {ip}:853 (requires the optional aioquic package)")
     have_quic = getattr(getattr(dns, "quic", None), "have_quic", False)
     if not have_quic:
         ctx.out("DoQ not tested — the optional 'aioquic' package is not installed.", "WARNING", indent=4)

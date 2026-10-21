@@ -26,14 +26,17 @@ def run(ctx):
     resolver = ec.resolver_for(ctx, timeout=zc.XFR_TIMEOUT)
     extra = (ctx.host, ctx.ip) if getattr(ctx, "ip", None) else None
     exposed: list[str] = []
+    ctx.debug(f"attempting AXFR for {len(domains)} domain(s) against each authoritative name server over TCP")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"discovering authoritative name servers for {domain}")
         servers, primary, _ = zc.transfer_targets(resolver, domain, extra)
         if not servers:
             ctx.out("No NS records found for the domain (cannot try AXFR).", "WARNING", indent=8)
             continue
 
+        ctx.debug(f"{len(servers)} name server(s) found for {domain}; trying AXFR against each")
         for ns in servers:
             role = "primary" if ns.is_primary else "secondary"
             if not ns.ips:

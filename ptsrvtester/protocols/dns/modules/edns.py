@@ -20,6 +20,7 @@ def run(ctx):
         return
     ip, port = target
 
+    ctx.debug(f"sending an EDNS(0) query with a client cookie to {ip}:{port} and reading the OPT record back")
     info = fp.edns_probe(ip, port)
     if info.error:
         ctx.out(f"EDNS probe failed: {info.error}", "WARNING", indent=4)

@@ -22,9 +22,11 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
+    ctx.debug(f"comparing SOA serial and NS set across each name server for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"querying each authoritative NS of {domain} for its SOA serial and NS set")
         views, consistent, notes = ig.ns_consistency(resolver, domain)
         if not views:
             ctx.out("No NS records found for the domain.", "WARNING", indent=8)

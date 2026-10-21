@@ -16,11 +16,17 @@ DIGEST_SECURITY_MAPPING = {
 
 def _rsync_try_ssh(ctx):
     try:
+        ctx.debug(f"Sent: TCP connection to SSH service at {ctx.ip}:22", indent=4)
         with socket.create_connection((ctx.ip, 22), timeout=ctx.timeout) as s:
+            ctx.debug("Received: SSH service accepted the TCP connection", indent=8)
             ctx.out(f"The host supports SSH", "INFO", indent=4)
 
             try:
                 auth_m = get_auth_methods(ctx.ip, 22)
+                ctx.debug(
+                    f"Received SSH authentication methods: {', '.join(auth_m) if auth_m else '<none>'}",
+                    indent=8,
+                )
                 if auth_m:
                     ctx.out(f"Supported authentication methods: {', '.join(auth_m)}", "INFO", indent=8)
                 else:
@@ -42,6 +48,11 @@ def run(ctx):
                 indent=4,
             )
 
+    ctx.debug(
+        f"Received supported rsync digest algorithms: "
+        f"{', '.join(supported_digests) if supported_digests else '<none>'}",
+        indent=4,
+    )
     ctx.out(f"Supported hash digest algorithms:", "INFO", indent=4)
     for hd in supported_digests:
         ctx.out(f"{hd}", DIGEST_SECURITY_MAPPING.get(hd, "INFO"), indent=8)

@@ -37,6 +37,7 @@ def _fill_module(ctx, module):
                     probe.write(os.urandom(chunk_size))
 
                 try:
+                    ctx.debug(f"Uploading {chunk_size} bytes to {rsync_url(ctx, f"{module}/{probe_name}")}", indent=4)
                     upload = subprocess.run(
                         [
                             "rsync",

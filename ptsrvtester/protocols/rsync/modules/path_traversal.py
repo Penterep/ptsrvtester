@@ -36,15 +36,21 @@ def _try_path_traversal_write(ctx):
         with open(local_path, "w", encoding="utf-8") as marker:
             marker.write("Temporary rsync path traversal probe.\n")
 
+        ctx.debug(f"Created local temporary path traversal probe at {local_path}", indent=4)
+        
         try:
+            command = [
+                "rsync",
+                "--no-motd",
+                "--ignore-existing",
+                local_path,
+                rsync_url(ctx, f"{traversal_dir}/{marker_name}"),
+            ]
+            
+            ctx.debug(f"Running command \"{' '.join(command)}\"", indent=4)
+            
             upload = subprocess.run(
-                [
-                    "rsync",
-                    "--no-motd",
-                    "--ignore-existing",
-                    local_path,
-                    rsync_url(ctx, f"{traversal_dir}/{marker_name}"),
-                ],
+                command,
                 capture_output=True,
                 text=True,
                 input="",
@@ -58,6 +64,9 @@ def _try_path_traversal_write(ctx):
             ctx.out("rsync client binary not found on this machine", "ERROR", indent=4)
             return
 
+        ctx.debug(f"Received stdout: {upload.stdout.rstrip}", indent=4)
+        ctx.debug(f"Received stderr: {upload.stderr.rstrip}", indent=4)
+        
         if upload.returncode != 0:
             error = upload.stderr.strip().splitlines()
             detail = error[0] if error else f"rsync exited with status {upload.returncode}"

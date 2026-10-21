@@ -22,6 +22,8 @@ def _check_module(module):
         rsync_url(ctx, f"{module_name}/"),
     ]
 
+    ctx.debug(f"Running command \"{' '.join(command)}\"", indent=4)
+    
     try:
         result = subprocess.run(
             command,
@@ -39,6 +41,10 @@ def _check_module(module):
         return
 
     output = f"{result.stdout}\n{result.stderr}"
+    
+    ctx.debug(f"Received stdout: {result.stdout.rstrip()}", indent=4)
+    ctx.debug(f"Received stderr: {result.stderr.rstrip()}", indent=4)
+    
     if re.search(
         r"@RSYNCD:\s*AUTHREQD|auth(?:entication)?\s+(?:is\s+)?(?:required|failed)|password\s*:",
         output,

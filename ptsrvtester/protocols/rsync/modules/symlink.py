@@ -25,15 +25,19 @@ def _upload_symlink(ctx, module):
 
         upload = None
         try:
+            command = [
+                "rsync",
+                "--links",
+                "--no-motd",
+                "--contimeout=5",
+                local_path,
+                rsync_url(ctx, f"{module}/{link_name}"),
+            ]
+            
+            ctx.debug(f"Running command: \"{' '.join(command)}\"", indent=4)            
+            
             upload = subprocess.run(
-                [
-                    "rsync",
-                    "--links",
-                    "--no-motd",
-                    "--contimeout=5",
-                    local_path,
-                    rsync_url(ctx, f"{module}/{link_name}"),
-                ],
+                command,
                 capture_output=True,
                 text=True,
                 input="",
@@ -47,13 +51,16 @@ def _upload_symlink(ctx, module):
             return
 
         if upload is not None:
+            ctx.debug(f"Received stdout: {upload.stdout.rstrip}", indent=4)
+            ctx.debug(f"Received stderr: {upload.stderr.rstrip}", indent=4)
+            
             if upload.returncode != 0:
                 error = upload.stderr.strip().splitlines()
                 detail = error[0] if error else f"rsync exited with status {upload.returncode}"
                 ctx.out(f"Symlink upload to module {module} was unsuccessful: {detail}", "OK", indent=4)
             else:
                 try:
-                    print(f"Verifying the uploaded symlink in module {module}/{link_name}")
+                    ctx.debug(f"Verifying the uploaded symlink in module {module}/{link_name}", indent=4)
                     verify = subprocess.run(
                         [
                             "rsync",

@@ -71,7 +71,7 @@ def run(ctx):
         baseline = _probe_user(ctx, module, baseline_user)
         ctx.debug(
             f"Baseline response for random username '{baseline_user}': "
-            f"returncode={baseline[0]}, stdout={baseline[1]!r}, stderr={baseline[2]!r}"
+            f"returncode={baseline[0]}, stdout={baseline[1]!r}, stderr={baseline[2]!r}", indent=4
         )
     except subprocess.TimeoutExpired:
         ctx.out(f"Timed out checking authentication for module '{module}'", "ERROR", indent=4)

@@ -27,13 +27,22 @@ def check_write_access(module_dict: dict):
         local_path = os.path.join(tmpdir, marker_name)
         with open(local_path, "w") as f:
             f.write(marker_content)
- 
+
+        ctx.debug(f"Created temporary write probe at {local_path}", indent=4)
+        
         upload_url = rsync_url(ctx, f"{module}/{marker_name}")
         try:
+            command = ["rsync", "--contimeout=5", local_path, upload_url]
+            ctx.debug(f"Uploading write probe with command: \"{command}\"", indent=4)
+            
             upload = subprocess.run(
-                ["rsync", "--contimeout=5", local_path, upload_url],
+                command,
                 capture_output=True, text=True, input="", env=env, timeout=ctx.timeout,
             )
+            
+            ctx.debug(f"Received stdout: {upload.stdout.rstrip}", indent=4)
+            ctx.debug(f"Received stderr: {upload.stderr.rstrip}", indent=4)
+            
             result["upload_returncode"] = upload.returncode
             result["upload_stderr"] = upload.stderr[:1000]
 
@@ -65,6 +74,9 @@ def check_write_access(module_dict: dict):
                         f"{empty_dir}/",
                         rsync_url(ctx, f"{module}/"),
                     ]
+                    
+                    ctx.debug(f"Executing cleanup: \"{' '.join(delete_cmd)}\"", indent=4)
+                    
                     delcheck = subprocess.run(
                         delete_cmd,
                         capture_output=True,

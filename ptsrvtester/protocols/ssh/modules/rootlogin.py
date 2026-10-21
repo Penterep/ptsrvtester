@@ -25,7 +25,7 @@ import secrets
 # side effect (so old servers still negotiate and paramiko does not spam stderr).
 from ptsrvtester.protocols.ssh.utils import ssh_helpers
 from ptsrvtester.protocols.ssh.utils.helpers import text_or_file
-from ptsrvtester.protocols.ssh.utils.results import SSHCreds, VULNS
+from ptsrvtester.protocols.ssh.utils.results import SSHCreds
 from ptsrvtester.protocols.ssh.utils.rootlogin_core import assess_root_login
 
 __MODULELABEL__ = "Root login permitted"
@@ -130,16 +130,4 @@ def _render(ctx, r):
         ctx.out(n, "TEXT", indent=8)
 
     if r.is_finding:
-        if r.verdict == "confirmed":
-            request = f"account: {r.account}\nreal login attempt with supplied credentials"
-            response = f"authenticated successfully as '{r.account}' — root access is permitted"
-        else:
-            request = f"account: {r.account}\nread advertised authentication methods"
-            response = (f"server offers a password method to '{r.account}' "
-                        f"({_fmt_methods(r.root_methods)}) — password root login is permitted")
-        with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.RootLoginPermitted.value,
-                "vuln_request": request,
-                "vuln_response": response,
-            })
+        ctx.vulns.hit(ctx.module_code)

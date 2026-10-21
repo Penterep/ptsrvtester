@@ -28,7 +28,7 @@ import paramiko
 # side effect (so old servers still negotiate and paramiko does not spam stderr).
 from ptsrvtester.protocols.ssh.utils import ssh_helpers  # noqa: F401
 from ptsrvtester.protocols.ssh.utils.helpers import text_or_file
-from ptsrvtester.protocols.ssh.utils.results import SSHCreds, VULNS
+from ptsrvtester.protocols.ssh.utils.results import SSHCreds
 from ptsrvtester.protocols.ssh.utils.shellaccess_core import (
     ProbeOutcome,
     assess_shell_access,
@@ -229,11 +229,4 @@ def _render(ctx, r):
         ctx.debug(n)
 
     if r.is_finding:
-        how = "interactive shell" if r.verdict == "shell" else "command execution"
-        with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.ShellAccess.value,
-                "vuln_request": f"account: {r.account}\npost-auth: open a session channel and "
-                                f"run a command / request a shell",
-                "vuln_response": f"{how} obtained as '{r.account}' — shell access is permitted",
-            })
+        ctx.vulns.hit(ctx.module_code)

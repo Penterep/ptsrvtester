@@ -11,4 +11,4 @@ __ORDER__ = 41
 
 
 def run(ctx):
-    report_algorithm_section(ctx, "key", vuln_request="ssh-audit host-key algorithms")
+    report_algorithm_section(ctx, "key")

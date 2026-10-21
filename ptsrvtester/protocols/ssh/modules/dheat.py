@@ -24,7 +24,6 @@ from ptsrvtester.protocols.ssh.utils.sshaudit import (
     DHEAT_DEFAULT_DURATION,
     run_ssh_audit_dheat,
 )
-from ptsrvtester.protocols.ssh.utils.results import VULNS
 
 __MODULELABEL__ = "DHEat DoS attack (CVE-2002-20001)"
 __MODULECODE__ = "DHEAT"
@@ -101,9 +100,4 @@ def run(ctx):
         ctx.out(line, "TEXT", indent=8)
 
     if result.vulnerable is True:
-        with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.DHEat.value,
-                "vuln_request": f"ssh-audit --dheat against {ip}:{port}",
-                "vuln_response": "\n".join([result.verdict or ""] + result.stats).strip(),
-            })
+        ctx.vulns.hit(ctx.module_code)

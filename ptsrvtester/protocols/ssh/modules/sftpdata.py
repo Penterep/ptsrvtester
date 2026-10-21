@@ -27,7 +27,7 @@ import paramiko
 # side effect (so old servers still negotiate and paramiko does not spam stderr).
 from ptsrvtester.protocols.ssh.utils import ssh_helpers  # noqa: F401
 from ptsrvtester.protocols.ssh.utils.helpers import text_or_file
-from ptsrvtester.protocols.ssh.utils.results import SSHCreds, VULNS
+from ptsrvtester.protocols.ssh.utils.results import SSHCreds
 from ptsrvtester.protocols.ssh.utils.sftpdata_core import (
     CAP_BOMB_MB,
     CAP_MAX_FILES,
@@ -345,32 +345,10 @@ def _render(ctx, r):
     for n in r.notes:
         ctx.debug(n)
 
-    with ctx.results_lock:
-        _push_vulns(ctx, r)
+    _push_vulns(ctx, r)
 
 
 def _push_vulns(ctx, r):
-    obs = r.obs
-    if r.no_antivirus_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpNoAntivirus.value,
-            "vuln_request": f"account: {r.account}\nSFTP upload of the EICAR test file",
-            "vuln_response": "the EICAR test file was stored intact — uploads are not scanned for "
-                             "malware on receipt",
-        })
-    if r.processing_dos_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpContentProcessingDoS.value,
-            "vuln_request": f"account: {r.account}\nSFTP upload of a compressible archive vs baseline",
-            "vuln_response": f"compressible upload took {obs.bomb_seconds:.2f}s vs "
-                             f"{obs.baseline_seconds:.2f}s baseline — the server processes/decompresses "
-                             "uploads (ZIP-bomb / XXE denial-of-service surface)",
-        })
-    if r.no_quota_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpNoQuota.value,
-            "vuln_request": f"account: {r.account}\nSFTP bounded write ({obs.mb_written:.0f} MB) and "
-                            f"{obs.files_created} files",
-            "vuln_response": "no size or file-count quota within the tested bounds — an attacker can "
-                             "fill the disk (denial of service)",
-        })
+    """Record the module finding (PTV-SVC-SFTPDATA) if any content/limit issue was found."""
+    if r.any_finding:
+        ctx.vulns.hit(ctx.module_code)

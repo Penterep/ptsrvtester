@@ -9,7 +9,6 @@ pre-auth, so it runs in the default sweep.
 """
 from ptsrvtester.protocols.ssh.utils.ssh_helpers import read_kexinit
 from ptsrvtester.protocols.ssh.utils.protohygiene_core import assess_terrapin
-from ptsrvtester.protocols.ssh.utils.results import VULNS
 
 __MODULELABEL__ = "Terrapin (CVE-2023-48795)"
 __MODULECODE__ = "TERRAPIN"
@@ -52,10 +51,4 @@ def run(ctx):
         ctx.out(n, "TEXT", indent=8)
 
     if r.is_finding:
-        with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.Terrapin.value,
-                "vuln_request": "read server KEXINIT (kex/enc/mac name-lists)",
-                "vuln_response": "no strict kex (kex-strict-s-v00@openssh.com) and Terrapin-affected "
-                                 "mode(s) offered: " + ", ".join(r.vulnerable_modes),
-            })
+        ctx.vulns.hit(ctx.module_code)

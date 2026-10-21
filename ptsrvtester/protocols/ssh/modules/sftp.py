@@ -24,7 +24,7 @@ import paramiko
 # side effect (so old servers still negotiate and paramiko does not spam stderr).
 from ptsrvtester.protocols.ssh.utils import ssh_helpers  # noqa: F401
 from ptsrvtester.protocols.ssh.utils.helpers import text_or_file
-from ptsrvtester.protocols.ssh.utils.results import SSHCreds, VULNS
+from ptsrvtester.protocols.ssh.utils.results import SSHCreds
 from ptsrvtester.protocols.ssh.utils.sftp_core import (
     SftpObservations,
     assess_sftp,
@@ -386,43 +386,10 @@ def _render(ctx, r):
     for n in r.notes:
         ctx.debug(n)
 
-    with ctx.results_lock:
-        _push_vulns(ctx, r)
+    _push_vulns(ctx, r)
 
 
 def _push_vulns(ctx, r):
-    obs = r.obs
-    if r.no_chroot_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpNoChroot.value,
-            "vuln_request": f"account: {r.account}\nSFTP: browse '/', stat system paths",
-            "vuln_response": "no ChrootDirectory confinement — the account can browse the real "
-                             "filesystem (readable: " + (", ".join(obs.system_readable) or "system paths") + ")",
-        })
-    if r.write_outside_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpTraversal.value,
-            "vuln_request": f"account: {r.account}\nSFTP: write probe outside the login tree",
-            "vuln_response": "writable location(s) outside the intended tree: "
-                             + ", ".join(obs.system_writable),
-        })
-    if r.symlink_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpSymlinkEscape.value,
-            "vuln_request": f"account: {r.account}\nSFTP: create symlink to a system file and read it",
-            "vuln_response": obs.symlink_detail or "a symlink resolved outside the confinement",
-        })
-    if r.unrestricted_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpUnrestricted.value,
-            "vuln_request": f"account: {r.account}\npost-auth: SFTP + shell/exec/forward probes",
-            "vuln_response": "the SFTP account also has: " + ", ".join(r.extra_capabilities)
-                             + " — it is not restricted to file transfer",
-        })
-    if r.ads_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpADS.value,
-            "vuln_request": f"account: {r.account}\nSFTP: write an NTFS alternate data stream",
-            "vuln_response": "an NTFS Alternate Data Stream was written — data can be hidden and "
-                             "may bypass content scanning",
-        })
+    """Record the module finding (PTV-SVC-SFTP) if any confinement issue was found."""
+    if r.any_finding:
+        ctx.vulns.hit(ctx.module_code)

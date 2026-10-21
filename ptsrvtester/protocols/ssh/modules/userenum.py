@@ -38,7 +38,6 @@ from ptlibs.ptprinthelper import ptprint, clear_line
 # side effect (so old servers still negotiate and paramiko does not spam stderr).
 from ptsrvtester.protocols.ssh.utils import ssh_helpers
 from ptsrvtester.protocols.ssh.utils.helpers import text_or_file
-from ptsrvtester.protocols.ssh.utils.results import VULNS
 from ptsrvtester.protocols.ssh.utils.userenum_core import (
     DEFAULT_BASELINE_USERS,
     DEFAULT_SAMPLES,
@@ -277,16 +276,7 @@ def _render(ctx, result, valid_user, candidates):
     for n in cal.notes:
         ctx.out(n, "TEXT", indent=8)
 
-    with ctx.results_lock:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.UserEnum.value,
-            "vuln_request": f"known-valid login: {valid_user}\n"
-                            f"baseline: {len(cal.invalid_stats)} random names, "
-                            f"{cal.valid_stat.attempted} samples each",
-            "vuln_response": f"valid login responds {gap_ms:.1f} ms {slower} than invalid "
-                             f"names ({cal.observed_sigma:.1f}σ) — usernames can be enumerated "
-                             "by timing",
-        })
+    ctx.vulns.hit(ctx.module_code)
 
     if not candidates:
         ctx.out("Provide -U/--users <wordlist> to enumerate usernames from a list.",
@@ -308,11 +298,5 @@ def _render(ctx, result, valid_user, candidates):
     if unmeasured:
         ctx.out(f"{len(unmeasured)} name(s) could not be measured: {', '.join(unmeasured[:10])}"
                 + (" …" if len(unmeasured) > 10 else ""), "TEXT", indent=8)
-
-    if result.found:
-        with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.UserEnum.value,
-                "vuln_request": f"candidate list: {len(candidates)} names (-U)",
-                "vuln_response": "enumerated valid usernames: " + ", ".join(result.found),
-            })
+    # The USERENUM finding (PTV-SVC-USERENUM) was already recorded above; the
+    # enumerated names are surfaced in the terminal output / log, not the JSON.

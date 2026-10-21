@@ -87,6 +87,7 @@ class ModuleContext:
         self.target = target                       # (ip, port)
         self.json = bool(getattr(args, "json", False))
         self.verbose = bool(getattr(args, "debug", False))
+        self.module_code = None                     # set by BaseMain._run_module
 
     def out(self, string="", category="TEXT", *, colortext=False, indent=0, condition=None):
         """Buffer one formatted line (printed by the main after the module finishes).
@@ -119,6 +120,15 @@ class ModuleContext:
         here, so a module's breadcrumbs are always captured in the log.
         """
         self.ptjsonlib.add_to_log(str(message))
+
+    def add_vulnerability(self) -> None:
+        """Record the running module's finding in ``results.vulnerabilities``.
+
+        Adds ONLY the code, derived from the module as ``PTV-SVC-<MODULECODE>``
+        (e.g. BANNER -> ``PTV-SVC-BANNER``) — no request/response/evidence. ptlibs
+        de-duplicates by code, so a module records at most one entry.
+        """
+        self.ptjsonlib.add_vulnerability(vuln_code=f"PTV-SVC-{self.module_code}")
 
 
 class _DiscoveredModule:
@@ -292,6 +302,7 @@ class BaseMain(BaseModule):
     def _run_module(self, code: str, discovered: dict[str, _DiscoveredModule], extras: dict) -> None:
         entry = discovered[code]
         ctx = self._make_context(extras)
+        ctx.module_code = code
         ctx.out(entry.label, "INFO", colortext=True)
         try:
             entry.module.run(ctx)

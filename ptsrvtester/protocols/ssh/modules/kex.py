@@ -7,4 +7,4 @@ __ORDER__ = 40
 
 
 def run(ctx):
-    report_algorithm_section(ctx, "kex", vuln_request="ssh-audit key exchange (kex)")
+    report_algorithm_section(ctx, "kex")

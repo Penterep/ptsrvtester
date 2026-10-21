@@ -8,7 +8,6 @@ the default sweep.
 """
 from ptsrvtester.protocols.ssh.utils.ssh_helpers import grab_banner
 from ptsrvtester.protocols.ssh.utils.protohygiene_core import assess_sshv1
-from ptsrvtester.protocols.ssh.utils.results import VULNS
 
 __MODULELABEL__ = "SSH protocol 1 (legacy)"
 __MODULECODE__ = "SSHV1"
@@ -41,11 +40,4 @@ def run(ctx):
         ctx.out("SSH-1 not supported (SSH-2 only)", "OK", indent=4)
 
     if r.is_finding:
-        with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.SSHv1.value,
-                "vuln_request": "read the SSH identification banner",
-                "vuln_response": f"protocol version '{r.protoversion}' — SSH-1 is "
-                                 + ("the only protocol offered" if r.only_v1 else "offered as a fallback")
-                                 + " (SSH-1 is cryptographically broken)",
-            })
+        ctx.vulns.hit(ctx.module_code)

@@ -32,7 +32,6 @@ from ptsrvtester.protocols.ssh.utils.lockout_core import (
     Outcome,
     run_lockout_check,
 )
-from ptsrvtester.protocols.ssh.utils.results import VULNS
 
 __MODULELABEL__ = "Brute-force lockout (account & IP)"
 __MODULECODE__ = "LOCKOUT"
@@ -257,19 +256,6 @@ def _render(ctx, r, user):
     for n in r.notes:
         ctx.out(n, "TEXT", indent=8)
 
-    # --- JSON vulns (absence of protection is the finding) ---
-    with ctx.results_lock:
-        if r.account_tested and r.account_lockout_detected is False:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.NoAccountLockout.value,
-                "vuln_request": f"user: {user}\n{r.attempts_made} failed SSH logins",
-                "vuln_response": f"account '{user}' still authenticated with the valid "
-                                 "password after the failed attempts (no account lockout)",
-            })
-        if r.ip_block_detected is False:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.NoIpBlocking.value,
-                "vuln_request": f"{r.attempts_made} failed SSH logins from this IP",
-                "vuln_response": "the server kept serving this IP after the failed attempts "
-                                 "(no fail2ban-style IP blocking)",
-            })
+    # --- JSON vuln (absence of brute-force protection is the finding) ---
+    if (r.account_tested and r.account_lockout_detected is False) or r.ip_block_detected is False:
+        ctx.vulns.hit(ctx.module_code)

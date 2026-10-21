@@ -1,6 +1,5 @@
 """BADHOSTKEY — compare the server host key against known static (bad) keys."""
 from ptsrvtester.protocols.ssh.utils.ssh_helpers import get_host_key, check_bad_pubkey
-from ptsrvtester.protocols.ssh.utils.results import VULNS
 
 __MODULELABEL__ = "Known static (bad) host key"
 __MODULECODE__ = "BADHOSTKEY"
@@ -31,11 +30,6 @@ def run(ctx):
 
     if result.bad:
         ctx.out(f"Matched key path: {result.path}", "VULN", indent=4)
-        with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.BadHostKey.value,
-                "vuln_request": f"matched key from: {path}",
-                "vuln_response": result.path,
-            })
+        ctx.vulns.hit(ctx.module_code)
     else:
         ctx.out("No match", "NOTVULN", indent=4)

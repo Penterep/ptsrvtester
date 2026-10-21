@@ -1,20 +1,20 @@
 """SSH protocol main — protocol-specific configuration only.
 
-All the generic machinery (module discovery, ``-ts`` selection, parallel
-execution, ordered output, the ``ctx`` object) lives in :class:`BaseMain` in
-``protocols/_base.py``. This file declares only what is specific to SSH plus a
-small :meth:`output` override so every module contributes to a single shared
-``software`` node in JSON output (banner, host key, auth methods, ssh-audit,
-bad-key and bruteforce findings all bind to one node, like the old flat module).
+All the generic machinery (module discovery, ``-ts`` selection, ordered output,
+the ``ctx`` object) lives in :class:`BaseMain` in ``protocols/_base.py``. This
+file declares only what is specific to SSH. The JSON output carries nothing but
+the run ``log`` and ``vulnerabilities``: a module that finds something calls
+``ctx.vulns.hit(ctx.module_code)``, and :meth:`output` emits ONE vulnerability
+object per hit test code — each a ``{"vulnCode": "PTV-SSH-<MODULECODE>"}`` entry
+(second position = protocol) in ``results.vulnerabilities``. No nodes or
+properties are emitted.
 """
 import argparse
 import socket
-import threading
-
-from ptlibs.ptjsonlib import PtJsonLib
 
 from .._base import BaseMain, BaseArgs
 from .utils.cli import SSHArgs
+from .utils.results import VulnCollector
 from .utils.sshaudit import SSHAuditShared
 
 
@@ -40,18 +40,6 @@ class SSH(BaseMain):
             chosen = [c for c in chosen if getattr(discovered[c].module, "__RUN_IN_ALL__", True)]
         return chosen
 
-    def __init__(self, args: BaseArgs, ptjsonlib: PtJsonLib) -> None:
-        super().__init__(args, ptjsonlib)
-        self._properties: dict = {
-            "software_type": None,
-            "name": "ssh",
-            "version": None,
-            "vendor": None,
-            "description": None,
-        }
-        self._deferred_vulns: list[dict] = []
-        self._results_lock = threading.Lock()
-
     def _prepare_target(self) -> None:
         """Fill the default port (22) and resolve the host to an IP for the modules."""
         target = self.args.target
@@ -75,22 +63,22 @@ class SSH(BaseMain):
     def build_context(self) -> dict:
         """Handles every SSH module receives on ``ctx`` (besides the core fields).
 
-        ``properties`` / ``deferred_vulns`` are the shared JSON accumulators and
-        ``results_lock`` guards them; modules read connection info as ``ctx.host`` /
-        ``ctx.ip`` / ``ctx.port``. ``ssh_audit`` is the run-once ssh-audit holder
-        every crypto section test (KEX/KEYALG/ENC/MAC/FINGERPRINT) shares, so the
-        external ssh-audit scan happens at most once per invocation.
+        Modules read connection info as ``ctx.host`` / ``ctx.ip`` / ``ctx.port``
+        and record a finding with ``ctx.vulns.hit(ctx.module_code)``; ``vulns`` is
+        one shared :class:`VulnCollector` for the whole run. ``ssh_audit`` is the
+        run-once ssh-audit holder every crypto section test
+        (KEX/KEYALG/ENC/MAC/FINGERPRINT) shares, so the external ssh-audit scan
+        happens at most once per invocation.
         """
         from .._shared.utils.connection import SSHBannerAdapter
 
+        self._vulns = VulnCollector()
         rate_timeout = getattr(self.args, "rate_timeout", 5.0) or 5.0
         return {
             "host": self.target_host,
             "ip": self.target[0],
             "port": self.target[1],
-            "properties": self._properties,
-            "deferred_vulns": self._deferred_vulns,
-            "results_lock": self._results_lock,
+            "vulns": self._vulns,
             "ssh_audit": SSHAuditShared(self.target[0], self.target[1]),
             # Sharper RATELIMIT signal: a connection counts only once sshd sends
             # its SSH-2.0 banner, and holding it (no KEX) exercises LoginGraceTime.
@@ -100,13 +88,16 @@ class SSH(BaseMain):
         }
 
     def output(self) -> None:
-        """Build the single shared ``software`` node and bind every module's vulns."""
-        ssh_node = self.ptjsonlib.create_node_object("software", None, None, self._properties)
-        self.ptjsonlib.add_node(ssh_node)
-        node_key = ssh_node["key"]
-        for v in self._deferred_vulns:
-            self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
+        """Emit one vulnerability object per SSH test code that found something.
 
+        Each ``PTV-SSH-<MODULECODE>`` code the run collected becomes its own entry
+        in ``results.vulnerabilities`` (``{"vulnCode": ...}``), added through ptlibs
+        ``add_vulnerability`` (which de-duplicates by code). Besides the log,
+        nothing else is written to the JSON.
+        """
+        vulns = getattr(self, "_vulns", None)
+        for code in (vulns.codes if vulns is not None else []):
+            self.ptjsonlib.add_vulnerability(vuln_code=code)
         self.ptjsonlib.set_status("finished", "")
         if self.use_json:
             print(self.ptjsonlib.get_result_json())

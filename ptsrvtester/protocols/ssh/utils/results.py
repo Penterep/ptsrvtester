@@ -6,7 +6,6 @@ place (absolute import — the modules are loaded dynamically by BaseMain and ha
 no package parent, so relative imports would fail).
 """
 from dataclasses import dataclass
-from enum import Enum
 from typing import NamedTuple
 
 from ptsrvtester.protocols.ssh.utils.helpers import Creds
@@ -27,40 +26,27 @@ class BadPubkeyResult(NamedTuple):
     path: str
 
 
-class VULNS(Enum):
-    InsecureCrypto = "PTV-GENERAL-INSECURECRYPTO"
-    BadHostKey = "PTV-SSH-BADHOSTKEY"
-    BadAuthKeys = "PTV-SSH-BADAUTHKEYS"
-    WeakCreds = "PTV-GENERAL-WEAKCREDENTIALS"
-    Banner = "PTV-SVC-BANNER"
-    DHEat = "PTV-SSH-DHEAT"
-    # Missing brute-force protection (LOCKOUT test):
-    NoAccountLockout = "PTV-SSH-NOACCOUNTLOCKOUT"
-    NoIpBlocking = "PTV-SSH-NOIPBLOCKING"
-    # Username enumeration via auth timing side-channel (USERENUM test):
-    UserEnum = "PTV-SSH-USERENUM"
-    # Direct root login permitted (ROOTLOGIN test):
-    RootLoginPermitted = "PTV-SSH-ROOTLOGIN"
-    # Shell / command execution permitted after login (SHELL test):
-    ShellAccess = "PTV-SSH-SHELLACCESS"
-    # Post-auth privileges & access (PRIVS test):
-    PrivilegedGroup = "PTV-SSH-PRIVGROUP"
-    SensitiveFileAccess = "PTV-SSH-SENSITIVEFILE"
-    SudoAccess = "PTV-SSH-SUDOACCESS"
-    # Port forwarding & tunneling (FORWARD test):
-    PortForwarding = "PTV-SSH-PORTFORWARDING"
-    AgentForwarding = "PTV-SSH-AGENTFORWARDING"
-    X11Forwarding = "PTV-SSH-X11FORWARDING"
-    # SFTP access control & confinement (SFTP test):
-    SftpNoChroot = "PTV-SSH-SFTPNOCHROOT"
-    SftpTraversal = "PTV-SSH-SFTPTRAVERSAL"
-    SftpSymlinkEscape = "PTV-SSH-SFTPSYMLINK"
-    SftpUnrestricted = "PTV-SSH-SFTPUNRESTRICTED"
-    SftpADS = "PTV-SSH-SFTPADS"
-    # SFTP content scanning & resource limits (SFTPDATA test):
-    SftpNoAntivirus = "PTV-SSH-SFTPNOAV"
-    SftpContentProcessingDoS = "PTV-SSH-SFTPPROCESSINGDOS"
-    SftpNoQuota = "PTV-SSH-SFTPNOQUOTA"
-    # Protocol & config hygiene (TERRAPIN / SSHV1 tests):
-    Terrapin = "PTV-SSH-TERRAPIN"
-    SSHv1 = "PTV-SSH-SSHV1"
+class VulnCollector:
+    """Collects the codes of the SSH tests that found something.
+
+    SSH emits ONE JSON vulnerability object per test code that reported a finding
+    (``results.vulnerabilities`` is a list of ``{"vulnCode": ...}`` entries). A code
+    is ``PTV-SSH-<MODULECODE>`` (second position = protocol), derived from the
+    running module's ``-ts`` code.
+
+    Injected onto every module's ``ctx`` as ``ctx.vulns`` by ``SSH.build_context``;
+    a module that finds something calls ``ctx.vulns.hit(ctx.module_code)``. The SSH
+    main iterates :attr:`codes` in ``output()`` and adds each as a separate
+    vulnerability via ptlibs ``add_vulnerability`` (which de-duplicates by code).
+    """
+
+    PROTOCOL = "SSH"
+
+    def __init__(self) -> None:
+        self.codes: list[str] = []
+
+    def hit(self, module_code: str) -> None:
+        """Record that the module identified by ``module_code`` found something."""
+        code = f"PTV-{self.PROTOCOL}-{str(module_code).upper()}"
+        if code not in self.codes:
+            self.codes.append(code)

@@ -7,7 +7,6 @@ identification (identify_service) is applied on top of whichever banner we got.
 """
 from ptsrvtester.protocols.ssh.utils.service_identification import identify_service
 from ptsrvtester.protocols.ssh.utils.ssh_helpers import grab_banner
-from ptsrvtester.protocols.ssh.utils.results import VULNS
 
 __MODULELABEL__ = "Banner"
 __MODULECODE__ = "BANNER"
@@ -50,8 +49,7 @@ def run(ctx):
     ctx.out(banner, banner_cat, indent=4)
 
     if sid is not None and sid.version is not None:
-        with ctx.results_lock:
-            ctx.deferred_vulns.append({"vuln_code": VULNS.Banner.value})
+        ctx.vulns.hit(ctx.module_code)
 
     if sid is not None:
         ctx.out("Service Identification", "INFO", colortext=True)

@@ -1,6 +1,6 @@
 from pysnmp.hlapi.v3arch.asyncio import *
 import asyncio
-from ptsrvtester.protocols.snmp.utils.helpers import write_to_file
+from ptsrvtester.protocols.snmp.utils.helpers import snmp_debug, write_to_file
 from ptsrvtester.protocols.snmp.utils.registry import text_or_file
 from typing import List
 
@@ -37,12 +37,10 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
         errorIndication, errorStatus, errorIndex, varBinds = await iterator
 
         if not errorIndication and not errorStatus:
-            ctx.out(f"Valid community string found: {community}", "ADDITIONS", indent=4, condition=ctx.verbose,
-                    colortext=True)
+            snmp_debug(ctx, f"Valid community string found: {community}", indent=4)
             valid_communities.append(community)
         else:
-            ctx.out(f"Error: {errorIndication or errorStatus} for {community}", "ADDITIONS", indent=4,
-                    condition=ctx.verbose, colortext=True)
+            snmp_debug(ctx, f"Error: {errorIndication or errorStatus} for {community}", indent=4)
 
     if valid_communities:
         #self.ptprint("\n")

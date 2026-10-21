@@ -6,6 +6,7 @@ from pysnmp.hlapi.v3arch.asyncio import *
 from pysnmp.proto.errind import RequestTimedOut
 import asyncio
 from ptsrvtester.protocols.snmp.utils.registry import SNMPVersion
+from ptsrvtester.protocols.snmp.utils.helpers import snmp_debug
 
 
 async def version_detection(ctx: dict) -> SNMPVersion | None:
@@ -47,14 +48,15 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
     errorIndication, errorStatus, errorIndex, varBinds = iterator
 
     if errorIndication:
-        ctx.debug(f"SNMPv1 detection error", indent=4)
-        ctx.debug(f"Sent: {obj_type}", indent=8)
-        ctx.debug(f"Received: {errorIndication}", indent=8)
+        snmp_debug(ctx, f"SNMPv1 detection error", indent=4)
+        snmp_debug(ctx, f"Sent: {obj_type}", indent=8)
+        snmp_debug(ctx, f"Received: {errorIndication}", indent=8)
     elif errorStatus:
-        ctx.debug("SNMPv1 detection error", indent=4)
-        ctx.debug(f"Sent: {obj_type}", indent=8)
-        ctx.debug(f"Received: {errorStatus.prettyPrint()}", indent=8)
-        ctx.debug(
+        snmp_debug(ctx, "SNMPv1 detection error", indent=4)
+        snmp_debug(ctx, f"Sent: {obj_type}", indent=8)
+        snmp_debug(ctx, f"Received: {errorStatus.prettyPrint()}", indent=8)
+        snmp_debug(
+            ctx,
             "{} at {}".format(
                 errorStatus.prettyPrint(),
                 errorIndex and varBinds[int(errorIndex) - 1][0] or "?",
@@ -64,15 +66,15 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
     else:
         versions.update({"v1": True})
         res = ""
-        ctx.debug(f"SNMPv1 detection success", indent=4)
+        snmp_debug(ctx, f"SNMPv1 detection success", indent=4)
         
         for varBind in varBinds:
             res += ' = '.join([x.prettyPrint() for x in varBind])
         
         ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-OLDVER", poc=res)
         
-        ctx.debug(f"Sent: {obj_type}", indent=8)
-        ctx.debug(f"Received: {res}", indent=8)
+        snmp_debug(ctx, f"Sent: {obj_type}", indent=8)
+        snmp_debug(ctx, f"Received: {res}", indent=8)
 
     ###########################################################################################
     # Detect v2c                                                                              #
@@ -89,15 +91,16 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
     errorIndication, errorStatus, errorIndex, varBinds = iterator
 
     if errorIndication:
-        ctx.debug(f"SNMPv2c detection error", indent=4)
-        ctx.debug(f"Sent: {obj_type}", indent=8)
-        ctx.debug(f"Received: {errorIndication}", indent=8)
+        snmp_debug(ctx, f"SNMPv2c detection error", indent=4)
+        snmp_debug(ctx, f"Sent: {obj_type}", indent=8)
+        snmp_debug(ctx, f"Received: {errorIndication}", indent=8)
     elif errorStatus:
-        ctx.debug(f"SNMPv2c detection error", indent=4)
-        ctx.debug(f"Sent: {obj_type}", indent=8)
-        ctx.debug(f"Received: {errorStatus.prettyPrint()}", indent=8)
-        ctx.debug(f"SNMPv2c detection error: {errorStatus.prettyPrint()}", indent=4)
-        ctx.debug(
+        snmp_debug(ctx, f"SNMPv2c detection error", indent=4)
+        snmp_debug(ctx, f"Sent: {obj_type}", indent=8)
+        snmp_debug(ctx, f"Received: {errorStatus.prettyPrint()}", indent=8)
+        snmp_debug(ctx, f"SNMPv2c detection error: {errorStatus.prettyPrint()}", indent=4)
+        snmp_debug(
+            ctx,
             "{} at {}".format(
                 errorStatus.prettyPrint(),
                 errorIndex and varBinds[int(errorIndex) - 1][0] or "?",
@@ -107,12 +110,12 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
     else:
         versions.update({"v2c": True})
         res = ""
-        ctx.debug(f"SNMPv2c detection success", indent=4)
+        snmp_debug(ctx, f"SNMPv2c detection success", indent=4)
         for varBind in varBinds:
             res += ' = '.join([x.prettyPrint() for x in varBind])
         ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-OLDVER", poc=res)
-        ctx.debug(f"Sent: {obj_type}", indent=8)
-        ctx.debug(f"Received: {res}", indent=8)
+        snmp_debug(ctx, f"Sent: {obj_type}", indent=8)
+        snmp_debug(ctx, f"Received: {res}", indent=8)
 
     ###########################################################################################
     # Detect v3                                                                               #
@@ -129,19 +132,20 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
 
     if errorIndication:
         if isinstance(errorIndication, RequestTimedOut):
-            ctx.debug(f"SNMPv3 detection error", indent=4)
-            ctx.debug(f"Sent: {sent}", indent=8)
-            ctx.debug(f"Received: {errorIndication}", indent=8)
+            snmp_debug(ctx, f"SNMPv3 detection error", indent=4)
+            snmp_debug(ctx, f"Sent: {sent}", indent=8)
+            snmp_debug(ctx, f"Received: {errorIndication}", indent=8)
         else:
-            ctx.debug(f"SNMPv3 detection success", indent=4)
-            ctx.debug(f"Sent: {sent}", indent=8)
-            ctx.debug(f"Received: {errorIndication}", indent=8)
+            snmp_debug(ctx, f"SNMPv3 detection success", indent=4)
+            snmp_debug(ctx, f"Sent: {sent}", indent=8)
+            snmp_debug(ctx, f"Received: {errorIndication}", indent=8)
             versions.update({"v3": True})
     elif errorStatus:
-        ctx.debug(f"SNMPv3 detection error", indent=4)
-        ctx.debug(f"Sent: {sent}", indent=8)
-        ctx.debug(f"Received: {errorStatus.prettyPrint()}", indent=8)
-        ctx.debug(
+        snmp_debug(ctx, f"SNMPv3 detection error", indent=4)
+        snmp_debug(ctx, f"Sent: {sent}", indent=8)
+        snmp_debug(ctx, f"Received: {errorStatus.prettyPrint()}", indent=8)
+        snmp_debug(
+            ctx,
             "{} at {}".format(
                 errorStatus.prettyPrint(),
                 errorIndex and varBinds[int(errorIndex) - 1][0] or "?",
@@ -150,12 +154,13 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
         )
     else:
         versions.update({"v3": True})
-        ctx.debug(f"SNMPv3 detection success", indent=4)
-        ctx.debug(f"Sent: {sent}", indent=8)
+        snmp_debug(
+            ctx, f"SNMPv3 detection success", indent=4)
+        snmp_debug(ctx, f"Sent: {sent}", indent=8)
         res = ""
         for varBind in varBinds:
             res += " = ".join([x.prettyPrint() for x in varBind])
-        ctx.debug(f"Received: {res}", indent=8)
+        snmp_debug(ctx, f"Received: {res}", indent=8)
 
     if not any(versions.values()):
         ctx.out("No SNMP version detected", "OK", indent=4)

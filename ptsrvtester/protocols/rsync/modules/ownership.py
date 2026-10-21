@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import uuid
 
-from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
+from ptsrvtester.protocols.rsync.utils.registry import rsync_debug, rsync_env, rsync_url
 
 
 __MODULELABEL__ = "Rsync daemon UID/GID probe"
@@ -42,7 +42,7 @@ def _cleanup_probe(ctx, module, probe_name, empty_dir, env):
     else:
         if cleanup.returncode != 0:
             ctx.out(f"Could not remove the ownership probe from module {module}", "OK", indent=4)
-            ctx.debug(f"Ownership probe cleanup failed: {cleanup.stderr.strip()}")
+            rsync_debug(ctx, f"Ownership probe cleanup failed: {cleanup.stderr.strip()}")
 
 
 def _probe_module(ctx, module):
@@ -57,7 +57,7 @@ def _probe_module(ctx, module):
         with open(probe_path, "w", encoding="utf-8") as probe:
             probe.write("Temporary rsync ownership probe.\n")
 
-        ctx.debug(f"Created a temporary probe at {probe_path}", indent=4)
+        rsync_debug(ctx, f"Created a temporary probe at {probe_path}", indent=4)
         
         try:
             command = [
@@ -70,7 +70,7 @@ def _probe_module(ctx, module):
                         rsync_url(ctx, f"{module}/{probe_name}"),
             ]
             
-            ctx.debug(f"Running command \"{' '.join(command)}\"", indent=4)
+            rsync_debug(ctx, f"Running command \"{' '.join(command)}\"", indent=4)
             
             upload = subprocess.run(
                 command,
@@ -88,8 +88,8 @@ def _probe_module(ctx, module):
             ctx.out("rsync client binary not found on this machine", "ERROR", indent=4)
             return False
 
-        ctx.debug(f"Received stdout: {upload.stdout.rstrip}", indent=4)
-        ctx.debug(f"Received stderr: {upload.stderr.rstrip}", indent=4)
+        rsync_debug(ctx, f"Received stdout: {upload.stdout.rstrip}", indent=4)
+        rsync_debug(ctx, f"Received stderr: {upload.stderr.rstrip}", indent=4)
                 
         if upload.returncode != 0:
             error = upload.stderr.strip().splitlines()
@@ -113,7 +113,7 @@ def _probe_module(ctx, module):
                     download_path,
                 ]
                 
-                ctx.debug(f"Querying for UID/GID: \"{' '.join(query_cmd)}\"")
+                rsync_debug(ctx, f"Querying for UID/GID: \"{' '.join(query_cmd)}\"")
                 
                 query = subprocess.run(
                     query_cmd,
@@ -132,8 +132,8 @@ def _probe_module(ctx, module):
 
             match = _ID_PATTERN.search(query.stdout)
             
-            ctx.debug(f"Received stdout: {query.stdout.rstrip}", indent=4)
-            ctx.debug(f"Received stderr: {query.stderr.rstrip}", indent=4)
+            rsync_debug(ctx, f"Received stdout: {query.stdout.rstrip}", indent=4)
+            rsync_debug(ctx, f"Received stderr: {query.stderr.rstrip}", indent=4)
             
             if query.returncode != 0:
                 error = query.stderr.strip().splitlines()
@@ -141,7 +141,7 @@ def _probe_module(ctx, module):
                 ctx.out(f"Could not read file ownership from module {module}: {detail}", "OK", indent=4)
             elif match is None:
                 ctx.out(f"Could not parse UID/GID from module {module} dry-run output", "OK", indent=4)
-                ctx.debug(f"Ownership probe dry-run output: {query.stdout.strip()}")
+                rsync_debug(ctx, f"Ownership probe dry-run output: {query.stdout.strip()}")
             else:
                 uid, gid, file_name = match.groups()
                 if uid == "0" and gid == "DEFAULT":

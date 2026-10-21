@@ -1,6 +1,6 @@
 from pysnmp.hlapi.v3arch.asyncio import *
 import asyncio
-from ptsrvtester.protocols.snmp.utils.helpers import write_to_file, format_timeticks
+from ptsrvtester.protocols.snmp.utils.helpers import format_timeticks, snmp_debug, write_to_file
 from ptsrvtester.protocols.snmp.utils.registry import PROTOCOL_NAMES, AuthPrivProtocols
 
 
@@ -75,13 +75,14 @@ async def getBulk_SNMPv3(ctx) -> list:
     results = None
     oids = {}
     probe = ObjectType(ObjectIdentity(ctx.oid))
-    ctx.debug(
+    snmp_debug(
+        ctx,
         f"SNMPv3 walk using user {ctx.single_username!r} "
         f"({PROTOCOL_NAMES.get(Protocols.auth_protocols, 'Unknown Protocol')}, "
         f"{PROTOCOL_NAMES.get(Protocols.priv_protocols, 'Unknown Protocol')})",
         indent=4,
     )
-    ctx.debug(f"Sent: walk starting at OID {ctx.oid}", indent=8)
+    snmp_debug(ctx, f"Sent: walk starting at OID {ctx.oid}", indent=8)
 
     objects = walk_cmd(
         SnmpEngine(),
@@ -98,7 +99,7 @@ async def getBulk_SNMPv3(ctx) -> list:
             f"{errorStatus.prettyPrint()} at {errorIndex}" if errorStatus else
             ", ".join(" = ".join(part.prettyPrint() for part in varBind) for varBind in varBinds)
         )
-        ctx.debug(f"Received: {received}", indent=8)
+        snmp_debug(ctx, f"Received: {received}", indent=8)
         if errorIndication:
             ctx.out(f"Error: {errorIndication}", "ERROR",  indent=4)
             break

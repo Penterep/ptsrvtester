@@ -1,5 +1,6 @@
 import socket
 from ptsrvtester.protocols.rsync.modules.banner import get_supported_digests
+from ptsrvtester.protocols.rsync.utils.registry import rsync_debug
 
 __MODULELABEL__ = "Rsync daemon and digest detection"
 __MODULECODE__ = "encrypt"
@@ -15,11 +16,11 @@ DIGEST_SECURITY_MAPPING = {
 
 def _rsync_try_daemon(ctx):
     try:
-        ctx.debug(f"Sent: TCP connection to rsync daemon at {ctx.ip}:{ctx.port}", indent=4)
+        rsync_debug(ctx, f"Sent: TCP connection to rsync daemon at {ctx.ip}:{ctx.port}", indent=4)
         with socket.create_connection((ctx.ip, ctx.port), timeout=ctx.timeout) as sock:
             with sock.makefile("rb") as reader:
                 greeting = reader.readline().decode(errors="replace").strip()
-        ctx.debug(f"Received: {greeting or '<empty response>'}", indent=8)
+        rsync_debug(ctx, f"Received: {greeting or '<empty response>'}", indent=8)
         if greeting.startswith("@RSYNCD:"):
             ctx.out("The host supports the rsync daemon", "INFO", indent=4)
             ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-RUNTYPE", 
@@ -41,7 +42,7 @@ def run(ctx):
                 indent=4,
             )
 
-    ctx.debug(
+    rsync_debug(ctx,
         f"Received supported rsync digest algorithms: "
         f"{', '.join(supported_digests) if supported_digests else '<none>'}",
         indent=4,

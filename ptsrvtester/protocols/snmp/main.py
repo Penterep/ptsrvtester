@@ -20,7 +20,7 @@ from .utils.cli import SNMPArgs
 
 import sys
 from ptlibs.threads import printlock
-from ptlibs.ptprinthelper import out_if
+from ptlibs.ptprinthelper import out_if, ptprint
 
 class SNMP(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
     #: Short protocol identity (also namespaces this protocol's tests).
@@ -56,49 +56,6 @@ class SNMP(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
                 )
         self.target_host = host
         self.target = (ip, target.port)
-
-    def _run_module(self, code: str, discovered, extras: dict) -> None:
-        """Print the heading before running and stream non-JSON output live."""
-        entry = discovered[code]
-        lock = printlock.PrintLock()
-        ctx = self._make_context(lock, extras)
-        if not self.use_json:
-            def live_out(
-                string="", category="TEXT", *, colortext=False, indent=0, condition=None
-            ):
-                cond = True if condition is None else condition
-                line = out_if(string, category, cond, colortext=colortext, indent=indent)
-                if line:
-                    with self._lock:
-                        sys.stdout.write(line if line.endswith("\n") else line + "\n")
-                        sys.stdout.flush()
-
-            ctx.out = live_out
-
-            def live_debug(string="", *, indent=4):
-                if not ctx.verbose:
-                    return
-                line = out_if(string, "ADDITIONS", True, colortext=True, indent=indent)
-                if line:
-                    with self._lock:
-                        sys.stdout.write(line if line.endswith("\n") else line + "\n")
-                        sys.stdout.flush()
-            ctx.debug = live_debug
-        if entry.label.strip() and not self.use_json:
-            with self._lock:
-                sys.stdout.write(out_if(entry.label, "INFO", True, colortext=True) + "\n")
-                sys.stdout.flush()
-        try:
-            entry.module.run(ctx)
-        except Exception as e:
-            ctx.out(f"Error in module {code}: {e}", "ERROR")
-        chunk = lock.get_output_string()
-        if chunk and not self.use_json:
-            with self._lock:
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
-        with self._lock:
-            self._outputs[code] = "" if not self.use_json else chunk
 
     def build_context(self) -> dict:
         """Protocol handles injected onto every module's ``ctx`` (besides core fields).

@@ -34,7 +34,7 @@ def _run_starvation(ctx):
             # Send DISCOVER
             offer_filter = f"udp and src port 67 and (ether dst ff:ff:ff:ff:ff:ff or ether dst {src_mac})"
             discover_pkt = prepare_discover_packet(src_mac, transaction_id)
-            debug_packet(ctx, "Sent", debug_packet)
+            debug_packet(ctx, "Sent", discover_pkt)
             sendp(discover_pkt, ctx.interface, verbose=False)
 
             # Wait for OFFER
@@ -53,7 +53,7 @@ def _run_starvation(ctx):
             if requested_ip:
                 # Send REQUEST
                 req_packet = prepare_request_packet(src_mac, transaction_id, requested_ip)
-                debug_packet(ctx, "Received", req_packet)
+                debug_packet(ctx, "Sent", req_packet)
                 sendp(req_packet,
                       ctx.interface, verbose=False)
                 ctx.out(f"[+] Obtained {requested_ip} for {src_mac}", "OK", indent=4)

@@ -3,7 +3,7 @@ import subprocess
 import tempfile
 import uuid
 
-from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
+from ptsrvtester.protocols.rsync.utils.registry import rsync_debug, rsync_env, rsync_url
 
 
 __MODULELABEL__ = "Rsync symlink upload probe"
@@ -34,7 +34,7 @@ def _upload_symlink(ctx, module):
                 rsync_url(ctx, f"{module}/{link_name}"),
             ]
             
-            ctx.debug(f"Running command: \"{' '.join(command)}\"", indent=4)            
+            rsync_debug(ctx, f"Running command: \"{' '.join(command)}\"", indent=4)
             
             upload = subprocess.run(
                 command,
@@ -51,8 +51,8 @@ def _upload_symlink(ctx, module):
             return
 
         if upload is not None:
-            ctx.debug(f"Received stdout: {upload.stdout.rstrip}", indent=4)
-            ctx.debug(f"Received stderr: {upload.stderr.rstrip}", indent=4)
+            rsync_debug(ctx, f"Received stdout: {upload.stdout.rstrip}", indent=4)
+            rsync_debug(ctx, f"Received stderr: {upload.stderr.rstrip}", indent=4)
             
             if upload.returncode != 0:
                 error = upload.stderr.strip().splitlines()
@@ -60,7 +60,7 @@ def _upload_symlink(ctx, module):
                 ctx.out(f"Symlink upload to module {module} was unsuccessful: {detail}", "OK", indent=4)
             else:
                 try:
-                    ctx.debug(f"Verifying the uploaded symlink in module {module}/{link_name}", indent=4)
+                    rsync_debug(ctx, f"Verifying the uploaded symlink in module {module}/{link_name}", indent=4)
                     verify_cmd = [
                         "rsync",
                         "--list-only",
@@ -163,7 +163,7 @@ def _upload_symlink(ctx, module):
         else:
             if cleanup.returncode != 0:
                 ctx.out(f"Could not remove the symlink probe from module {module}", "OK", indent=4)
-                ctx.debug(f"Symlink probe cleanup failed: {cleanup.stderr.strip()}")
+                rsync_debug(ctx, f"Symlink probe cleanup failed: {cleanup.stderr.strip()}")
 
 
 def run(ctx):

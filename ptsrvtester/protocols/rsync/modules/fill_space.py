@@ -4,7 +4,7 @@ import tempfile
 import uuid
 
 from ptlibs.ptprinthelper import ptprint
-from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
+from ptsrvtester.protocols.rsync.utils.registry import rsync_debug, rsync_env, rsync_url
 
 
 __MODULELABEL__ = "Rsync bounded storage probe"
@@ -37,7 +37,7 @@ def _fill_module(ctx, module):
                     probe.write(os.urandom(chunk_size))
 
                 try:
-                    ctx.debug(f"Uploading {chunk_size} bytes to {rsync_url(ctx, f"{module}/{probe_name}")}", indent=4)
+                    rsync_debug(ctx, f"Uploading {chunk_size} bytes to {rsync_url(ctx, f"{module}/{probe_name}")}", indent=4)
                     upload = subprocess.run(
                         [
                             "rsync",

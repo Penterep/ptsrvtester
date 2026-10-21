@@ -4,7 +4,8 @@ from ptsrvtester.protocols.dhcp.utils.registry import (
     random_mac,
     sendp,
     prepare_ack_packet,
-    debug_packet
+    debug_packet,
+    debug_output,
 )
 
 from icmplib import ping
@@ -69,7 +70,7 @@ def _spoof_ack(ctx):
     )
 
     if ping_res.is_alive:
-        ctx.debug(f"{ping_res}", indent=12)
+        debug_output(ctx, f"{ping_res}", indent=12)
         ctx.out(f"Successfully changed the clients IP to {ctx.client_ip}", "VULN", indent=4)
         ctx.ptjsonlib.add_vulnerability("PTV-DHCP-ACK-SPOOFING")
     else:

@@ -76,9 +76,15 @@ def is_valid_mac_address(mac_a: str) -> str:
 
 
 def debug_packet(ctx, direction: str, packet) -> None:
-    ctx.debug(f"{direction} DHCP packet:", indent=12)
+    debug_output(ctx, f"{direction} DHCP packet:", indent=12)
     for line in packet.show(dump=True).splitlines():
-        ctx.debug(line, indent=16)
+        debug_output(ctx, line, indent=16)
+
+
+def debug_output(ctx, message: str, *, indent: int = 4) -> None:
+    ctx.debug(message, indent=indent)
+    if ctx.json and message:
+        ctx.ptjsonlib.add_to_log(message)
 
 
 def get_interface_ip(interface: str) -> str:

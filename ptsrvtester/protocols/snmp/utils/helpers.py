@@ -1,6 +1,13 @@
 import argparse
 
 
+def snmp_debug(ctx, message: str, *, indent: int = 4) -> None:
+    """Emit SNMP verbose output and include it in JSON results when enabled."""
+    ctx.debug(message, indent=indent)
+    if ctx.json and message:
+        ctx.ptjsonlib.add_to_log(message)
+
+
 def write_to_file(output, message_or_messages: str | list[str]):
     """
     File Output.

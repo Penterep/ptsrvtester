@@ -1,6 +1,6 @@
 from pysnmp.hlapi.v3arch.asyncio import *
 import asyncio
-from ptsrvtester.protocols.snmp.utils.helpers import write_to_file, format_timeticks
+from ptsrvtester.protocols.snmp.utils.helpers import format_timeticks, snmp_debug, write_to_file
 from ptsrvtester.protocols.snmp.utils.registry import text_or_file
 
 __MODULELABEL__ = "SNMPv2 Walk"
@@ -43,8 +43,8 @@ async def _getBulk_SNMPv2(ctx) -> str:
         try:
             # Use walk_cmd to traverse the MIB
             probe = ObjectType(ObjectIdentity(ctx.oid))
-            ctx.debug(f"SNMPv2 walk using community {community!r}", indent=4)
-            ctx.debug(f"Sent: walk starting at OID {ctx.oid}", indent=8)
+            snmp_debug(ctx, f"SNMPv2 walk using community {community!r}", indent=4)
+            snmp_debug(ctx, f"Sent: walk starting at OID {ctx.oid}", indent=8)
             objects = walk_cmd(
                 SnmpEngine(),
                 CommunityData(community),
@@ -61,7 +61,7 @@ async def _getBulk_SNMPv2(ctx) -> str:
                     f"{errorStatus.prettyPrint()} at {errorIndex}" if errorStatus else
                     ", ".join(" = ".join(part.prettyPrint() for part in varBind) for varBind in varBinds)
                 )
-                ctx.debug(f"Received: {received}", indent=8)
+                snmp_debug(ctx, f"Received: {received}", indent=8)
                 if errorIndication:
                     ctx.out(f"Error: {errorIndication}", "ERROR", indent=8)
                     break

@@ -40,6 +40,7 @@ def _probe_user(ctx, module: str, username: str):
 def run(ctx):
     modules = getattr(ctx.args, "modules", None) or []
     modules = [module.strip() for module in modules if module.strip()]
+    count = 0
     if len(modules) != 1:
         ctx.out("USER_ENUM requires exactly one module via -m/--modules", "ERROR", indent=4)
         return
@@ -118,7 +119,11 @@ def run(ctx):
             )
             if response != baseline:
                 ctx.out(f"Possible username found: {username}", "VULN", indent=4)
+                ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-ENUM", poc={"return_code": response[0],
+                                                                           "stdout": response[1],
+                                                                           "stderr": response[2]})
     finally:
+        count += 1
         if show_progress and progress_line is not None:
             ptprint(
                 progress_line,
@@ -129,3 +134,6 @@ def run(ctx):
                 clear_to_eol=True,
                 indent=4,
             )
+        
+        if count > 10:
+            ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-GUESS", poc={"guesses_without_lockout": count})

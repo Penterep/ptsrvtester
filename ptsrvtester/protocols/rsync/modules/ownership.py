@@ -149,6 +149,9 @@ def _probe_module(ctx, module):
                             f"Try running the test as root", "OK", indent=4)
                 else:
                     ctx.out(f"Rsync daemon file UID: {uid}, GID: {gid} (module {module})", "VULN", indent=4)
+                    ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-ACCOUNT", poc={"daemon_uid": uid,
+                                                                                  "daemon_gid": gid
+                                                                                })
                 found_ids = True
         finally:
             _cleanup_probe(ctx, module, probe_name, empty_dir, env)

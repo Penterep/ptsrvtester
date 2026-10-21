@@ -109,6 +109,7 @@ def run(ctx):
     for r in res:
         if r["write_allowed"]:
             ctx.out(f"The module {r.get("module")} is writable", "VULN", indent=4)
+            ctx.ptjsonlib.add_vulnerability()
         else:
             cleanup_stderr = r.get("cleanup_stderr", r.get("upload_stderr", "")).strip()
             ctx.out(f"The module {r.get("module")} is not writable", "OK", indent=4)

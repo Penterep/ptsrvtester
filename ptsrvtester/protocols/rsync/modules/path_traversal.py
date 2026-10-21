@@ -74,6 +74,11 @@ def _try_path_traversal_write(ctx):
             return
 
         ctx.out("Write-based path traversal successful", "VULN", indent=4)
+        ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-TRAVERS", poc={"command": ' '.join(command),
+                                                                      "return_code": upload.returncode,
+                                                                      "stdout": upload.stdout,
+                                                                      "stderr": upload.stderr
+                                                                      })
 
         empty_dir = os.path.join(tmpdir, "empty")
         os.makedirs(empty_dir)

@@ -61,15 +61,16 @@ def _upload_symlink(ctx, module):
             else:
                 try:
                     ctx.debug(f"Verifying the uploaded symlink in module {module}/{link_name}", indent=4)
+                    verify_cmd = [
+                        "rsync",
+                        "--list-only",
+                        "--no-motd",
+                        "--contimeout=5",
+                        "-l",
+                        rsync_url(ctx, f"{module}/{link_name}"),
+                    ]
                     verify = subprocess.run(
-                        [
-                            "rsync",
-                            "--list-only",
-                            "--no-motd",
-                            "--contimeout=5",
-                            "-l",
-                            rsync_url(ctx, f"{module}/{link_name}"),
-                        ],
+                        verify_cmd,
                         capture_output=True,
                         text=True,
                         input="",
@@ -91,6 +92,11 @@ def _upload_symlink(ctx, module):
                     )
                     if verified:
                         ctx.out(f"Uploaded and verified symlink to {_SYMLINK_TARGET} in module {module}", "VULN", indent=4)
+                        ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-SYMLINK", poc={"verify_command": ' '.join(verify_cmd),
+                                                                                      "return_code": verify.returncode,
+                                                                                      "stdout": verify.stdout,
+                                                                                      "stderr": verify.stderr
+                                                                                      })
                         contents_path = os.path.join(tmpdir, "remote_passwd")
                         try:
                             read_result = subprocess.run(

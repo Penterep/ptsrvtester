@@ -40,8 +40,4 @@ def run(ctx):
     ctx.out("Upstream cookie use toward authoritative servers is separate and not observable here.", "TEXT", indent=4)
 
     with ctx.results_lock:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.NoCookie.value,
-            "vuln_request": "EDNS COOKIE (8-byte client cookie)",
-            "vuln_response": "no server cookie returned",
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.NoCookie.value})

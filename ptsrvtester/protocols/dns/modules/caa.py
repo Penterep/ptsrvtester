@@ -35,8 +35,4 @@ def run(ctx):
         else:
             ctx.out("No CAA record — any public CA may issue certificates for this domain.", "VULN", indent=8)
             with ctx.results_lock:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.CaaMissing.value,
-                    "vuln_request": f"CAA {domain}",
-                    "vuln_response": "no CAA record set",
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.CaaMissing.value})

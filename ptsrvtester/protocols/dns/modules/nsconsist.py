@@ -45,8 +45,4 @@ def run(ctx):
         for n in notes:
             ctx.out(n, "VULN", indent=8)
         with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.NsInconsistent.value,
-                "vuln_request": f"per-NS SOA/NS comparison for {domain}",
-                "vuln_response": "; ".join(notes),
-            })
+            ctx.deferred_vulns.append({"vuln_code": VULNS.NsInconsistent.value})

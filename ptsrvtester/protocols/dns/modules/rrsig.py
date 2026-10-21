@@ -52,14 +52,6 @@ def run(ctx):
 
         with ctx.results_lock:
             if expired:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.RrsigExpired.value,
-                    "vuln_request": f"RRSIG expiration for {domain}",
-                    "vuln_response": "; ".join(f"{s.covers} tag {s.key_tag} expired {_fmt(s.expiration)}" for s in expired),
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.RrsigExpired.value})
             elif expiring:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.RrsigExpiring.value,
-                    "vuln_request": f"RRSIG expiration for {domain}",
-                    "vuln_response": "; ".join(f"{s.covers} tag {s.key_tag} in {s.days_left:g}d" for s in expiring),
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.RrsigExpiring.value})

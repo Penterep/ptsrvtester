@@ -52,8 +52,4 @@ def run(ctx):
 
 def _finding(ctx, name, kind, arrow):
     with ctx.results_lock:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.CnameChain.value,
-            "vuln_request": f"CNAME chain of {name}",
-            "vuln_response": f"{kind}: {arrow}",
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.CnameChain.value})

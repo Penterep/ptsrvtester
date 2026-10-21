@@ -39,8 +39,4 @@ def run(ctx):
 
     ctx.out(f"Cache snooping possible: {len(cached)} name(s) answered from cache to a non-recursive query.", "VULN", indent=4)
     with ctx.results_lock:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.CacheSnoop.value,
-            "vuln_request": "RD=0 (non-recursive) queries for popular names",
-            "vuln_response": "cached: " + ", ".join(f"{r.name}(TTL {r.ttl})" for r in cached),
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.CacheSnoop.value})

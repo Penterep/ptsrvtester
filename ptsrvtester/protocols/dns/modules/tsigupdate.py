@@ -85,10 +85,6 @@ def run(ctx):
             for n in writable:
                 ctx.out(f"    {n}", "TEXT", indent=8)
             with ctx.results_lock:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.TsigAcl.value,
-                    "vuln_request": f"TSIG-signed UPDATE of arbitrary names in {domain}",
-                    "vuln_response": "writable: " + ", ".join(writable),
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.TsigAcl.value})
         else:
             ctx.out("Key could not write the arbitrary probe names — update policy appears scoped.", "OK", indent=8)

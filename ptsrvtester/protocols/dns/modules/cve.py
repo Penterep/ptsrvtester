@@ -49,8 +49,4 @@ def run(ctx):
         ctx.out(f"  {entry.cve}: {entry.summary}", "VULN", indent=4)
 
     with ctx.results_lock:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.KnownCve.value,
-            "vuln_request": f"version.bind = {version_string} ({product})",
-            "vuln_response": "; ".join(f"{m.cve}: {m.summary}" for m in matches),
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.KnownCve.value})

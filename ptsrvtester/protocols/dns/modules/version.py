@@ -40,8 +40,4 @@ def run(ctx):
     ctx.out("Server discloses software/build information via CHAOS TXT.", "VULN", indent=4)
 
     with ctx.results_lock:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.VersionDisclosure.value,
-            "vuln_request": "CHAOS TXT: " + ", ".join(fp.CHAOS_NAMES),
-            "vuln_response": "; ".join(f"{n}={', '.join(v)}" for n, v in disclosed.items()),
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.VersionDisclosure.value})

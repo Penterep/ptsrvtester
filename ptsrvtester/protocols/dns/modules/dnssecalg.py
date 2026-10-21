@@ -49,8 +49,4 @@ def run(ctx):
         if deprecated:
             ctx.out("Deprecated DNSSEC algorithm(s) in use — migrate to ECDSA/EdDSA.", "VULN", indent=8)
             with ctx.results_lock:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.WeakDnssecAlg.value,
-                    "vuln_request": f"DNSKEY algorithms for {domain}",
-                    "vuln_response": ", ".join(deprecated),
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.WeakDnssecAlg.value})

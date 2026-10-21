@@ -38,11 +38,7 @@ def run(ctx):
             ctx.out("DNSSEC not deployed (no DNSKEY) — responses are not authenticated.", "VULN", indent=8)
             summary[domain] = "unsigned"
             with ctx.results_lock:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.DnssecMissing.value,
-                    "vuln_request": f"DNSKEY {domain}",
-                    "vuln_response": "no DNSKEY (zone not signed)",
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.DnssecMissing.value})
             continue
 
         key_count = len(keys.dnskey)
@@ -53,8 +49,4 @@ def run(ctx):
             ctx.out(f"DNSSEC deployed but INVALID: {keys.error}", "VULN", indent=8)
             summary[domain] = f"signed, invalid ({keys.error})"
             with ctx.results_lock:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.DnssecInvalid.value,
-                    "vuln_request": f"validate DNSKEY RRSIG for {domain}",
-                    "vuln_response": keys.error or "signature validation failed",
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.DnssecInvalid.value})

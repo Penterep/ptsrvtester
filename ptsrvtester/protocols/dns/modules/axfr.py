@@ -61,8 +61,4 @@ def run(ctx):
         ctx.out("A secondary name server allows AXFR (misconfigured mirror).", "VULN", indent=4)
 
     with ctx.results_lock:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.ZoneTransfer.value,
-            "vuln_request": "AXFR (full zone transfer) over TCP",
-            "vuln_response": "; ".join(exposed),
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.ZoneTransfer.value})

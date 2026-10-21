@@ -59,8 +59,4 @@ def run(ctx):
         ctx.out(f"High amplification: {best.rtype} gives x{best.factor} "
                 f"({best.request_size}→{best.response_size} B) — usable as a reflector/amplifier.", "VULN", indent=8)
         with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.AmpFactor.value,
-                "vuln_request": f"{best.rtype} {domain} ({best.request_size} B)",
-                "vuln_response": f"{best.response_size} B response, amplification factor x{best.factor}",
-            })
+            ctx.deferred_vulns.append({"vuln_code": VULNS.AmpFactor.value})

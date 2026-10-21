@@ -38,11 +38,7 @@ def run(ctx):
                 ctx.out("Zone is signed (DNSKEY present) but the parent publishes NO DS — "
                         "island of security; not authenticated from the root.", "VULN", indent=8)
                 with ctx.results_lock:
-                    ctx.deferred_vulns.append({
-                        "vuln_code": VULNS.DnssecChain.value,
-                        "vuln_request": f"DS {domain} (parent)",
-                        "vuln_response": "DNSKEY present but no DS at parent (broken chain)",
-                    })
+                    ctx.deferred_vulns.append({"vuln_code": VULNS.DnssecChain.value})
             else:
                 ctx.out("No DS at parent and no DNSKEY — zone is simply unsigned.", "OK", indent=8)
             continue
@@ -61,10 +57,6 @@ def run(ctx):
         if broken:
             ctx.out("Chain of trust is broken (a parent DS has no matching child DNSKEY).", "VULN", indent=8)
             with ctx.results_lock:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.DnssecChain.value,
-                    "vuln_request": f"DS↔DNSKEY match for {domain}",
-                    "vuln_response": "; ".join(f"tag {m.key_tag}={'ok' if m.matched else 'no-match'}" for m in matches),
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.DnssecChain.value})
         elif all(m.matched for m in matches):
             ctx.out("Chain of trust consistent (every DS matches a DNSKEY).", "OK", indent=8)

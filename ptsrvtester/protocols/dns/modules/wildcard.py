@@ -43,8 +43,4 @@ def run(ctx):
 
         summary[domain] = {"wildcard": True, "a": sorted(wc.a), "aaaa": sorted(wc.aaaa), "cname": sorted(wc.cname)}
         with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.Wildcard.value,
-                "vuln_request": f"random-label probe under {domain}",
-                "vuln_response": ", ".join(sorted(wc.a | wc.aaaa | wc.cname)) or "resolves",
-            })
+            ctx.deferred_vulns.append({"vuln_code": VULNS.Wildcard.value})

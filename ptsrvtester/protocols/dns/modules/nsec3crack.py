@@ -60,8 +60,4 @@ def run(ctx):
             ctx.out(f"{name:<40} {h}", "VULN", indent=8)
         ctx.out(f"Recovered {len(revealed)}/{len(hashes)} name(s) by offline NSEC3 cracking.", "VULN", indent=8)
         with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.Nsec3Cracked.value,
-                "vuln_request": f"NSEC3 offline crack of {domain} (iterations {params.iterations}, salt {params.salt_hex})",
-                "vuln_response": f"{len(revealed)} names: " + ", ".join(sorted(revealed.values())),
-            })
+            ctx.deferred_vulns.append({"vuln_code": VULNS.Nsec3Cracked.value})

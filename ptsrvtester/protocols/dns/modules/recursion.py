@@ -40,8 +40,4 @@ def run(ctx):
 
     ctx.out("Open recursion: the server resolves arbitrary external names for this client.", "VULN", indent=4)
     with ctx.results_lock:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.OpenRecursion.value,
-            "vuln_request": "RD=1 queries for external names (" + ", ".join(rc.EXTERNAL_NAMES[:3]) + ", …)",
-            "vuln_response": "resolved: " + ", ".join(p.name for p in probes if p.answered),
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.OpenRecursion.value})

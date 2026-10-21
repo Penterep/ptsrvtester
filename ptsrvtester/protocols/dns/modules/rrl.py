@@ -50,8 +50,4 @@ def run(ctx):
         ctx.out("No RRL observed at this rate — server answered the whole burst "
                 "(weaker against amplification/reflection abuse).", "VULN", indent=8)
         with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.NoRrl.value,
-                "vuln_request": f"burst of {res.sent} identical A queries for {domain}",
-                "vuln_response": f"received {res.received}/{res.sent}, no rate limiting seen",
-            })
+            ctx.deferred_vulns.append({"vuln_code": VULNS.NoRrl.value})

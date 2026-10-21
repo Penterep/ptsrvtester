@@ -57,8 +57,4 @@ def run(ctx):
         return
     with ctx.results_lock:
         flat = [s for subs in discovered.values() for s in subs]
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.Subdomains.value,
-            "vuln_request": "Subdomain brute force (-sub wordlist)",
-            "vuln_response": ", ".join(flat),
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.Subdomains.value})

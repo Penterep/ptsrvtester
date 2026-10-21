@@ -46,11 +46,7 @@ def run(ctx):
                         "the full zone can be walked (enumerate every name).", "VULN", indent=8)
                 summary[domain] = "NSEC (walkable)"
                 with ctx.results_lock:
-                    ctx.deferred_vulns.append({
-                        "vuln_code": VULNS.NsecWalk.value,
-                        "vuln_request": f"NSEC probe for {domain}",
-                        "vuln_response": f"classic NSEC (owner {info.nsec_owner}, next {info.nsec_next}) — walkable",
-                    })
+                    ctx.deferred_vulns.append({"vuln_code": VULNS.NsecWalk.value})
             else:
                 ctx.out("Minimal-covering NSEC (e.g. 'black lies') — signs each name on demand, "
                         "so the zone is NOT walkable.", "OK", indent=8)
@@ -66,8 +62,4 @@ def run(ctx):
             ctx.out("NSEC3 uses non-zero iterations and/or a salt — RFC 9276 recommends "
                     "0 iterations and no salt (extra iterations only add validation cost).", "VULN", indent=8)
             with ctx.results_lock:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.Nsec3Params.value,
-                    "vuln_request": f"NSEC3 parameters for {domain}",
-                    "vuln_response": f"iterations={info.nsec3_iterations}, salt={salt}",
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.Nsec3Params.value})

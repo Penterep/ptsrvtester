@@ -58,11 +58,7 @@ def run(ctx):
             ctx.out(f"Enumerated {len(names)} name(s) via NSEC walking{tail}.", "VULN", indent=8)
             summary[domain] = {"method": "NSEC", "count": len(names)}
             with ctx.results_lock:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.ZoneWalk.value,
-                    "vuln_request": f"NSEC chain walk of {domain}",
-                    "vuln_response": f"{len(names)} names: " + ", ".join(names[:50]),
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.ZoneWalk.value})
             continue
 
         # NSEC3
@@ -75,8 +71,4 @@ def run(ctx):
         ctx.out("Names are hashed; run NSEC3CRACK to attempt offline recovery.", "TEXT", indent=8)
         summary[domain] = {"method": "NSEC3", "hashes": len(hashes)}
         with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.ZoneWalk.value,
-                "vuln_request": f"NSEC3 hash collection of {domain}",
-                "vuln_response": f"{len(hashes)} NSEC3 hashes (iterations {params.iterations}, salt {params.salt_hex})",
-            })
+            ctx.deferred_vulns.append({"vuln_code": VULNS.ZoneWalk.value})

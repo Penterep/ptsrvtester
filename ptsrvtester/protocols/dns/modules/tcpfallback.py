@@ -50,8 +50,4 @@ def run(ctx):
             ctx.out(f"TCP/53 does NOT answer ({res.tcp_error or 'no reply'}) — large answers & DNSSEC break, "
                     "and UDP-only is more amplifiable.", "VULN", indent=8)
             with ctx.results_lock:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.TcpFallback.value,
-                    "vuln_request": f"SOA {domain} over TCP/53",
-                    "vuln_response": res.tcp_error or "no reply over TCP",
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.TcpFallback.value})

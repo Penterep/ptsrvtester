@@ -4,29 +4,15 @@ from __future__ import annotations
 import argparse
 import importlib
 import socket
-import sys
 
-from ptlibs.threads import printlock
-
-from .._base import BaseArgs, BaseMain
+from .._base import BaseArgs
 from .utils.cli import MSRPCArgs, validate_msrpc_selection
 from .utils.engine import MsrpcEngine
+from .utils.output import ProtocolMain, protocol_json_errors
 from .utils.registry import MSRPC_TESTS, expand_msrpc_selection, selection_families
 
 
-class _LivePrintLock(printlock.PrintLock):
-    """Keep ptlibs rendering while releasing each serial output chunk immediately."""
-
-    def add_string_to_output(self, *args, **kwargs):
-        super().add_string_to_output(*args, **kwargs)
-        chunk = self.get_output_string()
-        if chunk:
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            self.output_string = ""
-
-
-class MSRPC(BaseMain):
+class MSRPC(ProtocolMain):
     """Run selected MSRPC checks through one serial, shared engine."""
 
     NAME = "msrpc"
@@ -36,6 +22,7 @@ class MSRPC(BaseMain):
     def module_args() -> BaseArgs:
         return MSRPCArgs()
 
+    @protocol_json_errors
     def __init__(self, args: BaseArgs, ptjsonlib) -> None:
         if not isinstance(args, MSRPCArgs):
             raise argparse.ArgumentError(None, "wrong arguments namespace for msrpc")
@@ -93,23 +80,26 @@ class MSRPC(BaseMain):
                 + ", ".join(missing)
             )
             self.engine.record_module_error("DISCOVERY", message)
-            if not self.use_json:
-                self.ptjsonlib.end_error(message, False)
+            if self.use_json:
+                self._make_context(self.build_context()).log(f"Error: {message}", "ERROR")
+            else:
+                self._end_error(message)
             return []
         chosen = list(requested)
         chosen.sort(key=lambda code: (discovered[code].order, code))
         return chosen
 
-    def _thread_count(self) -> int:
-        # bind_ctx() and the result accumulator are intentionally shared.
-        return 1
-
     def _transport_error(self, family: str) -> OSError | None:
         """Check each selected TCP endpoint once, independently of authentication."""
         failure = self.engine.transport_failure(family)
         if failure is not None:
+            self.engine.ptdebug(f"{family.upper()} transport was already marked unavailable")
             return failure
         if family not in self._transport_checks:
+            self.engine.ptdebug(
+                f"Checking {family.upper()} TCP endpoint "
+                f"{self.target[0]}:{self.transport_ports[family]}"
+            )
             try:
                 connection = socket.create_connection(
                     (self.target[0], self.transport_ports[family]),
@@ -120,32 +110,38 @@ class MSRPC(BaseMain):
                 self._transport_checks[family] = exc
             else:
                 self._transport_checks[family] = None
+                self.engine.ptdebug(f"{family.upper()} TCP endpoint accepted the connection")
         return self._transport_checks[family]
+
+    @protocol_json_errors
+    def run(self) -> None:
+        super().run()
 
     def _run_module(self, code, discovered, extras) -> None:
         """Stream serial output so unavailable endpoints and progress appear promptly."""
         entry = discovered[code]
-        ctx = self._make_context(_LivePrintLock(), extras)
+        ctx = self._make_context(extras)
         ctx.out(entry.label, "INFO", colortext=True)
+        self.engine.bind_ctx(ctx)
         family = str(MSRPC_TESTS[code]["family"])
-        error = self._transport_error(family)
-        if error is not None:
-            message = (
-                f"{family.upper()} endpoint {self.target_host}:{self.transport_ports[family]} "
-                f"is unavailable; {code} skipped: {self.engine._sanitized_samr_error(error)}"
-            )
-            self.engine.record_module_error(code, message)
-            ctx.out(message, "TITLE", indent=4)
-        else:
-            try:
-                entry.module.run(ctx)
-            except Exception as exc:
-                self.engine.record_module_error(code, exc)
-                category = "ERROR" if isinstance(exc, argparse.ArgumentError) else "TITLE"
-                ctx.out(f"Error in module {code}: {exc}", category, indent=4)
-        # BaseMain.run will see no deferred text; JSON remains wholly silent.
-        with self._lock:
-            self._outputs[code] = ""
+        try:
+            error = self._transport_error(family)
+            if error is not None:
+                message = (
+                    f"{family.upper()} endpoint {self.target_host}:{self.transport_ports[family]} "
+                    f"is unavailable; {code} skipped: {self.engine._sanitized_samr_error(error)}"
+                )
+                self.engine.record_module_error(code, message)
+                ctx.out(message, "TITLE", indent=4)
+            else:
+                try:
+                    entry.module.run(ctx)
+                except Exception as exc:
+                    self.engine.record_module_error(code, exc)
+                    category = "ERROR" if isinstance(exc, argparse.ArgumentError) else "TITLE"
+                    ctx.out(f"Error in module {code}: {exc}", category, indent=4)
+        finally:
+            self.engine.bind_ctx(None)
 
     def build_context(self) -> dict:
         return {

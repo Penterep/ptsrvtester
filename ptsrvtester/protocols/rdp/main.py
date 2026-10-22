@@ -12,12 +12,10 @@ from __future__ import annotations
 import argparse
 import importlib
 import socket
-import sys
 from collections.abc import Iterable
 
-from ptlibs.threads import printlock
-
-from .._base import BaseArgs, BaseMain
+from .._base import BaseArgs
+from .utils.output import ProtocolMain, protocol_json_errors
 from .utils.cli import (
     RDP_EXPLICIT_ONLY_TESTS,
     RDP_TEST_ALIASES,
@@ -26,7 +24,7 @@ from .utils.cli import (
 )
 
 
-class RDP(BaseMain):
+class RDP(ProtocolMain):
     """Run the selected RDP checks through one shared RDP engine."""
 
     NAME = "rdp"
@@ -36,6 +34,7 @@ class RDP(BaseMain):
     def module_args() -> BaseArgs:
         return RDPArgs()
 
+    @protocol_json_errors
     def __init__(self, args: BaseArgs, ptjsonlib) -> None:
         # BaseMain validates the namespace and calls _prepare_target() first.
         super().__init__(args, ptjsonlib)
@@ -208,10 +207,9 @@ class RDP(BaseMain):
 
         if unknown:
             available = list(RDP_TEST_ORDER) + list(RDP_TEST_ALIASES)
-            self.ptjsonlib.end_error(
+            self._end_error(
                 f"Unknown module(s): {', '.join(unknown)}. "
                 f"Available: ALL, {', '.join(available)}",
-                self.use_json,
             )
             return self._remember_selection([])
         if "RATELIMIT" in chosen:
@@ -233,45 +231,19 @@ class RDP(BaseMain):
         """RDP modules share caches and a possible authenticated session."""
         return 1
 
-    def _run_module(self, code, discovered, extras) -> None:
-        """Put the BRUTE heading before its live progress lines."""
-        if code != "BRUTE" or self.use_json:
-            super()._run_module(code, discovered, extras)
-            return
-
-        # RDP runs modules serially. Earlier module output can be flushed now
-        # without changing selection order, then this test can report progress.
-        for chunk in self._outputs.values():
-            if chunk:
-                sys.stdout.write(chunk)
-        self._outputs.clear()
-
-        entry = discovered[code]
-        heading_lock = printlock.PrintLock()
-        self._make_context(heading_lock, extras).out(
-            entry.label, "INFO", colortext=True
-        )
-        sys.stdout.write(heading_lock.get_output_string())
-        sys.stdout.flush()
-
-        output_lock = printlock.PrintLock()
-        ctx = self._make_context(output_lock, extras)
-        try:
-            entry.module.run(ctx)
-        except Exception as exc:
-            ctx.out(f"Error in module {code}: {exc}", "ERROR")
-        with self._lock:
-            self._outputs[code] = output_lock.get_output_string()
-
+    @protocol_json_errors
     def run(self) -> None:
         """Require a valid pre-auth RDP response before dispatching any tests."""
+        if getattr(self.args, "debug", False):
+            self._make_context(self.build_context()).out(
+                "RDP service availability", "INFO", colortext=True
+            )
         probe = self.rdp_engine.preflight_service()
         if not (probe.successful or probe.failed_by_server):
             detail = probe.error or "No valid RDP negotiation response"
-            self.ptjsonlib.end_error(
+            self._end_error(
                 f"Cannot connect to RDP service at "
                 f"{self.target_host}:{self.target[1]}: {detail}",
-                self.use_json,
                 category="TITLE",
             )
             return

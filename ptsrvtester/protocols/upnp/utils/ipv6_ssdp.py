@@ -10,6 +10,7 @@ import ipaddress
 import math
 import socket
 import time
+from collections.abc import Callable
 
 from .ipv6 import IPv6Target, multicast_endpoint, multicast_host_header
 
@@ -68,6 +69,7 @@ def discover_ipv6_packets(
     mx: int,
     ttl: int,
     interface_ip: str | None = None,
+    on_response: Callable[[int], None] | None = None,
 ) -> dict:
     """Return raw responses from one target and bounded receive accounting.
 
@@ -75,6 +77,7 @@ def discover_ipv6_packets(
     link-local addresses use FF02::C and other native IPv6 addresses use FF05::C.
     Responses are unicast to this socket's ephemeral port, so group membership is
     unnecessary. ``received`` counts every datagram, including other hosts.
+    ``on_response`` observes the selected-target count during reception.
     """
     if not isinstance(target, IPv6Target):
         raise TypeError("target must be an IPv6Target")
@@ -193,6 +196,8 @@ def discover_ipv6_packets(
             received += 1
             if _source_matches(source, target_ip, target.scope_id, link_local):
                 packets.append((response, source))
+                if on_response is not None:
+                    on_response(len(packets))
 
     return {
         "packets": packets,

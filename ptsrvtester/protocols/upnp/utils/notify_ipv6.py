@@ -13,6 +13,7 @@ import re
 import socket
 import struct
 import time
+from collections.abc import Callable
 
 from .ipv6 import (
     LINK_LOCAL_SSDP_ADDRESS,
@@ -92,6 +93,8 @@ def listen_ssdp_notify_ipv6(
     seconds: float,
     max_notifications: int = 100,
     max_datagrams: int = MAX_NOTIFY_DATAGRAMS,
+    *,
+    on_notification: Callable[[dict, int], None] | None = None,
 ) -> dict:
     """Join one IPv6 SSDP group and observe only the selected target.
 
@@ -158,6 +161,8 @@ def listen_ssdp_notify_ipv6(
             if not _source_matches(source, target_ip, target.scope_id):
                 continue
             notifications.append(parse_ssdp_notify_ipv6(packet, source, group))
+            if on_notification is not None:
+                on_notification(notifications[-1], len(notifications))
 
     truncated = len(notifications) >= max_notifications or received >= max_datagrams
     if truncated or any(not item["valid"] for item in notifications):

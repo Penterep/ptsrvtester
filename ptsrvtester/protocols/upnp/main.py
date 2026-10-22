@@ -7,12 +7,13 @@ import importlib
 import ipaddress
 import socket
 
-from .._base import BaseArgs, BaseMain
+from .._base import BaseArgs
 from .utils.cli import UPnPArgs
 from .utils.ipv6 import IPv6Target
+from .utils.output import ProtocolMain, protocol_json_errors
 
 
-class UPnP(BaseMain):
+class UPnP(ProtocolMain):
     NAME = "upnp"
     ARGS_CLASS = UPnPArgs
 
@@ -20,6 +21,7 @@ class UPnP(BaseMain):
     def module_args() -> BaseArgs:
         return UPnPArgs()
 
+    @protocol_json_errors
     def __init__(self, args: BaseArgs, ptjsonlib) -> None:
         super().__init__(args, ptjsonlib)
         # Keep the operator's name for output while pinning network operations
@@ -206,10 +208,13 @@ class UPnP(BaseMain):
             selected.append("EVENTS")
         missing = [code for code in selected if code not in discovered]
         if missing:
-            raise argparse.ArgumentError(
-                None, f"UPnP test adapter(s) unavailable: {', '.join(missing)}"
-            )
+            self._end_error(f"UPnP test adapter(s) unavailable: {', '.join(missing)}")
+            return []
         return selected
+
+    @protocol_json_errors
+    def run(self) -> None:
+        super().run()
 
     def _run_module(self, code, discovered, extras) -> None:
         # A silent UDP endpoint is inconclusive. Dependent tests need valid
@@ -220,10 +225,22 @@ class UPnP(BaseMain):
         if code not in {"DISCOVER", "DESCRIBE", "NOTIFY"} and self.engine.description_status != "not_run":
             if not any(item["status"] == "described" for item in self.engine.devices):
                 return
-        super()._run_module(code, discovered, extras)
+        entry = discovered[code]
+        ctx = self._make_context(extras)
+        ctx.out(entry.label, "INFO", colortext=True)
+        try:
+            entry.module.run(ctx)
+        except Exception as exc:
+            self.engine._error(code, exc)
+            category = "ERROR" if isinstance(exc, argparse.ArgumentError) else "TITLE"
+            ctx.out(f"Error in module {code}: {exc}", category, indent=4)
+        finally:
+            self.engine.bind_ctx(None)
 
-    def _thread_count(self) -> int:
-        return 1
+    def _make_context(self, extras):
+        ctx = super()._make_context(extras)
+        self.engine.bind_ctx(ctx)
+        return ctx
 
     def build_context(self) -> dict:
         return {

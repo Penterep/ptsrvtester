@@ -86,7 +86,7 @@ def _share(entry):
     }
 
 
-def enumerate_shares(smb, *, limit=MAX_SHARES, max_pages=MAX_SHARE_PAGES):
+def enumerate_shares(smb, *, limit=MAX_SHARES, max_pages=MAX_SHARE_PAGES, debug=None):
     """Read level-1 shares without logging in again or closing ``smb``.
 
     ``error`` holds an exception only for operational failures; callers must
@@ -113,10 +113,14 @@ def enumerate_shares(smb, *, limit=MAX_SHARES, max_pages=MAX_SHARE_PAGES):
             filename=r"\srvsvc", smb_connection=smb,
         )
         dce = rpc_transport.get_dce_rpc()
+        if debug is not None:
+            debug("Opening the SRVS named pipe for share enumeration")
         dce.connect()
         dce.bind(srvs.MSRPC_UUID_SRVS)
         for _ in range(max_pages):
             result["pages"] += 1
+            if debug is not None:
+                debug(f"Requesting SMB share page {result['pages']}")
             try:
                 response = srvs.hNetrShareEnum(
                     dce, 1, resumeHandle=context,
@@ -128,6 +132,8 @@ def enumerate_shares(smb, *, limit=MAX_SHARES, max_pages=MAX_SHARE_PAGES):
                     raise
                 response = exc.get_packet()
             entries, next_context, more = _page(response)
+            if debug is not None:
+                debug(f"Received SMB share page {result['pages']}: {len(entries)} entries")
             for entry in entries:
                 if len(result["shares"]) >= limit:
                     result.update(status="partial", reason="share_limit_reached", truncated=True)

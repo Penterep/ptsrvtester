@@ -55,7 +55,7 @@ def _decode_entry(entry):
 
 def iter_epm_entries(
     dce, *, max_entries=MAX_EPM_ENTRIES, max_pages=MAX_EPM_PAGES,
-    page_size=EPM_PAGE_ENTRIES,
+    page_size=EPM_PAGE_ENTRIES, debug=None,
 ):
     """Yield Impacket-compatible entries and preserve earlier pages on failure.
 
@@ -70,7 +70,7 @@ def iter_epm_entries(
     handle = epm.ept_lookup_handle_t()
     seen_entries = set()
     try:
-        for _ in range(max_pages):
+        for page in range(1, max_pages + 1):
             requested = min(page_size, max_entries - len(seen_entries))
             request = epm.ept_lookup()
             request["inquiry_type"] = epm.RPC_C_EP_ALL_ELTS
@@ -79,6 +79,8 @@ def iter_epm_entries(
             request["vers_option"] = epm.RPC_C_VERS_ALL
             request["entry_handle"] = handle
             request["max_ents"] = requested
+            if debug is not None:
+                debug(f"Requesting Endpoint Mapper page {page} (up to {requested} entries)")
             response = dce.request(request, checkError=False)
             handle = response["entry_handle"]
             status = _unsigned(response["status"], "status")
@@ -88,6 +90,8 @@ def iter_epm_entries(
             entries = response["entries"]
             if not isinstance(entries, (list, tuple)) or len(entries) != count or count > requested:
                 raise ValueError("Inconsistent Endpoint Mapper entry count")
+            if debug is not None:
+                debug(f"Received Endpoint Mapper page {page}: {count} entries")
             if status == epm.RPC_NO_MORE_ELEMENTS and count:
                 raise ValueError("Endpoint Mapper returned entries after its terminal status")
             previous_count = len(seen_entries)

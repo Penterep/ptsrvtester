@@ -32,7 +32,7 @@ from enum import Enum
 from typing import Protocol
 
 EXPECTED_DEPENDENCY_VERSIONS = {
-    "aardwolf": "0.2.13",
+    "aardwolf": "0.2.16",
     "asyauth": "0.0.23",
     "asysocks": "0.2.18",
 }

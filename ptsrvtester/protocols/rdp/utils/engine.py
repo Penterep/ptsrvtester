@@ -4913,8 +4913,8 @@ class RDP(BaseModule):
     @staticmethod
     def _rate_limit_output_category(result: RDPConnectionLimitResult) -> Out:
         return {
-            "possible_ip_block_or_service_impact": Out.ERROR,
-            "error": Out.ERROR,
+            "possible_ip_block_or_service_impact": Out.TITLE,
+            "error": Out.TITLE,
             "limiting_observed": Out.WARNING,
             "slowdown_observed": Out.WARNING,
             "behavior_observed": Out.WARNING,
@@ -5813,7 +5813,8 @@ class RDP(BaseModule):
         )
         self.ptdebug(
             f"Wordlist candidates: {result.candidate_count_requested} requested, "
-            f"{result.candidate_count_tested} tested, "
+            f"{result.candidate_count_tested} probed, "
+            f"{result.candidate_count_baseline_reused} reused from baseline, "
             f"{result.candidate_count_skipped} skipped"
         )
 
@@ -5960,9 +5961,15 @@ class RDP(BaseModule):
             timing = f", median {metrics.median_ms:.1f} ms"
         if metrics.p95_ms is not None:
             timing += f", p95 {metrics.p95_ms:.1f} ms"
+        failures = ", ".join(
+            f"{outcome.replace('_', ' ')}: {count}"
+            for outcome, count in metrics.outcome_counts.items()
+            if outcome != RateProbeOutcome.ACCEPTED.value and count
+        )
+        failure_summary = f"; {failures}" if failures else ""
         return (
             f"accepted {metrics.accepted}/{metrics.attempted} attempted "
-            f"({metrics.requested} configured){timing}"
+            f"({metrics.requested} configured){timing}{failure_summary}"
         )
 
     def _output_rate_limit_text(self, result: RDPConnectionLimitResult) -> None:
@@ -6009,8 +6016,8 @@ class RDP(BaseModule):
             "limiting_observed": Out.WARNING,
             "slowdown_observed": Out.WARNING,
             "not_observed": Out.WARNING,
-            "impact_persisted": Out.ERROR,
-            "error": Out.ERROR,
+            "impact_persisted": Out.TITLE,
+            "error": Out.TITLE,
         }
         for scenario in result.scenarios:
             name = (
@@ -6024,28 +6031,28 @@ class RDP(BaseModule):
                 indent=8,
             )
             self.ptprint(
-                f"{name} baseline: {self._rate_metrics_summary(scenario.baseline)}"
+                f"            Baseline: {self._rate_metrics_summary(scenario.baseline)}"
             )
             self.ptprint(
-                f"{name} load: {self._rate_metrics_summary(scenario.load)}"
+                f"            Load:     {self._rate_metrics_summary(scenario.load)}"
             )
             if scenario.control is not None:
                 self.ptprint(
-                    f"{name} control: {self._rate_metrics_summary(scenario.control)}"
+                    f"            Control:  {self._rate_metrics_summary(scenario.control)}"
                 )
             self.ptprint(
-                f"{name} recovery: {self._rate_metrics_summary(scenario.recovery)}"
+                f"            Recovery: {self._rate_metrics_summary(scenario.recovery)}"
             )
             if scenario.held_open_count:
                 self.ptprint(
-                    f"{name}: {scenario.held_open_count} client socket handles were "
+                    f"            {scenario.held_open_count} client socket handles were "
                     "retained after X.224 acceptance; peer-side liveness snapshot: "
                     f"{scenario.held_alive_count} alive, "
                     f"{scenario.held_closed_count} closed, "
                     f"{scenario.held_liveness_unknown_count} unknown"
                 )
             for note in scenario.notes:
-                self.ptprint(f"{name}: {note}")
+                self.ptprint(f"            {note}")
 
     def _nla_json(self, result: NLAResult) -> dict:
         return {
@@ -6271,6 +6278,7 @@ class RDP(BaseModule):
             "baselineAttempts": result.baseline_attempts,
             "candidateCountRequested": result.candidate_count_requested,
             "candidateCountTested": result.candidate_count_tested,
+            "candidateCountBaselineReused": result.candidate_count_baseline_reused,
             "candidateCountSkipped": result.candidate_count_skipped,
             "invalidBaselinesConsistent": result.invalid_baselines_consistent,
             "knownUserFingerprint": self._semantic_fingerprint_json(
@@ -6286,6 +6294,7 @@ class RDP(BaseModule):
                 {
                     "login": candidate.login,
                     "classification": candidate.classification,
+                    "baselineReused": candidate.baseline_reused,
                     "durationMs": (
                         round(candidate.duration_ms, 3)
                         if candidate.duration_ms is not None

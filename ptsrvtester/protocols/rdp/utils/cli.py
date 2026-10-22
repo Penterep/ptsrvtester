@@ -164,9 +164,13 @@ _RDP_TEST_HELP = {
     },
     "USERENUM": {
         "description": "Compare RDP responses for candidate usernames",
-        "detail": "Send wrong passwords for a known login and optional candidates; attempts can contribute to lockout.",
+        "detail": "Compare a known valid login with random nonexistent logins using the same generated wrong password. Test --users only if account-specific CredSSP server statuses distinguish the controls; generic login failures and timing differences do not confirm enumeration. Attempts can contribute to lockout.",
         "requires": ("-u/--user (known valid username)", "--allow-auth-failures"),
         "usage_args": " -u <known-user> --allow-auth-failures",
+        "examples": (
+            "ptsrvtester rdp -tg 192.168.1.10 -ts USERENUM -u known-user --allow-auth-failures",
+            "ptsrvtester rdp -tg 192.168.1.10 -ts USERENUM -u DOMAIN\\known-user -U users.txt --allow-auth-failures",
+        ),
         "options": (
             ["-u", "--user", "<name>", "Known valid username for the baseline"],
             ["-p", "--password", "[password]", "Optional valid password to verify the baseline"],

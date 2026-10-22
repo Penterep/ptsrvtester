@@ -158,6 +158,7 @@ class EnumerationCandidateResult:
     classification: str
     fingerprint: SemanticFingerprint
     duration_ms: float | None
+    baseline_reused: bool = False
 
 
 @dataclass(frozen=True)
@@ -173,11 +174,21 @@ class UserEnumerationResult:
 
     @property
     def candidate_count_tested(self) -> int:
-        return len(self.candidates)
+        """Count fresh wordlist probes, excluding evidence reused from baseline."""
+        return sum(not item.baseline_reused for item in self.candidates)
+
+    @property
+    def candidate_count_baseline_reused(self) -> int:
+        return sum(item.baseline_reused for item in self.candidates)
 
     @property
     def candidate_count_skipped(self) -> int:
-        return max(0, self.candidate_count_requested - len(self.candidates))
+        return max(
+            0,
+            self.candidate_count_requested
+            - self.candidate_count_tested
+            - self.candidate_count_baseline_reused,
+        )
 
     @property
     def existing_users(self) -> tuple[str, ...]:
@@ -938,20 +949,31 @@ def run_user_enumeration(
         )
 
     normalized_candidates: list[str] = []
-    seen = {
-        config.valid_login.casefold(),
-        *(login.casefold() for login in invalid_logins),
-    }
+    candidate_results: list[EnumerationCandidateResult] = []
+    known_key = config.valid_login.casefold()
+    seen = {login.casefold() for login in invalid_logins}
     for candidate in config.candidates:
         normalized = normalize_candidate_login(candidate, config.valid_login)
         key = normalized.casefold()
         if key in seen:
             continue
         seen.add(key)
+        if key == known_key:
+            # The confirmed baseline already tested this wordlist identity.
+            # Reuse its evidence instead of sending another bad password.
+            candidate_results.append(
+                EnumerationCandidateResult(
+                    login=normalized,
+                    classification="existing",
+                    fingerprint=known_fingerprint,
+                    duration_ms=known_attempt.duration_ms,
+                    baseline_reused=True,
+                )
+            )
+            continue
         normalized_candidates.append(normalized)
     _shuffle(normalized_candidates, shuffle)
 
-    candidate_results: list[EnumerationCandidateResult] = []
     result_status = "enumerable"
     reason = (
         "known and invalid identities produced distinct identity-specific server "

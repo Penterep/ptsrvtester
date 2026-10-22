@@ -1,5 +1,6 @@
 from pysnmp.hlapi.v3arch.asyncio import *
 import asyncio
+import os
 from ptsrvtester.protocols.snmp.utils.helpers import snmp_debug, write_to_file
 from ptsrvtester.protocols.snmp.utils.registry import text_or_file
 from typing import List
@@ -23,14 +24,23 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
        - list[Credential]: A list of valid communities found during the attack.
        - None: If no credentials are found or required inputs are missing.
     """
-        
+
+    if not ctx.single_community and not ctx.community_file:
+        ctx.out("No community or wordlist provided. Using the default top-50 community wordlist.",
+                "WARNING", indent=4)
+        ctx.community_file = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "wordlists",
+            "top50wordlist.txt",
+        )
+
     communities = text_or_file(ctx.single_community, ctx.community_file)
     valid_communities = []
 
     for community in communities:
         iterator = get_cmd(SnmpEngine(),
                             CommunityData(community),
-                           await UdpTransportTarget.create((ctx.ip, ctx.port), timeout=0.1),
+                           await UdpTransportTarget.create((ctx.ip, ctx.port), timeout=0.25, retries=0),
                            # Initialize transport target correctly
                            ContextData(),
                            ObjectType(ObjectIdentity("SNMPv2-MIB", "sysDescr", 0)))
@@ -62,8 +72,4 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
 
 
 def run(ctx):
-    if not ctx.single_community and not ctx.community_file:
-        ctx.out("Error: Neither a community file nor a single community string was provided.", "WARNING", indent=4)
-        return
-    
     asyncio.run(_snmpv2_brute(ctx))

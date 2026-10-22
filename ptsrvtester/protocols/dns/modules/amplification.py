@@ -24,7 +24,9 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
+    ctx.debug(f"sending small RD=1 queries (TXT/DNSKEY/ANY) for out-of-zone names to {ip}:{port} and measuring response size")
     results = rc.amplification(ip, port)
+    ctx.debug(f"amplification probe complete; {len(results)} response(s) received")
     if not results:
         ctx.out("No response to any amplification probe.", "OK", indent=4)
         return
@@ -43,22 +45,13 @@ def run(ctx):
     best = rc.best_amplification(results)
     if best is None:
         ctx.out("Server does not resolve out-of-zone names — not usable as an amplifier.", "OK", indent=4)
-        with ctx.results_lock:
-            ctx.properties["amplification"] = "not out-of-zone recursive"
         return
 
     if best.factor < AMP_THRESHOLD:
         ctx.out(f"Resolves out-of-zone names but max amplification is low (x{best.factor}).", "WARNING", indent=4)
-        with ctx.results_lock:
-            ctx.properties["amplification"] = f"out-of-zone recursive, max x{best.factor}"
         return
 
     ctx.out(f"Usable as a reflector/amplifier: {best.name} {best.rtype} gives x{best.factor} "
             f"({best.request_size}→{best.response_size} B).", "VULN", indent=4)
     with ctx.results_lock:
-        ctx.properties["amplification"] = f"x{best.factor} via {best.name}/{best.rtype}"
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.Amplification.value,
-            "vuln_request": f"RD=1 {best.name} {best.rtype} ({best.request_size} B)",
-            "vuln_response": f"{best.response_size} B response, amplification factor x{best.factor}",
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.Amplification.value})

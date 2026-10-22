@@ -7,7 +7,7 @@ from ptsrvtester.protocols.snmp.utils.registry import (PROTOCOL_NAMES, text_or_f
 from ptsrvtester.protocols.snmp.modules.v3_enum import user_enum
 
 __MODULELABEL__ = "SNMPv3 Brute Force Test"
-__MODULECODE__ = "v3_brute"
+__MODULECODE__ = "v3brute"
 __ORDER__ = 100
 
 
@@ -153,6 +153,7 @@ async def snmpv3_brute(ctx) -> list[Credential] | None:
 
     if valid_usernames:
         # self.ctx.out("\n")
+        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-BRUTE")
         ctx.out(f"Potential valid usernames:", "INFO",  indent=4)
         for username in valid_usernames:
             ctx.out(username, "VULN",  indent=8)
@@ -164,6 +165,7 @@ async def snmpv3_brute(ctx) -> list[Credential] | None:
     if found_credentials:
         # self.ctx.out("\n")
         ctx.out("Found credentials:", "INFO",  indent=4)
+        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-BRUTE")
         creds_dict = {}
         for cred in found_credentials:
             ctx.out(f"Username: {cred.username}, Password: {cred.password}", "VULN",  indent=8)

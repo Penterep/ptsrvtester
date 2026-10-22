@@ -19,6 +19,41 @@ _NOT_TESTED = "Could not connect. HELO/EHLO bypass was not tested."
 _OPEN_RELAY_IRRELEVANT = "Test is irelevant, because server is set as Open Relay"
 
 
+def _helobyp_value_line(name: str, bypass: set[str], ehlo_accepted: set[str]) -> tuple[str, str]:
+    gray = colors["ADDITIONS"]
+    reset = colors["TEXT"]
+    if name in bypass:
+        return name, "VULN"
+    if name not in ehlo_accepted:
+        return f"{name} {gray}(not accepted){reset}", "NOTVULN"
+    return name, "NOTVULN"
+
+
+def _stream_helo_bypass_tested_title(e) -> None:
+    """Print ``[*] Tested values`` once, after the open-relay probe and before payloads."""
+    if e.use_json or getattr(e, "_helobyp_tested_title_shown", False):
+        return
+    e._ptprint_raw("Tested values", bullet_type="TITLE", condition=True, indent=4)
+    e._helobyp_tested_title_shown = True
+    e._flush_terminal()
+
+
+def _stream_helo_bypass_one_value(
+    e,
+    name: str,
+    *,
+    bypass: set[str],
+    ehlo_accepted: set[str],
+) -> None:
+    """One EHLO payload: live verdict under ``Tested values`` (after -vv I/O)."""
+    if e.use_json:
+        return
+    e._helobyp_streamed_live = True
+    msg, bullet = _helobyp_value_line(name, bypass, ehlo_accepted)
+    e._ptprint_raw(msg, bullet_type=bullet, condition=True, indent=8)
+    e._flush_terminal()
+
+
 def test_helo_bypass(e) -> HeloBypassResult:
     """
     Test HELO/EHLO value for bypassing security restrictions (PTV-SVC-SMTP-HELO).
@@ -158,6 +193,21 @@ def test_helo_bypass(e) -> HeloBypassResult:
     port_hint = ph if ph != "unknown" else ("submission" if port in (587, 465, 2525) else "mta")
     rcpt_external = "external-test@gmail.com"
     tested: list[str] = []
+    emitted: set[str] = set()
+
+    def _emit_value_result(helo_value: str) -> None:
+        if helo_value not in tested or helo_value in emitted:
+            return
+        emitted.add(helo_value)
+        bypass_now = set(submission_bypass) | set(relay_bypass)
+        _stream_helo_bypass_one_value(
+            e,
+            helo_value,
+            bypass=bypass_now,
+            ehlo_accepted=set(accepts_invalid),
+        )
+
+    _stream_helo_bypass_tested_title(e)
 
     for helo_value in unique_payloads:
         smtp = None
@@ -211,7 +261,9 @@ def test_helo_bypass(e) -> HeloBypassResult:
             # 1. EHLO <payload>
             ehlo_status, ehlo_reply_bytes = smtp.docmd("EHLO", helo_value)
             ehlo_reply_str = ehlo_reply_bytes.decode(errors="replace") if ehlo_reply_bytes else ""
-            e._smtp_vv_io(f"EHLO {helo_value}", f"{ehlo_status} {ehlo_reply_str}")
+            e._smtp_vv_io(
+                f"EHLO {helo_value}", f"{ehlo_status} {ehlo_reply_str}", indent=8,
+            )
             tested.append(helo_value)
             e.end_if_blocked(ehlo_status, ehlo_reply_str)
             extensions = _get_ehlo_extension_keys(ehlo_reply_str)
@@ -221,28 +273,34 @@ def test_helo_bypass(e) -> HeloBypassResult:
                 accepts_invalid.append(helo_value)
 
             if ehlo_status != 250:
-                smtp.quit()
                 continue
 
             # 2. MAIL FROM – measure latency for every payload (auth check may reject here)
             start = time.monotonic()
             mail_status, mail_reply = smtp.docmd("MAIL", "FROM:<tester@example.com>")
             mail_latency = time.monotonic() - start
-            e._smtp_vv_io("MAIL FROM:<tester@example.com>", f"{mail_status} {e.bytes_to_str(mail_reply)}")
+            e._smtp_vv_io(
+                "MAIL FROM:<tester@example.com>",
+                f"{mail_status} {e.bytes_to_str(mail_reply)}",
+                indent=8,
+            )
             e.end_if_blocked(mail_status, mail_reply)
 
             if mail_status not in (250, 251):
                 rcpt_latencies[helo_value] = mail_latency  # Store MAIL latency when rejected here
                 if mail_latency > 5.0:
                     tarpitting_list.append(helo_value)
-                smtp.quit()
                 continue
 
             # 3. RCPT TO – measure latency
             start = time.monotonic()
             rcpt_status, rcpt_reply = smtp.docmd("RCPT", f"TO:<{rcpt_external}>")
             rcpt_latency = time.monotonic() - start
-            e._smtp_vv_io(f"RCPT TO:<{rcpt_external}>", f"{rcpt_status} {e.bytes_to_str(rcpt_reply)}")
+            e._smtp_vv_io(
+                f"RCPT TO:<{rcpt_external}>",
+                f"{rcpt_status} {e.bytes_to_str(rcpt_reply)}",
+                indent=8,
+            )
             e.end_if_blocked(rcpt_status, rcpt_reply)
             rcpt_latencies[helo_value] = rcpt_latency
 
@@ -258,6 +316,7 @@ def test_helo_bypass(e) -> HeloBypassResult:
         except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
             pass
         finally:
+            _emit_value_result(helo_value)
             if smtp:
                 try:
                     smtp.quit()
@@ -351,25 +410,21 @@ def _stream_helo_bypass_result(e) -> None:
     if hb.indeterminate and not hb.tested_ehlo:
         pp(f"Indeterminate: {hb.detail or 'Could not complete'}", bullet_type="WARNING", condition=show, indent=4)
         return
-    pp("Tested values", bullet_type="TITLE", condition=show, indent=4)
-    bypass = set(hb.submission_bypass_ehlo) | set(hb.relay_bypass_ehlo)
-    gray = colors["ADDITIONS"]
-    reset = colors["TEXT"]
-    for name in hb.tested_ehlo:
-        if name in bypass:
-            pp(name, bullet_type="VULN", condition=show, indent=8)
-        else:
-            pp(
-                f"{name} {gray}(not accepted){reset}",
-                bullet_type="NOTVULN",
-                condition=show,
-                indent=8,
-            )
+    if not getattr(e, "_helobyp_streamed_live", False):
+        if show:
+            _stream_helo_bypass_tested_title(e)
+        bypass = set(hb.submission_bypass_ehlo) | set(hb.relay_bypass_ehlo)
+        ehlo_accepted = set(hb.accepts_invalid_format)
+        for name in hb.tested_ehlo:
+            msg, bullet = _helobyp_value_line(name, bypass, ehlo_accepted)
+            pp(msg, bullet_type=bullet, condition=show, indent=8)
     if hb.indeterminate:
         pp(f"Indeterminate: {hb.detail or 'Could not complete'}", bullet_type="WARNING", condition=show, indent=4)
 
 def run(ctx):
     e = eng(ctx)
+    e._helobyp_streamed_live = False
+    e._helobyp_tested_title_shown = False
     try:
         e.results.helo_bypass = test_helo_bypass(e)
     except Exception as ex:

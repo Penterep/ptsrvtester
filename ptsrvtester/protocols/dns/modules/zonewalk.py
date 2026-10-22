@@ -28,9 +28,11 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, object] = {}
+    ctx.debug(f"attempting zone walking via NSEC/NSEC3 for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"finding authoritative servers for {domain} and detecting the authenticated-denial type")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
@@ -46,6 +48,7 @@ def run(ctx):
                 ctx.out("Minimal-covering NSEC ('black lies') — the zone is NOT walkable.", "OK", indent=8)
                 summary[domain] = "NSEC (not walkable)"
                 continue
+            ctx.debug(f"walking the NSEC next-chain from the apex of {domain}")
             names, truncated = zw.walk_nsec(servers, domain)
             for n in names[:SAMPLE]:
                 ctx.out(n, "TEXT", indent=8)
@@ -55,12 +58,7 @@ def run(ctx):
             ctx.out(f"Enumerated {len(names)} name(s) via NSEC walking{tail}.", "VULN", indent=8)
             summary[domain] = {"method": "NSEC", "count": len(names)}
             with ctx.results_lock:
-                ctx.properties.setdefault("zonewalk", {})[domain] = names
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.ZoneWalk.value,
-                    "vuln_request": f"NSEC chain walk of {domain}",
-                    "vuln_response": f"{len(names)} names: " + ", ".join(names[:50]),
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.ZoneWalk.value})
             continue
 
         # NSEC3
@@ -73,11 +71,4 @@ def run(ctx):
         ctx.out("Names are hashed; run NSEC3CRACK to attempt offline recovery.", "TEXT", indent=8)
         summary[domain] = {"method": "NSEC3", "hashes": len(hashes)}
         with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.ZoneWalk.value,
-                "vuln_request": f"NSEC3 hash collection of {domain}",
-                "vuln_response": f"{len(hashes)} NSEC3 hashes (iterations {params.iterations}, salt {params.salt_hex})",
-            })
-
-    with ctx.results_lock:
-        ctx.properties["zonewalk_summary"] = summary
+            ctx.deferred_vulns.append({"vuln_code": VULNS.ZoneWalk.value})

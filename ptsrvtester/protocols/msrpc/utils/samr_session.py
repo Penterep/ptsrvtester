@@ -82,7 +82,8 @@ def iter_samr_domains(engine, dce, server_handle):
     context = 0
     seen_contexts = {context}
     seen_names = set()
-    for _ in range(MAX_ENUMERATION_PAGES):
+    for page in range(1, MAX_ENUMERATION_PAGES + 1):
+        engine.ptdebug(f"Requesting SAMR domain page {page}")
         try:
             response = samr.hSamrEnumerateDomainsInSamServer(
                 dce, server_handle, enumerationContext=context,
@@ -95,6 +96,7 @@ def iter_samr_domains(engine, dce, server_handle):
                 raise
             response = exc.get_packet()
         entries, next_context, more = enumeration_page(response)
+        engine.ptdebug(f"Received SAMR domain page {page}: {len(entries)} entries")
         for entry in entries:
             name = str(entry["Name"]).rstrip("\x00")
             if not name:
@@ -115,29 +117,61 @@ def iter_samr_domains(engine, dce, server_handle):
     raise RuntimeError("SAMR domain enumeration page limit reached")
 
 
+def samr_access_metadata(engine) -> dict:
+    anonymous = (
+        getattr(engine.args, "username", None) is None
+        and getattr(engine.args, "password", None) is None
+    )
+    return {
+        "accessMode": "anonymous" if anonymous else "authenticated",
+        "sessionType": None,
+        "anonymousLoginAccepted": False,
+    }
+
+
+def authenticate_samr_session(engine, smb, access: dict) -> None:
+    anonymous = access["accessMode"] == "anonymous"
+    if anonymous:
+        credentials = ("", "", "")
+    else:
+        credentials = (
+            engine.args.username,
+            engine.args.password,
+            getattr(engine.args, "domain", "") or "",
+        )
+    smb.login(*credentials, ntlmFallback=False)
+    identity = engine._smb_session_identity(smb)
+    access["sessionType"] = identity
+    if anonymous:
+        # SMB1 has no distinct Null flag. A fresh successful login with no
+        # account or domain still proves access without supplied credentials.
+        if identity == "authenticated":
+            access["sessionType"] = "anonymous"
+        access["anonymousLoginAccepted"] = True
+
+
 @contextmanager
-def samr_session(engine):
-    """Authenticate once, open a minimal SAM server handle, and always close it."""
+def samr_session(engine, access: dict | None = None):
+    if access is None:
+        access = samr_access_metadata(engine)
     smb = dce = server_handle = None
     logged_in = False
     try:
+        engine.ptdebug(f"Opening an SMB session at {engine.args.ip}:{engine.smb_port}")
         smb = SMBConnection(
             engine.args.ip, engine.args.ip, sess_port=engine.smb_port,
             timeout=engine.connect_timeout,
         )
         try:
-            smb.login(
-                engine.args.username, engine.args.password,
-                getattr(engine.args, "domain", "") or "", ntlmFallback=False,
-            )
+            authenticate_samr_session(engine, smb, access)
             logged_in = True
+            engine.ptdebug("SMB login accepted; checking the SAMR session identity")
         except SessionError as exc:
             if engine._samr_error_code(exc) in _AUTH_DENIED:
                 raise SamrDenied("authentication_denied") from exc
             raise
-        identity = engine._smb_session_identity(smb)
-        if identity != "authenticated":
-            raise SamrDenied(f"{identity}_session")
+        if access["accessMode"] != "anonymous" and access["sessionType"] != "authenticated":
+            raise SamrDenied(f"{access['sessionType']}_session")
         rpc_transport = transport.DCERPCTransportFactory(
             f"ncacn_np:{engine.args.ip}[\\pipe\\samr]"
         )
@@ -146,14 +180,17 @@ def samr_session(engine):
         rpc_transport.setRemoteHost(engine.args.ip)
         rpc_transport.set_smb_connection(smb)
         dce = rpc_transport.get_dce_rpc()
+        engine.ptdebug("Opening the SAMR pipe and binding the SAMR interface")
         dce.connect()
         dce.bind(samr.MSRPC_UUID_SAMR)
+        engine.ptdebug("Requesting a SAMR server handle")
         connected = samr.hSamrConnect5(
             dce, desiredAccess=(
                 samr.SAM_SERVER_ENUMERATE_DOMAINS | samr.SAM_SERVER_LOOKUP_DOMAIN
             ),
         )
         server_handle = connected["ServerHandle"]
+        engine.ptdebug("SAMR server handle received")
         yield dce, server_handle
     except Exception as exc:
         if engine._samr_access_denied(exc):

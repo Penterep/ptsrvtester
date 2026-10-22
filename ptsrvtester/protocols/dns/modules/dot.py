@@ -24,16 +24,16 @@ def run(ctx):
         return
     host = getattr(ctx, "host", None) or ip
 
+    ctx.debug(f"handshaking TLS to {ip}:853 (ALPN dot) to read the negotiated version, cipher and certificate")
     probe = tt.tls_probe(ip, 853, host, alpn=["dot"])
     if not probe.connected:
         ctx.out(f"DoT/853 not available ({probe.error}).", "TEXT", indent=4)
-        with ctx.results_lock:
-            ctx.properties["dot"] = "unavailable"
         return
 
     ctx.out(f"DoT/853 available — {probe.tls_version}, {probe.cipher} ({probe.cipher_bits}-bit)"
             + (f", ALPN {probe.alpn}" if probe.alpn else ""), "OK", indent=4)
 
+    ctx.debug("confirming the server actually answers a DNS query over TLS")
     try:
         dns.query.tls(dns.message.make_query(host if "." in host else "example.com", dns.rdatatype.A),
                       ip, port=853, timeout=6, server_hostname=host)
@@ -42,5 +42,3 @@ def run(ctx):
         ctx.out(f"TLS handshake works but DNS-over-TLS query failed: {type(e).__name__}", "WARNING", indent=4)
 
     tt.report_tls(ctx, "DoT", host, probe)
-    with ctx.results_lock:
-        ctx.properties["dot"] = f"{probe.tls_version}, cert {'valid' if probe.verify_ok else 'invalid'}"

@@ -23,9 +23,11 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
+    ctx.debug(f"checking each delegated NS for authoritative answers (RD=0 SOA) across {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"querying each NS of {domain} directly for the zone SOA")
         results = ig.lame_delegations(resolver, domain)
         if not results:
             ctx.out("No NS records found for the domain.", "WARNING", indent=8)
@@ -41,9 +43,4 @@ def run(ctx):
 
         if lame:
             with ctx.results_lock:
-                ctx.properties.setdefault("lame_delegation", {})[domain] = [f"{r.ns}: {r.status}" for r in lame]
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.LameDelegation.value,
-                    "vuln_request": f"per-NS authoritative check (RD=0 SOA) for {domain}",
-                    "vuln_response": "; ".join(f"{r.ns} ({r.status})" for r in lame),
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.LameDelegation.value})

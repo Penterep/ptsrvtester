@@ -25,7 +25,7 @@ import secrets
 # side effect (so old servers still negotiate and paramiko does not spam stderr).
 from ptsrvtester.protocols.ssh.utils import ssh_helpers
 from ptsrvtester.protocols.ssh.utils.helpers import text_or_file
-from ptsrvtester.protocols.ssh.utils.results import SSHCreds, VULNS
+from ptsrvtester.protocols.ssh.utils.results import SSHCreds
 from ptsrvtester.protocols.ssh.utils.rootlogin_core import assess_root_login
 
 __MODULELABEL__ = "Root login permitted"
@@ -62,6 +62,7 @@ def run(ctx):
             "INFO", colortext=True, indent=4)
 
     # (1) Behavioural probe: methods for root vs an ordinary (random) name.
+    ctx.debug(f"probing advertised auth methods for '{account}' vs a random baseline name")
     try:
         root_methods = ssh_helpers.get_auth_methods_for(ip, port, account)
     except Exception as e:
@@ -79,6 +80,8 @@ def run(ctx):
     if creds_list:
         ctx.out(f"Credentials supplied — attempting a real login as '{account}' "
                 f"({len(creds_list)} secret(s))", "WARNING", indent=4)
+    ctx.debug(f"attempting a real login as '{account}' with {len(creds_list)} secret(s)"
+              if creds_list else "no credentials supplied — behavioural verdict only")
     login_succeeded, login_attempted = _attempt_login(ip, port, creds_list)
 
     result = assess_root_login(
@@ -126,24 +129,5 @@ def _render(ctx, r):
     for n in r.notes:
         ctx.out(n, "TEXT", indent=8)
 
-    with ctx.results_lock:
-        ctx.properties["rootLoginAccount"] = r.account
-        ctx.properties["rootLoginVerdict"] = r.verdict
-        ctx.properties["rootAuthMethods"] = r.root_methods
-        if r.password_enabled is not None:
-            ctx.properties["rootPasswordEnabled"] = bool(r.password_enabled)
-        ctx.properties["rootLoginConfirmed"] = bool(r.login_succeeded)
-
-        if r.is_finding:
-            if r.verdict == "confirmed":
-                request = f"account: {r.account}\nreal login attempt with supplied credentials"
-                response = f"authenticated successfully as '{r.account}' — root access is permitted"
-            else:
-                request = f"account: {r.account}\nread advertised authentication methods"
-                response = (f"server offers a password method to '{r.account}' "
-                            f"({_fmt_methods(r.root_methods)}) — password root login is permitted")
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.RootLoginPermitted.value,
-                "vuln_request": request,
-                "vuln_response": response,
-            })
+    if r.is_finding:
+        ctx.vulns.hit(ctx.module_code)

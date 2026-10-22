@@ -22,9 +22,11 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, dict] = {}
+    ctx.debug(f"probing {len(domains)} domain(s) for wildcard records using random labels")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"querying a random non-existent label under {domain}")
         wc = ec.wildcard_detect(resolver, domain)
         if not wc.present:
             ctx.out("No wildcard record (random labels do not resolve).", "OK", indent=8)
@@ -41,11 +43,4 @@ def run(ctx):
 
         summary[domain] = {"wildcard": True, "a": sorted(wc.a), "aaaa": sorted(wc.aaaa), "cname": sorted(wc.cname)}
         with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.Wildcard.value,
-                "vuln_request": f"random-label probe under {domain}",
-                "vuln_response": ", ".join(sorted(wc.a | wc.aaaa | wc.cname)) or "resolves",
-            })
-
-    with ctx.results_lock:
-        ctx.properties["wildcard"] = summary
+            ctx.deferred_vulns.append({"vuln_code": VULNS.Wildcard.value})

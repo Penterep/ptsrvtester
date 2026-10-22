@@ -24,7 +24,7 @@ import paramiko
 # side effect (so old servers still negotiate and paramiko does not spam stderr).
 from ptsrvtester.protocols.ssh.utils import ssh_helpers  # noqa: F401
 from ptsrvtester.protocols.ssh.utils.helpers import text_or_file
-from ptsrvtester.protocols.ssh.utils.results import SSHCreds, VULNS
+from ptsrvtester.protocols.ssh.utils.results import SSHCreds
 from ptsrvtester.protocols.ssh.utils.sftp_core import (
     SftpObservations,
     assess_sftp,
@@ -267,11 +267,14 @@ def run(ctx):
     ctx.out(f"Testing SFTP confinement for '{account}' on {ip}:{port} "
             f"({len(creds)} secret(s))", "INFO", colortext=True, indent=4)
 
+    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
+    ctx.debug("login succeeded" if client is not None
+              else "login failed with the supplied secret(s)")
 
     obs = SftpObservations()
     if client is None:
@@ -319,9 +322,6 @@ def _render(ctx, r):
         ctx.out(f"SFTP: NOT TESTED — could not authenticate as '{r.account}'", "WARNING", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["sftpAccount"] = r.account
-            ctx.properties["sftpVerdict"] = "no-auth"
         return
 
     # A. availability
@@ -337,10 +337,6 @@ def _render(ctx, r):
     if not obs.sftp_available:
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["sftpAccount"] = r.account
-            ctx.properties["sftpAvailable"] = False
-            ctx.properties["sftpVerdict"] = "no-sftp"
         return
 
     # B. confinement
@@ -390,52 +386,10 @@ def _render(ctx, r):
     for n in r.notes:
         ctx.debug(n)
 
-    with ctx.results_lock:
-        ctx.properties["sftpAccount"] = r.account
-        ctx.properties["sftpAvailable"] = True
-        ctx.properties["sftpConfined"] = obs.confined
-        ctx.properties["sftpHome"] = obs.home
-        ctx.properties["sftpSystemReadable"] = obs.system_readable
-        ctx.properties["sftpSystemWritable"] = obs.system_writable
-        ctx.properties["sftpSymlinkEscape"] = obs.symlink_escape
-        ctx.properties["sftpExtraCapabilities"] = caps
-        ctx.properties["sftpAdsWritable"] = obs.ads_supported
-        _push_vulns(ctx, r)
+    _push_vulns(ctx, r)
 
 
 def _push_vulns(ctx, r):
-    obs = r.obs
-    if r.no_chroot_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpNoChroot.value,
-            "vuln_request": f"account: {r.account}\nSFTP: browse '/', stat system paths",
-            "vuln_response": "no ChrootDirectory confinement — the account can browse the real "
-                             "filesystem (readable: " + (", ".join(obs.system_readable) or "system paths") + ")",
-        })
-    if r.write_outside_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpTraversal.value,
-            "vuln_request": f"account: {r.account}\nSFTP: write probe outside the login tree",
-            "vuln_response": "writable location(s) outside the intended tree: "
-                             + ", ".join(obs.system_writable),
-        })
-    if r.symlink_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpSymlinkEscape.value,
-            "vuln_request": f"account: {r.account}\nSFTP: create symlink to a system file and read it",
-            "vuln_response": obs.symlink_detail or "a symlink resolved outside the confinement",
-        })
-    if r.unrestricted_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpUnrestricted.value,
-            "vuln_request": f"account: {r.account}\npost-auth: SFTP + shell/exec/forward probes",
-            "vuln_response": "the SFTP account also has: " + ", ".join(r.extra_capabilities)
-                             + " — it is not restricted to file transfer",
-        })
-    if r.ads_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpADS.value,
-            "vuln_request": f"account: {r.account}\nSFTP: write an NTFS alternate data stream",
-            "vuln_response": "an NTFS Alternate Data Stream was written — data can be hidden and "
-                             "may bypass content scanning",
-        })
+    """Record the module finding (PTV-SVC-SFTP) if any confinement issue was found."""
+    if r.any_finding:
+        ctx.vulns.hit(ctx.module_code)

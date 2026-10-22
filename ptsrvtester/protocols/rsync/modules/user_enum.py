@@ -3,7 +3,7 @@ import subprocess
 import sys
 
 from ptlibs.ptprinthelper import ptprint
-from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
+from ptsrvtester.protocols.rsync.utils.registry import rsync_debug, rsync_env, rsync_url
 
 
 __MODULELABEL__ = "Rsync username enumeration"
@@ -40,6 +40,7 @@ def _probe_user(ctx, module: str, username: str):
 def run(ctx):
     modules = getattr(ctx.args, "modules", None) or []
     modules = [module.strip() for module in modules if module.strip()]
+    count = 0
     if len(modules) != 1:
         ctx.out("USER_ENUM requires exactly one module via -m/--modules", "ERROR", indent=4)
         return
@@ -69,9 +70,9 @@ def run(ctx):
     try:
         baseline_user = f"ptenum_{secrets.token_hex(8)}"
         baseline = _probe_user(ctx, module, baseline_user)
-        ctx.debug(
+        rsync_debug(ctx,
             f"Baseline response for random username '{baseline_user}': "
-            f"returncode={baseline[0]}, stdout={baseline[1]!r}, stderr={baseline[2]!r}"
+            f"returncode={baseline[0]}, stdout={baseline[1]!r}, stderr={baseline[2]!r}", indent=4
         )
     except subprocess.TimeoutExpired:
         ctx.out(f"Timed out checking authentication for module '{module}'", "ERROR", indent=4)
@@ -112,13 +113,17 @@ def run(ctx):
                 ctx.out(f"Error checking rsync credentials: {e}", "ERROR", indent=4)
                 return
 
-            ctx.debug(
+            rsync_debug(ctx,
                 f"Response for username '{username}': returncode={response[0]}, "
                 f"stdout={response[1]!r}, stderr={response[2]!r}"
             )
             if response != baseline:
                 ctx.out(f"Possible username found: {username}", "VULN", indent=4)
+                ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-ENUM", poc={"return_code": response[0],
+                                                                           "stdout": response[1],
+                                                                           "stderr": response[2]})
     finally:
+        count += 1
         if show_progress and progress_line is not None:
             ptprint(
                 progress_line,
@@ -129,3 +134,6 @@ def run(ctx):
                 clear_to_eol=True,
                 indent=4,
             )
+        
+        if count > 10:
+            ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-GUESS", poc={"guesses_without_lockout": count})

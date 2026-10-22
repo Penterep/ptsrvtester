@@ -18,6 +18,9 @@ import socket
 from .._base import BaseMain, BaseArgs
 from .utils.cli import SNMPArgs
 
+import sys
+from ptlibs.threads import printlock
+from ptlibs.ptprinthelper import out_if, ptprint
 
 class SNMP(BaseMain):  # rename to your protocol class, e.g. class SMB(BaseMain)
     #: Short protocol identity (also namespaces this protocol's tests).

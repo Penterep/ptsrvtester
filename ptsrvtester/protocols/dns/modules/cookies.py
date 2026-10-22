@@ -22,15 +22,15 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
+    ctx.debug(f"sending an EDNS query carrying an 8-byte client cookie to {ip}:{port} (RFC 7873)")
     info = pc.cookie_probe(ip, port)
+    ctx.debug("cookie probe complete; checking whether the server returned a server cookie")
     if "error" in info:
         ctx.out(f"Cookie probe failed: {info['error']}", "WARNING", indent=4)
         return
 
     if info.get("server_cookie"):
         ctx.out(f"DNS cookies supported — server cookie returned ({info['length']} bytes).", "OK", indent=4)
-        with ctx.results_lock:
-            ctx.properties["dns_cookies"] = "supported"
         return
 
     if info.get("present"):
@@ -40,9 +40,4 @@ def run(ctx):
     ctx.out("Upstream cookie use toward authoritative servers is separate and not observable here.", "TEXT", indent=4)
 
     with ctx.results_lock:
-        ctx.properties["dns_cookies"] = "not supported (client-facing)"
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.NoCookie.value,
-            "vuln_request": "EDNS COOKIE (8-byte client cookie)",
-            "vuln_response": "no server cookie returned",
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.NoCookie.value})

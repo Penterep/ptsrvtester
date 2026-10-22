@@ -6,6 +6,13 @@ from urllib.parse import quote
 
 _INVALID_PROBE_PASSWORD = "ptsrvtester-auth-probe-invalid"
 
+def rsync_debug(ctx, message: str, *, indent: int = 4) -> None:
+    debug = getattr(ctx, "debug", None)
+    if debug is not None:
+        debug(message, indent=indent)
+    if getattr(ctx, "json", False) and message:
+        ctx.ptjsonlib.add_to_log(message)
+
 
 def rsync_url(ctx, path="", *, host=None, port=None, username=None):
     if username is None:

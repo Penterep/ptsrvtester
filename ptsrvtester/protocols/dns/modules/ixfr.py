@@ -25,14 +25,17 @@ def run(ctx):
     resolver = ec.resolver_for(ctx, timeout=zc.XFR_TIMEOUT)
     extra = (ctx.host, ctx.ip) if getattr(ctx, "ip", None) else None
     exposed: list[str] = []
+    ctx.debug(f"attempting IXFR for {len(domains)} domain(s) against each authoritative name server over TCP")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"discovering authoritative name servers and current serial for {domain}")
         servers, primary, serial = zc.transfer_targets(resolver, domain, extra)
         if not servers:
             ctx.out("No NS records found for the domain (cannot try IXFR).", "WARNING", indent=8)
             continue
         since = (serial - 1) if serial and serial > 1 else 1
+        ctx.debug(f"requesting IXFR since serial {since} from {len(servers)} name server(s)")
 
         for ns in servers:
             role = "primary" if ns.is_primary else "secondary"
@@ -52,9 +55,4 @@ def run(ctx):
         return
 
     with ctx.results_lock:
-        ctx.properties["ixfr_allowed"] = exposed
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.IncrementalTransfer.value,
-            "vuln_request": "IXFR (incremental zone transfer) over TCP",
-            "vuln_response": "; ".join(exposed),
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.IncrementalTransfer.value})

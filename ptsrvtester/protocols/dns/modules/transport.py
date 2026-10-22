@@ -20,7 +20,9 @@ def run(ctx):
     ip, port = target
     host = getattr(ctx, "host", None)
 
+    ctx.debug(f"probing UDP/53, TCP/53, DoT/853, DoH/443 and DoQ/853 on {ip} with a benign query")
     results = fp.transports(host, ip, port)
+    ctx.debug("transport probing complete; summarizing which transports answered")
     supported: list[str] = []
     for name in ("UDP/53", "TCP/53", "DoT/853", "DoH/443", "DoQ/853"):
         res = results.get(name)
@@ -33,6 +35,3 @@ def run(ctx):
             ctx.out(f"{name:<10} not available ({res.detail})", "TEXT", indent=4)
         else:
             ctx.out(f"{name:<10} not tested ({res.detail})", "WARNING", indent=4)
-
-    with ctx.results_lock:
-        ctx.properties["transports"] = ", ".join(supported) if supported else None

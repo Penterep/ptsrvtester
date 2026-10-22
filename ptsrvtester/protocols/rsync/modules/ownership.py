@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import uuid
 
-from ptsrvtester.protocols.rsync.utils.registry import rsync_env, rsync_url
+from ptsrvtester.protocols.rsync.utils.registry import rsync_debug, rsync_env, rsync_url
 
 
 __MODULELABEL__ = "Rsync daemon UID/GID probe"
@@ -42,7 +42,7 @@ def _cleanup_probe(ctx, module, probe_name, empty_dir, env):
     else:
         if cleanup.returncode != 0:
             ctx.out(f"Could not remove the ownership probe from module {module}", "OK", indent=4)
-            ctx.debug(f"Ownership probe cleanup failed: {cleanup.stderr.strip()}")
+            rsync_debug(ctx, f"Ownership probe cleanup failed: {cleanup.stderr.strip()}")
 
 
 def _probe_module(ctx, module):
@@ -57,17 +57,23 @@ def _probe_module(ctx, module):
         with open(probe_path, "w", encoding="utf-8") as probe:
             probe.write("Temporary rsync ownership probe.\n")
 
+        rsync_debug(ctx, f"Created a temporary probe at {probe_path}", indent=4)
+        
         try:
+            command = [
+                        "rsync",
+                        "--no-motd",
+                        "--contimeout=5",
+                        "--no-o",
+                        "--no-g",
+                        probe_path,
+                        rsync_url(ctx, f"{module}/{probe_name}"),
+            ]
+            
+            rsync_debug(ctx, f"Running command \"{' '.join(command)}\"", indent=4)
+            
             upload = subprocess.run(
-                [
-                    "rsync",
-                    "--no-motd",
-                    "--contimeout=5",
-                    "--no-o",
-                    "--no-g",
-                    probe_path,
-                    rsync_url(ctx, f"{module}/{probe_name}"),
-                ],
+                command,
                 capture_output=True,
                 text=True,
                 input="",
@@ -82,6 +88,9 @@ def _probe_module(ctx, module):
             ctx.out("rsync client binary not found on this machine", "ERROR", indent=4)
             return False
 
+        rsync_debug(ctx, f"Received stdout: {upload.stdout.rstrip}", indent=4)
+        rsync_debug(ctx, f"Received stderr: {upload.stderr.rstrip}", indent=4)
+                
         if upload.returncode != 0:
             error = upload.stderr.strip().splitlines()
             detail = error[0] if error else f"rsync exited with status {upload.returncode}"
@@ -92,18 +101,22 @@ def _probe_module(ctx, module):
         found_ids = False
         try:
             try:
+                query_cmd = [
+                    "rsync",
+                    "--dry-run",
+                    "--archive",
+                    "--numeric-ids",
+                    "--no-motd",
+                    "--contimeout=5",
+                    f"--out-format=%U|%G|%n",
+                    rsync_url(ctx, f"{module}/{probe_name}"),
+                    download_path,
+                ]
+                
+                rsync_debug(ctx, f"Querying for UID/GID: \"{' '.join(query_cmd)}\"")
+                
                 query = subprocess.run(
-                    [
-                        "rsync",
-                        "--dry-run",
-                        "--archive",
-                        "--numeric-ids",
-                        "--no-motd",
-                        "--contimeout=5",
-                        f"--out-format=%U|%G|%n",
-                        rsync_url(ctx, f"{module}/{probe_name}"),
-                        download_path,
-                    ],
+                    query_cmd,
                     capture_output=True,
                     text=True,
                     input="",
@@ -118,14 +131,17 @@ def _probe_module(ctx, module):
                 return False
 
             match = _ID_PATTERN.search(query.stdout)
-
+            
+            rsync_debug(ctx, f"Received stdout: {query.stdout.rstrip}", indent=4)
+            rsync_debug(ctx, f"Received stderr: {query.stderr.rstrip}", indent=4)
+            
             if query.returncode != 0:
                 error = query.stderr.strip().splitlines()
                 detail = error[0] if error else f"rsync exited with status {query.returncode}"
                 ctx.out(f"Could not read file ownership from module {module}: {detail}", "OK", indent=4)
             elif match is None:
                 ctx.out(f"Could not parse UID/GID from module {module} dry-run output", "OK", indent=4)
-                ctx.debug(f"Ownership probe dry-run output: {query.stdout.strip()}")
+                rsync_debug(ctx, f"Ownership probe dry-run output: {query.stdout.strip()}")
             else:
                 uid, gid, file_name = match.groups()
                 if uid == "0" and gid == "DEFAULT":
@@ -133,6 +149,9 @@ def _probe_module(ctx, module):
                             f"Try running the test as root", "OK", indent=4)
                 else:
                     ctx.out(f"Rsync daemon file UID: {uid}, GID: {gid} (module {module})", "VULN", indent=4)
+                    ctx.ptjsonlib.add_vulnerability("PTV-SVC-RSYNC-ACCOUNT", poc={"daemon_uid": uid,
+                                                                                  "daemon_gid": gid
+                                                                                })
                 found_ids = True
         finally:
             _cleanup_probe(ctx, module, probe_name, empty_dir, env)

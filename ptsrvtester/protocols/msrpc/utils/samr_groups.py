@@ -12,7 +12,8 @@ from impacket.nt_errors import (
 from .samr_output import print_samr_authentication_failure
 from .samr_session import (
     ENUMERATION_PAGE_BYTES, MAX_ENUMERATION_PAGES, SamrDenied,
-    enumeration_page, iter_samr_domains, samr_array, samr_session, samr_u32,
+    enumeration_page, iter_samr_domains, samr_access_metadata, samr_array,
+    samr_session, samr_u32,
 )
 
 
@@ -46,6 +47,7 @@ def _require_success(response):
 def _read_members(engine, dce, domain_handle, domain_sid, group, limit):
     handle = None
     try:
+        engine.ptdebug(f"Requesting direct members of SAMR {group['kind']} RID {group['rid']}")
         if group["kind"] == "group":
             opened = samr.hSamrOpenGroup(
                 dce, domain_handle, desiredAccess=samr.GROUP_LIST_MEMBERS,
@@ -82,6 +84,7 @@ def _read_members(engine, dce, domain_handle, domain_sid, group, limit):
         # SAMR GetMembers calls have no pagination or server-side count bound.
         # This cap bounds retained output, not the RPC response's wire size.
         group["membersTruncated"] = count > limit
+        engine.ptdebug(f"Received SAMR member response: {count} members")
         group.update(
             membersStatus="partial" if count > limit else "complete",
             membersReason="member_limit_reached" if count > limit else None,
@@ -108,7 +111,8 @@ def _enumerate_kind(engine, dce, handle, domain, kind, remaining, member_limit):
     seen_rids = set()
     start = len(domain["groups"])
     try:
-        for _ in range(MAX_ENUMERATION_PAGES):
+        for page in range(1, MAX_ENUMERATION_PAGES + 1):
+            engine.ptdebug(f"Requesting SAMR {kind} page {page}")
             try:
                 response = enumerate_rpc(
                     dce, handle, enumerationContext=context,
@@ -121,6 +125,7 @@ def _enumerate_kind(engine, dce, handle, domain, kind, remaining, member_limit):
                     raise
                 response = exc.get_packet()
             entries, next_context, more = enumeration_page(response)
+            engine.ptdebug(f"Received SAMR {kind} page {page}: {len(entries)} entries")
             for entry in entries:
                 rid = samr_u32(entry["RelativeId"], "group RID")
                 name = str(entry["Name"]).rstrip("\x00")
@@ -200,7 +205,10 @@ def _print_result(engine, result):
         category = "TITLE" if index == 0 and result["status"] != "complete" else "TEXT"
         engine.ptprint(line, out=category)
     if getattr(engine.args, "output", None):
-        engine.write_to_file(lines)
+        try:
+            engine.write_to_file(lines)
+        except Exception as exc:
+            engine.record_module_error("SAMRGROUPS", f"{type(exc).__name__}: Cannot write SAMR output")
 
 
 def enumerate_samr_groups(engine) -> dict:
@@ -212,9 +220,10 @@ def enumerate_samr_groups(engine) -> dict:
         "status": "error", "reason": None, "limit": limit,
         "memberLimit": member_limit, "memberLimitScope": "per_group_output",
         "returned": 0, "truncated": False, "domains": [],
+        **samr_access_metadata(engine),
     }
     try:
-        with samr_session(engine) as (dce, server_handle):
+        with samr_session(engine, result) as (dce, server_handle):
             for name in iter_samr_domains(engine, dce, server_handle):
                 domain = {
                     "name": name, "sid": None, "status": "error", "reason": None,

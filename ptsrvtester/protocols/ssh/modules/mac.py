@@ -7,4 +7,4 @@ __ORDER__ = 43
 
 
 def run(ctx):
-    report_algorithm_section(ctx, "mac", vuln_request="ssh-audit MAC algorithms")
+    report_algorithm_section(ctx, "mac")

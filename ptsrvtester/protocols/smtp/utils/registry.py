@@ -91,7 +91,7 @@ _TS_COMMON_MSG: list[list[str]] = [
 
 # Bare target or ALL, with no -r/--send. Same set as the previous default scan.
 SMTP_DEFAULT_SUITE: tuple[str, ...] = (
-    "BANNER", "ROLE", "EHLO", "ENCRYPT", "OPENREL", "HELOVAL", "AUTHDN",
+    "BANNER", "ROLE", "EHLO", "ENCRYPT", "OPENREL", "RELANON", "DOMFILL", "HELOVAL", "AUTHDN",
     "BLACKLIST", "SPF", "ENUM", "NTLM",
 )
 
@@ -114,7 +114,7 @@ SMTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "IDENTIFY", "IDAGG", "EHLO", "AUTHLIST", "ROLE", "ENCRYPT", "NTLM"]),
     ("Authentication", ["AUTHFMT", "AUTHDN"]),
     ("Protocol & validation", ["HELOVAL", "HELOONLY", "HELOBYP", "INVCMD"]),
-    ("Relay & addressing", ["OPENREL", "DOMAIN", "ALIAS", "BCC", "SPOOF", "BOUNCE"]),
+    ("Relay & addressing", ["OPENREL", "RELANON", "DOMFILL", "DOMAIN", "ALIAS", "BCC", "SPOOF", "BOUNCE"]),
     ("Enumeration & credentials", ["ENUM", "AUTHENUM", "BRUTE"]),
     ("Rate limiting & stress", ["RATELIM", "RATELIMIT", "RCPTLIM", "RCPTDUP", "NOOP1", "NOOP2", "BOMB", "SIZE"]),
     ("Content security", ["AV", "SSRF", "ZIPXXE"]),
@@ -235,6 +235,12 @@ SMTP_TESTS: dict[str, dict] = {
                  "(open relay)."],
         "flags": {"open_relay": True},
     },
+    "RELANON": {
+        "desc": "Test relay without authentication",
+        "long": ["Same relay probes as OPENREL. Used when the server role is",
+                 "Submission: mail accepted for external recipients without AUTH."],
+        "flags": {"relay_unauth": True},
+    },
     "DOMAIN": {
         "desc": "Accepted incoming domain",
         "long": ["Probe which recipient domain the server's RCPT TO treats as local."],
@@ -242,6 +248,12 @@ SMTP_TESTS: dict[str, dict] = {
         "mods": [
             ["-d", "--domain", "<domain>", "Recipient domain to probe (default: banner/EHLO)"],
         ],
+    },
+    "DOMFILL": {
+        "desc": "MAIL FROM domain autofill",
+        "long": ["Send MAIL FROM:<test> without a domain. A reply that echoes",
+                 "test@domain discloses the sender domain the server filled in."],
+        "flags": {"domfill": True},
     },
     "ALIAS": {
         "desc": "Test alias and addressing bypass",
@@ -311,7 +323,7 @@ SMTP_TESTS: dict[str, dict] = {
         "mods": [
             ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
-            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
             ["-t", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
@@ -492,7 +504,7 @@ SMTP_TEST_DESTS: tuple[str, ...] = (
     "auth_format", "auth_enum", "auth_downgrade", "helo_validation",
     "invalid_commands", "helo_only", "helo_bypass", "bounce_replay",
     "spoof_headers", "alias_test", "isencrypt", "ntlm", "noop_flood1",
-    "probe_accepted_domain", "open_relay", "role_identify", "interactive",
+    "probe_accepted_domain", "open_relay", "relay_unauth", "domfill", "role_identify", "interactive",
     "blacklist_test", "spf_test", "bomb", "antivirus", "ssrf", "flood", "zipxxe",
     "shared_rate_limit", "bcc_disclosure",
 )

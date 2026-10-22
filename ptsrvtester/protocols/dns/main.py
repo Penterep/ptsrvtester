@@ -3,9 +3,10 @@
 All the generic machinery (module discovery, ``-ts`` selection, parallel
 execution, ordered output, the ``ctx`` object) lives in :class:`BaseMain` in
 ``protocols/_base.py``. This file declares only what is specific to DNS plus a
-small :meth:`output` override so every module contributes to a single shared
-``software`` node in JSON output (all DNS findings bind to one node). Mirrors
-``ssh/main.py``.
+small :meth:`output` override: the JSON carries nothing but the run ``log`` and
+``vulnerabilities``, where every distinct finding code a module reported becomes
+its own ``{"vulnCode": ...}`` entry. No ``software`` node and no ``properties``
+are emitted. Mirrors ``ssh/main.py``.
 """
 import argparse
 import socket
@@ -29,13 +30,6 @@ class DNS(BaseMain):
 
     def __init__(self, args: BaseArgs, ptjsonlib: PtJsonLib) -> None:
         super().__init__(args, ptjsonlib)
-        self._properties: dict = {
-            "software_type": None,
-            "name": "dns",
-            "version": None,
-            "vendor": None,
-            "description": None,
-        }
         self._deferred_vulns: list[dict] = []
         self._results_lock = threading.Lock()
 
@@ -73,27 +67,30 @@ class DNS(BaseMain):
     def build_context(self) -> dict:
         """Handles every DNS module receives on ``ctx`` (besides the core fields).
 
-        ``properties`` / ``deferred_vulns`` are the shared JSON accumulators and
-        ``results_lock`` guards them; modules read connection info as
-        ``ctx.host`` / ``ctx.ip`` / ``ctx.port`` (any may be ``None`` when no
-        ``-tg`` server was given).
+        ``deferred_vulns`` is the shared findings accumulator and ``results_lock``
+        guards it; modules read connection info as ``ctx.host`` / ``ctx.ip`` /
+        ``ctx.port`` (any may be ``None`` when no ``-tg`` server was given). No
+        ``properties`` handle is exposed — the JSON ``properties`` object stays empty.
         """
         return {
             "host": self.target_host,
             "ip": self.target[0],
             "port": self.target[1],
-            "properties": self._properties,
             "deferred_vulns": self._deferred_vulns,
             "results_lock": self._results_lock,
         }
 
     def output(self) -> None:
-        """Build the single shared ``software`` node and bind every module's vulns."""
-        dns_node = self.ptjsonlib.create_node_object("software", None, None, self._properties)
-        self.ptjsonlib.add_node(dns_node)
-        node_key = dns_node["key"]
+        """Emit one vulnerability object per finding code, like ``ssh/main.py``.
+
+        Each code a module appended to ``ctx.deferred_vulns`` becomes its own
+        ``{"vulnCode": ...}`` entry in ``results.vulnerabilities`` via ptlibs
+        ``add_vulnerability`` (which de-duplicates by code, so the same code seen
+        for several domains collapses to one entry). No ``software`` node and no
+        ``properties`` are written; besides the log, nothing else goes into the JSON.
+        """
         for v in self._deferred_vulns:
-            self.ptjsonlib.add_vulnerability(node_key=node_key, **v)
+            self.ptjsonlib.add_vulnerability(vuln_code=v["vuln_code"])
 
         self.ptjsonlib.set_status("finished", "")
         if self.use_json:

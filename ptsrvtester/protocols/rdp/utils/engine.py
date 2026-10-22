@@ -16,7 +16,7 @@ import struct
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -40,6 +40,8 @@ except ModuleNotFoundError as exc:  # transitional compatibility before base reb
     from ptsrvtester.modules._base import BaseArgs, BaseModule, Out
 
 from ptsrvtester.protocols._shared.utils.progress import CredentialProgress
+
+from .output import ModuleContext
 
 from .auth_analysis import (
     MAX_BRUTE_ATTEMPTS,
@@ -2184,6 +2186,7 @@ class RDP(BaseModule):
     def run_test(self, test: str) -> None:
         """Execute one discovered RDP test while retaining this scan's shared caches."""
         canonical = RDP_TEST_ALIASES.get(str(test).upper(), str(test).upper())
+        self.ptdebug(f"Starting {canonical} test")
         if canonical == "NLA":
             self.results.nla = self._run_nla_test()
         elif canonical == "RDPSEC":
@@ -2214,6 +2217,7 @@ class RDP(BaseModule):
             self.results.connection_limit = self._run_rate_limit_test()
         elif canonical not in self.results.not_implemented:
             self.results.not_implemented.append(canonical)
+        self.ptdebug(f"Finished {canonical} test")
 
     def run_module(self, test: str, ctx) -> None:
         """Execute one adapter and retain unexpected failures for JSON output.
@@ -2224,6 +2228,8 @@ class RDP(BaseModule):
         failure instead of producing a successful-looking partial report.
         """
         canonical = RDP_TEST_ALIASES.get(str(test).upper(), str(test).upper())
+        previous_context = self._active_output_context
+        self._active_output_context = ctx
         try:
             self.run_test(canonical)
             self.emit_test_output(canonical, ctx)
@@ -2242,9 +2248,10 @@ class RDP(BaseModule):
             detail = f"{type(exc).__name__}: {redacted}"
             self.results.module_errors[canonical] = detail
             ctx.out(f"Error in module {canonical}: {redacted}", "ERROR")
+        finally:
+            self._active_output_context = previous_context
 
     def emit_test_output(self, test: str, ctx) -> None:
-        """Render one result through a module's isolated BaseMain output context."""
         canonical = RDP_TEST_ALIASES.get(str(test).upper(), str(test).upper())
         outputters = {
             "NLA": ("Network Level Authentication (NLA) test", self.results.nla, self._output_nla_text),
@@ -2284,10 +2291,10 @@ class RDP(BaseModule):
         end: str = "\n",
         json: bool = False,
     ):
-        """Route legacy reporting through BaseMain's per-module buffer when active."""
-        if getattr(self, "_active_output_context", None) is None:
-            return super().ptprint(string, out, title, end, json)
         if json:
+            if self.use_json and self._active_output_context is None:
+                # Logging the final JSON response would recursively embed it.
+                ptprinthelper.ptprint(string, "TEXT", True, flush=True, end=end)
             return
         if (
             getattr(self, "_suppressed_module_heading", None) is not None
@@ -2298,7 +2305,7 @@ class RDP(BaseModule):
             self._suppressed_module_heading = None
             return
         category = Out.TITLE.value if title else out.value
-        self._active_output_context.out(
+        self._report_context().out(
             string,
             category,
             colortext=bool(title or out == Out.INFO),
@@ -2313,24 +2320,30 @@ class RDP(BaseModule):
         *,
         indent_override: int | None = None,
     ) -> None:
-        """Route verbose legacy reporting through BaseMain's module buffer."""
-        if getattr(self, "_active_output_context", None) is None:
-            return super().ptdebug(
-                string,
-                out,
-                title,
-                end,
-                indent_override=indent_override,
-            )
-        self._active_output_context.debug(
-            string,
-            indent=4 if indent_override is None else indent_override,
+        if (
+            not getattr(getattr(self, "args", None), "debug", False)
+        ):
+            return
+        if getattr(self, "_active_brute_progress", None) is not None:
+            self._active_brute_progress.finish()
+        indent = 4 if indent_override is None else indent_override
+        self._report_context().debug(string, indent=indent)
+
+    def _report_context(self):
+        if self._active_output_context is not None:
+            return self._active_output_context
+        return ModuleContext(
+            args=self.args,
+            ptjsonlib=self.ptjsonlib,
+            target=(self.connect_host, self.args.target.port),
         )
 
     def _get_auth_tls_validation_result(self) -> AuthTLSValidationResult:
         if self._auth_tls_validation_result is not None:
+            self.ptdebug("Authentication TLS preflight: using cached certificate check")
             return self._auth_tls_validation_result
 
+        self.ptdebug("Authentication TLS preflight: checking the server certificate")
         _probe, _tls_version, _cipher, cert_der, error = self._tls_handshake(
             PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX,
             verify_certificate=not self.args.insecure_auth,
@@ -2365,6 +2378,7 @@ class RDP(BaseModule):
 
     def _get_authenticated_session_result(self) -> AuthenticatedSessionResult:
         if self._authenticated_session_result is not None:
+            self.ptdebug("Authenticated session: using cached session result")
             return self._authenticated_session_result
 
         if self.args.login is None or self.args.password is None:
@@ -2404,6 +2418,7 @@ class RDP(BaseModule):
                     for code in raw_tests
                 }
 
+        self.ptdebug("Authenticated session: starting CredSSP authentication and session setup")
         self._authenticated_session_result = _run_aardwolf_authenticated_session(
             self.args.target.ip,
             self.args.target.port,
@@ -2524,6 +2539,7 @@ class RDP(BaseModule):
             kdc_ip=getattr(self.args, "kdc", None),
             spn_hostname=getattr(self.args, "spn_host", None),
         )
+        self.ptdebug(f"Authentication attempt: starting {mechanism.value.upper()} exchange")
         return run_auth_attempt(request)
 
     @staticmethod
@@ -2569,9 +2585,13 @@ class RDP(BaseModule):
         """Cache an internal NTLM challenge without publishing a finding."""
 
         if self.results.ntlm_info is not None:
+            self.ptdebug("NTLM information: using cached test result")
             return self.results.ntlm_info
         if self._ntlm_info_preflight_result is None:
+            self.ptdebug("NTLM information: requesting a pre-authentication challenge")
             self._ntlm_info_preflight_result = self._run_ntlminfo_test()
+        else:
+            self.ptdebug("NTLM information: using cached pre-authentication challenge")
         return self._ntlm_info_preflight_result
 
     @staticmethod
@@ -3539,6 +3559,7 @@ class RDP(BaseModule):
             config=config,
         )
         stopped_after_completed = False
+        self.ptdebug(f"Connection pressure: starting {mode} scenario(s)")
         if mode == "completed":
             scenarios = (runner.run_completed(),)
         elif mode == "held":
@@ -3579,16 +3600,23 @@ class RDP(BaseModule):
     def preflight_service(self) -> NegotiationProbe:
         """Require a valid X.224 response within one overall timeout budget."""
         if self._service_preflight_probe is None:
+            self.ptdebug("Service preflight: checking the RDP negotiation response")
             self._service_preflight_probe = self._negotiate(
                 "Full negotiation",
                 PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX,
                 deadline=time.monotonic() + self.timeout_seconds,
             )
+        else:
+            self.ptdebug("Service preflight: using cached RDP negotiation")
         return self._service_preflight_probe
 
     def _get_security_probes(self) -> list[NegotiationProbe]:
         if self._security_probes is not None:
+            self.ptdebug("Security negotiation: using cached protocol probes")
             return self._security_probes
+        self.ptdebug("Security negotiation: probing supported RDP security protocols")
+        if self._service_preflight_probe is not None:
+            self.ptdebug("Security negotiation: reusing the service preflight response")
         self._security_probes = [
             self._service_preflight_probe or self._negotiate(
                 "Full negotiation",
@@ -3617,7 +3645,7 @@ class RDP(BaseModule):
         ]
         non_nla_allowed = any(
             p.selected_protocol in (PROTOCOL_RDP, PROTOCOL_SSL)
-            for p in non_nla_probes
+            for p in probes
         )
         non_nla_rejected_by_server = (
             len(non_nla_probes) == 2
@@ -3625,7 +3653,13 @@ class RDP(BaseModule):
         )
 
         if not nla_supported:
-            status = "not_supported"
+            status = (
+                "not_supported"
+                if self._nla_not_supported_probes(probes)
+                else "allowed_not_required"
+                if non_nla_allowed
+                else "inconclusive"
+            )
         elif non_nla_allowed:
             status = "allowed_not_required"
         elif non_nla_rejected_by_server:
@@ -3722,6 +3756,10 @@ class RDP(BaseModule):
         )
 
     def _probe_legacy_encryption(self, encryption_method: int) -> LegacyEncryptionProbe:
+        self.ptdebug(
+            "Legacy encryption: probing "
+            + ENCRYPTION_METHOD_NAMES.get(encryption_method, "unknown method")
+        )
         try:
             with socket.create_connection(
                 (self.args.target.ip, self.args.target.port),
@@ -3764,7 +3802,10 @@ class RDP(BaseModule):
 
     def _get_basic_settings_result(self) -> BasicSettingsResult:
         if self._basic_settings_result is None:
+            self.ptdebug("Basic Settings: requesting server core and channel data")
             self._basic_settings_result = self._probe_basic_settings()
+        else:
+            self.ptdebug("Basic Settings: using cached server core and channel data")
         return self._basic_settings_result
 
     def _probe_basic_settings(self) -> BasicSettingsResult:
@@ -3775,6 +3816,9 @@ class RDP(BaseModule):
         for requested_protocol in (PROTOCOL_SSL, PROTOCOL_RDP):
             sock: socket.socket | ssl.SSLSocket | None = None
             try:
+                self.ptdebug(
+                    f"Basic Settings: connecting with {protocol_name(requested_protocol)}"
+                )
                 sock = socket.create_connection(
                     (self.args.target.ip, self.args.target.port),
                     timeout=self.timeout_seconds,
@@ -3805,6 +3849,7 @@ class RDP(BaseModule):
                         if _target_is_ip(self.args.target.ip)
                         else self.args.target.ip
                     )
+                    self.ptdebug("Basic Settings: starting the TLS handshake")
                     sock = _create_tls_context().wrap_socket(
                         sock,
                         server_hostname=server_hostname,
@@ -3816,6 +3861,7 @@ class RDP(BaseModule):
                     if response_flags & NEG_RSP_EXTENDED_CLIENT_DATA_SUPPORTED
                     else None
                 )
+                self.ptdebug("Basic Settings: sending MCS Connect Initial")
                 sock.sendall(
                     _build_mcs_connect_initial(
                         encryption_methods,
@@ -3824,6 +3870,7 @@ class RDP(BaseModule):
                         requested_protocol,
                     )
                 )
+                self.ptdebug("Basic Settings: waiting for MCS Connect Response")
                 response = _read_tpkt(sock)
 
                 return BasicSettingsResult(
@@ -3870,11 +3917,11 @@ class RDP(BaseModule):
         )
 
     def _get_version_result(self) -> RDPVersionResult:
-        return (
-            self.results.version
-            or self.results.os_detection
-            or self._run_version_test()
-        )
+        cached = self.results.version or self.results.os_detection
+        if cached is not None:
+            self.ptdebug("Protocol version: using cached version evidence")
+            return cached
+        return self._run_version_test()
 
     def _run_version_test(self) -> RDPVersionResult:
         basic_settings = self._get_basic_settings_result()
@@ -4274,6 +4321,7 @@ class RDP(BaseModule):
         requested_protocols = PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX
 
         try:
+            self.ptdebug("NTLM information: connecting and negotiating CredSSP")
             sock = socket.create_connection(
                 (self.args.target.ip, self.args.target.port),
                 timeout=self.timeout_seconds,
@@ -4311,13 +4359,16 @@ class RDP(BaseModule):
                 None if _target_is_ip(self.args.target.ip) else self.args.target.ip
             )
             context = _create_tls_context()
+            self.ptdebug("NTLM information: starting the TLS handshake")
             with context.wrap_socket(sock, server_hostname=server_hostname) as tls_sock:
                 sock = None
                 ntlm_negotiate = _build_ntlm_negotiate_message()
                 spnego_init = _build_spnego_ntlm_init(ntlm_negotiate)
                 request_started = dt.datetime.now(dt.timezone.utc)
+                self.ptdebug("NTLM information: sending the anonymous NTLM negotiate request")
                 tls_sock.sendall(_build_credssp_ts_request(spnego_init))
 
+                self.ptdebug("NTLM information: waiting for the NTLM challenge")
                 response = _read_der_message(tls_sock)
                 response_received = dt.datetime.now(dt.timezone.utc)
                 nego_token = _extract_credssp_nego_token(response)
@@ -4417,6 +4468,11 @@ class RDP(BaseModule):
         sock: socket.socket | None = None
         probe: NegotiationProbe | None = None
         try:
+            version_label = tls_version.name if tls_version is not None else "automatic version"
+            self.ptdebug(
+                f"TLS probe: connecting with {protocol_mask_to_string(requested_protocols)} "
+                f"and {version_label}"
+            )
             sock = socket.create_connection(
                 (self.args.target.ip, self.args.target.port),
                 timeout=self.timeout_seconds,
@@ -4458,6 +4514,7 @@ class RDP(BaseModule):
                 context = _create_tls_context(tls_version)
             if cipher_names:
                 context.set_ciphers(":".join(cipher_names) + ":@SECLEVEL=0")
+            self.ptdebug("TLS probe: starting the TLS handshake")
             with context.wrap_socket(sock, server_hostname=server_hostname) as tls_sock:
                 sock = None
                 cert_der = tls_sock.getpeercert(binary_form=True)
@@ -4708,6 +4765,11 @@ class RDP(BaseModule):
         self, name: str, requested_protocols: int, *, deadline: float | None = None,
     ) -> NegotiationProbe:
         try:
+            self.ptdebug(
+                f"Negotiation ({name}): connecting to {self.connect_host}:"
+                f"{self.args.target.port}; offering "
+                f"{protocol_mask_to_string(requested_protocols)}"
+            )
             with socket.create_connection(
                 (self.connect_host, self.args.target.port),
                 timeout=(
@@ -4720,6 +4782,7 @@ class RDP(BaseModule):
                     if deadline is not None else self.timeout_seconds
                 )
                 sock.sendall(_build_negotiation_request(requested_protocols))
+                self.ptdebug(f"Negotiation ({name}): waiting for the X.224 response")
                 reply = _parse_negotiation_reply_details(
                     _read_tpkt(sock, deadline=deadline)
                     if deadline is not None else _read_tpkt(sock)
@@ -4862,6 +4925,111 @@ class RDP(BaseModule):
     def _encryption_level_assessment(level: int) -> str:
         return ENCRYPTION_LEVEL_ASSESSMENTS.get(level, "unknown")
 
+    @staticmethod
+    def _nla_not_supported_probes(probes: list[NegotiationProbe]) -> list[NegotiationProbe]:
+        """Require a response to a CredSSP-only offer, not a missing response."""
+        nla_mask = PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX
+        return [
+            probe for probe in probes
+            if probe.requested_protocols & nla_mask
+            and not probe.requested_protocols & ~nla_mask
+            and probe.error is None
+            and (
+                probe.selected_protocol in (PROTOCOL_RDP, PROTOCOL_SSL)
+                # Missing/disallowed TLS prevents the offered CredSSP path.
+                # Flags errors and responses requiring NLA do not prove absence.
+                or probe.failure_code in (0x00000002, 0x00000003)
+            )
+        ]
+
+    @staticmethod
+    def _negotiation_evidence(probe: NegotiationProbe) -> str:
+        offered = protocol_mask_to_string(probe.requested_protocols)
+        evidence = (
+            f"{probe.name}: requestedProtocols=0x{probe.requested_protocols:08x} "
+            f"({offered})"
+        )
+        if probe.selected_protocol is not None:
+            return (
+                f"{evidence}; selectedProtocol=0x{probe.selected_protocol:08x} "
+                f"({protocol_name(probe.selected_protocol)})"
+            )
+        return (
+            f"{evidence}; failureCode=0x{probe.failure_code:08x} "
+            f"({FAILURE_CODES.get(probe.failure_code, 'unknown failure')})"
+        )
+
+    def _non_nla_poc(self, probes: list[NegotiationProbe]) -> str:
+        return (
+            f"RDP endpoint {self.args.target.ip}:{self.args.target.port} accepted "
+            "security negotiation without CredSSP/NLA:\n"
+            + "\n".join(self._negotiation_evidence(probe) for probe in probes)
+            + "\nThe selected non-NLA transport shows that NLA is not enforced "
+            "for RDP connection setup."
+        )
+
+    def _legacy_security_poc(
+        self, probes: list[NegotiationProbe], legacy: Iterable[LegacyEncryptionProbe] = (),
+    ) -> str:
+        evidence = [self._negotiation_evidence(probe) for probe in probes]
+        for probe in legacy:
+            if probe.accepted is not True:
+                continue
+            line = (
+                f"Encryption probe: requestedMethod=0x{probe.requested_method:08x} "
+                f"({ENCRYPTION_METHOD_NAMES[probe.requested_method]}); accepted=true"
+            )
+            if probe.selected_method is not None:
+                line += f"; selectedMethod=0x{probe.selected_method:08x}"
+            if probe.encryption_level is not None:
+                line += (
+                    f"; encryptionLevel={probe.encryption_level} "
+                    f"({ENCRYPTION_LEVEL_NAMES.get(probe.encryption_level, 'unknown')})"
+                )
+            evidence.append(line)
+        return (
+            f"RDP endpoint {self.args.target.ip}:{self.args.target.port} accepted "
+            "native Standard RDP Security:\n" + "\n".join(evidence)
+            + "\nThis exposes the legacy RDP cryptographic path."
+        )
+
+    def _tls_configuration_poc(self, result: SSLResult) -> str:
+        evidence = [
+            f"RDP TLS scan of {self.args.target.ip}:{self.args.target.port} observed:",
+            *result.weak_findings,
+        ]
+        if result.selected_tls_version is not None:
+            evidence.append(f"Handshake TLS version: {result.selected_tls_version}")
+        if result.selected_cipher is not None:
+            evidence.append(f"Handshake cipher: {result.selected_cipher}")
+        for probe in result.version_probes:
+            if probe.supported:
+                evidence.append(
+                    f"Accepted version probe: {probe.version}; "
+                    f"cipher={probe.selected_cipher or 'not reported'}"
+                )
+        if result.weak_cipher_scan is not None:
+            evidence.extend(
+                f"Accepted weak cipher probe: {cipher}"
+                for cipher in result.weak_cipher_scan.accepted_ciphers
+            )
+        cert = result.certificate
+        if cert is not None and cert.parse_error is None:
+            for name, value in (
+                ("Certificate subject", cert.subject),
+                ("Certificate issuer", cert.issuer),
+                ("Certificate notBefore", cert.not_before),
+                ("Certificate notAfter", cert.not_after),
+                ("Certificate signature hash", cert.signature_hash_algorithm),
+            ):
+                if value is not None:
+                    evidence.append(f"{name}: {value}")
+            if cert.san_present is not None:
+                evidence.append(f"Certificate SAN present: {cert.san_present}")
+            if cert.target_matches_san is not None:
+                evidence.append(f"Certificate SAN matches target: {cert.target_matches_san}")
+        return "\n".join(evidence)
+
     def _rdp_encryption_vulnerabilities(
         self,
         result: RDPEncryptionResult,
@@ -4895,6 +5063,10 @@ class RDP(BaseModule):
                     "vuln_code": VULNS.RDP_SECURITY_ALLOWED.value,
                     "vuln_request": "RDP encryption and security enumeration",
                     "vuln_response": "\n".join(response_lines),
+                    "poc": self._legacy_security_poc(
+                        [probe for probe in result.protocol_probes if probe.selected_protocol == PROTOCOL_RDP],
+                        result.legacy_probes,
+                    ),
                 }
             )
 
@@ -4904,6 +5076,11 @@ class RDP(BaseModule):
                     "vuln_code": VULNS.NLA_NOT_REQUIRED.value,
                     "vuln_request": "RDP negotiation requesting TLS without CredSSP/NLA",
                     "vuln_response": "Server accepted TLS security without CredSSP/NLA",
+                    "poc": self._non_nla_poc([
+                        probe for probe in result.protocol_probes
+                        if probe.requested_protocols == PROTOCOL_SSL
+                        and probe.selected_protocol == PROTOCOL_SSL
+                    ]),
                 }
             )
 
@@ -4929,7 +5106,7 @@ class RDP(BaseModule):
                 deferred_vulns[vuln_code] = dict(vulnerability)
                 return
 
-            for field_name in ("vuln_request", "vuln_response"):
+            for field_name in ("vuln_request", "vuln_response", "poc"):
                 existing_lines = existing.get(field_name, "").splitlines()
                 for line in vulnerability.get(field_name, "").splitlines():
                     if line and line not in existing_lines:
@@ -4942,20 +5119,33 @@ class RDP(BaseModule):
                 self._output_nla_text(self.results.nla)
             properties["nla"] = self._nla_json(self.results.nla)
 
-            if self.results.nla.status == "allowed_not_required":
+            non_nla_probes = [
+                probe for probe in self.results.nla.probes
+                if probe.selected_protocol in (PROTOCOL_RDP, PROTOCOL_SSL)
+                and probe.error is None
+            ]
+            unsupported_probes = self._nla_not_supported_probes(self.results.nla.probes)
+            if self.results.nla.status == "allowed_not_required" and non_nla_probes:
                 defer_vulnerability(
                     {
                         "vuln_code": VULNS.NLA_NOT_REQUIRED.value,
                         "vuln_request": "RDP negotiation without CredSSP/NLA",
                         "vuln_response": "Server accepted a non-NLA security protocol",
+                        "poc": self._non_nla_poc(non_nla_probes),
                     }
                 )
-            elif self.results.nla.status == "not_supported":
+            elif self.results.nla.status == "not_supported" and unsupported_probes:
                 defer_vulnerability(
                     {
                         "vuln_code": VULNS.NLA_NOT_SUPPORTED.value,
                         "vuln_request": "RDP negotiation with CredSSP/NLA",
                         "vuln_response": "Server did not select CredSSP/NLA",
+                        "poc": (
+                            f"The CredSSP-only negotiation at {self.args.target.ip}:"
+                            f"{self.args.target.port} received:\n"
+                            + "\n".join(self._negotiation_evidence(probe) for probe in unsupported_probes)
+                            + "\nThe server response did not provide the requested NLA/CredSSP path."
+                        ),
                     }
                 )
 
@@ -4963,12 +5153,16 @@ class RDP(BaseModule):
             if emit_text:
                 self._output_rdp_security_text(self.results.rdp_security)
             properties["rdpSecurity"] = self._rdp_security_json(self.results.rdp_security)
-            if self.results.rdp_security.status == "allowed":
+            if (
+                self.results.rdp_security.status == "allowed"
+                and self.results.rdp_security.probe.selected_protocol == PROTOCOL_RDP
+            ):
                 defer_vulnerability(
                     {
                         "vuln_code": VULNS.RDP_SECURITY_ALLOWED.value,
                         "vuln_request": "RDP negotiation with PROTOCOL_RDP",
                         "vuln_response": "Server accepted legacy Standard RDP Security",
+                        "poc": self._legacy_security_poc([self.results.rdp_security.probe]),
                     }
                 )
 
@@ -5014,6 +5208,7 @@ class RDP(BaseModule):
             if (
                 self.results.ntlm_info.status == "ok"
                 and self.results.ntlm_info.info is not None
+                and _ntlm_info_has_values(self.results.ntlm_info.info)
             ):
                 defer_vulnerability(
                     {
@@ -5021,6 +5216,12 @@ class RDP(BaseModule):
                         "vuln_request": "CredSSP NTLM negotiate challenge",
                         "vuln_response": "\n".join(
                             self._ntlm_info_output_lines(self.results.ntlm_info.info)
+                        ),
+                        "poc": (
+                            f"The unauthenticated CredSSP NTLM challenge at "
+                            f"{self.args.target.ip}:{self.args.target.port} disclosed:\n"
+                            + "\n".join(self._ntlm_info_output_lines(self.results.ntlm_info.info))
+                            + "\nThese server identity details were available before user authentication."
                         ),
                     }
                 )
@@ -5035,6 +5236,7 @@ class RDP(BaseModule):
                         "vuln_code": VULNS.TLS_WEAK_CONFIG.value,
                         "vuln_request": "RDP TLS handshake and TLS version probes",
                         "vuln_response": "\n".join(self.results.ssl.weak_findings),
+                        "poc": self._tls_configuration_poc(self.results.ssl),
                     }
                 )
 
@@ -5108,7 +5310,7 @@ class RDP(BaseModule):
 
         if self.results.not_implemented:
             properties["notImplementedTests"] = self.results.not_implemented
-            if emit_text and not self.use_json:
+            if emit_text:
                 for test in self.results.not_implemented:
                     self.ptprint(f"{test} test", Out.INFO)
                     self._print_status("Test is not implemented yet", Out.TITLE)
@@ -5133,9 +5335,6 @@ class RDP(BaseModule):
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)
 
     def _output_nla_text(self, result: NLAResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("Network Level Authentication (NLA) test", Out.INFO)
         if result.status == "required":
             self._print_status(
@@ -5144,7 +5343,14 @@ class RDP(BaseModule):
             )
         elif result.status == "allowed_not_required":
             self._print_status(
-                "NLA is allowed but not required",
+                (
+                    "NLA is not required; NLA support could not be established"
+                    if result.probes and not any(
+                        probe.selected_protocol in (PROTOCOL_HYBRID, PROTOCOL_HYBRID_EX)
+                        for probe in result.probes
+                    )
+                    else "NLA is allowed but not required"
+                ),
                 self._nla_output_category(result),
             )
         elif result.status == "not_supported":
@@ -5169,9 +5375,6 @@ class RDP(BaseModule):
                 self.ptdebug(f"{probe.name}: {probe.note}")
 
     def _output_rdp_security_text(self, result: RDPSecurityResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("RDP Security test", Out.INFO)
         if result.status == "allowed":
             self._print_status(
@@ -5196,9 +5399,6 @@ class RDP(BaseModule):
         self.ptdebug(result.probe.summary())
 
     def _output_credssp_text(self, result: CredSSPResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("CredSSP test", Out.INFO)
         if result.status == "supported":
             self._print_status(
@@ -5230,9 +5430,6 @@ class RDP(BaseModule):
             self.ptdebug(probe.summary())
 
     def _output_rdp_encryption_text(self, result: RDPEncryptionResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("RDP security and encryption enumeration", Out.INFO)
         if result.status == "error":
             self._print_status(str(result.error), Out.TITLE)
@@ -5312,9 +5509,6 @@ class RDP(BaseModule):
             self.ptdebug(probe.summary())
 
     def _output_capabilities_text(self, result: CapabilityResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("RDP capabilities", Out.INFO)
         for finding in result.findings:
             if finding.status == "supported":
@@ -5349,9 +5543,6 @@ class RDP(BaseModule):
             self.ptdebug(f"Capability probe error: {result.error}")
 
     def _output_version_text(self, result: RDPVersionResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("RDP protocol version", Out.INFO)
         if result.status in ("ok", "ambiguous"):
             self._print_status(
@@ -5386,9 +5577,6 @@ class RDP(BaseModule):
             self.ptdebug(f"Version source: {result.source}")
 
     def _output_os_detection_text(self, result: RDPVersionResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("OS detection", Out.INFO)
         if result.status in {"ok", "ambiguous"}:
             candidates = self._version_json(result)["typicalWindowsOs"]
@@ -5413,9 +5601,6 @@ class RDP(BaseModule):
             )
 
     def _output_ntlminfo_text(self, result: NTLMInfoResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("RDP NTLM information", Out.INFO)
         if result.status == "ok" and result.info is not None:
             protocol = result.selected_protocol or "unknown protocol"
@@ -5446,9 +5631,6 @@ class RDP(BaseModule):
             self.ptdebug(result.negotiation_probe.summary())
 
     def _output_ssl_text(self, result: SSLResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("TLS / SSL configuration test", Out.INFO)
         if result.status in ("ok", "weak", "partial"):
             detail = result.selected_tls_version or "unknown TLS version"
@@ -5503,9 +5685,6 @@ class RDP(BaseModule):
             self.ptdebug(f"{probe.version}: {status}")
 
     def _output_auth_text(self, result: RDPAuthResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("RDP authentication test", Out.INFO)
         if result.status == "authenticated":
             selected_protocol = protocol_name(result.selected_protocol)
@@ -5556,9 +5735,6 @@ class RDP(BaseModule):
             )
 
     def _output_auth_methods_text(self, result: RDPAuthMethodsResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("RDP authentication methods", Out.INFO)
         if result.note:
             self._print_status(
@@ -5608,9 +5784,6 @@ class RDP(BaseModule):
         self,
         result: UserEnumerationResult,
     ) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("RDP user enumeration", Out.INFO)
         self.ptdebug("Scope: RDP CredSSP/NLA username-password authentication via NTLM")
         messages = {
@@ -5662,9 +5835,6 @@ class RDP(BaseModule):
         self,
         result: RDPBruteProtectionResult,
     ) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("RDP password-guessing protections", Out.INFO)
         self.ptdebug("Scope: RDP CredSSP/NLA username-password authentication via NTLM")
         analysis = result.analysis
@@ -5803,9 +5973,6 @@ class RDP(BaseModule):
         )
 
     def _output_rate_limit_text(self, result: RDPConnectionLimitResult) -> None:
-        if self.use_json:
-            return
-
         self.ptprint("RDP connection rate limiting", Out.INFO)
         if not result.scenarios:
             detail = f": {result.error}" if result.error else ""

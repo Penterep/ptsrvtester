@@ -211,6 +211,7 @@ DEFAULT_BRUTE_USERS = ("root", "admin", "demo", "test", "user", "jane", "john")
 DEFAULT_BRUTE_PASSWORDS = (
     "pass", "pass123", "Pass123", "password", "Pa$$w0rd",
     "abcd", "abcde", "abcdef", "0000", "1234", "12345", "123456", "Admin123",
+    "test", "root", "admin",
 )
 
 

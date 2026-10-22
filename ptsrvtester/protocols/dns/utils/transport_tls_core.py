@@ -176,19 +176,11 @@ def report_tls(ctx, proto: str, host: str, probe: TlsProbe) -> None:
     if weak:
         ctx.out(f"Weak TLS version negotiated: {probe.tls_version}.", "VULN", indent=4)
         with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.WeakTls.value,
-                "vuln_request": f"{proto} handshake to {host}",
-                "vuln_response": f"negotiated {probe.tls_version}",
-            })
+            ctx.deferred_vulns.append({"vuln_code": VULNS.WeakTls.value})
     if invalid:
         ctx.out(f"Invalid certificate: {invalid}.", "VULN", indent=4)
         with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.TlsCert.value,
-                "vuln_request": f"{proto} certificate of {host}",
-                "vuln_response": invalid,
-            })
+            ctx.deferred_vulns.append({"vuln_code": VULNS.TlsCert.value})
     elif probe.verify_ok:
         if cert and 0 <= cert.days_left < EXPIRY_WARN_DAYS:
             ctx.out(f"Certificate valid but expires soon ({cert.days_left}d).", "WARNING", indent=4)

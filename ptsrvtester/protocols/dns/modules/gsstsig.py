@@ -26,15 +26,18 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
+    ctx.debug(f"probing secure-update (GSS-TSIG) enforcement for {len(domains)} domain(s) with a non-writing prerequisite update")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"resolving the primary/authoritative servers for {domain}")
         servers = du.primary_ips(resolver, domain)
         if not servers:
             ctx.out("Could not resolve the zone's primary/authoritative servers.", "WARNING", indent=8)
             continue
         ip = servers[0]
 
+        ctx.debug(f"sending a non-writing prerequisite-only UPDATE (RFC 2136 §2.4) to {ip}")
         rcode = du.prereq_probe(ip, domain)
         rtext = dns.rcode.to_text(rcode) if rcode is not None else "no response"
 
@@ -51,6 +54,3 @@ def run(ctx):
 
         ctx.out("GSS-TSIG (RFC 3645) is the AD/Kerberos secure-update mechanism. Confirming it, "
                 "and any authenticated update test, needs AD domain credentials — not performed here.", "TEXT", indent=8)
-
-        with ctx.results_lock:
-            ctx.properties.setdefault("secure_update", {})[domain] = rtext

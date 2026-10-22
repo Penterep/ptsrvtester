@@ -43,9 +43,11 @@ __ORDER__ = 10
 
 from ptsrvtester.protocols.ntp.ntp_utils.ntp_classes import NTPResults
 from ptsrvtester.protocols.ntp.ntp_utils.connection import gather_info, ntp_to_utc, get_ntp_time, sec_to_readable
+from ptsrvtester.protocols._base import ModuleContext
 
+def run(ctx: ModuleContext):
+    ctx.debug("Running test: " + __MODULECODE__)
 
-def run(ctx):
     mode_translate = {
         0: "Reserved",
         1: "Symmetric active",
@@ -95,21 +97,16 @@ def run(ctx):
         "RMOT": "Alteration of association from a remote host running ntpdc.",
         "STEP": "A step change in system time has occurred, but the association has not yet resynchronized",
     }
-    results: NTPResults
-    
+    results: NTPResults = ctx.results
     ip, port = ctx.target
-    ctx.out(f"IP:                   {ip}", "INFO", indent=4)
-    ctx.out(f"Port:                 {port}", "INFO", indent=4)
 
 
     # -------------------------------------------- Getting results from server --------------------------------------------
 
-    if not ctx.results.has_ran:
-        gather_info(ip, port, ctx.results)
-        results = ctx.results
-        ctx.results = results
-    else:
-        results = ctx.results
+    if not results.has_ran:
+        ctx.out(f"IP:                   {ip}", "INFO", indent=4)
+        ctx.out(f"Port:                 {port}", "INFO", indent=4)
+        gather_info(ip, port, ctx)
     if results.error:
         ctx.out(f"An error occured while trying to connect to server: {results.error_info}", "ERROR", indent=4)
         ctx.out(f"It is possible the server accepts only a specific IP range or needs authentication", "INFO", indent=4)
@@ -121,10 +118,12 @@ def run(ctx):
     # ---------------------------------------- Kiss of Death detection and parsing ----------------------------------------
 
     if results.kod_sent:
+        ctx.debug("Kiss of Death packet received")
         ctx.out(f"Server sent a KoD (Kiss of Death) packet", "WARNING", indent=4)
         
         # KoD code translation
         if results.ref_id != "":
+            ctx.debug("Translating KoD packet reason")
             ref_id: str = str(results.ref_id).upper()
             info = ""
             if ref_id[0] == "X":
@@ -151,6 +150,7 @@ def run(ctx):
     # -------------------------------------------------- Stratum parsing --------------------------------------------------
     # TODO: fake or misconfigured servers can apparently return a weird combination of stratum and refID, should try detecting that
 
+    ctx.debug("Parsing stratum")
     stratum_status = "Unsynchronized"
     if results.stratum == 0:
         stratum_status = "Invalid"
@@ -163,6 +163,7 @@ def run(ctx):
 
     # ----------------------------------------------- Reference ID parsing ------------------------------------------------
 
+    ctx.debug("Parsing reference ID meaning")
     info = ""
     ref_id = str(results.ref_id).upper()
     if ref_id != "":
@@ -178,6 +179,7 @@ def run(ctx):
     # --------------------------------------------- Time and sync information ---------------------------------------------
     # TODO: check if leap seconds coincide with global events (very low priority)
 
+    ctx.debug("Parsing time information")
     leap_status = "Unsynchronized"
     if results.leap == 0:
         leap_status = "Last minute had 60s"

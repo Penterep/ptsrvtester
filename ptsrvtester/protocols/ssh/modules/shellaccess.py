@@ -28,7 +28,7 @@ import paramiko
 # side effect (so old servers still negotiate and paramiko does not spam stderr).
 from ptsrvtester.protocols.ssh.utils import ssh_helpers  # noqa: F401
 from ptsrvtester.protocols.ssh.utils.helpers import text_or_file
-from ptsrvtester.protocols.ssh.utils.results import SSHCreds, VULNS
+from ptsrvtester.protocols.ssh.utils.results import SSHCreds
 from ptsrvtester.protocols.ssh.utils.shellaccess_core import (
     ProbeOutcome,
     assess_shell_access,
@@ -171,11 +171,14 @@ def run(ctx):
     ctx.out(f"Testing shell access for '{account}' on {ip}:{port} "
             f"({len(creds)} secret(s))", "INFO", colortext=True, indent=4)
 
+    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
+    ctx.debug("login succeeded" if client is not None
+              else "login failed with the supplied secret(s)")
 
     if client is None:
         result = assess_shell_access(account=account, authenticated=False)
@@ -184,8 +187,10 @@ def run(ctx):
 
     try:
         cmd, expected = _make_marker()
+        ctx.debug("probing command execution (exec channel)")
         exec_res = _probe_exec(client, cmd, expected)
         cmd2, expected2 = _make_marker()
+        ctx.debug("probing interactive shell (PTY channel)")
         shell_res = _probe_shell(client, cmd2, expected2)
     finally:
         try:
@@ -206,9 +211,6 @@ def _render(ctx, r):
                 "WARNING", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["shellAccessAccount"] = r.account
-            ctx.properties["shellAccessVerdict"] = "no-auth"
         return
 
     if r.verdict == "shell":
@@ -226,18 +228,5 @@ def _render(ctx, r):
     for n in r.notes:
         ctx.debug(n)
 
-    with ctx.results_lock:
-        ctx.properties["shellAccessAccount"] = r.account
-        ctx.properties["shellAccessVerdict"] = r.verdict
-        ctx.properties["shellAccessConfirmed"] = r.is_finding
-        if r.banner:
-            ctx.properties["shellRestrictedBanner"] = r.banner.splitlines()[0][:200]
-
-        if r.is_finding:
-            how = "interactive shell" if r.verdict == "shell" else "command execution"
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.ShellAccess.value,
-                "vuln_request": f"account: {r.account}\npost-auth: open a session channel and "
-                                f"run a command / request a shell",
-                "vuln_response": f"{how} obtained as '{r.account}' — shell access is permitted",
-            })
+    if r.is_finding:
+        ctx.vulns.hit(ctx.module_code)

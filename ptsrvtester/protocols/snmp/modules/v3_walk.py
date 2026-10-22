@@ -1,11 +1,11 @@
 from pysnmp.hlapi.v3arch.asyncio import *
 import asyncio
-from ptsrvtester.protocols.snmp.utils.helpers import write_to_file, format_timeticks
+from ptsrvtester.protocols.snmp.utils.helpers import format_timeticks, snmp_debug, write_to_file
 from ptsrvtester.protocols.snmp.utils.registry import PROTOCOL_NAMES, AuthPrivProtocols
 
 
 __MODULELABEL__ = "SNMPv3 Walk"
-__MODULECODE__ = "v3_walk"
+__MODULECODE__ = "v3walk"
 __ORDER__ = 100
 
 
@@ -74,6 +74,15 @@ async def getBulk_SNMPv3(ctx) -> list:
     # self.drawDoubleLine()
     results = None
     oids = {}
+    probe = ObjectType(ObjectIdentity(ctx.oid))
+    snmp_debug(
+        ctx,
+        f"SNMPv3 walk using user {ctx.single_username!r} "
+        f"({PROTOCOL_NAMES.get(Protocols.auth_protocols, 'Unknown Protocol')}, "
+        f"{PROTOCOL_NAMES.get(Protocols.priv_protocols, 'Unknown Protocol')})",
+        indent=4,
+    )
+    snmp_debug(ctx, f"Sent: walk starting at OID {ctx.oid}", indent=8)
 
     objects = walk_cmd(
         SnmpEngine(),
@@ -81,11 +90,16 @@ async def getBulk_SNMPv3(ctx) -> list:
                     privProtocol=Protocols.priv_protocols),
         await UdpTransportTarget.create((ctx.ip, ctx.port)),
         ContextData(),
-        ObjectType(ObjectIdentity(ctx.oid))
+        probe
     )
 
     # Iterate over the returned OID-value pairs
     async for errorIndication, errorStatus, errorIndex, varBinds in objects:
+        received = errorIndication or (
+            f"{errorStatus.prettyPrint()} at {errorIndex}" if errorStatus else
+            ", ".join(" = ".join(part.prettyPrint() for part in varBind) for varBind in varBinds)
+        )
+        snmp_debug(ctx, f"Received: {received}", indent=8)
         if errorIndication:
             ctx.out(f"Error: {errorIndication}", "ERROR",  indent=4)
             break
@@ -123,7 +137,7 @@ async def getBulk_SNMPv3(ctx) -> list:
     if results:
         node = ctx.ptjsonlib.create_node_object("snmpv3_walk_results", properties=oids)
         ctx.ptjsonlib.add_node(node)
-        ctx.ptjsonlib.add_vulnerability("PTV-SNMP-V3-WALK")
+        ctx.ptjsonlib.add_vulnerability("PTV-SNMP-V3-WALK", poc=oids)
 
     return results
 

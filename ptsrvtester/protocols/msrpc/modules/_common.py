@@ -1,3 +1,6 @@
+from ..utils.samr_checks import SAMR_CODES, run_samr_checks
+
+
 def eng(ctx):
     return ctx.engine.bind_ctx(ctx)
 
@@ -6,7 +9,11 @@ def run_probe(ctx, code: str, result_field: str, method_name: str) -> None:
     """Run one engine method and retain unexpected failures for JSON output."""
     engine = eng(ctx)
     try:
-        setattr(engine.results, result_field, getattr(engine, method_name)())
+        result = (
+            run_samr_checks(engine, code, method_name)
+            if code in SAMR_CODES else getattr(engine, method_name)()
+        )
+        setattr(engine.results, result_field, result)
     except Exception as exc:
         engine.record_module_error(code, exc)
         from argparse import ArgumentError

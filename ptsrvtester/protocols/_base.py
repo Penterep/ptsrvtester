@@ -2,15 +2,11 @@ import argparse
 import importlib.util
 import os
 import sys
-import threading
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Optional
 
-from ptlibs import ptprinthelper
 from ptlibs.ptjsonlib import PtJsonLib
-from ptlibs.threads import ptthreads, printlock
-from ptlibs.ptprinthelper import out_if
+from ptlibs.ptprinthelper import ptprint
 
 
 class Out(Enum):
@@ -77,91 +73,6 @@ class BaseModule(ABC):
     def output(self) -> None:
         raise NotImplementedError
 
-    def ptdebug(
-        self,
-        string: str,
-        out: Out = Out.TEXT,
-        title: bool = False,
-        end: str = "\n",
-        *,
-        indent_override: Optional[int] = None,
-    ) -> None:
-        """Verbose-only (-vv / ``args.debug``): ``ptprinthelper.ptprint`` in ADDITIONS.
-
-        Default indent is 4 spaces for every line (subsection ``title=True`` uses the same
-        indent so blocks align under section headings like ``[+] RCPT TO limit``).
-        Use ``indent_override=0`` when continuing the same physical line (e.g. table cells).
-        ``out`` and ``title`` are kept for call-site compatibility; color is always ADDITIONS.
-        Suppressed when ``--json`` is set.
-        """
-        if not self.args.debug or self.args.json:
-            return
-
-        if indent_override is not None:
-            indent = indent_override
-        else:
-            indent = 4
-
-        lines = string.splitlines()
-        if not lines:
-            lines = [string]
-
-        if len(lines) == 1:
-            ptprinthelper.ptprint(
-                lines[0],
-                "ADDITIONS",
-                True,
-                end=end,
-                flush=True,
-                colortext=True,
-                indent=indent,
-            )
-            return
-
-        for i, line in enumerate(lines):
-            last = i == len(lines) - 1
-            ptprinthelper.ptprint(
-                line,
-                "ADDITIONS",
-                True,
-                end=end if last else "\n",
-                flush=True,
-                colortext=True,
-                indent=indent,
-            )
-
-    def ptprint(
-        self,
-        string: str,
-        out: Out = Out.TEXT,
-        title: bool = False,
-        end: str = "\n",
-        json: bool = False,
-    ):
-        """Prints in normal mode, with optional JSON override in JSON mode.
-
-        Args:
-            string (str): _description_
-            out (Out, optional): output category. Defaults to Out.TEXT.
-            title (bool, optional): whether to print a title. Defaults to False.
-            end (str, optional): line ending. Defaults to "\n".
-            json (bool, optional): force-print JSON in JSON mode. Defaults to False.
-        """
-
-        if json and not self.args.json:
-            return
-        elif not json and self.args.json:
-            return
-
-        if title:
-            colortext = True
-            category = Out.TITLE.value
-        else:
-            colortext = (out == Out.INFO)
-            category = out.value
-
-        ptprinthelper.ptprint(string, category, True, flush=True, colortext=colortext, end=end)
-
 
 class ModuleContext:
     """Everything a module's ``run(ctx)`` receives.
@@ -170,13 +81,13 @@ class ModuleContext:
     protocol-specific handles onto the same object as plain attributes.
     """
 
-    def __init__(self, *, args, ptjsonlib, target, print_lock):
+    def __init__(self, *, args, ptjsonlib, target):
         self.args = args
         self.ptjsonlib = ptjsonlib
         self.target = target                       # (ip, port)
-        self.print_lock = print_lock
         self.json = bool(getattr(args, "json", False))
         self.verbose = bool(getattr(args, "debug", False))
+        self.module_code = None                     # set by BaseMain._run_module
 
     def out(self, string="", category="TEXT", *, colortext=False, indent=0, condition=None):
         """Buffer one formatted line (printed by the main after the module finishes).
@@ -184,16 +95,40 @@ class ModuleContext:
         Suppressed in JSON mode unless ``condition`` is given explicitly.
         """
         cond = (not self.json) if condition is None else condition
-        self.print_lock.add_string_to_output(
-            out_if(string, category, cond, colortext=colortext, indent=indent)
-        )
+        ptprint(string, category, cond, colortext=colortext, indent=indent)
 
     def debug(self, string="", *, indent=4):
-        """Buffer a verbose-only line (``-vv``); suppressed in JSON mode."""
+        """Verbose breadcrumb: record it in the JSON log AND print it under ``-vv``.
+
+        Modules call this with a short note of what they are doing right now. The
+        note always lands in ``results.log`` (so the structured output keeps the
+        run trace regardless of ``-vv`` / ``-j``) and is also printed live, as a
+        grey ``[*]`` line, only with ``-vv`` and not in JSON mode. This is what
+        feeds the ``-vv`` switch.
+        """
+        if string != "":
+            self.log(string)
         if self.verbose and not self.json:
-            self.print_lock.add_string_to_output(
-                out_if(string, "ADDITIONS", True, colortext=True, indent=indent)
-            )
+            ptprint(string, "ADDITIONS", True, colortext=True, indent=indent)
+
+    def log(self, message="") -> None:
+        """Append one entry to the JSON ``results.log`` via ptlibs ``add_to_log``.
+
+        Unlike :meth:`out` (which prints to the terminal), this records a line in
+        the structured output regardless of ``-j`` / ``-vv``. Entries are kept in
+        order and separated by ``\\r\\n`` by ptlibs. :meth:`debug` routes through
+        here, so a module's breadcrumbs are always captured in the log.
+        """
+        self.ptjsonlib.add_to_log(str(message))
+
+    def add_vulnerability(self) -> None:
+        """Record the running module's finding in ``results.vulnerabilities``.
+
+        Adds ONLY the code, derived from the module as ``PTV-SVC-<MODULECODE>``
+        (e.g. BANNER -> ``PTV-SVC-BANNER``) — no request/response/evidence. ptlibs
+        de-duplicates by code, so a module records at most one entry.
+        """
+        self.ptjsonlib.add_vulnerability(vuln_code=f"PTV-SVC-{self.module_code}")
 
 
 class _DiscoveredModule:
@@ -211,10 +146,8 @@ class BaseMain(BaseModule):
 
     A concrete protocol subclasses this and provides ONLY the protocol-specific
     bits — ``NAME``, ``ARGS_CLASS``, ``module_args()``, ``_prepare_target()`` and
-    ``build_context()``. Everything else (discovery, ``-ts`` selection, parallel
-    execution with ptlibs ``PtThreads``, isolated ``PrintLock`` output flushed in
-    order, JSON output) is inherited unchanged. See ``protocols/_TEMPLATE_main.py``
-    for the copyable skeleton.
+    ``build_context()``. Everything else (discovery, ``-ts`` selection) is
+    inherited unchanged. See ``protocols/_TEMPLATE_main.py`` for the copyable skeleton.
 
     Module contract (one file per module in the protocol's ``./modules/``)::
 
@@ -225,7 +158,7 @@ class BaseMain(BaseModule):
         def run(ctx) -> None: ...
 
     ``ctx`` (a :class:`ModuleContext`) gives every module ``args``, ``target``,
-    ``ptjsonlib``, ``print_lock``, ``out()``/``debug()``, ``json``/``verbose`` and
+    ``ptjsonlib``, ``out()``/``debug()``, ``json``/``verbose`` and
     whatever ``build_context()`` injects.
     """
 
@@ -239,8 +172,6 @@ class BaseMain(BaseModule):
         self.args = args
         self.ptjsonlib = ptjsonlib
         self.use_json = bool(getattr(args, "json", False))
-        self.ptthreads = ptthreads.PtThreads()
-        self._lock = threading.Lock()
         self._outputs: dict[str, str] = {}
         self._prepare_target()
 
@@ -365,44 +296,28 @@ class BaseMain(BaseModule):
             return
 
         extras = self.build_context()
-        self._outputs = {}
-        self.ptthreads.threads(
-            list(selected),
-            lambda module_code: self._run_module(module_code, discovered, extras),
-            self._thread_count(),
-        )
-
-        for code in selected:
-            chunk = self._outputs.get(code, "")
-            if chunk:
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
+        for testcode in selected:
+            self._run_module(testcode, discovered, extras)
 
     def _run_module(self, code: str, discovered: dict[str, _DiscoveredModule], extras: dict) -> None:
         entry = discovered[code]
-        lock = printlock.PrintLock()
-        ctx = self._make_context(lock, extras)
+        ctx = self._make_context(extras)
+        ctx.module_code = code
         ctx.out(entry.label, "INFO", colortext=True)
         try:
             entry.module.run(ctx)
         except Exception as e:
             ctx.out(f"Error in module {code}: {e}", "ERROR")
-        with self._lock:
-            self._outputs[code] = lock.get_output_string()
 
-    def _make_context(self, print_lock, extras: dict) -> ModuleContext:
+    def _make_context(self, extras: dict) -> ModuleContext:
         ctx = ModuleContext(
             args=self.args,
             ptjsonlib=self.ptjsonlib,
             target=self.target,
-            print_lock=print_lock,
         )
         for key, value in extras.items():
             setattr(ctx, key, value)
         return ctx
-
-    def _thread_count(self) -> int:
-        return max(1, int(getattr(self.args, "module_threads", 1) or 1))
 
     def output(self) -> None:
         self.ptjsonlib.set_status("finished")

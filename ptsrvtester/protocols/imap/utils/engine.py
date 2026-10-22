@@ -80,7 +80,7 @@ from .capa import (
 )
 from ptlibs.ptprinthelper import out_if, ptprint
 from .ptprinthelper import get_colored_text
-from .progress import ThreadedProgress
+from .progress import ThreadedProgress, clear_raw_line, paint_raw_line
 
 from .decompression_payloads import (
     BILLION_LAUGHS_XML,
@@ -165,6 +165,9 @@ class ImapEngine:
         if self.use_json and not json:
             return
         if json and not self.use_json:
+            return
+        if json:
+            print(string, end=end)
             return
         if title:
             cat, color = "INFO", True
@@ -2900,7 +2903,7 @@ class ImapEngine:
 
     def test_anonymous_access(self) -> AnonymousAccessResult:
         """
-        Probe anonymous and weak default IMAP logins (PTL-SVC-IMAP-ANONYMOUS).
+        Probe anonymous and weak default IMAP logins (PTV-SVC-IMAP-ANON).
         RFC 4505 (SASL ANONYMOUS); pre-auth CAPABILITY may list AUTH=ANONYMOUS (RFC 3501).
         """
         self._anonymous_live = False
@@ -5287,7 +5290,7 @@ class ImapEngine:
     def auth_ntlm(self) -> NTLMResult:
         """
         CAPABILITY (pre-auth) for AUTH=NTLM, then AUTHENTICATE NTLM with Negotiate message;
-        decode Challenge for NetBIOS/DNS/OS disclosure (PTL-SVC-IMAP-NTLMINFO).
+        decode Challenge for NetBIOS/DNS/OS disclosure (PTV-SVC-NTLMINFO).
         """
         imap = self.connect()
         auth_ntlm_advertised = False
@@ -5869,6 +5872,8 @@ class ImapEngine:
             else:
                 self._tprint("Not configured (server rejects invalid creds)", bullet="NOTVULN")
 
+    _ANON_LABEL_W = len('Use LOGIN "anonymous" and password "anonymous":')
+
     def _anonymous_vv(self, text: str) -> None:
         if self.use_json:
             return
@@ -5881,42 +5886,79 @@ class ImapEngine:
         self._ptprint_raw(text, bullet_type=bullet, condition=True, indent=4)
         self._flush_terminal()
 
+    def _anonymous_aligned(self, label: str, value: str, bullet: str) -> None:
+        self._anonymous_verdict(f"{label:<{self._ANON_LABEL_W}} {value}", bullet)
+
+    @staticmethod
+    def _anonymous_login_label(user: str, password: str) -> str:
+        if password:
+            return f'Use LOGIN "{user}" and password "{password}":'
+        return f'Use LOGIN "{user}" and empty password:'
+
+    def _anonymous_login_value(self, accepted: bool, detail: str | None) -> tuple[str, str]:
+        if accepted:
+            return "accepted", "VULN"
+        if self._imap_text_is_timeout(detail):
+            return "timed out (not confirmed)", "WARNING"
+        return "rejected", "NOTVULN"
+
+    def _anonymous_auth_value(self, ok: bool, detail: str | None) -> tuple[str, str]:
+        if ok:
+            return "accepted", "VULN"
+        if self._imap_text_is_timeout(detail):
+            return "timed out (not confirmed)", "WARNING"
+        return "not accepted", "NOTVULN"
+
     def _anonymous_emit_auth_capa(self, advertised: bool) -> None:
         self._anonymous_vv(f"AUTH=ANONYMOUS advertised={advertised}")
         if advertised:
-            self._anonymous_verdict("AUTH method ANONYMOUS advertised", "WARNING")
+            self._anonymous_aligned("AUTH method ANONYMOUS:", "advertised", "WARNING")
         else:
-            self._anonymous_verdict("AUTH method ANONYMOUS not advertised", "NOTVULN")
+            self._anonymous_aligned("AUTH method ANONYMOUS:", "not advertised", "NOTVULN")
 
     def _anonymous_emit_authenticate(self, ok: bool, detail: str | None) -> None:
         extra = f": {detail}" if detail else ""
+        value, bullet = self._anonymous_auth_value(ok, detail)
         if ok:
             self._anonymous_vv(f"AUTHENTICATE ANONYMOUS OK{extra}")
-            self._anonymous_verdict("Use AUTHENTICATE ANONYMOUS: accepted", "VULN")
-        elif self._imap_text_is_timeout(detail):
-            self._anonymous_vv(f"AUTHENTICATE ANONYMOUS failed{extra}")
-            self._anonymous_verdict("Use AUTHENTICATE ANONYMOUS: timed out (not confirmed)", "WARNING")
         else:
             self._anonymous_vv(f"AUTHENTICATE ANONYMOUS failed{extra}")
-            self._anonymous_verdict("Use AUTHENTICATE ANONYMOUS: not accepted", "NOTVULN")
+        self._anonymous_aligned("Use AUTHENTICATE ANONYMOUS:", value, bullet)
 
     def _anonymous_emit_login(self, user: str, password: str, accepted: bool, detail: str | None) -> None:
         pw_disp = '""' if not password else password
         self._anonymous_vv(f"LOGIN {user} {pw_disp}")
+        value, bullet = self._anonymous_login_value(accepted, detail)
         if accepted:
             self._anonymous_vv("OK")
-            tail, bullet = "accepted", "VULN"
-        elif self._imap_text_is_timeout(detail):
-            self._anonymous_vv(f"failed: {detail or 'timed out'}")
-            tail, bullet = "timed out (not confirmed)", "WARNING"
         else:
-            self._anonymous_vv(f"failed: {detail or 'rejected'}")
-            tail, bullet = "rejected", "NOTVULN"
-        if password:
-            text = f'Use LOGIN "{user}" and password "{password}": {tail}'
-        else:
-            text = f'Use LOGIN "{user}" and empty password: {tail}'
-        self._anonymous_verdict(text, bullet)
+            self._anonymous_vv(f"failed: {detail or value}")
+        self._anonymous_aligned(self._anonymous_login_label(user, password), value, bullet)
+
+    def _anonymous_description(self, ar: AnonymousAccessResult) -> str:
+        if not ar.auth_probed and not ar.login_probed:
+            return ar.detail
+        lines: list[str] = []
+        if ar.auth_probed:
+            capa = "advertised" if ar.auth_anonymous_advertised else "not advertised"
+            lines.append(f"AUTH method ANONYMOUS: {capa}")
+            auth_value, _ = self._anonymous_auth_value(
+                ar.authenticate_anonymous_ok, ar.authenticate_detail
+            )
+            lines.append(f"Use AUTHENTICATE ANONYMOUS: {auth_value}")
+        attempts = list(ar.login_attempts)
+        if not attempts and ar.login_probed:
+            attempts.append(
+                AnonymousLoginProbe("anonymous", "", ar.login_anonymous_empty_ok, None)
+            )
+            for hit in ar.weak_credentials_ok:
+                user, _, pw = hit.partition(" / ")
+                password = "" if pw in ("<empty>", "") else pw
+                attempts.append(AnonymousLoginProbe(user, password, True, "OK"))
+        for probe in attempts:
+            value, _ = self._anonymous_login_value(probe.accepted, probe.detail)
+            lines.append(f"{self._anonymous_login_label(probe.username, probe.password)} {value}")
+        return "\r\n".join(lines) if lines else ar.detail
 
     def _anonymous_emit_terminal(self, ar: AnonymousAccessResult) -> None:
         pp = self._ptprint_raw
@@ -6691,6 +6733,104 @@ class ImapEngine:
         ptjsonlib.set_status("finished", "")
         self._ptprint(ptjsonlib.get_result_json(), json=True)
 
+    def _is_anon_only_output(self) -> bool:
+        """``-ts ANON`` alone: description, and PTV-SVC-IMAP-ANON when access succeeded."""
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"ANON"}
+
+    def _emit_anon_json(self, ptjsonlib) -> None:
+        ar = self.results.anonymous
+        err = getattr(self.results, "anonymous_error", None)
+        if ar is not None:
+            description = self._anonymous_description(ar)
+        elif err:
+            description = f"Anonymous probe error: {err}"
+        else:
+            description = "Anonymous access was not tested."
+        ptjsonlib.add_properties({"description": description})
+        if ar is not None and ar.vulnerable:
+            ptjsonlib.add_vulnerability(vuln_code=VULNS.Anonymous.value)
+        ptjsonlib.set_status("finished", "")
+        self._ptprint(ptjsonlib.get_result_json(), json=True)
+
+    def _is_ntlm_only_output(self) -> bool:
+        """``-ts NTLM`` alone: description, and PTV-SVC-NTLMINFO when the challenge is decoded."""
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"NTLM"}
+
+    def _ntlm_description(self, ntlm) -> str:
+        if getattr(ntlm, "incomplete", False):
+            return "NTLM timed out (not confirmed)"
+        if not (ntlm.success and ntlm.ntlm is not None):
+            return "Not available"
+        lines = ["NTLM Challenge decoded — infrastructure identifiers disclosed"]
+        if ntlm.auth_ntlm_advertised:
+            lines.insert(0, "Pre-login CAPABILITY lists AUTH=NTLM")
+        info = ntlm.ntlm
+        lines.extend([
+            f"Target name: {info.target_name}",
+            f"NetBios domain name: {info.netbios_domain}",
+            f"NetBios computer name: {info.netbios_computer}",
+            f"DNS domain name: {info.dns_domain}",
+            f"DNS computer name: {info.dns_computer}",
+            f"DNS tree: {info.dns_tree}",
+            f"OS version: {info.os_version}",
+        ])
+        return "\r\n".join(lines)
+
+    def _emit_ntlm_json(self, ptjsonlib) -> None:
+        ntlm = self.results.ntlm
+        err = getattr(self.results, "ntlm_error", None)
+        if ntlm is not None:
+            description = self._ntlm_description(ntlm)
+        elif err:
+            description = f"NTLM probe error: {err}"
+        else:
+            description = "NTLM was not tested."
+        ptjsonlib.add_properties({"description": description})
+        if ntlm is not None and ntlm.success and ntlm.ntlm is not None:
+            ptjsonlib.add_vulnerability(vuln_code=VULNS.NTLM.value)
+        ptjsonlib.set_status("finished", "")
+        self._ptprint(ptjsonlib.get_result_json(), json=True)
+
+    def _is_authlist_only_output(self) -> bool:
+        """``-ts AUTHLIST`` alone: description, and PTV-SVC-IMAP-AUTHMETHODS on cleartext."""
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"AUTHLIST"}
+
+    def _authlist_description(self, al) -> str:
+        lines: list[str] = []
+        for p in al.paths:
+            label = self._authlist_path_label(p.path)
+            if not p.available:
+                lines.append(f"{label}: {self._authlist_unavailable_text(p.path, connected=False)}")
+                continue
+            if not p.methods:
+                lines.append(f"{label}: {self._authlist_unavailable_text(p.path, connected=True)}")
+                continue
+            for row in p.methods:
+                _, text = self._authlist_row_display(p.path, row)
+                lines.append(f"{label}: {text}")
+        return "\r\n".join(lines) if lines else (al.detail or "AUTH methods were not tested.")
+
+    def _emit_authlist_json(self, ptjsonlib) -> None:
+        al = getattr(self.results, "imap_authlist", None)
+        err = getattr(self.results, "imap_authlist_error", None)
+        if al is not None:
+            description = self._authlist_description(al)
+        elif err:
+            description = f"AUTHLIST failed: {err}"
+        else:
+            description = "AUTH methods were not tested."
+        ptjsonlib.add_properties({"description": description})
+        if al is not None and al.vulnerable:
+            ptjsonlib.add_vulnerability(vuln_code=VULNS.AuthMethods.value)
+        ptjsonlib.set_status("finished", "")
+        self._ptprint(ptjsonlib.get_result_json(), json=True)
+
     def build_json(self, ptjsonlib) -> None:
         """Build JSON node(s). Terminal output is streamed from run()."""
         if (info_error := getattr(self.results, "info_error", None)) is not None:
@@ -6700,6 +6840,15 @@ class ImapEngine:
             return
         if self._is_brute_only_output():
             self._emit_brute_json(ptjsonlib)
+            return
+        if self._is_anon_only_output():
+            self._emit_anon_json(ptjsonlib)
+            return
+        if self._is_ntlm_only_output():
+            self._emit_ntlm_json(ptjsonlib)
+            return
+        if self._is_authlist_only_output():
+            self._emit_authlist_json(ptjsonlib)
             return
         properties = {
             "software_type": None,
@@ -6974,7 +7123,7 @@ class ImapEngine:
         if (catch_all := getattr(self.results, "catch_all", None)) is not None:
             if catch_all == "indeterminate":
                 properties.update({"catchAll": "indeterminate"})
-        # Anonymous / weak default access (PTL-SVC-IMAP-ANONYMOUS)
+        # Anonymous / weak default access (PTV-SVC-IMAP-ANON)
         if (ar := self.results.anonymous) is not None:
             properties.update(
                 {
@@ -7365,7 +7514,7 @@ class ImapEngine:
                         "vuln_response": resp_plain,
                     }
                 )
-        # NTLM info disclosure (PTL-SVC-IMAP-NTLMINFO)
+        # NTLM info disclosure (PTV-SVC-NTLMINFO)
         if ntlm := self.results.ntlm:
             ntlm_props: dict = {
                 "authNtlmAdvertised": ntlm.auth_ntlm_advertised,
@@ -7542,16 +7691,14 @@ class ImapEngine:
             nonlocal live_line_dirty
             if not show_progress or verbose:
                 return
-            sys.stdout.write(f"\033[2K\r            {text:<100}")
-            sys.stdout.flush()
+            paint_raw_line(f"            {text:<100}")
             live_line_dirty = True
 
         def clear_live():
             nonlocal live_line_dirty
             if not show_progress or not live_line_dirty:
                 return
-            sys.stdout.write("\033[2K\r")
-            sys.stdout.flush()
+            clear_raw_line()
             live_line_dirty = False
 
         def emit_vv(msg: str) -> None:
@@ -7972,17 +8119,14 @@ class ImapEngine:
             nonlocal live_line_dirty
             if not show_progress:
                 return
-            line = get_colored_text(text, "ADDITIONS")
-            sys.stdout.write(f"\033[2K\r{line}")
-            sys.stdout.flush()
+            paint_raw_line(text)
             live_line_dirty = True
 
         def clear_live():
             nonlocal live_line_dirty
             if not show_progress or not live_line_dirty:
                 return
-            sys.stdout.write("\033[2K\r")
-            sys.stdout.flush()
+            clear_raw_line()
             live_line_dirty = False
 
         connections, est_err, est_disc, est_timeout = self._noop2_establish_pool(

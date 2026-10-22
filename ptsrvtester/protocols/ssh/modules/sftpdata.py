@@ -27,7 +27,7 @@ import paramiko
 # side effect (so old servers still negotiate and paramiko does not spam stderr).
 from ptsrvtester.protocols.ssh.utils import ssh_helpers  # noqa: F401
 from ptsrvtester.protocols.ssh.utils.helpers import text_or_file
-from ptsrvtester.protocols.ssh.utils.results import SSHCreds, VULNS
+from ptsrvtester.protocols.ssh.utils.results import SSHCreds
 from ptsrvtester.protocols.ssh.utils.sftpdata_core import (
     CAP_BOMB_MB,
     CAP_MAX_FILES,
@@ -251,11 +251,14 @@ def run(ctx):
     ctx.out("aggressive test — uploads bounded test files (all cleaned up afterwards)",
             "WARNING", indent=4)
 
+    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
+    ctx.debug("login succeeded" if client is not None
+              else "login failed with the supplied secret(s)")
 
     obs = SftpDataObservations()
     if client is None:
@@ -299,15 +302,9 @@ def _render(ctx, r):
         ctx.out(f"SFTPDATA: NOT TESTED — could not authenticate as '{r.account}'", "WARNING", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["sftpdataAccount"] = r.account
-            ctx.properties["sftpdataVerdict"] = "no-auth"
         return
     if not obs.sftp_available:
         ctx.out("SFTP subsystem not available — nothing to upload", "OK", indent=4)
-        with ctx.results_lock:
-            ctx.properties["sftpdataAccount"] = r.account
-            ctx.properties["sftpdataVerdict"] = "no-sftp"
         return
 
     # Antivirus
@@ -348,41 +345,10 @@ def _render(ctx, r):
     for n in r.notes:
         ctx.debug(n)
 
-    with ctx.results_lock:
-        ctx.properties["sftpdataAccount"] = r.account
-        ctx.properties["sftpdataEicarPersisted"] = obs.eicar_persisted_intact
-        ctx.properties["sftpdataProcessingSuspected"] = r.processing_suspected
-        ctx.properties["sftpdataBaselineSeconds"] = obs.baseline_seconds
-        ctx.properties["sftpdataBombSeconds"] = obs.bomb_seconds
-        ctx.properties["sftpdataSizeLimitHit"] = obs.size_limit_hit
-        ctx.properties["sftpdataCountLimitHit"] = obs.count_limit_hit
-        ctx.properties["sftpdataMbWritten"] = obs.mb_written
-        ctx.properties["sftpdataFilesCreated"] = obs.files_created
-        _push_vulns(ctx, r)
+    _push_vulns(ctx, r)
 
 
 def _push_vulns(ctx, r):
-    obs = r.obs
-    if r.no_antivirus_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpNoAntivirus.value,
-            "vuln_request": f"account: {r.account}\nSFTP upload of the EICAR test file",
-            "vuln_response": "the EICAR test file was stored intact — uploads are not scanned for "
-                             "malware on receipt",
-        })
-    if r.processing_dos_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpContentProcessingDoS.value,
-            "vuln_request": f"account: {r.account}\nSFTP upload of a compressible archive vs baseline",
-            "vuln_response": f"compressible upload took {obs.bomb_seconds:.2f}s vs "
-                             f"{obs.baseline_seconds:.2f}s baseline — the server processes/decompresses "
-                             "uploads (ZIP-bomb / XXE denial-of-service surface)",
-        })
-    if r.no_quota_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.SftpNoQuota.value,
-            "vuln_request": f"account: {r.account}\nSFTP bounded write ({obs.mb_written:.0f} MB) and "
-                            f"{obs.files_created} files",
-            "vuln_response": "no size or file-count quota within the tested bounds — an attacker can "
-                             "fill the disk (denial of service)",
-        })
+    """Record the module finding (PTV-SVC-SFTPDATA) if any content/limit issue was found."""
+    if r.any_finding:
+        ctx.vulns.hit(ctx.module_code)

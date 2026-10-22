@@ -22,9 +22,11 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, list[str]] = {}
+    ctx.debug(f"querying CAA records for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"querying CAA for {domain}")
         records = ec.caa_records(resolver, domain)
         summary[domain] = records
         if records:
@@ -33,11 +35,4 @@ def run(ctx):
         else:
             ctx.out("No CAA record — any public CA may issue certificates for this domain.", "VULN", indent=8)
             with ctx.results_lock:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.CaaMissing.value,
-                    "vuln_request": f"CAA {domain}",
-                    "vuln_response": "no CAA record set",
-                })
-
-    with ctx.results_lock:
-        ctx.properties["caa"] = {d: r for d, r in summary.items()}
+                ctx.deferred_vulns.append({"vuln_code": VULNS.CaaMissing.value})

@@ -24,38 +24,36 @@ def run(ctx):
     selectors = getattr(ctx.args, "dkim_selectors", None) or ec.DEFAULT_DKIM_SELECTORS
     resolver = ec.resolver_for(ctx)
     summary: dict[str, dict] = {}
+    ctx.debug(f"checking email security for {len(domains)} domain(s); DKIM selectors tried: {', '.join(selectors)}")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"querying SPF (TXT), DMARC (_dmarc TXT) and DKIM selectors for {domain}")
         info = ec.email_security(resolver, domain, selectors)
         vulns: list[dict] = []
 
         # SPF
         if not info.spf:
             ctx.out("SPF      missing — anyone can spoof mail from this domain", "VULN", indent=8)
-            vulns.append({"vuln_code": VULNS.SpfMissing.value,
-                          "vuln_request": f"TXT {domain} (v=spf1)", "vuln_response": "no SPF record"})
+            vulns.append({"vuln_code": VULNS.SpfMissing.value})
         else:
             ctx.out(f"SPF      {info.spf}", "TEXT", indent=8)
             if info.spf_all in (None, "pass"):
                 detail = "+all (passes everything)" if info.spf_all == "pass" else "no all mechanism"
                 ctx.out(f"SPF      weak: {detail}", "VULN", indent=8)
-                vulns.append({"vuln_code": VULNS.SpfWeak.value,
-                              "vuln_request": f"SPF policy for {domain}", "vuln_response": info.spf})
+                vulns.append({"vuln_code": VULNS.SpfWeak.value})
             else:
                 ctx.out(f"SPF      policy: {info.spf_all}", "OK", indent=8)
 
         # DMARC
         if not info.dmarc:
             ctx.out("DMARC    missing — no anti-spoofing policy published", "VULN", indent=8)
-            vulns.append({"vuln_code": VULNS.DmarcMissing.value,
-                          "vuln_request": f"TXT _dmarc.{domain}", "vuln_response": "no DMARC record"})
+            vulns.append({"vuln_code": VULNS.DmarcMissing.value})
         else:
             ctx.out(f"DMARC    {info.dmarc}", "TEXT", indent=8)
             if info.dmarc_policy == "none":
                 ctx.out("DMARC    weak: p=none (monitoring only, does not block spoofing)", "VULN", indent=8)
-                vulns.append({"vuln_code": VULNS.DmarcWeak.value,
-                              "vuln_request": f"DMARC policy for {domain}", "vuln_response": info.dmarc})
+                vulns.append({"vuln_code": VULNS.DmarcWeak.value})
             else:
                 ctx.out(f"DMARC    policy: p={info.dmarc_policy}", "OK", indent=8)
 
@@ -73,6 +71,3 @@ def run(ctx):
         }
         with ctx.results_lock:
             ctx.deferred_vulns.extend(vulns)
-
-    with ctx.results_lock:
-        ctx.properties["email_security"] = summary

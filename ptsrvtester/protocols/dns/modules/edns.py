@@ -20,14 +20,13 @@ def run(ctx):
         return
     ip, port = target
 
+    ctx.debug(f"sending an EDNS(0) query with a client cookie to {ip}:{port} and reading the OPT record back")
     info = fp.edns_probe(ip, port)
     if info.error:
         ctx.out(f"EDNS probe failed: {info.error}", "WARNING", indent=4)
         return
     if not info.supported:
         ctx.out("Server does not support EDNS(0).", "TEXT", indent=4)
-        with ctx.results_lock:
-            ctx.properties["edns"] = "unsupported"
         return
 
     ctx.out(f"{'EDNS version':<18} {info.version}", "OK", indent=4)
@@ -37,6 +36,3 @@ def run(ctx):
         "OK" if info.cookie else "TEXT",
         indent=4,
     )
-
-    with ctx.results_lock:
-        ctx.properties["edns"] = f"v{info.version}, payload {info.udp_payload}, cookies {'yes' if info.cookie else 'no'}"

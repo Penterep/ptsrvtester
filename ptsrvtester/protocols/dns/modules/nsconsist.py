@@ -22,9 +22,11 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
+    ctx.debug(f"comparing SOA serial and NS set across each name server for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"querying each authoritative NS of {domain} for its SOA serial and NS set")
         views, consistent, notes = ig.ns_consistency(resolver, domain)
         if not views:
             ctx.out("No NS records found for the domain.", "WARNING", indent=8)
@@ -38,16 +40,9 @@ def run(ctx):
 
         if consistent:
             ctx.out("All name servers agree on SOA serial and NS set.", "OK", indent=8)
-            with ctx.results_lock:
-                ctx.properties.setdefault("ns_consistency", {})[domain] = "consistent"
             continue
 
         for n in notes:
             ctx.out(n, "VULN", indent=8)
         with ctx.results_lock:
-            ctx.properties.setdefault("ns_consistency", {})[domain] = notes
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.NsInconsistent.value,
-                "vuln_request": f"per-NS SOA/NS comparison for {domain}",
-                "vuln_response": "; ".join(notes),
-            })
+            ctx.deferred_vulns.append({"vuln_code": VULNS.NsInconsistent.value})

@@ -7,4 +7,4 @@ __ORDER__ = 42
 
 
 def run(ctx):
-    report_algorithm_section(ctx, "enc", vuln_request="ssh-audit encryption (ciphers)")
+    report_algorithm_section(ctx, "enc")

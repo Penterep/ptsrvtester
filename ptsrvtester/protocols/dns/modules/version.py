@@ -19,8 +19,10 @@ def run(ctx):
         return
     ip, port = target
 
+    ctx.debug(f"querying CHAOS-class TXT records ({', '.join(fp.CHAOS_NAMES)}) on {ip}:{port}")
     chaos = fp.collect_chaos(ip, port)
     disclosed = {name: vals for name, vals in chaos.items() if vals}
+    ctx.debug(f"CHAOS query complete; {len(disclosed)} of {len(fp.CHAOS_NAMES)} name(s) disclosed information")
 
     for name in fp.CHAOS_NAMES:
         vals = chaos.get(name)
@@ -37,23 +39,5 @@ def run(ctx):
 
     ctx.out("Server discloses software/build information via CHAOS TXT.", "VULN", indent=4)
 
-    version_string = (disclosed.get("version.bind") or [None])[0]
-    product = version = None
-    if version_string:
-        product, version, _ = fp.identify_product(version_string)
-
     with ctx.results_lock:
-        ctx.properties["software_type"] = "dns-server"
-        for name, vals in disclosed.items():
-            ctx.properties[name.replace(".", "_")] = ", ".join(vals)
-        if version_string:
-            ctx.properties["description"] = f"version.bind: {version_string}"
-        if version:
-            ctx.properties["version"] = ".".join(str(p) for p in version)
-        if product:
-            ctx.properties["vendor"] = product
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.VersionDisclosure.value,
-            "vuln_request": "CHAOS TXT: " + ", ".join(fp.CHAOS_NAMES),
-            "vuln_response": "; ".join(f"{n}={', '.join(v)}" for n, v in disclosed.items()),
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.VersionDisclosure.value})

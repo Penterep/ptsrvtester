@@ -26,7 +26,7 @@ import paramiko
 # side effect (so old servers still negotiate and paramiko does not spam stderr).
 from ptsrvtester.protocols.ssh.utils import ssh_helpers  # noqa: F401
 from ptsrvtester.protocols.ssh.utils.helpers import text_or_file
-from ptsrvtester.protocols.ssh.utils.results import SSHCreds, VULNS
+from ptsrvtester.protocols.ssh.utils.results import SSHCreds
 from ptsrvtester.protocols.ssh.utils.privileges_core import (
     ADMIN_COMMANDS,
     SENSITIVE_PATHS,
@@ -138,11 +138,14 @@ def run(ctx):
     ctx.out(f"Enumerating privileges for '{account}' on {ip}:{port} "
             f"({len(creds)} secret(s))", "INFO", colortext=True, indent=4)
 
+    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
+    ctx.debug("login succeeded" if client is not None
+              else "login failed with the supplied secret(s)")
 
     have_password = bool(getattr(a, "password", None) or getattr(a, "passwords", None))
 
@@ -191,9 +194,6 @@ def _render(ctx, r):
                 "WARNING", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["privAccount"] = r.account
-            ctx.properties["privVerdict"] = "no-auth"
         return
 
     who = r.username or r.account
@@ -205,9 +205,6 @@ def _render(ctx, r):
                 "(nologin / SFTP-only / forced command)", "OK", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["privAccount"] = r.account
-            ctx.properties["privVerdict"] = "restricted"
         return
 
     _render_groups(ctx, r)
@@ -218,21 +215,8 @@ def _render(ctx, r):
     for n in r.notes:
         ctx.debug(n)
 
-    with ctx.results_lock:
-        ctx.properties["privAccount"] = r.account
-        ctx.properties["privUsername"] = r.username
-        ctx.properties["privUid"] = r.uid
-        ctx.properties["privGroups"] = r.groups
-        ctx.properties["privPrivilegedGroups"] = r.privileged_groups + r.root_equivalent_groups
-        ctx.properties["privWritableSensitive"] = [p.path for p in r.writable_sensitive]
-        ctx.properties["privReadableSensitive"] = [p.path for p in r.readable_sensitive]
-        ctx.properties["privWritablePathDirs"] = r.writable_path_dirs
-        ctx.properties["privAdminCommands"] = r.admin_commands
-        ctx.properties["privSudoState"] = r.sudo_state.value
-
-        _push_group_vuln(ctx, r)
-        _push_files_vuln(ctx, r)
-        _push_sudo_vuln(ctx, r)
+    if r.any_finding:
+        ctx.vulns.hit(ctx.module_code)
 
 
 def _render_groups(ctx, r):
@@ -290,47 +274,3 @@ def _render_sudo(ctx, r):
         ctx.out(e, "TEXT", indent=8)
 
 
-# --- deferred vulnerabilities (bound to the shared software node) -------------
-
-def _push_group_vuln(ctx, r):
-    if not r.group_is_finding:
-        return
-    groups = r.root_equivalent_groups + r.privileged_groups
-    ctx.deferred_vulns.append({
-        "vuln_code": VULNS.PrivilegedGroup.value,
-        "vuln_request": f"account: {r.account}\nread group membership (id)",
-        "vuln_response": f"member of privilege-granting group(s): {', '.join(groups)}",
-    })
-
-
-def _push_files_vuln(ctx, r):
-    if not r.files_is_finding:
-        return
-    lines = []
-    for p in r.writable_sensitive:
-        lines.append(f"writable: {p.path} ({p.label})")
-    for p in r.readable_sensitive:
-        lines.append(f"readable: {p.path} ({p.label})")
-    for d in r.writable_path_dirs:
-        lines.append(f"writable $PATH dir: {d}")
-    ctx.deferred_vulns.append({
-        "vuln_code": VULNS.SensitiveFileAccess.value,
-        "vuln_request": f"account: {r.account}\ntest r/w/x on sensitive paths and $PATH dirs",
-        "vuln_response": "\n".join(lines),
-    })
-
-
-def _push_sudo_vuln(ctx, r):
-    if not r.sudo_is_finding:
-        return
-    if r.sudo_state == SudoState.NOPASSWD_ALL:
-        resp = "passwordless sudo to ALL — instant root"
-    elif r.sudo_state == SudoState.NOPASSWD_SOME:
-        resp = "passwordless sudo to: " + ("; ".join(r.sudo_entries) or "specific commands")
-    else:
-        resp = "sudo requires a password, but the login password was supplied — likely full sudo"
-    ctx.deferred_vulns.append({
-        "vuln_code": VULNS.SudoAccess.value,
-        "vuln_request": f"account: {r.account}\nsudo -n -l",
-        "vuln_response": resp,
-    })

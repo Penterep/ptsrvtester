@@ -24,14 +24,17 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
+    ctx.debug(f"checking UDP truncation (TC bit) and TCP/53 fallback for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"finding authoritative servers for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
+        ctx.debug(f"probing {servers[0]} with a 512-byte UDP buffer, then retrying over TCP/53")
         res = dos.tcp_fallback(servers[0], domain)
 
         if res.udp_truncated is True:
@@ -43,15 +46,8 @@ def run(ctx):
 
         if res.tcp_ok:
             ctx.out("TCP/53 answers — TCP fallback works.", "OK", indent=8)
-            with ctx.results_lock:
-                ctx.properties.setdefault("tcp_fallback", {})[domain] = "ok"
         else:
             ctx.out(f"TCP/53 does NOT answer ({res.tcp_error or 'no reply'}) — large answers & DNSSEC break, "
                     "and UDP-only is more amplifiable.", "VULN", indent=8)
             with ctx.results_lock:
-                ctx.properties.setdefault("tcp_fallback", {})[domain] = "broken"
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.TcpFallback.value,
-                    "vuln_request": f"SOA {domain} over TCP/53",
-                    "vuln_response": res.tcp_error or "no reply over TCP",
-                })
+                ctx.deferred_vulns.append({"vuln_code": VULNS.TcpFallback.value})

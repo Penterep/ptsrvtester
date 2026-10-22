@@ -26,14 +26,17 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
+    ctx.debug(f"probing for Response Rate Limiting on {len(domains)} domain(s) with a small bounded query burst")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"finding authoritative servers for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
+        ctx.debug(f"firing an identical-query burst at {servers[0]} and watching for drops / TC-slip")
         res = dos.rrl_probe(servers[0], domain)
         if res.error:
             ctx.out(f"RRL probe failed: {res.error}", "WARNING", indent=8)
@@ -42,16 +45,9 @@ def run(ctx):
         ctx.out(f"Sent {res.sent}, received {res.received} (truncated/slip {res.truncated}).", "TEXT", indent=8)
         if res.rrl_detected:
             ctx.out("Response Rate Limiting appears active (drops / TC-slip observed).", "OK", indent=8)
-            with ctx.results_lock:
-                ctx.properties.setdefault("rrl", {})[domain] = "active"
             continue
 
         ctx.out("No RRL observed at this rate — server answered the whole burst "
                 "(weaker against amplification/reflection abuse).", "VULN", indent=8)
         with ctx.results_lock:
-            ctx.properties.setdefault("rrl", {})[domain] = "not observed"
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.NoRrl.value,
-                "vuln_request": f"burst of {res.sent} identical A queries for {domain}",
-                "vuln_response": f"received {res.received}/{res.sent}, no rate limiting seen",
-            })
+            ctx.deferred_vulns.append({"vuln_code": VULNS.NoRrl.value})

@@ -19,7 +19,9 @@ def run(ctx):
         return
     ip, port = target
 
+    ctx.debug(f"sending an EDNS query with an empty NSID option (option 3) to {ip}:{port}")
     raw = fp.nsid(ip, port)
+    ctx.debug("server echoed an NSID value; decoding it" if raw is not None else "server returned no NSID option")
     if raw is None:
         ctx.out("Server does not return an NSID (no instance identity disclosed).", "OK", indent=4)
         return
@@ -30,9 +32,4 @@ def run(ctx):
     ctx.out("Server reveals its instance identity via NSID.", "VULN", indent=4)
 
     with ctx.results_lock:
-        ctx.properties["nsid"] = ascii_val
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.NsidDisclosure.value,
-            "vuln_request": "EDNS OPT with NSID (option 3)",
-            "vuln_response": f"{ascii_val} (hex {hex_val})",
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.NsidDisclosure.value})

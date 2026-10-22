@@ -24,9 +24,11 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, str] = {}
+    ctx.debug(f"querying a random non-existent name per domain to inspect NSEC/NSEC3 authenticated denial ({len(domains)} domain(s))")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
+        ctx.debug(f"requesting authenticated-denial records for a bogus name under {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         info = dc.denial_of_existence(servers, domain) if servers else dc.DenialInfo(error="no authoritative servers")
 
@@ -44,11 +46,7 @@ def run(ctx):
                         "the full zone can be walked (enumerate every name).", "VULN", indent=8)
                 summary[domain] = "NSEC (walkable)"
                 with ctx.results_lock:
-                    ctx.deferred_vulns.append({
-                        "vuln_code": VULNS.NsecWalk.value,
-                        "vuln_request": f"NSEC probe for {domain}",
-                        "vuln_response": f"classic NSEC (owner {info.nsec_owner}, next {info.nsec_next}) — walkable",
-                    })
+                    ctx.deferred_vulns.append({"vuln_code": VULNS.NsecWalk.value})
             else:
                 ctx.out("Minimal-covering NSEC (e.g. 'black lies') — signs each name on demand, "
                         "so the zone is NOT walkable.", "OK", indent=8)
@@ -64,11 +62,4 @@ def run(ctx):
             ctx.out("NSEC3 uses non-zero iterations and/or a salt — RFC 9276 recommends "
                     "0 iterations and no salt (extra iterations only add validation cost).", "VULN", indent=8)
             with ctx.results_lock:
-                ctx.deferred_vulns.append({
-                    "vuln_code": VULNS.Nsec3Params.value,
-                    "vuln_request": f"NSEC3 parameters for {domain}",
-                    "vuln_response": f"iterations={info.nsec3_iterations}, salt={salt}",
-                })
-
-    with ctx.results_lock:
-        ctx.properties["nsec"] = summary
+                ctx.deferred_vulns.append({"vuln_code": VULNS.Nsec3Params.value})

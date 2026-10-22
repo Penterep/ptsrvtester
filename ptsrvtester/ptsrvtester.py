@@ -31,6 +31,7 @@ from .protocols._shared.utils.cli import add_shared_rate_limit_args
 from ._version import __version__
 from .protocols._base import BaseArgs
 
+
 SCRIPTNAME = "ptsrvtester"
 
 MODULES: dict[str, tuple[str, str]] = {
@@ -63,7 +64,10 @@ class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
     """Keep fatal errors structured and allow informational communication output.
 
     Default errors include an 'Error:' prefix. TITLE uses a plain message and an
-    information bullet; both retain JSON status=error and empty result objects.
+    information bullet. Only ``end_error`` (the fatal path) is customised for the
+    terminal output; all JSON state is held and mutated through the inherited
+    ``ptlibs.ptjsonlib.PtJsonLib`` object and its methods (``set_status``,
+    ``add_node``, ``add_vulnerability``, ``add_to_log``, …).
     """
 
     def end_error(self, message, condition, details=None, *, category="ERROR"):
@@ -79,11 +83,7 @@ class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
         if details:
             from ptlibs.ptprinthelper import get_colored_text
             ptprint("    " + out_ifnot(f"{get_colored_text(details, 'ADDITIONS')}", "TEXT", condition))
-        self.json_object["status"] = "error"
-        self.json_object["message"] = full_msg
-        self.json_object["results"]["nodes"] = []
-        self.json_object["results"]["properties"] = {}
-        self.json_object["results"]["vulnerabilities"] = []
+        self.set_status("error", full_msg)
         ptprint(out_if(self.get_result_json(), None, condition))
         if not condition:
             sys.stdout.write("\033[?25h")

@@ -28,7 +28,9 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     threads = getattr(ctx.args, "threads", 10) or 10
+    ctx.debug(f"reverse-resolving {len(addrs)} address(es) with {threads} thread(s)")
     results = ec.ptr_sweep(resolver, addrs, threads)
+    ctx.debug(f"PTR sweep complete; {len(results)} address(es) have a PTR record")
 
     if not results:
         ctx.out(f"No PTR records found across {len(addrs)} address(es).", "OK", indent=4)
@@ -37,6 +39,3 @@ def run(ctx):
     for ip in sorted(results, key=lambda x: tuple(int(p) for p in x.split(".")) if x.count(".") == 3 else x):
         ctx.out(f"{ip:<18} {', '.join(results[ip])}", "TEXT", indent=4)
     ctx.out(f"{len(results)} of {len(addrs)} address(es) have a PTR record.", "INFO", colortext=True, indent=4)
-
-    with ctx.results_lock:
-        ctx.properties["ptr_sweep"] = {ip: names for ip, names in results.items()}

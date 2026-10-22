@@ -141,6 +141,11 @@ class SSHAuditShared:
         self._lock = threading.Lock()
         self._result: SSHAuditRun | None = None
 
+    @property
+    def done(self) -> bool:
+        """True once the shared scan has run (so a caller can log run-vs-reuse)."""
+        return self._result is not None
+
     def get(self) -> SSHAuditRun:
         with self._lock:
             if self._result is None:
@@ -307,24 +312,22 @@ def classify_algorithm(entry: dict) -> tuple[str, str]:
     return "OK", ""
 
 
-def report_algorithm_section(ctx, section: str, *, vuln_request: str) -> None:
+def report_algorithm_section(ctx, section: str) -> None:
     """Shared body for the KEX/KEYALG/ENC/MAC section tests.
 
     Pulls the shared ssh-audit result, prints each algorithm in the ``section``
     with its OK/WARNING/VULN status, and (if any weak algorithms were found)
-    records one INSECURECRYPTO vulnerability for the section.
+    records one vulnerability for the running module (PTV-SVC-<MODULECODE>).
     """
-    from ptsrvtester.protocols.ssh.utils.results import VULNS
-
+    if ctx.ssh_audit.done:
+        ctx.debug(f"reusing the shared ssh-audit scan for the {section} section")
+    else:
+        ctx.debug(f"running ssh-audit against {ctx.ip}:{ctx.port} (shared crypto scan)")
     run = ctx.ssh_audit.get()
+    ctx.debug(f"parsing {section} algorithms from the ssh-audit result")
     if not run.ok:
         ctx.out(f"ssh-audit did not run: {run.error}", "WARNING", indent=4)
-        with ctx.results_lock:
-            ctx.properties["sshauditStatus"] = run.error or "error"
         return
-
-    with ctx.results_lock:
-        ctx.properties["sshauditStatus"] = "ok"
 
     entries = (run.data or {}).get(section) or []
     if not entries:
@@ -347,9 +350,4 @@ def report_algorithm_section(ctx, section: str, *, vuln_request: str) -> None:
             weak.append(f"{alg}: {note}" if note else alg)
 
     if weak:
-        with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.InsecureCrypto.value,
-                "vuln_request": vuln_request,
-                "vuln_response": "\n".join(weak),
-            })
+        ctx.vulns.hit(ctx.module_code)

@@ -8,7 +8,6 @@ from ptsrvtester.protocols.ssh.utils.ssh_helpers import (
     cred_to_str,
     try_login,
 )
-from ptsrvtester.protocols.ssh.utils.results import VULNS
 
 __MODULELABEL__ = "Login bruteforce"
 __MODULECODE__ = "BRUTE"
@@ -30,6 +29,10 @@ def run(ctx):
         ctx.out("No credentials to try (empty user/secret list)", "WARNING", indent=4)
         return
 
+    ctx.debug(
+        f"trying {len(creds)} credential(s) against {ip}:{port} "
+        f"with {a.threads} thread(s)"
+    )
     err = StringIO("")
     old_write = sys.stderr.write
     sys.stderr.write = err.write
@@ -37,11 +40,9 @@ def run(ctx):
         found = threaded_bruteforce(creds, lambda c: try_login(ip, port, c), a.threads)
     finally:
         sys.stderr.write = old_write
+    ctx.debug(f"bruteforce finished: {len(found)} valid credential(s) found")
     errors = len(err.getvalue()) > 0
     err.close()
-
-    with ctx.results_lock:
-        ctx.properties["bruteStatus"] = "errors" if errors else "ok"
 
     if errors:
         ctx.out(
@@ -54,20 +55,6 @@ def run(ctx):
         ctx.out(f"{len(found)} valid credentials", "INFO", colortext=True)
         for cred in found:
             ctx.out(cred_to_str(cred), "TEXT", indent=4)
-
-        user_str = f"username: {a.user}" if a.user else f"usernames: {a.users}"
-        if a.password:
-            passw_str = f"password: {a.password}"
-        elif getattr(a, "privkeys", None):
-            passw_str = f"private keys: {a.privkeys}"
-        else:
-            passw_str = f"passwords: {a.passwords}"
-
-        with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.WeakCreds.value,
-                "vuln_request": f"{user_str}\n{passw_str}",
-                "vuln_response": "\n".join(cred_to_str(c) for c in found),
-            })
+        ctx.vulns.hit(ctx.module_code)
     else:
         ctx.out("No valid credentials found", "NOTVULN", indent=4)

@@ -32,7 +32,7 @@ from paramiko.message import Message
 # side effect (so old servers still negotiate and paramiko does not spam stderr).
 from ptsrvtester.protocols.ssh.utils import ssh_helpers  # noqa: F401
 from ptsrvtester.protocols.ssh.utils.helpers import text_or_file
-from ptsrvtester.protocols.ssh.utils.results import SSHCreds, VULNS
+from ptsrvtester.protocols.ssh.utils.results import SSHCreds
 from ptsrvtester.protocols.ssh.utils.forwarding_core import (
     LocalProbe,
     State,
@@ -211,11 +211,14 @@ def run(ctx):
     ctx.out(f"Testing forwarding capabilities for '{account}' on {ip}:{port} "
             f"({len(creds)} secret(s))", "INFO", colortext=True, indent=4)
 
+    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
+    ctx.debug("login succeeded" if client is not None
+              else "login failed with the supplied secret(s)")
 
     if client is None:
         _render(ctx, assess_forwarding(account=account, authenticated=False))
@@ -278,9 +281,6 @@ def _render(ctx, r):
                 "WARNING", indent=4)
         for n in r.notes:
             ctx.out(n, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.properties["forwardAccount"] = r.account
-            ctx.properties["forwardVerdict"] = "no-auth"
         return
 
     # TCP forwarding (local / dynamic-SOCKS / remote) + PermitOpen + GatewayPorts
@@ -323,18 +323,7 @@ def _render(ctx, r):
     for n in r.notes:
         ctx.out(n, "TEXT", indent=8)
 
-    with ctx.results_lock:
-        ctx.properties["forwardAccount"] = r.account
-        ctx.properties["forwardLocal"] = r.local.value
-        ctx.properties["forwardRemote"] = r.remote.value
-        ctx.properties["forwardDynamicSocks"] = r.dynamic.value
-        ctx.properties["forwardGateway"] = r.gateway.value
-        ctx.properties["forwardPermitOpenRestricted"] = r.permitopen_restricted
-        ctx.properties["forwardAgent"] = r.agent.value
-        ctx.properties["forwardX11"] = r.x11.value
-        ctx.properties["forwardPty"] = r.pty.value
-
-        _push_vulns(ctx, r)
+    _push_vulns(ctx, r)
 
 
 def _word(state: State, *, allowed="ALLOWED", denied="denied", unknown=None) -> str:
@@ -350,30 +339,6 @@ def _word(state: State, *, allowed="ALLOWED", denied="denied", unknown=None) -> 
 
 
 def _push_vulns(ctx, r):
-    if r.tcp_forwarding_finding:
-        kinds = ", ".join(r.enabled_tcp_kinds())
-        extra = ""
-        if r.gateway == State.ALLOWED:
-            extra = "\nGatewayPorts: wildcard remote bind accepted (verify external exposure)"
-        if r.permitopen_restricted:
-            extra += "\nPermitOpen allow-list is in effect (not a blanket allow)"
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.PortForwarding.value,
-            "vuln_request": f"account: {r.account}\ndirect-tcpip / tcpip-forward requests",
-            "vuln_response": f"TCP forwarding enabled: {kinds} — usable for pivoting / lateral "
-                             f"movement{extra}",
-        })
-    if r.agent_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.AgentForwarding.value,
-            "vuln_request": f"account: {r.account}\nauth-agent-req@openssh.com (want_reply)",
-            "vuln_response": "agent forwarding permitted — a compromised server can reach and use "
-                             "the client's ssh-agent keys",
-        })
-    if r.x11_finding:
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.X11Forwarding.value,
-            "vuln_request": f"account: {r.account}\nx11-req",
-            "vuln_response": "X11 forwarding permitted — a malicious server can open X11 "
-                             "connections back to the client (keystroke/screen capture)",
-        })
+    """Record the module finding (PTV-SVC-FORWARD) if anything is tunnelable."""
+    if r.any_finding:
+        ctx.vulns.hit(ctx.module_code)

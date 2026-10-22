@@ -20,7 +20,9 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
+    ctx.debug(f"sending RD=1 queries for {len(rc.EXTERNAL_NAMES)} out-of-zone name(s) to {ip}:{port}")
     is_open, probes = rc.open_recursion(ip, port)
+    ctx.debug("open recursion detected" if is_open else "server did not recurse external names for this client")
     for p in probes:
         ra = "yes" if p.ra else "no"
         if p.answered and not p.authoritative:
@@ -34,15 +36,8 @@ def run(ctx):
 
     if not is_open:
         ctx.out("Recursion is not open to this client (server does not resolve external names).", "OK", indent=4)
-        with ctx.results_lock:
-            ctx.properties["open_recursion"] = False
         return
 
     ctx.out("Open recursion: the server resolves arbitrary external names for this client.", "VULN", indent=4)
     with ctx.results_lock:
-        ctx.properties["open_recursion"] = True
-        ctx.deferred_vulns.append({
-            "vuln_code": VULNS.OpenRecursion.value,
-            "vuln_request": "RD=1 queries for external names (" + ", ".join(rc.EXTERNAL_NAMES[:3]) + ", …)",
-            "vuln_response": "resolved: " + ", ".join(p.name for p in probes if p.answered),
-        })
+        ctx.deferred_vulns.append({"vuln_code": VULNS.OpenRecursion.value})

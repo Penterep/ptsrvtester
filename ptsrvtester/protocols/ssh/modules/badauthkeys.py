@@ -1,6 +1,5 @@
 """BADAUTHKEY — try known static (bad) user private keys against the server."""
 from ptsrvtester.protocols.ssh.utils.ssh_helpers import check_bad_authkeys
-from ptsrvtester.protocols.ssh.utils.results import VULNS
 
 __MODULELABEL__ = "Known static (bad) auth keys"
 __MODULECODE__ = "BADAUTHKEY"
@@ -15,6 +14,7 @@ def run(ctx):
         return
 
     ip, port = ctx.target
+    ctx.debug(f"trying known-bad private user keys from {path} against {ip}:{port}")
     try:
         keys = check_bad_authkeys(ip, port, path)
     except OSError as e:
@@ -25,11 +25,6 @@ def run(ctx):
         ctx.out(f"Matched {len(keys)} key(s)", "VULN", indent=4)
         for k in keys:
             ctx.out(k, "TEXT", indent=8)
-        with ctx.results_lock:
-            ctx.deferred_vulns.append({
-                "vuln_code": VULNS.BadAuthKeys.value,
-                "vuln_request": f"matched keys from: {path}",
-                "vuln_response": "\n".join(keys),
-            })
+        ctx.vulns.hit(ctx.module_code)
     else:
         ctx.out("No match", "NOTVULN", indent=4)

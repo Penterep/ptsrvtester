@@ -3,15 +3,23 @@ import asyncio
 import os
 from ptsrvtester.protocols.snmp.utils.helpers import snmp_debug, write_to_file
 from ptsrvtester.protocols.snmp.utils.registry import text_or_file
+from ptsrvtester.protocols.snmp.modules.v2_write import test_snmpv2_write_access
 from typing import List
+from dataclasses import dataclass
 
-__MODULELABEL__ = "SNMPv2 Brute Force Module"
+__MODULELABEL__ = "SNMPv2 Community Access Brute Force Module"
 __MODULECODE__ = "v2brute"
 __ORDER__ = 100
 
+@dataclass
+class ValidCommunity:
+    community: str
+    read_access: bool
+    write_access: bool
+
 async def _snmpv2_brute(ctx: dict) -> List[str]:
     """
-    Performs a dictionary attack on SNMPv2/1 to find valid communities.
+    Finds SNMPv2/1 communities with read or write access.
 
         Parameters:
        - ctx.single_community (str): A single community string for SNMPv2/1 authentication.
@@ -21,8 +29,7 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
        - ctx.output (bool): If True, writes valid credentials to a file.
 
         Returns:
-       - list[Credential]: A list of valid communities found during the attack.
-       - None: If no credentials are found or required inputs are missing.
+       - A list of communities with read or write access.
     """
 
     if not ctx.single_community and not ctx.community_file:
@@ -48,19 +55,28 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
 
         if not errorIndication and not errorStatus:
             snmp_debug(ctx, f"Valid community string found: {community}", indent=4)
-            valid_communities.append(community)
+
+            has_write_access = await test_snmpv2_write_access(ctx, community)
+            snmp_debug(
+                ctx,
+                f"Community {community} has {'write' if has_write_access else 'read-only'} access",
+                indent=4,
+            )
+            valid_communities.append(ValidCommunity(community, True, has_write_access))
         else:
             snmp_debug(ctx, f"Error: {errorIndication or errorStatus} for {community}", indent=4)
 
     if valid_communities:
         #self.ptprint("\n")
         ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-BRUTE")
-        ctx.out(f"Valid communities:", "INFO", indent=4)
+        ctx.out("Valid communities:", "INFO", indent=4)
         for community in valid_communities:
-            ctx.out(community, "VULN", indent=8)
+            ctx.out(community.community, "INFO", indent=8)
+            ctx.out("Read access", "VULN", indent=12, condition=community.read_access)
+            ctx.out("Write access", "VULN", indent=12, condition=community.write_access)
         if ctx.write_to_file:
             for community in valid_communities:
-                write_to_file(ctx.write_to_file, community)
+                write_to_file(ctx.write_to_file, community.community)
 
         node = ctx.ptjsonlib.create_node_object("valid_community_strings", properties={"valid": valid_communities})
         ctx.ptjsonlib.add_node(node)

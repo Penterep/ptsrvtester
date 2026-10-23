@@ -32,7 +32,7 @@ SNMP_TESTS: dict[str, dict] = {
         "usage": ["-tg 192.168.15.53:161"]
     },
     "V2BRUTE": {
-        "desc": "SNMPv2 dictionary attack",
+        "desc": "Find SNMPv2 communities with read or write access",
         "long": "",
         "flags": {"v2_brute_force": True},
         "requires": [

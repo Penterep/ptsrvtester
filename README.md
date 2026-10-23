@@ -224,7 +224,7 @@ ptsrvtester <module> -h     for help for module use
 ## Dependencies
 
 ```
-aardwolf==0.2.13
+aardwolf==0.2.16
 asyauth==0.0.23
 asysocks==0.2.18
 cryptography>=42.0.8

@@ -29,6 +29,8 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
         "v3": False
     }
 
+    poc = {}
+
     #v1: bool = False
     #v2c: bool = False
     #v3: bool = False
@@ -74,7 +76,7 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
         for varBind in varBinds:
             res += ' = '.join([x.prettyPrint() for x in varBind])
         
-        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-OLDVER", poc=res)
+        poc.update({"v1": {"sent": str(obj_type), "received": res}})
         
         snmp_debug(ctx, f"Sent: {obj_type}", indent=8)
         snmp_debug(ctx, f"Received: {res}", indent=8)
@@ -119,7 +121,7 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
         snmp_debug(ctx, f"SNMPv2c detection success", indent=4)
         for varBind in varBinds:
             res += ' = '.join([x.prettyPrint() for x in varBind])
-        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-OLDVER", poc=res)
+        poc.update({"v2c": {"sent": str(obj_type), "received": res}})
         snmp_debug(ctx, f"Sent: {obj_type}", indent=8)
         snmp_debug(ctx, f"Received: {res}", indent=8)
 
@@ -175,6 +177,8 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
     if not any(versions.values()):
         ctx.out("No SNMP version detected", "OK", indent=4)
         return SNMPVersion(**versions)
+
+    ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-OLDVER", poc=poc)
 
     return SNMPVersion(**versions)
 

@@ -23,6 +23,7 @@ class SMBArgs(BaseArgs):
             ]},
         ]
 
+    # TODO: add password and login options
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """ptsrvtester smb 192.168.1.1 -ts info
 ptsrvtester smb -h"""
@@ -37,7 +38,7 @@ ptsrvtester smb -h"""
             raise TypeError
         
         parser.add_argument(
-            "target",
+            "-tg", "--target",
             type=valid_target_smb,
             help="""IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 445 is default""",
         )

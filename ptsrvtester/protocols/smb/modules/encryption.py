@@ -29,41 +29,169 @@ __MODULELABEL__ = "Encryption status information"
 __MODULECODE__ = "ENCRYPTION"
 __ORDER__ = 12
 
-from ..smb_utils.helpers import SMBContext
+# from ..smb_utils.helpers import SMBContext
 from ..smb_utils.server_connection import ServerConnection
-from impacket.smbconnection import (
-    SMB2_DIALECT_30,
-    SMB2_DIALECT_311,
-)
+from ..smb_utils.helpers import SMBResults, SMBv1Flags, SMBv23Flags
+from ptsrvtester.protocols._base import ModuleContext
+
+def get_flag(source: int, mask: int) -> bool:
+    return bool(source & mask)
 
 
-# TODO: add encryption requirement check
-
-def run(ctx: SMBContext) -> None:
+def run(ctx: ModuleContext) -> None:
+    ctx.debug("Running test: " + __MODULECODE__)
     ip, port = ctx.target
-    # ctx.out(f"Would check {ip}:{port} here.", "TEXT")
-    # For JSON mode, add structured findings instead of text, e.g.:
-    #   ctx.ptjsonlib.add_vulnerability("PTV-SMTP-...")
-    
-    sc = ServerConnection(ctx)
-    
-    for dialect in [SMB2_DIALECT_30, SMB2_DIALECT_311]:
-        out = sc.connect(dialect, try_login=False, parse_info=False, parse_encryption=True)
-        if out is not None:
-            if dialect == SMB2_DIALECT_30:
-                ctx.v30_encryption = out["v30_encryption"]
-                ctx.successful_dialects.append("SMBv3.0")
-            elif dialect == SMB2_DIALECT_311:
-                ctx.v311_encryption = out["v311_encryption"]
-                ctx.successful_dialects.append("SMBv3.1.1")
-            else:
-                assert(False)
-    
-    if "SMBv3.0" not in ctx.successful_dialects and "SMBv3.1.1" not in ctx.successful_dialects:
-        ctx.out("Encryption is only supported on SMBv3 and above. The server doensn't use them", category="INFO", condition=True, indent=4)
-    else:
-        ctx.out(f"SMBv3.0:    {ctx.v30_encryption if ctx.v30_encryption is not None else "Unknown"}",
-                category="INFO", condition="SMBv3.0" in ctx.successful_dialects, indent=4)
+    output: SMBResults = ctx.output
 
-        ctx.out(f"SMBv3.1.1:  {ctx.v311_encryption if ctx.v311_encryption is not None else "Unknown"}",
-                category="INFO", condition="SMBv3.1.1" in ctx.successful_dialects, indent=4)
+    sc = ServerConnection(ctx)
+    if not output.has_ran:
+        ctx.out(f"IP address:              {ip}", "INFO", indent=4)
+        ctx.out(f"Port:                    {port}", "INFO", indent=4)
+        # TODO: add login and password check
+        sc.connect()
+    
+    if output.had_error:
+        ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
+        return
+    
+    
+    if output.used_dialect == "SMBv1":
+        category = "VULN"
+    elif output.used_dialect in ["SMBv2.0", "SMBv2.1"]:
+        category = "WARNING"
+    else:
+        category = "NOTVULN"
+    ctx.out(f"Used dialect:            {output.used_dialect}", category, indent=4)
+
+    if output.used_dialect == "SMBv1" and output.v1_flags:
+        ctx.out("SMBv1 should be disabled unless you know what you're doing", "WARNING", indent=4)
+        ctx.debug("Reading SMBv1 flags:")
+        flags1, flags2, security_mode, capabilities = output.v1_flags
+
+        signing_support: bool = get_flag(flags2, SMBv1Flags.FLAGS2_SMB_SECURITY_SIGNATURE)
+        signing_requirement: bool = get_flag(flags2, SMBv1Flags.FLAGS2_SMB_SECURITY_SIGNATURE_REQUIRED)
+        # extended_security_support: bool = get_flag(flags2, SMBv1Flags.FLAGS2_EXTENDED_SECURITY)
+
+        # cap_extended_security_support: bool = get_flag(capabilities, SMBv1Flags.CAP_EXTENDED_SECURITY)
+        
+        user_level_auth: bool = get_flag(security_mode, SMBv1Flags.NEGOTIATE_USER_SECURITY)
+        uses_challenge_response: bool = get_flag(security_mode, SMBv1Flags.NEGOTIATE_ENCRYPT_PASSWORDS)
+        # sec_signing_support: bool = get_flag(security_mode, SMBv1Flags.NEGOTIATE_SECURITY_SIGNATURE_ENABLE)
+        # sec_signing_requirement: bool = get_flag(security_mode, SMBv1Flags.NEGOTIATE_SECURITY_SIGNATURE_REQUIRED)
+
+        ctx.debug(f"user_level_auth = {user_level_auth}")
+        ctx.debug(f"uses_challenge_response = {uses_challenge_response}")
+        ctx.debug(f"does_support_NTLMv2 = {output.does_support_NTLMv2}")
+        ctx.debug(f"signing_support = {signing_support}")
+        ctx.debug(f"signing_requirement = {signing_requirement}")
+        ctx.debug(f"is_login_required = {output.is_login_required}")
+        ctx.debug(f"guest_session = {output.guest_session}")
+
+        if user_level_auth:
+            category = "OK"
+            msg = "Separate username/password per user"
+        else:
+            category = "WARNING"
+            msg = "Shared password for the whole share"
+        ctx.out(f"Authentication level:    {msg}", category, indent=4)
+
+        if uses_challenge_response:
+            category = "OK"
+            msg = "Supports hashed/challenge-response auth"
+        else:
+            category = "WARNING"
+            msg = "Only accepts plaintext passwords"
+        ctx.out(f"Challenge response:      {msg}", category, indent=4)
+        
+        ctx.out(f"NTLMv2 supported:        {output.does_support_NTLMv2}",
+                "WARNING" if not output.does_support_NTLMv2 else "OK", indent=4)
+        
+        if signing_requirement:
+            category = "OK"
+            msg = "Mandatory"
+        elif signing_support:
+            category = "WARNING"
+            msg = "Available but optional"
+        else:
+            category = "VULN"
+            msg = "Unsupported"
+        ctx.out(f"Message signing:         {msg}", category, indent=4)
+        
+        ctx.out(f"Login required:          {output.is_login_required}",
+                "WARNING" if not output.is_login_required else "OK", indent=4)
+        
+        if output.successful_login:
+            category = "VULN"
+            msg = "Allowed (possibly enables information gathering)"
+        else:
+            category = "OK"
+            msg = "Could not establish"
+        ctx.out(f"NULL session:            {msg}", category, indent=4)
+        
+
+    elif output.used_dialect != "SMBv1" and output.v23_flags:
+        ctx.debug("Reading SMBv2/3 flags:")
+        security_mode, capabilities, session_flags = output.v23_flags
+
+        signing_support: bool = get_flag(security_mode, SMBv23Flags.SMB2_NEGOTIATE_SIGNING_ENABLED)
+        signing_requirement: bool = get_flag(security_mode, SMBv23Flags.SMB2_NEGOTIATE_SIGNING_REQUIRED)
+        encryption_support: bool = get_flag(capabilities, SMBv23Flags.SMB2_GLOBAL_CAP_ENCRYPTION)
+        session_encryption_requirement: bool = get_flag(session_flags, SMBv23Flags.SMB2_SESSION_FLAG_ENCRYPT_DATA)
+        null_session: bool = get_flag(session_flags, SMBv23Flags.SMB2_SESSION_FLAG_IS_NULL)
+
+        ctx.debug(f"signing_support = {signing_support}")
+        ctx.debug(f"signing_requirement = {signing_requirement}")
+        ctx.debug(f"encryption_support = {encryption_support}")
+        ctx.debug(f"session_encryption_requirement = {session_encryption_requirement}")
+        ctx.debug(f"does_support_NTLMv2 = {output.does_support_NTLMv2}")
+        ctx.debug(f"is_login_required = {output.is_login_required}")
+        ctx.debug(f"null_session = {null_session}")
+        ctx.debug(f"guest_session = {output.guest_session}")
+
+        if signing_requirement:
+            category = "OK"
+            msg = "Mandatory"
+        elif signing_support:
+            category = "WARNING"
+            msg = "Available but optional"
+        else:
+            category = "VULN"
+            msg = "Not supported or enforced"
+        ctx.out(f"Message signing:         {msg}", category, indent=4)
+        
+        if session_encryption_requirement:
+            category = "OK"
+            msg = "Was required for the session"
+        elif encryption_support:
+            category = "OK"
+            msg = "Supported"
+        else:
+            category = "VULN"
+            msg = "Not supported or enforced"
+        ctx.out(f"Encryption support:      {msg}", category, indent=4)
+
+        ctx.out(f"NTLMv2 supported:        {output.does_support_NTLMv2}",
+                "WARNING" if not output.does_support_NTLMv2 else "OK", indent=4)       
+
+        ctx.out(f"Login required:          {output.is_login_required}",
+                "WARNING" if not output.is_login_required else "OK", indent=4)
+
+        if null_session:
+            category = "VULN"
+            msg = "Allowed (possibly enables information gathering)"
+        else:
+            category = "OK"
+            msg = "Could not establish"
+        ctx.out(f"NULL session:            {msg}", category, indent=4)
+        
+        if output.guest_session:
+            category = "VULN"
+            msg = "Allowed (possibly enables information gathering)"
+        else:
+            category = "OK"
+            msg = "Could not establish"
+        ctx.out(f"Guest session:           {msg}", category, indent=4)
+        
+    else:
+        ctx.out(f"An error occured while parsing SMB flags", "ERROR", indent=4)
+        return

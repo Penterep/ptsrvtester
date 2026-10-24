@@ -46,10 +46,6 @@ async def user_enum(ctx) -> list[str]:
             elif "Wrong SNMP PDU digest" in str(errorIndication):
                 ctx.out(f"Potential valid username: {username}", "WARNING",  indent=4)
                 potentially_valid_usernames.add(username)
-            else:
-
-                ctx.out(f"Error for username {username}: {errorIndication or errorStatus}", "ERROR",
-                         indent=4)
 
         except Exception as e:
             ctx.out(f"Error for username {username}: {e}", "ERROR",  indent=4)

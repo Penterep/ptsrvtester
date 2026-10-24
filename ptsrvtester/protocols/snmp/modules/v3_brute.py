@@ -3,8 +3,9 @@ from pysnmp.hlapi.v3arch.asyncio import *
 import asyncio
 from ptsrvtester.protocols.snmp.utils.helpers import write_to_file
 from ptsrvtester.protocols.snmp.utils.registry import (PROTOCOL_NAMES, text_or_file,
-                                                       AuthPrivProtocols, Credential)
+                                                       AuthPrivProtocols, Credential, WriteTestResult)
 from ptsrvtester.protocols.snmp.modules.v3_enum import user_enum
+from ptsrvtester.protocols.snmp.modules.v3_write import test_snmpv3_write_access
 
 __MODULELABEL__ = "SNMPv3 Brute Force Test"
 __MODULECODE__ = "v3brute"
@@ -47,7 +48,6 @@ async def snmpv3_brute(ctx) -> list[Credential] | None:
     # Users and passwords from input
     users = text_or_file(ctx.single_username, ctx.username_file)
     passwords = text_or_file(ctx.single_password, ctx.password_file)
-    valid_usernames = set()
 
     # setting the hash function for bruteforce
     default_auth_protocols = [
@@ -70,7 +70,6 @@ async def snmpv3_brute(ctx) -> list[Credential] | None:
     if (ctx.auth_protocols is None or ctx.priv_protocols is None) and ctx.username_file:
         ctx.out("No auth or priv protocols set", "TITLE",  indent=4)
         users = await user_enum(ctx)
-        valid_usernames = set(users)
         if not users:
             # self.ctx.out("\n")
             ctx.out("It is not possible to find valid credentials with these usernames", "OK",
@@ -103,6 +102,7 @@ async def snmpv3_brute(ctx) -> list[Credential] | None:
         creds = [Credential(u, p) for u in users for p in passwords]
 
     found_credentials = []  # store valid found credentials
+    write_results: list[WriteTestResult] = []
     successful_protocol = None  # Track the successful protocol combination
     valid_usernames = set()
 
@@ -119,12 +119,15 @@ async def snmpv3_brute(ctx) -> list[Credential] | None:
                 continue
         for cred in creds:
             try:
+
                 iterator = get_cmd(SnmpEngine(),
                                    UsmUserData(cred.username, cred.password, authProtocol=protocol.auth_protocols,
                                                privProtocol=protocol.priv_protocols),
                                    await UdpTransportTarget.create((ctx.ip, ctx.port)),
                                    ContextData(),
-                                   ObjectType(ObjectIdentity("SNMPv2-MIB", "sysDescr", 0)))
+                                   ObjectType(ObjectIdentity("1.3.6.1.2.1.1.1.0")),
+                                   lookupMib=False)
+
                 errorIndication, errorStatus, errorIndex, varBinds = await iterator
 
                 if not errorIndication and not errorStatus:
@@ -133,10 +136,57 @@ async def snmpv3_brute(ctx) -> list[Credential] | None:
                     valid_usernames.add(cred.username)
                     auth_name = PROTOCOL_NAMES.get(successful_protocol.auth_protocols, "Unknown Protocol")
                     priv_name = PROTOCOL_NAMES.get(successful_protocol.priv_protocols, "Unknown Protocol")
+                    read_response = repr(varBinds)
+                    read_poc = {
+                        "sent": "get-request 1.3.6.1.2.1.1.1.0",
+                        "received": read_response,
+                    }
                     ctx.out(f"Valid credentials found: Username: {cred.username}, Password: {cred.password}",
                             "VULN",  indent=4)
                     ctx.out(f"Successful Authentication and Private protocols are: {auth_name} and {priv_name}",
                             "INFO",  indent=4)
+                    ctx.ptjsonlib.add_vulnerability(
+                        vuln_code="PTV-SVC-SNMP-BRUTE",
+                        poc={
+                            "username": cred.username,
+                            "password": cred.password,
+                            "auth_protocol": auth_name,
+                            "priv_protocol": priv_name,
+                            "read_poc": read_poc,
+                        },
+                    )
+                    has_write_access, write_var_binds, _ = await test_snmpv3_write_access(ctx, cred, protocol)
+                    if has_write_access:
+                        ctx.out(f"Write access verified for {cred.username}/{cred.password}", "VULN",
+                                indent=4)
+                        write_response = repr(write_var_binds)
+                        write_poc = {
+                            "sent": f"set-request 1.3.6.1.2.1.1.5.0 = {str(ctx.value)!r}",
+                            "received": write_response,
+                        }
+                        ctx.ptjsonlib.add_vulnerability(
+                            vuln_code="PTV-SVC-SNMP-WRITE",
+                            poc={
+                                "username": cred.username,
+                                "password": cred.password,
+                                "auth_protocol": auth_name,
+                                "priv_protocol": priv_name,
+                                "write_poc": write_poc,
+                            },
+                        )
+                        oid = "1.3.6.1.2.1.1.5.0"
+                        ctx.out(f"OID: {oid} was set to {ctx.value}", "INFO", indent=8)
+                        ctx.out(
+                            "Note: Attribute was modified for testing purposes. Don't forget to revert it back if necessary.",
+                            "INFO", indent=8)
+                        write_results.append(WriteTestResult(
+                            OID=oid,
+                            creds=f"{cred.username or 'None'}:{cred.password or 'None'}",
+                            value=str(ctx.value)
+                        ))
+                    else:
+                        ctx.out(f"Write access not available for {cred.username}/{cred.password}", "INFO",
+                                indent=4)
                 elif "Wrong SNMP PDU digest" in str(errorIndication):
                     ctx.out(
                         f"Digest match (likely valid username - Try different password or protocols): {cred.username}",

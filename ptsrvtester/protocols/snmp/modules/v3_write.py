@@ -8,6 +8,21 @@ __MODULECODE__ = "v3write"
 __ORDER__ = 100
 
 
+async def test_snmpv3_write_access(ctx, cred: Credential, protocols: AuthPrivProtocols):
+    print("nice")
+    iterator = set_cmd(
+        SnmpEngine(),
+        UsmUserData(cred.username, cred.password, authProtocol=protocols.auth_protocols,
+                    privProtocol=protocols.priv_protocols),
+        await UdpTransportTarget.create((ctx.ip, ctx.port)),
+        ContextData(),
+        ObjectType(ObjectIdentity("SNMPv2-MIB", "sysName", 0), OctetString(ctx.value)),
+        lookupMib=True
+    )
+    error_indication, error_status, error_index, var_binds = await iterator
+    return not error_indication and not error_status, var_binds, error_indication or error_status
+
+
 async def test_snmpv3_write_permissions(ctx) -> list[WriteTestResult]:
     """
         Tests SNMPv3 write permissions by attempting to set a value on the target device.
@@ -85,18 +100,9 @@ async def test_snmpv3_write_permissions(ctx) -> list[WriteTestResult]:
         try:
             ctx.out(f"Testing write permission for user: {cred.username} with password: {cred.password}", "INFO",
                     indent=4)
-            iterator = set_cmd(
-                SnmpEngine(),
-                UsmUserData(cred.username, cred.password, authProtocol=Protocols.auth_protocols,
-                            privProtocol=Protocols.priv_protocols),
-                await UdpTransportTarget.create((ctx.ip, ctx.port)),
-                ContextData(),
-                ObjectType(ObjectIdentity("SNMPv2-MIB", "sysName", 0), OctetString(ctx.value))
-            )
+            has_write_access, varBinds, write_error = await test_snmpv3_write_access(ctx, cred, Protocols)
 
-            errorIndication, errorStatus, errorIndex, varBinds = await iterator
-
-            if not errorIndication and not errorStatus:
+            if has_write_access:
                 ctx.out("Test was successful!", "VULN", indent=8)
                 for varBind in varBinds:
                     ctx.out(f"OID: {varBind[0]} was set to {varBind[1]}", "INFO", indent=8)
@@ -109,7 +115,7 @@ async def test_snmpv3_write_permissions(ctx) -> list[WriteTestResult]:
                         value=str(varBind[1])
                     ))
             else:
-                ctx.out(f"Test failed: {errorIndication or errorStatus}", "OK",
+                ctx.out(f"Test failed: {write_error}", "OK",
                         indent=8)
 
         except Exception as e:

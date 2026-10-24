@@ -43,7 +43,6 @@ async def _getBulk_SNMPv2(ctx) -> str:
         try:
             # Use walk_cmd to traverse the MIB
             probe = ObjectType(ObjectIdentity(ctx.oid))
-            snmp_debug(ctx, f"SNMPv2 walk using community {community!r}", indent=4)
             snmp_debug(ctx, f"Sent: walk starting at OID {ctx.oid}", indent=8)
             objects = walk_cmd(
                 SnmpEngine(),
@@ -57,6 +56,7 @@ async def _getBulk_SNMPv2(ctx) -> str:
 
             # Iterate over the returned OID-value pairs
             async for errorIndication, errorStatus, errorIndex, varBinds in objects:
+                added_to_json = False
                 received = errorIndication or (
                     f"{errorStatus.prettyPrint()} at {errorIndex}" if errorStatus else
                     ", ".join(" = ".join(part.prettyPrint() for part in varBind) for varBind in varBinds)
@@ -87,7 +87,10 @@ async def _getBulk_SNMPv2(ctx) -> str:
                             value_output = f'INTEGER: {value_str}'
                         else:
                             value_output = value_str  # Default for other types
-
+                        if not added_to_json:
+                            poc = {"sent": "get-request " + str(oid), "received": value_output}
+                            ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-WALK", poc=poc)
+                            added_to_json = True
                         # Construct the final formatted string
                         formatted_output = f"{oid} = {value_output}"
                         oids.update({str(oid): value_output})
@@ -96,13 +99,9 @@ async def _getBulk_SNMPv2(ctx) -> str:
 
             # Stop the loop if results are found
             if results:
-                node = ctx.ptjsonlib.create_node_object("snmpv2_walk_results", properties=oids)
-                ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-WALK", poc=oids)
-                ctx.ptjsonlib.add_node(node)
                 ctx.out(f"Results found with community '{community}', stopping further attempts.", "VULN",
                         indent=8)
                 result = "success"
-                ctx.ptjsonlib.add_vulnerability("PTV-SNMP-V2-WALK")
                 break
 
 

@@ -15,7 +15,9 @@ __ORDER__ = 100
 class ValidCommunity:
     community: str
     read_access: bool
+    read_poc: dict
     write_access: bool
+    write_poc: dict
 
 async def _snmpv2_brute(ctx: dict) -> List[str]:
     """
@@ -45,41 +47,59 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
     valid_communities = []
 
     for community in communities:
+        obj_type = ObjectType(ObjectIdentity("SNMPv2-MIB", "sysDescr", 0))
         iterator = get_cmd(SnmpEngine(),
                             CommunityData(community),
                            await UdpTransportTarget.create((ctx.ip, ctx.port), timeout=0.25, retries=0),
                            # Initialize transport target correctly
                            ContextData(),
-                           ObjectType(ObjectIdentity("SNMPv2-MIB", "sysDescr", 0)))
+                           obj_type)
         errorIndication, errorStatus, errorIndex, varBinds = await iterator
 
         if not errorIndication and not errorStatus:
-            snmp_debug(ctx, f"Valid community string found: {community}", indent=4)
+            read_res = ""
+            for varBind in varBinds:
+                read_res += " = ".join([x.prettyPrint() for x in varBind])
 
-            has_write_access = await test_snmpv2_write_access(ctx, community)
+            snmp_debug(ctx, f"Response for community {community}: {read_res}", indent=4)
+            has_write_access, var_binds = await test_snmpv2_write_access(ctx, community)
+
+            oid = "1.3.6.1.2.1.1.5.0"  # SNMPv2-MIB::sysName.0
+            value = str(ctx.value)
+
+            write_req = f"{oid} = {value!r}"
+            write_res = ""
+            for varBind in varBinds:
+                write_res += " = ".join([x.prettyPrint() for x in varBind])
             snmp_debug(
                 ctx,
                 f"Community {community} has {'write' if has_write_access else 'read-only'} access",
                 indent=4,
             )
-            valid_communities.append(ValidCommunity(community, True, has_write_access))
+            valid_communities.append(ValidCommunity(read_access=True,
+                                                    read_poc={"sent": "get-request "+ str(obj_type), "received": read_res},
+                                                    write_access=has_write_access,
+                                                    write_poc={"sent": "set-request " + write_req, "received": write_res},
+                                                    community=community)
+                                                    )
         else:
             snmp_debug(ctx, f"Error: {errorIndication or errorStatus} for {community}", indent=4)
 
     if valid_communities:
-        #self.ptprint("\n")
-        ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-BRUTE")
         ctx.out("Valid communities:", "INFO", indent=4)
         for community in valid_communities:
             ctx.out(community.community, "INFO", indent=8)
-            ctx.out("Read access", "VULN", indent=12, condition=community.read_access)
-            ctx.out("Write access", "VULN", indent=12, condition=community.write_access)
+            if community.read_access:
+                ctx.out("Read access", "VULN", indent=12)
+                ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-BRUTE", poc={"community": community.community,
+                                                                                     "read_poc": community.read_poc})
+            if community.write_access:
+                ctx.out("Write access", "VULN", indent=12)
+                ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-WRITE", poc={"community": community.community,
+                                                                                     "write_poc": community.write_poc})
         if ctx.write_to_file:
             for community in valid_communities:
                 write_to_file(ctx.write_to_file, community.community)
-
-        node = ctx.ptjsonlib.create_node_object("valid_community_strings", properties={"valid": valid_communities})
-        ctx.ptjsonlib.add_node(node)
 
     else:
         ctx.out("No valid communities found", "OK", indent=4)

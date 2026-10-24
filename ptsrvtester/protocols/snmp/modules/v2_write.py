@@ -20,10 +20,10 @@ async def _set_snmpv2_sysname(ctx, community: str):
     return await iterator
 
 
-async def test_snmpv2_write_access(ctx, community: str) -> bool:
+async def test_snmpv2_write_access(ctx, community: str) -> tuple[bool, tuple[ObjectType]]:
     """Return whether one SNMPv2 community can write to sysName."""
-    error_indication, error_status, _, _ = await _set_snmpv2_sysname(ctx, community)
-    return not error_indication and not error_status
+    error_indication, error_status, error_index, var_binds = await _set_snmpv2_sysname(ctx, community)
+    return (not error_indication and not error_status), var_binds
 
 
 async def test_snmpv2_write_permission(

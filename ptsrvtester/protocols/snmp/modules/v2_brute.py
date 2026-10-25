@@ -15,9 +15,9 @@ __ORDER__ = 100
 class ValidCommunity:
     community: str
     read_access: bool
-    read_poc: dict
+    read_poc: str
     write_access: bool
-    write_poc: dict
+    write_poc: str
 
 async def _snmpv2_brute(ctx: dict) -> List[str]:
     """
@@ -62,14 +62,14 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
                 read_res += " = ".join([x.prettyPrint() for x in varBind])
 
             snmp_debug(ctx, f"Response for community {community}: {read_res}", indent=4)
-            has_write_access, var_binds = await test_snmpv2_write_access(ctx, community)
+            has_write_access, write_var_binds = await test_snmpv2_write_access(ctx, community)
 
             oid = "1.3.6.1.2.1.1.5.0"  # SNMPv2-MIB::sysName.0
             value = str(ctx.value)
 
             write_req = f"{oid} = {value!r}"
             write_res = ""
-            for varBind in varBinds:
+            for varBind in write_var_binds:
                 write_res += " = ".join([x.prettyPrint() for x in varBind])
             snmp_debug(
                 ctx,
@@ -77,9 +77,9 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
                 indent=4,
             )
             valid_communities.append(ValidCommunity(read_access=True,
-                                                    read_poc={"sent": "get-request "+ str(obj_type), "received": read_res},
+                                                    read_poc=f"Sent: get-request {obj_type}\r\nReceived: {read_res}",
                                                     write_access=has_write_access,
-                                                    write_poc={"sent": "set-request " + write_req, "received": write_res},
+                                                    write_poc=f"Sent: set-request {write_req}\r\nReceived: {write_res}",
                                                     community=community)
                                                     )
         else:
@@ -91,12 +91,16 @@ async def _snmpv2_brute(ctx: dict) -> List[str]:
             ctx.out(community.community, "INFO", indent=8)
             if community.read_access:
                 ctx.out("Read access", "VULN", indent=12)
-                ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-BRUTE", poc={"community": community.community,
-                                                                                     "read_poc": community.read_poc})
+                ctx.ptjsonlib.add_vulnerability(
+                    vuln_code="PTV-SVC-SNMP-BRUTE",
+                    poc=f"Community: {community.community}\r\n{community.read_poc}",
+                )
             if community.write_access:
                 ctx.out("Write access", "VULN", indent=12)
-                ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-WRITE", poc={"community": community.community,
-                                                                                     "write_poc": community.write_poc})
+                ctx.ptjsonlib.add_vulnerability(
+                    vuln_code="PTV-SVC-SNMP-WRITE",
+                    poc=f"Community: {community.community}\r\n{community.write_poc}",
+                )
         if ctx.write_to_file:
             for community in valid_communities:
                 write_to_file(ctx.write_to_file, community.community)

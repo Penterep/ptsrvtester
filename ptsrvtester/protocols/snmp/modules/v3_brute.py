@@ -136,43 +136,43 @@ async def snmpv3_brute(ctx) -> list[Credential] | None:
                     valid_usernames.add(cred.username)
                     auth_name = PROTOCOL_NAMES.get(successful_protocol.auth_protocols, "Unknown Protocol")
                     priv_name = PROTOCOL_NAMES.get(successful_protocol.priv_protocols, "Unknown Protocol")
-                    read_response = repr(varBinds)
-                    read_poc = {
-                        "sent": "get-request 1.3.6.1.2.1.1.1.0",
-                        "received": read_response,
-                    }
+                    read_response = ", ".join(
+                        " = ".join(part.prettyPrint() for part in var_bind)
+                        for var_bind in varBinds
+                    )
                     ctx.out(f"Valid credentials found: Username: {cred.username}, Password: {cred.password}",
                             "VULN",  indent=4)
                     ctx.out(f"Successful Authentication and Private protocols are: {auth_name} and {priv_name}",
                             "INFO",  indent=4)
                     ctx.ptjsonlib.add_vulnerability(
                         vuln_code="PTV-SVC-SNMP-BRUTE",
-                        poc={
-                            "username": cred.username,
-                            "password": cred.password,
-                            "auth_protocol": auth_name,
-                            "priv_protocol": priv_name,
-                            "read_poc": read_poc,
-                        },
+                        poc=(
+                            f"Username: {cred.username}\r\n"
+                            f"Password: {cred.password}\r\n"
+                            f"Authentication protocol: {auth_name}\r\n"
+                            f"Privacy protocol: {priv_name}\r\n"
+                            "Sent: get-request 1.3.6.1.2.1.1.1.0\r\n"
+                            f"Received: {read_response}"
+                        ),
                     )
                     has_write_access, write_var_binds, _ = await test_snmpv3_write_access(ctx, cred, protocol)
                     if has_write_access:
                         ctx.out(f"Write access verified for {cred.username}/{cred.password}", "VULN",
                                 indent=4)
-                        write_response = repr(write_var_binds)
-                        write_poc = {
-                            "sent": f"set-request 1.3.6.1.2.1.1.5.0 = {str(ctx.value)!r}",
-                            "received": write_response,
-                        }
+                        write_response = ", ".join(
+                            " = ".join(part.prettyPrint() for part in var_bind)
+                            for var_bind in write_var_binds
+                        )
                         ctx.ptjsonlib.add_vulnerability(
                             vuln_code="PTV-SVC-SNMP-WRITE",
-                            poc={
-                                "username": cred.username,
-                                "password": cred.password,
-                                "auth_protocol": auth_name,
-                                "priv_protocol": priv_name,
-                                "write_poc": write_poc,
-                            },
+                            poc=(
+                                f"Username: {cred.username}\r\n"
+                                f"Password: {cred.password}\r\n"
+                                f"Authentication protocol: {auth_name}\r\n"
+                                f"Privacy protocol: {priv_name}\r\n"
+                                f"Sent: set-request 1.3.6.1.2.1.1.5.0 = {str(ctx.value)!r}\r\n"
+                                f"Received: {write_response}"
+                            ),
                         )
                         oid = "1.3.6.1.2.1.1.5.0"
                         ctx.out(f"OID: {oid} was set to {ctx.value}", "INFO", indent=8)

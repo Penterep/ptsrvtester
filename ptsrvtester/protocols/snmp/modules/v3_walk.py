@@ -126,7 +126,7 @@ async def getBulk_SNMPv3(ctx) -> list:
                     value_output = value_str  # Default for other types
 
                 if not added_to_json:
-                    poc = {"sent": "get-request " + str(oid), "received": value_output}
+                    poc = f"Sent: get-request {oid}\r\nReceived: {value_output}"
                     ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-WALK", poc=poc)
                     added_to_json = True
 

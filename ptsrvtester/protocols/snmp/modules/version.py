@@ -29,7 +29,7 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
         "v3": False
     }
 
-    poc = {}
+    poc = ""
 
     #v1: bool = False
     #v2c: bool = False
@@ -75,9 +75,9 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
         
         for varBind in varBinds:
             res += ' = '.join([x.prettyPrint() for x in varBind])
-        
-        poc.update({"v1": {"sent": str(obj_type), "received": res}})
-        
+
+        poc += f"PoC of SNMPv1 detection:\r\nSent: {obj_type}\r\nReceived: {res}\r\n"
+
         snmp_debug(ctx, f"Sent: {obj_type}", indent=8)
         snmp_debug(ctx, f"Received: {res}", indent=8)
 
@@ -121,7 +121,7 @@ async def version_detection(ctx: dict) -> SNMPVersion | None:
         snmp_debug(ctx, f"SNMPv2c detection success", indent=4)
         for varBind in varBinds:
             res += ' = '.join([x.prettyPrint() for x in varBind])
-        poc.update({"v2c": {"sent": str(obj_type), "received": res}})
+        poc += f"PoC of SNMPv2c detection:\r\nSent: {obj_type}\r\nReceived: {res}\r\n"
         snmp_debug(ctx, f"Sent: {obj_type}", indent=8)
         snmp_debug(ctx, f"Received: {res}", indent=8)
 

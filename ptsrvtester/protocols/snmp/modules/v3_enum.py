@@ -21,20 +21,22 @@ async def user_enum(ctx) -> list[str]:
     for username in users:
         try:
             user_data = UsmUserData(username, "userenumeration", authProtocol=None, privProtocol=None)
-            probe = ObjectType(ObjectIdentity("SNMPv2-MIB", "sysDescr", 0))
+            probe_oid = "1.3.6.1.2.1.1.1.0"
+            probe = ObjectType(ObjectIdentity(probe_oid))
             snmp_debug(ctx, f"SNMPv3 username enumeration for {username!r}", indent=4)
-            snmp_debug(ctx, f"Sent: {probe}", indent=8)
+            snmp_debug(ctx, f"Sent: get-request {probe_oid}", indent=8)
             iterator = get_cmd(
                 SnmpEngine(),
                 user_data,
                 await UdpTransportTarget.create((ctx.ip, ctx.port)),
                 ContextData(),
                 probe,
+                lookupMib=False,
             )
             errorIndication, errorStatus, errorIndex, varBinds = await iterator
             received = errorIndication or (
                 f"{errorStatus.prettyPrint()} at {errorIndex}" if errorStatus else
-                ", ".join(" = ".join(part.prettyPrint() for part in varBind) for varBind in varBinds)
+                repr(varBinds)
             )
             snmp_debug(ctx, f"Received: {received}", indent=8)
 
@@ -44,10 +46,6 @@ async def user_enum(ctx) -> list[str]:
             elif "Wrong SNMP PDU digest" in str(errorIndication):
                 ctx.out(f"Potential valid username: {username}", "WARNING",  indent=4)
                 potentially_valid_usernames.add(username)
-            else:
-
-                ctx.out(f"Error for username {username}: {errorIndication or errorStatus}", "ERROR",
-                         indent=4)
 
         except Exception as e:
             ctx.out(f"Error for username {username}: {e}", "ERROR",  indent=4)

@@ -9,50 +9,65 @@ __MODULECODE__ = "v2write"
 __ORDER__ = 100
 
 
-async def test_snmpv2_write_permission(ctx) -> list[WriteTestResult]:
+async def _set_snmpv2_sysname(ctx, community: str):
+    iterator = set_cmd(
+        SnmpEngine(),
+        CommunityData(community),
+        await UdpTransportTarget.create((ctx.ip, ctx.port)),
+        ContextData(),
+        ObjectType(ObjectIdentity("SNMPv2-MIB", "sysName", 0), OctetString(ctx.value))
+    )
+    return await iterator
+
+
+async def test_snmpv2_write_access(ctx, community: str) -> tuple[bool, tuple[ObjectType]]:
+    """Return whether one SNMPv2 community can write to sysName."""
+    error_indication, error_status, error_index, var_binds = await _set_snmpv2_sysname(ctx, community)
+    return (not error_indication and not error_status), var_binds
+
+
+async def test_snmpv2_write_permission(
+    ctx, communities: list[str] | None = None
+) -> list[WriteTestResult]:
     """
         Tests SNMPv2 write permissions by attempting to set a value on the target device.
 
         Parameters:
         - self.single_community (str): A single community string for SNMPv2/1 authentication.
         - self.community_file (str): Path to a file containing multiple valid community strings.
+        - communities (list[str] | None): Optional explicit communities to test instead of ctx inputs.
         - self.ip (str): The IP address of the target device.
         - self.port (int): The port number.
 
         Returns:
-        - None: Prints the results of the write test, including success or failure messages.
+        - Write results for communities with write access.
     """
     results: list[WriteTestResult] = []
-    if not ctx.community_file and not ctx.single_community:
+    if communities is None and not ctx.community_file and not ctx.single_community:
         ctx.out("Error: Neither a community file nor a single community string was provided.", "ERROR",
                 indent=4)
         return results
 
-    communities = text_or_file(ctx.single_community, ctx.community_file)
+    if communities is None:
+        communities = text_or_file(ctx.single_community, ctx.community_file)
     # self.drawDoubleLine()
     # self.ctx.out("Starting SNMPv2 write permission test...", title=True)
     # self.drawDoubleLine()
 
     for community in communities:
         try:
-            ctx.out(f"Testing write permission for community string: {community}", "INFO", 
+            ctx.out(f"Testing write permission for community string: {community}", "INFO",
                     indent=4)
-            iterator = set_cmd(
-                SnmpEngine(),
-                CommunityData(community),
-                await UdpTransportTarget.create((ctx.ip, ctx.port)),
-                ContextData(),
-                ObjectType(ObjectIdentity("SNMPv2-MIB", "sysName", 0), OctetString(ctx.value))
+            errorIndication, errorStatus, errorIndex, varBinds = await _set_snmpv2_sysname(
+                ctx, community
             )
-
-            errorIndication, errorStatus, errorIndex, varBinds = await iterator
 
             if not errorIndication and not errorStatus:
                 ctx.out("Write was successful!", "VULN", indent=8)
                 for varBind in varBinds:
                     ctx.out(f"OID: {varBind[0]} was set to {varBind[1]}", "INFO", indent=8)
                     ctx.out(
-                        f"Note: Attribute was modified for testing purposes. Don't forget to revert it back if necessary.",
+                        "Note: Attribute was modified for testing purposes. Don't forget to revert it back if necessary.",
                         "INFO", indent=8)
                     results.append(WriteTestResult(
                         OID=str(varBind[0]),

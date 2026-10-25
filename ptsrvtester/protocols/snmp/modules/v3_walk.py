@@ -73,7 +73,6 @@ async def getBulk_SNMPv3(ctx) -> list:
     # self.ctx.out("Starting SNMPv3 bulk walk...", title=True)
     # self.drawDoubleLine()
     results = None
-    oids = {}
     probe = ObjectType(ObjectIdentity(ctx.oid))
     snmp_debug(
         ctx,
@@ -95,6 +94,7 @@ async def getBulk_SNMPv3(ctx) -> list:
 
     # Iterate over the returned OID-value pairs
     async for errorIndication, errorStatus, errorIndex, varBinds in objects:
+        added_to_json = False
         received = errorIndication or (
             f"{errorStatus.prettyPrint()} at {errorIndex}" if errorStatus else
             ", ".join(" = ".join(part.prettyPrint() for part in varBind) for varBind in varBinds)
@@ -125,19 +125,18 @@ async def getBulk_SNMPv3(ctx) -> list:
                 else:
                     value_output = value_str  # Default for other types
 
+                if not added_to_json:
+                    poc = f"Sent: get-request {oid}\r\nReceived: {value_output}"
+                    ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-SNMP-WALK", poc=poc)
+                    added_to_json = True
+
                 # Construct the final formatted string
                 formatted_output = f"{oid} = {value_output}"
-                oids.update({str(oid): value_output})
                 ctx.out(formatted_output, "TEXT",  indent=8)
             results = "success"
 
     if ctx.write_to_file and results:
         write_to_file(ctx.write_to_file, results)
-
-    if results:
-        node = ctx.ptjsonlib.create_node_object("snmpv3_walk_results", properties=oids)
-        ctx.ptjsonlib.add_node(node)
-        ctx.ptjsonlib.add_vulnerability("PTV-SNMP-V3-WALK", poc=oids)
 
     return results
 

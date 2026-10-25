@@ -42,6 +42,7 @@ async def test_snmpv3_write_permissions(ctx) -> list[WriteTestResult]:
     results: list[WriteTestResult] = []
     default_auth_protocol = usmHMACSHAAuthProtocol
     default_priv_protocol = usmDESPrivProtocol
+    poc: str = ""
 
     PROTOCOL_OBJECTS = {v: k for k, v in PROTOCOL_NAMES.items()}
 
@@ -114,6 +115,7 @@ async def test_snmpv3_write_permissions(ctx) -> list[WriteTestResult]:
                         creds=f"{cred.username or 'None'}:{cred.password or 'None'}",
                         value=str(varBind[1])
                     ))
+                poc = f"Sent: set-request SNMPv2-MIB::sysName.0 = {ctx.value!r}\r\nReceived: {varBinds[0][0]} = {varBinds[0][1]}"
             else:
                 ctx.out(f"Test failed: {write_error}", "OK",
                         indent=8)
@@ -125,7 +127,7 @@ async def test_snmpv3_write_permissions(ctx) -> list[WriteTestResult]:
         json_results = [{"OID": res.OID, "creds": res.creds, "value": res.value} for res in results]
         node = ctx.ptjsonlib.create_node_object("snmpv3_write_test_results", properties={"results": json_results})
         ctx.ptjsonlib.add_node(node)
-        ctx.ptjsonlib.add_vulnerability("PTV-SNMP-V3-WRITE-ACCESS")
+        ctx.ptjsonlib.add_vulnerability("PTV-SNMP-V3-WRITE", poc=poc)
 
     return results
 

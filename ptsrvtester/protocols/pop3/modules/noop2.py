@@ -9,20 +9,6 @@ __MODULECODE__ = "NOOP2"
 __ORDER__ = 81
 
 
-def _flush_ctx(ctx) -> None:
-    if getattr(ctx, "json", False):
-        return
-    lock = getattr(ctx, "print_lock", None)
-    if lock is None:
-        return
-    chunk = lock.get_output_string()
-    if chunk:
-        import sys
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
-        lock.output_string = ""
-
-
 def _emit_noop2_result(ctx, result) -> None:
     from ..utils.results import (
         NOOP2_AVG_TIME_OK_MAX_SECONDS,
@@ -82,7 +68,6 @@ def _emit_noop2_result(ctx, result) -> None:
                     "TEXT",
                     indent=8,
                 )
-    _flush_ctx(ctx)
 
 
 def _maybe_add_conn_limit_vuln(ctx, result, vuln_code: str, phase: str) -> None:
@@ -105,7 +90,7 @@ def run(ctx):
 
     try:
         result_preauth = test_noop_conn_count_preauth(
-            ctx.args, debug=ctx.debug, out=ctx.out, flush=lambda: _flush_ctx(ctx),
+            ctx.args, debug=ctx.debug, out=ctx.out,
         )
     except Exception as e:
         ctx.out(f"Test failed: {e}", "ERROR", indent=4)
@@ -114,7 +99,7 @@ def run(ctx):
     if result_preauth and not result_preauth.error_message:
         if result_preauth.connections_established > 0:
             _emit_noop2_result(ctx, result_preauth)
-            _maybe_add_conn_limit_vuln(ctx, result_preauth, VULNS.NoopConnCountPreauth.value, "pre-auth")
+            _maybe_add_conn_limit_vuln(ctx, result_preauth, VULNS.ConnCntIp.value, "pre-auth")
     elif result_preauth:
         ctx.out(f"Test error: {result_preauth.error_message}", "ERROR", indent=4)
 
@@ -126,7 +111,7 @@ def run(ctx):
         try:
             result_postauth = test_noop_conn_count_postauth(
                 ctx.args, user, password,
-                debug=ctx.debug, out=ctx.out, flush=lambda: _flush_ctx(ctx),
+                debug=ctx.debug, out=ctx.out,
             )
         except Exception as e:
             ctx.out(f"Test failed: {e}", "ERROR", indent=4)
@@ -135,7 +120,7 @@ def run(ctx):
         if result_postauth and not result_postauth.error_message:
             if result_postauth.connections_established > 0:
                 _emit_noop2_result(ctx, result_postauth)
-                _maybe_add_conn_limit_vuln(ctx, result_postauth, VULNS.NoopConnCountPostauth.value, "post-auth")
+                _maybe_add_conn_limit_vuln(ctx, result_postauth, VULNS.ConnCntIp.value, "post-auth")
         elif result_postauth:
             ctx.out(f"Test error: {result_postauth.error_message}", "ERROR", indent=4)
     else:

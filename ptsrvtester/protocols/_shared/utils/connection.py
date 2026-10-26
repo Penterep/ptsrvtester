@@ -143,6 +143,34 @@ class SSHBannerAdapter(TcpConnectionAdapter):
         )
 
 
+def end_if_target_unreachable(owner, *, mode: str, timeout: float = 10.0, smtp_port_hint: bool = False) -> None:
+    """Stop the scan when the target itself cannot be reached.
+
+    A missing host or a closed service is not a test result. ``end_error``
+    prints the red line, sets JSON status to ``error``, and exits.
+    """
+    target = owner.args.target
+    host = target.ip
+    port = target.port
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError as exc:
+        msg = f"Could not connect to the target server {host}:{port} ({mode}): {exc}"
+        if (
+            smtp_port_hint
+            and port == 587
+            and not getattr(owner.args, "starttls", False)
+            and "refused" in str(exc).lower()
+        ):
+            msg += " (port 587 typically requires --starttls)"
+        owner.ptjsonlib.end_error(msg, owner.use_json)
+    else:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def banner_tcp_adapter(host: str, port: int, args) -> TcpConnectionAdapter:
     """TCP adapter that reads a greeting unless the port is implicit TLS."""
     timeout = getattr(args, "rate_timeout", 5.0) or 5.0
@@ -152,4 +180,10 @@ def banner_tcp_adapter(host: str, port: int, args) -> TcpConnectionAdapter:
     )
 
 
-__all__ = ["SocketHandle", "TcpConnectionAdapter", "SSHBannerAdapter", "banner_tcp_adapter"]
+__all__ = [
+    "SocketHandle",
+    "TcpConnectionAdapter",
+    "SSHBannerAdapter",
+    "banner_tcp_adapter",
+    "end_if_target_unreachable",
+]

@@ -11,7 +11,6 @@ def _section(ctx, e, title: str) -> None:
     if getattr(ctx, "json", False):
         return
     ctx.out(title, "INFO", colortext=True)
-    e._flush_terminal()
 
 
 def run(ctx):
@@ -22,7 +21,6 @@ def run(ctx):
         catch_all = e._ftp_auth_catch_all()
     except Exception as ex:
         ctx.out(f"Catch-all failed: {ex}", "ERROR", indent=4)
-        e._flush_terminal()
         return
 
     e._auth_catch_all = catch_all
@@ -36,19 +34,16 @@ def run(ctx):
         ctx.out("Catch-all timed out or could not connect. Not confirmed.", "WARNING", indent=4)
         e._brute_guessing = "not_tested"
         e._brute_guessing_detail = "Could not connect. Password guessing was not tested."
-        e._flush_terminal()
         return
     elif catch_all == "limited":
         detail = "Connection rate limit. Password guessing was not tested."
         ctx.out(detail, "WARNING", indent=4)
         e._brute_guessing = "not_tested"
         e._brute_guessing_detail = detail
-        e._flush_terminal()
         return
     else:
         ctx.out("Not configured (server rejects invalid creds)", "NOTVULN", indent=4)
 
-    e._flush_terminal()
     _section(ctx, e, "Guessing (credential bruteforce)")
     e.login_bruteforce()
     e._stream_brute_result()

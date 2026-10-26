@@ -64,9 +64,13 @@ def open_relay_test(e, smtp, mail_from, rcpt_to) -> bool:
                 return None if 400 <= rcpt_status < 500 else False
             data_status, data_reply = smtp.data(msg)
             data_rep = _reply_one_line(data_reply)
-            if verbose:
-                e._stream_smtp_trace_line(e._data_trace_entry(msg, data_status, data_reply))
+            e._smtp_vv_io('DATA', f'{data_status} {data_rep}')
             if data_status == 250:
+                e.note_poc(
+                    VULNS.OpenRelay.value,
+                    (f'RCPT TO:{rcpt_env}', f'{rcpt_status} {rcpt_rep}'),
+                    ('DATA', f'{data_status} {data_rep}'),
+                )
                 return True
             return None if 400 <= data_status < 500 else False
         except smtplib.SMTPRecipientsRefused as ex:

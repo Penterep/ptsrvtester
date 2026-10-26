@@ -1,6 +1,4 @@
 """NOOP1 — NOOP connection duration (pre-auth + post-auth if -u/-p)."""
-import sys
-
 from ..utils.connection import test_noop_duration_preauth, test_noop_duration_postauth
 from ..utils.helpers import first_cli_password, one_cli_user
 from ..utils.results import (
@@ -105,26 +103,12 @@ def _emit_duration(ctx, result, vulnerable):
     )
 
 
-def _flush_ctx(ctx) -> None:
-    if getattr(ctx, "json", False):
-        return
-    lock = getattr(ctx, "print_lock", None)
-    if lock is None:
-        return
-    chunk = lock.get_output_string()
-    if chunk:
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
-        lock.output_string = ""
-
-
 def run(ctx):
     ctx.out("Pre-authentication", "TITLE", indent=4)
-    _flush_ctx(ctx)
 
     try:
         result_preauth = test_noop_duration_preauth(
-            ctx.args, debug=ctx.debug, flush=lambda: _flush_ctx(ctx),
+            ctx.args, debug=ctx.debug,
         )
     except Exception as e:
         ctx.out(f"Test failed: {e}", "ERROR", indent=8)
@@ -140,7 +124,7 @@ def run(ctx):
         _emit_duration(ctx, result_preauth, vulnerable)
         if vulnerable:
             ctx.report.add_vulnerability(
-                vuln_code=VULNS.NoopDurationPreauth.value,
+                vuln_code=VULNS.ConnLong.value,
                 vuln_request=f"pre-auth NOOP duration ({rating})",
             )
     elif result_preauth:
@@ -150,12 +134,11 @@ def run(ctx):
     password = first_cli_password(ctx.args.password)
     if user and password:
         ctx.out("Post-authentication", "TITLE", indent=4)
-        _flush_ctx(ctx)
 
         try:
             result_postauth = test_noop_duration_postauth(
                 ctx.args, user, password,
-                debug=ctx.debug, flush=lambda: _flush_ctx(ctx),
+                debug=ctx.debug,
             )
         except Exception as e:
             ctx.out(f"Test failed: {e}", "ERROR", indent=8)
@@ -171,7 +154,7 @@ def run(ctx):
             _emit_duration(ctx, result_postauth, vulnerable)
             if vulnerable:
                 ctx.report.add_vulnerability(
-                    vuln_code=VULNS.NoopDurationPostauth.value,
+                    vuln_code=VULNS.ConnLong.value,
                     vuln_request=f"post-auth NOOP duration ({rating})",
                 )
         elif result_postauth:

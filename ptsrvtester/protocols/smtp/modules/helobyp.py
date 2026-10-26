@@ -35,7 +35,6 @@ def _stream_helo_bypass_tested_title(e) -> None:
         return
     e._ptprint_raw("Tested values", bullet_type="TITLE", condition=True, indent=4)
     e._helobyp_tested_title_shown = True
-    e._flush_terminal()
 
 
 def _stream_helo_bypass_one_value(
@@ -51,7 +50,6 @@ def _stream_helo_bypass_one_value(
     e._helobyp_streamed_live = True
     msg, bullet = _helobyp_value_line(name, bypass, ehlo_accepted)
     e._ptprint_raw(msg, bullet_type=bullet, condition=True, indent=8)
-    e._flush_terminal()
 
 
 def test_helo_bypass(e) -> HeloBypassResult:
@@ -309,6 +307,14 @@ def test_helo_bypass(e) -> HeloBypassResult:
 
             # 4. Evaluate: 250=CRITICAL, 530=CORRECT, 550/554=REJECTED
             if rcpt_status in (250, 251):
+                e.note_poc(
+                    VULNS.HeloBypass.value,
+                    (f"EHLO {helo_value}", f"{ehlo_status} {' '.join(ehlo_reply_str.split())}"),
+                    (
+                        f"RCPT TO:<{rcpt_external}>",
+                        f"{rcpt_status} {' '.join(e.bytes_to_str(rcpt_reply).split())}",
+                    ),
+                )
                 if port_hint == "submission":
                     submission_bypass.append(helo_value)
                 else:

@@ -11,7 +11,7 @@ def run(ctx):
     try:
         pop3 = ctx.connect(debug=ctx.debug)
         try:
-            enabled = auth_anonymous(pop3, debug=ctx.debug)
+            enabled, pairs = auth_anonymous(pop3, debug=ctx.debug)
         finally:
             pop3.close()
     except Exception as e:
@@ -22,6 +22,8 @@ def run(ctx):
         ctx.out("AUTH ANONYMOUS timed out (not confirmed)", "WARNING", indent=4)
     elif enabled:
         ctx.out("Enabled", "VULN", indent=4)
+        if pairs:
+            ctx.report.note_poc(VULNS.Anonymous.value, *pairs)
         ctx.report.add_vulnerability(
             vuln_code=VULNS.Anonymous.value,
             vuln_request="anonymous authentication",

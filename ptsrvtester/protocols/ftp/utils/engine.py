@@ -76,6 +76,8 @@ class FtpEngine:
         self.do_brute = check_if_brute(args)
         self._output_lock = threading.Lock()
         self.results = FTPResults()
+        self.ptjsonlib = None
+        self._vuln_poc: dict[str, str] = {}
 
     def bind_ctx(self, ctx) -> "FtpEngine":
         self.out = ctx.out
@@ -83,6 +85,8 @@ class FtpEngine:
         self.report = getattr(ctx, "report", self.report)
         self.use_json = bool(ctx.json)
         self._ctx = ctx
+        if getattr(ctx, "ptjsonlib", None) is not None:
+            self.ptjsonlib = ctx.ptjsonlib
         return self
 
     @staticmethod
@@ -119,28 +123,46 @@ class FtpEngine:
         s = (text or "").strip()
         return len(s) >= 3 and s[:3].isdigit()
 
-    def _dbg(self, msg: str, *, indent: int = 4) -> None:
-        """Verbose-only (-vv) line via ctx.debug / ADDITIONS."""
-        try:
-            self.debug(msg, indent=indent)
-        except TypeError:
-            self.debug(msg)
+    def _add_to_json_log(self, line: str) -> None:
+        if not self.use_json or not line:
+            return
+        ptjsonlib = getattr(self, "ptjsonlib", None)
+        add_to_log = getattr(ptjsonlib, "add_to_log", None) if ptjsonlib is not None else None
+        if callable(add_to_log):
+            add_to_log(line)
 
-    def _flush_terminal(self) -> None:
-        """Flush PrintLock so a -vv line appears immediately above its result."""
-        if self.use_json:
+    def note_poc(self, code: str, *pairs: tuple[str, str]) -> None:
+        """Remember the Send/Receive lines that prove one vulnerability.
+
+        Later pairs for the same code are ignored. The full session stays in
+        ``results.log``; this is only the proving snippet.
+        """
+        if not code or code in self._vuln_poc or not pairs:
             return
+        lines: list[str] = []
+        for send, recv in pairs:
+            if not send:
+                continue
+            recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
+            lines.append(f"Send: {send}")
+            lines.append(f"Receive: {recv_s}")
+        if lines:
+            self._vuln_poc[code] = "\r\n".join(lines)
+
+    def _dbg(self, msg: str, *, indent: int = 4) -> None:
+        """Breadcrumb. ``ctx.debug`` logs it always and prints it on ``-vv``."""
         ctx = getattr(self, "_ctx", None)
-        if ctx is None:
+        dbg = getattr(ctx, "debug", None) if ctx is not None else None
+        if callable(dbg):
+            try:
+                dbg(msg, indent=indent)
+            except TypeError:
+                dbg(msg)
             return
-        lock = getattr(ctx, "print_lock", None)
-        if lock is None:
-            return
-        chunk = lock.get_output_string()
-        if chunk:
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            lock.output_string = ""
+        if self.use_json:
+            for line in (str(msg).splitlines() or [str(msg)]):
+                if line:
+                    self._add_to_json_log(line)
 
     def _dbg_extra_lines(self, text: str | None, *, max_lines: int = 12) -> None:
         if not text:
@@ -153,6 +175,10 @@ class FtpEngine:
         if self.use_json and not json:
             return
         if json and not self.use_json:
+            return
+        if json:
+            sys.stdout.write(string if str(string).endswith("\n") else f"{string}\n")
+            sys.stdout.flush()
             return
         if title:
             cat, color = "INFO", True
@@ -354,7 +380,9 @@ class FtpEngine:
         """
         try:
             self._dbg("USER anonymous")
-            self.ftp.login()
+            resp = self.ftp.login()
+            if str(resp or "").strip():
+                self.note_poc(VULNS.Anonymous.value, ("PASS", str(resp).strip()))
             self._dbg("PASS → OK (anonymous)")
             return True
         except ftplib.Error as e:
@@ -951,10 +979,8 @@ class FtpEngine:
 
     def _ftp_dos_print_probe(self, r: FtpDosProbeRow, *, debug: bool) -> None:
         """Section title, file name, then the server reply. -vv trace sits under the file name."""
-        self._flush_terminal()
         self._tprint(self._ftp_dos_section_title(r), "TITLE")
         self._tprint(r.remote_filename, "TEXT", indent=8)
-        self._flush_terminal()
         if debug:
             if r.timed_out:
                 recv = "timed out"
@@ -971,12 +997,10 @@ class FtpEngine:
                     self._dbg(f"DELE {r.remote_filename} → OK", indent=12)
                 elif r.delete_error:
                     self._dbg(f"DELE {r.remote_filename} → {self._snip(r.delete_error)}", indent=12)
-            self._flush_terminal()
         bullet, text = self._ftp_dos_reply(r)
         self._tprint(text, bullet, indent=12)
         if r.stor_ok and not r.delete_ok:
             self._tprint("Cleanup failed", "WARNING", indent=12)
-        self._flush_terminal()
 
     def _ftp_dos_emit_probe(self, r: FtpDosProbeRow) -> None:
         if self.use_json:
@@ -1113,7 +1137,6 @@ class FtpEngine:
                 if row.cleanup_failed:
                     self._tprint("Cleanup failed", "WARNING")
                 self._enumpath_streamed = True
-            self._flush_terminal()
 
     @staticmethod
     def _enumpath_text(row: PathEnumResult) -> str:
@@ -1476,7 +1499,6 @@ class FtpEngine:
             f"Path enumeration: {len(directories)} directories, {len(files)} files, "
             f"depth={depth}, threads={enum_threads}"
         )
-        self._flush_terminal()
         flat: list[PathEnumResult] = list(self._enum_login_directory(creds, files))
         if not directories:
             return flat
@@ -1941,7 +1963,6 @@ class FtpEngine:
             return
         self._tprint(text, bullet)
         self._modes_streamed = True
-        self._flush_terminal()
 
     def _modes_report_passive(self, ok: bool, err: str | None) -> None:
         if ok:
@@ -2117,7 +2138,6 @@ class FtpEngine:
         probes: list[PasvPortRangeProbe] = []
         ports_ok: list[int] = []
 
-        self._flush_terminal()
         for i in range(sample_count):
             ftp = self.connect()
             err: str | None = None
@@ -2138,7 +2158,6 @@ class FtpEngine:
                     ftp.close()
                 except Exception:
                     pass
-                self._flush_terminal()
             probes.append(PasvPortRangeProbe(sample_index=i, data_port=port, error=err))
 
         ok_t = tuple(ports_ok)
@@ -2194,7 +2213,6 @@ class FtpEngine:
             return
         self._tprint(text, bullet)
         self._pasvport_streamed = True
-        self._flush_terminal()
 
     def _pasvport_report(self, ppr: PasvPortRangeResult) -> None:
         """One verdict. Sample lines are -vv only and already flushed."""
@@ -2414,7 +2432,6 @@ class FtpEngine:
             return
         self._tprint(text, bullet)
         self._connlim_streamed = True
-        self._flush_terminal()
 
     def _connlim_idle_line(self, label: str, measured: float, exceeded: bool, threshold: float, cap: float) -> bool:
         """Print one idle verdict. Return True when --duration is too short to decide."""
@@ -2504,8 +2521,6 @@ class FtpEngine:
                     sys.stdout.flush()
                     live_dirty = False
             self._dbg(msg)
-            if bool(getattr(self.args, "debug", False)):
-                self._flush_terminal()
 
         def _close_all(rows: list) -> None:
             for ftp in rows:
@@ -2613,7 +2628,6 @@ class FtpEngine:
                 self.out(f"Timeouts during connecting {est_timeout}", "TITLE", indent=4)
                 self.out(f"Dropped while idle {dropped} connections", "TITLE", indent=4)
                 self._connlim_streamed = True
-                self._flush_terminal()
             if connected <= 0:
                 self._connlim_line(
                     "Could not open any connection. Connection limit was not tested.",
@@ -2969,8 +2983,6 @@ class FtpEngine:
                     landed = made.strip().strip('"').strip("'")
             except Exception as e:
                 self._dbg(f"MKD {rel!r} → {self._snip(str(e))}")
-                if not self.use_json:
-                    self._flush_terminal()
                 return False
             try:
                 ftp.cwd(rel)
@@ -2990,15 +3002,11 @@ class FtpEngine:
                 pass
         if outside:
             self._chroot_line("../" + name, "VULN")
-        elif not self.use_json:
-            self._flush_terminal()
         if not created:
             return False
         removed = self._chroot_rmd_probe(creds, [rel, landed or ""], name)
         if not removed:
             self._chroot_line("Cleanup failed", "WARNING")
-        elif not self.use_json:
-            self._flush_terminal()
         return outside
 
     def _chroot_dotdot_chain(self, creds: Creds, max_steps: int | None = None) -> ChrootDotdotResult:
@@ -3050,7 +3058,6 @@ class FtpEngine:
             return
         self._tprint(text, bullet)
         self._chroot_streamed = True
-        self._flush_terminal()
 
     def test_chroot_audit(self, creds: Creds) -> ChrootAuditResult:
         """PTL-SVC-FTP-CHROOT: CWD to host-like paths, .. chain, RETR of passwd/shadow, MKD via ../."""
@@ -3094,12 +3101,9 @@ class FtpEngine:
                 if self._chroot_cwd_landed(pth, row):
                     self._chroot_line(pth, "VULN")
                 elif row.error_or_reply and self._ftp_text_is_unconfirmed(row.error_or_reply):
-                    if not self.use_json:
-                        self._flush_terminal()
+                    pass
                 else:
                     self._chroot_line(pth, "NOTVULN")
-            elif not self.use_json:
-                self._flush_terminal()
 
         dot = self._chroot_dotdot_chain(creds)
         pwd0n = self._chroot_norm_pwd(pwd_initial)
@@ -3110,8 +3114,6 @@ class FtpEngine:
                 dotdot_escape = True
         if dotdot_escape:
             self._chroot_line("..", "VULN")
-        elif not self.use_json:
-            self._flush_terminal()
 
         home_parent_ok = any(self._chroot_cwd_landed("/home", r) for r in rows if r.path == "/home")
         home_sibling = bool(
@@ -3130,8 +3132,6 @@ class FtpEngine:
             confirmed = True
         if passwd_ok:
             self._chroot_line("/etc/passwd", "VULN")
-        elif not self.use_json:
-            self._flush_terminal()
         passwd_rel_ok, passwd_rel_err, passwd_rel_sz = self._chroot_probe_retr_fresh(
             creds, self._chroot_rel_path("etc/passwd")
         )
@@ -3139,15 +3139,11 @@ class FtpEngine:
             confirmed = True
         if passwd_rel_ok and not passwd_ok:
             self._chroot_line("../etc/passwd", "VULN")
-        elif not self.use_json:
-            self._flush_terminal()
         shadow_ok, shadow_err, shadow_sz = self._chroot_probe_retr_fresh(creds, "/etc/shadow")
         if shadow_ok or not self._ftp_text_is_unconfirmed(shadow_err):
             confirmed = True
         if shadow_ok:
             self._chroot_line("/etc/shadow", "VULN")
-        elif not self.use_json:
-            self._flush_terminal()
         shadow_rel_ok, shadow_rel_err, shadow_rel_sz = self._chroot_probe_retr_fresh(
             creds, self._chroot_rel_path("etc/shadow")
         )
@@ -3155,8 +3151,6 @@ class FtpEngine:
             confirmed = True
         if shadow_rel_ok and not shadow_ok:
             self._chroot_line("../etc/shadow", "VULN")
-        elif not self.use_json:
-            self._flush_terminal()
         write_outside = self._chroot_probe_mkd_escape(creds, pwd_initial)
         if not confirmed:
             self._chroot_line("Could not connect. Isolation was not tested.", "WARNING")
@@ -4542,12 +4536,10 @@ class FtpEngine:
                 fu = fu_body or "(no reply)"
             self._dbg(f"Send: {p.follow_up_command}")
             self._dbg(f"Receive: {fu}")
-        self._flush_terminal()
         bullet, text, notes = self._inv_probe_verdict(p)
         self._tprint(text, bullet)
         for note in notes:
             self._tprint(note, "TEXT", indent=8)
-        self._flush_terminal()
         self._inv_terminal_emitted = True
 
     def _print_invalid_cmd_audit_terminal(self, inv: InvalidCmdAuditResult) -> None:
@@ -4658,7 +4650,6 @@ class FtpEngine:
         if getattr(self, "_cmd_audit_emit", False) and not self.use_json:
             self._print_cmd_audit_terminal(result)
             self._cmd_audit_streamed = True
-            self._flush_terminal()
         return result
 
     def _cmd_passive_audit_blob(self, ca: CommandAuditResult | None) -> str:
@@ -4781,7 +4772,6 @@ class FtpEngine:
                 bullet, text = self._cmd_active_line(row)
                 self._tprint(text, bullet)
                 self._cmd_active_streamed = True
-                self._flush_terminal()
 
         try:
             ftp = self.connect()
@@ -4832,7 +4822,6 @@ class FtpEngine:
         if ce and not self.use_json:
             self._tprint("Cleanup failed", "WARNING")
             self._cmd_active_streamed = True
-            self._flush_terminal()
         return CommandAuditActiveResult(
             timeout_s, probe_name, len(cleanup_errs) == 0, ce, tuple(probes), None
         )
@@ -5302,13 +5291,11 @@ class FtpEngine:
                 reconnect_ok = False
             if not self.use_json:
                 self._dbg("Reconnect: ok" if reconnect_ok else "Reconnect: failed")
-                self._flush_terminal()
                 if not reconnect_ok:
                     where = ""
                     if getattr(self, "_inv_show_phase", False):
                         where = "before login " if phase == "preAuth" else "after login "
                     self._tprint(f"A new connection {where}was refused after the drop", "VULN")
-                    self._flush_terminal()
 
         rating = self._inv_rate_session(
             tuple(probes_out), had_drop, reconnect_ok, null_suspect
@@ -5399,9 +5386,7 @@ class FtpEngine:
         )
         if post_login_err and not self.use_json:
             self._dbg(f"After login: {self._snip(post_login_err)}")
-            self._flush_terminal()
             self._tprint("Login failed. Commands after login were not tested.", "WARNING")
-            self._flush_terminal()
             self._inv_login_note_emitted = True
         return InvalidCmdAuditResult(
             timeout,
@@ -5425,6 +5410,7 @@ class FtpEngine:
         port = self.args.target.port
         timeout = 10.0
         plaintext_ok = False
+        plaintext_banner: str | None = None
         auth_tls_ok = False
         tls_ok = False
         plaintext_incomplete = False
@@ -5438,9 +5424,15 @@ class FtpEngine:
             try:
                 ftp = ftplib.FTP()
                 ftp.connect(host, port, timeout=timeout)
-                _ = ftp.welcome
+                welcome = ftp.welcome
+                if isinstance(welcome, (bytes, bytearray)):
+                    plaintext_banner = welcome.decode(errors="replace").strip()
+                elif welcome:
+                    plaintext_banner = str(welcome).strip()
                 plaintext_ok = True
                 self._dbg(f"Plaintext welcome: {self._snip(ftp.welcome)}")
+                if plaintext_banner:
+                    self.note_poc(VULNS.Sniffable.value, ("(connect)", plaintext_banner))
                 ftp.close()
             except Exception as e:
                 plaintext_incomplete = self._ftp_text_is_unconfirmed(str(e))
@@ -5510,6 +5502,7 @@ class FtpEngine:
             plaintext_incomplete,
             auth_tls_incomplete,
             tls_incomplete,
+            plaintext_banner,
         )
 
     def _stream_banner_result(self) -> None:
@@ -5657,7 +5650,6 @@ class FtpEngine:
                     indent=4,
                 )
         self._commands_streamed = True
-        self._flush_terminal()
 
     def _stream_encryption_result(self) -> None:
         """Stream encryption test result to terminal (thread-safe)."""
@@ -6002,6 +5994,35 @@ class FtpEngine:
         re.I,
     )
 
+    _FTP_DEFAULT_USERS = frozenset({"anonymous", "ftp", "guest", "admin", "root"})
+
+    @classmethod
+    def _ftp_default_account(cls, user: str, password: str) -> tuple[bool, bool]:
+        """Default account name, and whether the password is the paired default."""
+        name = (user or "").strip().lower()
+        secret = (password or "").strip().lower()
+        if name not in cls._FTP_DEFAULT_USERS:
+            return False, False
+        classic = secret in {"", name, "anonymous", "ftp", "guest", "email"}
+        return True, classic
+
+    def _ftp_brute_note_hit(self, cred: Creds, user_reply: str, pass_reply: str) -> None:
+        """First accepted login proves the weak-password and default-account codes."""
+        pairs: list[tuple[str, str]] = []
+        if user_reply:
+            pairs.append((f"USER {cred.user}", user_reply))
+        if pass_reply:
+            pairs.append(("PASS", pass_reply))
+        if not pairs:
+            return
+        self.note_poc(VULNS.WeakCredentials.value, *pairs)
+        self.note_poc(VULNS.WeakCreds.value, *pairs)
+        is_default, classic_pw = self._ftp_default_account(cred.user, cred.passw)
+        if is_default:
+            self.note_poc(VULNS.DefAcc.value, *pairs)
+        if classic_pw:
+            self.note_poc(VULNS.DefAccPw.value, *pairs)
+
     def _ftp_brute_hit(self, output, cred: Creds) -> None:
         if output is None or self.use_json:
             return
@@ -6078,6 +6099,7 @@ class FtpEngine:
                     output,
                 )
                 if ukind == "ok":
+                    self._ftp_brute_note_hit(cred, uline, "")
                     self._ftp_brute_hit(output, cred)
                 block = self._ftp_brute_block_paren(ucode, uline) if ukind == "blocked" else None
                 return ukind, block
@@ -6089,6 +6111,7 @@ class FtpEngine:
                 output,
             )
             if pkind == "ok":
+                self._ftp_brute_note_hit(cred, uline, pline)
                 self._ftp_brute_hit(output, cred)
             block = self._ftp_brute_block_paren(pcode, pline) if pkind == "blocked" else None
             return pkind, block
@@ -6531,8 +6554,250 @@ class FtpEngine:
     # region output
 
 
+    _CMD_VULN_CODES = frozenset({
+        "PTV-SVC-FTP-CMDEXEC",
+        "PTV-SVC-FTP-CMDCHMOD",
+        "PTV-SVC-FTP-CMDCHOWN",
+        "PTV-SVC-FTP-CMDCOPY",
+        "PTV-SVC-FTP-CMDUMASK",
+        "PTV-SVC-FTP-CMDLN",
+    })
+
+    @staticmethod
+    def _cmd_vuln_code(token: str) -> str | None:
+        text = f" {token.upper()} "
+        if any(mark in text for mark in (" EXEC ", " EXECUTE ", " RUN ")):
+            return VULNS.CmdExec.value
+        if " CHMOD " in text:
+            return VULNS.CmdChmod.value
+        if " CHOWN " in text:
+            return VULNS.CmdChown.value
+        if " CPFR " in text or " CPTO " in text:
+            return VULNS.CmdCopy.value
+        if " UMASK " in text:
+            return VULNS.CmdUmask.value
+        if any(mark in text for mark in (" SYMLINK ", " LINK ", " LN ")):
+            return VULNS.CmdLn.value
+        return None
+
+    def _cmd_poc(self, code: str) -> str:
+        ca = getattr(self.results, "cmd_audit", None)
+        if ca is None:
+            return ""
+        blobs = {
+            "helpPreAuth": ("HELP", ca.help_pre_auth),
+            "featResponse": ("FEAT", ca.feat_response),
+            "siteHelpPreAuth": ("SITE HELP", ca.site_help_pre),
+            "siteHelpAllPreAuth": ("SITE HELP", ca.site_help_all_pre),
+            "siteHelpPostAuth": ("SITE HELP", ca.site_help_post),
+            "siteHelpAllPostAuth": ("SITE HELP", ca.site_help_all_post),
+        }
+        for risk in ca.matched_risks:
+            if risk.tier not in ("critical", "high") or self._cmd_vuln_code(risk.token) != code:
+                continue
+            send, blob = blobs.get(risk.source, ("", None))
+            line = self._cmd_surface_line(blob, risk.token)
+            if send and line:
+                return self._poc_pair(send, line)
+        return ""
+
+    def _conn_limit_vuln_entries(self, cl) -> list[dict]:
+        """One code per limit the connection probe actually crossed."""
+        factors = list(cl.risk_factors)
+        groups = (
+            (VULNS.ConnCntIp.value, ("Connection limit", "per-account")),
+            (VULNS.ConnLong.value, ("idle timeout",)),
+            (VULNS.ConnRate.value, ("Ban/backoff", "PASV")),
+        )
+        entries: list[dict] = []
+        for code, needles in groups:
+            matched = [factor for factor in factors if any(needle in factor for needle in needles)]
+            if not matched:
+                continue
+            entries.append({
+                "vuln_code": code,
+                "vuln_request": "Connection / idle / PASV probes (--count / --duration)",
+                "vuln_response": "; ".join(matched),
+            })
+        return entries
+
+    def _poc_pair(self, send: str, recv) -> str:
+        recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
+        return f"Send: {send}\r\nReceive: {recv_s}"
+
+    def _cmd_surface_line(self, blob: str | None, token: str) -> str:
+        needle = (token or "").strip().lower()
+        if needle.startswith("feat "):
+            needle = needle[5:].strip()
+        if not blob or not needle:
+            return ""
+        for raw in blob.replace("\r", "").splitlines():
+            line = " ".join(raw.split())
+            if needle in line.lower():
+                return line[:200]
+        return ""
+
+    def _poc_for(self, code: str | None) -> str:
+        """Proving exchange only. Empty when the result has no server reply."""
+        if not code:
+            return ""
+        noted = self._vuln_poc.get(code)
+        if noted:
+            return noted
+        if code == "PTV-SVC-BANNER":
+            info = self.results.info
+            if info is not None and info.banner:
+                return self._poc_pair("(connect)", info.banner)
+            return ""
+        if code in self._CMD_VULN_CODES:
+            return self._cmd_poc(code)
+        if code in (VULNS.Bounce.value, VULNS.FtpActivePolicy.value):
+            aa = getattr(self.results, "active_audit", None)
+            if aa is None:
+                return ""
+            names = ("port_foreign",) if code == VULNS.Bounce.value else ("port_low", "port_own_high")
+            blocks = []
+            for step in aa.steps:
+                if step.code != 200 or step.name not in names:
+                    continue
+                if step.command and step.reply and self._ftp_server_reply(step.reply):
+                    blocks.append(self._poc_pair(step.command, step.reply))
+            return "\r\n".join(blocks)
+        if code == VULNS.FtpChrootIsolation.value:
+            ch = getattr(self.results, "chroot_audit", None)
+            if ch is None or not ch.isolation_broken_suspected:
+                return ""
+            home = self._chroot_norm_pwd(ch.pwd_initial)
+            blocks = []
+            for row in ch.cwd_probes:
+                path = row.path or ""
+                if not row.success or not row.pwd_after:
+                    continue
+                if not (path.startswith("/") or ".." in path):
+                    continue
+                if self._chroot_norm_pwd(row.pwd_after) == home and ".." not in path:
+                    continue
+                pwd = " ".join(row.pwd_after.split())
+                blocks.append(f"Send: CWD {path}\r\nSend: PWD\r\nReceive: {pwd}")
+                if len(blocks) >= 4:
+                    break
+            if (
+                not blocks
+                and ch.dotdot_parent_escape_suspected
+                and ch.dotdot is not None
+                and ch.dotdot.pwd_final
+            ):
+                blocks.append(self._poc_pair("PWD", ch.dotdot.pwd_final))
+            return "\r\n".join(blocks)
+        if code == VULNS.FtpInvalidCommandHandling.value:
+            inv = getattr(self.results, "invalid_cmd_audit", None)
+            if inv is None:
+                return ""
+            blocks = []
+            for sess in (inv.pre_auth, inv.post_auth):
+                if sess is None:
+                    continue
+                for probe in sess.probes:
+                    code_n = probe.reply_code
+                    bad_2xx = (
+                        code_n is not None
+                        and 200 <= code_n < 300
+                        and self._inv_2xx_counts_toward_vulnerable(probe.probe_id, code_n)
+                    )
+                    bad_3xx = (
+                        code_n is not None
+                        and 300 <= code_n < 400
+                        and probe.probe_id in self._INV_3XX_CRITICAL_PROBE_IDS
+                    )
+                    bad_login = probe.classification == "null_byte_possible_login_230"
+                    if not (bad_2xx or bad_3xx or bad_login):
+                        continue
+                    sent = (probe.line_sent_preview or "").strip()
+                    recv = (probe.reply_text or "").strip()
+                    if sent and recv:
+                        blocks.append(self._poc_pair(sent, recv))
+                    if (
+                        bad_login
+                        and probe.follow_up_command
+                        and probe.follow_up_reply_snippet
+                    ):
+                        blocks.append(
+                            self._poc_pair(probe.follow_up_command, probe.follow_up_reply_snippet)
+                        )
+                    if len(blocks) >= 4:
+                        return "\r\n".join(blocks)
+            return "\r\n".join(blocks)
+        if code == VULNS.FtpObsoleteTls.value:
+            inv = getattr(self.results, "invalid_cmd_audit", None)
+            hint = getattr(inv, "tls_handshake_hint", None) if inv is not None else None
+            if hint and str(hint).strip():
+                return self._poc_pair("TLS handshake", str(hint).strip())
+            return ""
+        if code == VULNS.AuthEnum.value:
+            ue = getattr(self.results, "user_enum", None)
+            if ue is None or not ue.enumeration_suspected:
+                return ""
+            ctrl = next(
+                (
+                    row
+                    for row in ue.probes
+                    if row.probe_kind == "control_invalid_random" and not row.error
+                ),
+                None,
+            )
+            base = self._user_enum_probe_signature(ctrl) if ctrl is not None else None
+            hit = next(
+                (
+                    row
+                    for row in ue.probes
+                    if row.probe_kind == "wordlist"
+                    and not row.error
+                    and (base is None or self._user_enum_probe_signature(row) != base)
+                ),
+                None,
+            )
+            blocks = []
+            for row in (ctrl, hit):
+                if row is None:
+                    continue
+                if row.user_reply_line:
+                    blocks.append(self._poc_pair(f"USER {row.username}", row.user_reply_line))
+                if row.user_reply_code in (331, 332) and row.pass_reply_line:
+                    blocks.append(self._poc_pair("PASS", row.pass_reply_line))
+            return "\r\n".join(blocks)
+        if code == VULNS.FtpProcessingResilience.value:
+            dos = getattr(self.results, "dos_audit", None)
+            if dos is None:
+                return ""
+            blocks = []
+            for probe in dos.probes:
+                if not (probe.background_processing_suspected or probe.timed_out):
+                    continue
+                if not probe.stor_reply_snippet or not self._ftp_server_reply(probe.stor_reply_snippet):
+                    continue
+                blocks.append(
+                    self._poc_pair(f"STOR {probe.remote_filename}", probe.stor_reply_snippet)
+                )
+                if len(blocks) >= 2:
+                    break
+            return "\r\n".join(blocks)
+        return ""
+
+    def _add_vulns(self, ptjsonlib, vulns: list[dict], *, node_key: str | None = None) -> None:
+        for entry in vulns:
+            stamped = dict(entry)
+            if not stamped.get("poc"):
+                poc = self._poc_for(stamped.get("vuln_code"))
+                if poc:
+                    stamped["poc"] = poc
+            if node_key:
+                ptjsonlib.add_vulnerability(node_key=node_key, **stamped)
+            else:
+                ptjsonlib.add_vulnerability(**stamped)
+
     def build_json(self, ptjsonlib) -> None:
         """Formats and outputs module results. Skips streamed sections in text mode; JSON always complete."""
+        self.ptjsonlib = ptjsonlib
         properties = {
             "software_type": None,
             "name": "ftp",
@@ -6588,6 +6853,12 @@ class FtpEngine:
                     }
                 }
             )
+            if enc.plaintext_ok:
+                deferred_vulns.append({
+                    "vuln_code": VULNS.Sniffable.value,
+                    "vuln_request": "Cleartext FTP greeting",
+                    "vuln_response": enc.plaintext_banner or "",
+                })
         # Anonymous authentication and access permissions (skip terminal if streamed)
         if (anonymous_error := self.results.anonymous_error) is not None:
             properties.update({"anonymousError": anonymous_error})
@@ -6633,6 +6904,8 @@ class FtpEngine:
         guessing = getattr(self, "_brute_guessing", None)
         if guessing is not None:
             properties.update({"ftpPasswordGuessing": guessing})
+        if guessing == "not_limited":
+            deferred_vulns.append({"vuln_code": VULNS.AuthBlock.value})
         if getattr(self, "_auth_catch_all", None) == "indeterminate":
             properties.update({"catchAll": "indeterminate"})
 
@@ -6678,13 +6951,21 @@ class FtpEngine:
                 else:
                     passw_str = f"passwords: {self.args.passwords}"
 
-                deferred_vulns.append(
-                    {
-                        "vuln_code": VULNS.WeakCreds.value,
-                        "vuln_request": f"{user_str}\n{passw_str}",
-                        "vuln_response": "\n".join(json_lines),
-                    }
-                )
+                request = f"{user_str}\n{passw_str}"
+                response = "\n".join(json_lines)
+                hit_codes = [VULNS.WeakCredentials.value, VULNS.WeakCreds.value]
+                if any(self._ftp_default_account(c.user, c.passw)[0] for c in creds):
+                    hit_codes.append(VULNS.DefAcc.value)
+                if any(self._ftp_default_account(c.user, c.passw)[1] for c in creds):
+                    hit_codes.append(VULNS.DefAccPw.value)
+                for code in hit_codes:
+                    deferred_vulns.append(
+                        {
+                            "vuln_code": code,
+                            "vuln_request": request,
+                            "vuln_response": response,
+                        }
+                    )
 
         # Directory listing
         if (
@@ -6719,6 +7000,15 @@ class FtpEngine:
                 for p in path_list
             ]
             properties.update({"pathEnum": path_enum_json})
+            found_paths = [p.path for p in path_list if p.exists]
+            if found_paths:
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.Wordlist.value,
+                        "vuln_request": "Wordlist CWD / SIZE",
+                        "vuln_response": "; ".join(found_paths[:12]),
+                    }
+                )
 
         # Data mode (passive/active)
         if modes_error := getattr(self.results, "modes_error", None):
@@ -6830,13 +7120,7 @@ class FtpEngine:
             }
             properties.update({"ftpConnLimitsAudit": cl_json})
             if cl.limits_insufficient_suspected:
-                deferred_vulns.append(
-                    {
-                        "vuln_code": VULNS.FtpConnectionLimits.value,
-                        "vuln_request": "Connection / idle / PASV probes (--count / --duration)",
-                        "vuln_response": "; ".join(cl.risk_factors) if cl.risk_factors else cl.detail,
-                    }
-                )
+                deferred_vulns.extend(self._conn_limit_vuln_entries(cl))
 
         # Chroot / user isolation audit (PTL-SVC-FTP-CHROOT)
         if ch_err := getattr(self.results, "chroot_audit_error", None):
@@ -6917,12 +7201,22 @@ class FtpEngine:
                 audit_props["lowPortsAccepted"] = list(aa.low_ports_accepted)
             properties.update({"activeAudit": audit_props})
 
-            if aa.foreign_ip_accepted or aa.low_port_accepted:
+            req = "PASV/PORT policy audit (--active-audit-full)" if aa.full_audit else "PASV/PORT policy audit (-M / --active-audit)"
+            if aa.foreign_ip_accepted:
+                deferred_vulns.append(
+                    {
+                        "vuln_code": VULNS.Bounce.value,
+                        "vuln_request": req,
+                        "vuln_response": (
+                            f"Server returned 200 for PORT to documentation address {doc_net_ip} "
+                            "(FTP bounce / third-party data connection risk per RFC 2577)."
+                        ),
+                    }
+                )
+            if aa.low_port_accepted or aa.list_after_own_port_ok:
                 parts = []
-                if aa.foreign_ip_accepted:
-                    parts.append(
-                        f"Server returned 200 for PORT to documentation address {doc_net_ip} (FTP bounce / third-party data connection risk per RFC 2577)."
-                    )
+                if aa.list_after_own_port_ok:
+                    parts.append("Active mode data transfer was accepted.")
                 if aa.low_port_accepted:
                     lp = ", ".join(str(p) for p in aa.low_ports_accepted) if aa.low_ports_accepted else ""
                     parts.append(
@@ -6930,7 +7224,6 @@ class FtpEngine:
                         + (f" (ports: {lp})" if lp else "")
                         + " (RFC 2577 recommends rejecting < 1024, often 504)."
                     )
-                req = "PASV/PORT policy audit (--active-audit-full)" if aa.full_audit else "PASV/PORT policy audit (-M / --active-audit)"
                 deferred_vulns.append(
                     {
                         "vuln_code": VULNS.FtpActivePolicy.value,
@@ -6959,18 +7252,19 @@ class FtpEngine:
                 "responseTruncated": ca.response_truncated,
             }
             properties.update({"ftpCommandAudit": audit_json})
-            vuln_risks = [r for r in ca.matched_risks if r.tier in ("critical", "high")]
-            if vuln_risks:
-                parts = [f"{r.tier}: {r.token} ({r.source})" for r in vuln_risks]
+            seen_cmd: set[str] = set()
+            for risk in ca.matched_risks:
+                if risk.tier not in ("critical", "high"):
+                    continue
+                code = self._cmd_vuln_code(risk.token)
+                if not code or code in seen_cmd:
+                    continue
+                seen_cmd.add(code)
                 deferred_vulns.append(
                     {
-                        "vuln_code": VULNS.FtpCmdSurface.value,
+                        "vuln_code": code,
                         "vuln_request": "HELP/FEAT/SITE HELP (cmd audit -C)",
-                        "vuln_response": (
-                            "Server advertises risky capabilities: "
-                            + "; ".join(parts)
-                            + ". Listing in HELP/SITE does not prove unprivileged execution; use --cmd-audit-active for safe SITE probes after login."
-                        ),
+                        "vuln_response": f"{risk.tier}: {risk.token} ({risk.source})",
                     }
                 )
 
@@ -7122,10 +7416,10 @@ class FtpEngine:
                 ],
             }
             properties.update({"ftpUserEnumeration": ue_json})
-            if ue.enumeration_suspected or ue.timing_anomaly_suspected:
+            if ue.enumeration_suspected:
                 deferred_vulns.append(
                     {
-                        "vuln_code": VULNS.FtpUserEnumeration.value,
+                        "vuln_code": VULNS.AuthEnum.value,
                         "vuln_request": "USER/PASS with fixed wrong password (-eu / --user-enum)",
                         "vuln_response": (
                             ue.detail
@@ -7272,8 +7566,7 @@ class FtpEngine:
         )
         ptjsonlib.add_node(ftp_node)
         node_key = ftp_node["key"]
-        for v in deferred_vulns:
-            ptjsonlib.add_vulnerability(node_key=node_key, **v)
+        self._add_vulns(ptjsonlib, deferred_vulns, node_key=node_key)
 
         ptjsonlib.set_status("finished", "")
         self._ptprint(ptjsonlib.get_result_json(), json=True)

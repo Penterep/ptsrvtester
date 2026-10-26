@@ -1,6 +1,4 @@
 """BRUTE — catch-all probe + USER/PASS bruteforce."""
-import sys
-
 from ..utils.connection import login_bruteforce, test_catch_all
 from ..utils.helpers import apply_default_brute_creds
 
@@ -13,7 +11,6 @@ def _section(ctx, title: str) -> None:
     if getattr(ctx, "json", False):
         return
     ctx.out(title, "INFO", colortext=True)
-    _flush_pop3(ctx)
 
 
 def run(ctx):
@@ -25,7 +22,6 @@ def run(ctx):
     catch_all = test_catch_all(ctx.args, debug=ctx.debug)
     if catch_all == "unreachable":
         ctx.out("Catch-all timed out or could not connect. Not confirmed.", "WARNING", indent=4)
-        _flush_pop3(ctx)
         return
     if catch_all == "indeterminate":
         ctx.out(
@@ -37,7 +33,6 @@ def run(ctx):
     else:
         ctx.out("Not configured (server rejects invalid creds)", "NOTVULN", indent=4)
 
-    _flush_pop3(ctx)
     _section(ctx, "Guessing (credential bruteforce)")
     creds = login_bruteforce(ctx)
     ctx.report.brute_creds = creds
@@ -47,19 +42,6 @@ def run(ctx):
         word = "login" if n == 1 else "logins"
         ctx.out(f"Found {n} valid {word}", "TITLE", colortext=False, indent=4)
     _pop3_guessing_line(ctx, guessing)
-
-
-def _flush_pop3(ctx) -> None:
-    if getattr(ctx, "json", False):
-        return
-    lock = getattr(ctx, "print_lock", None)
-    if lock is None:
-        return
-    chunk = lock.get_output_string()
-    if chunk:
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
-        lock.output_string = ""
 
 
 def _pop3_guessing_line(ctx, guessing: str | None) -> None:

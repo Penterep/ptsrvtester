@@ -4,14 +4,11 @@ from __future__ import annotations
 import argparse
 import importlib
 import socket
-import sys
-
-from ptlibs.ptprinthelper import out_if
-from ptlibs.threads import printlock
 
 from .._base import BaseArgs, BaseMain
-from .._shared.utils.connection import banner_tcp_adapter
+from .._shared.utils.connection import banner_tcp_adapter, end_if_target_unreachable
 from .utils.cli import SMTPArgs
+from .utils.helpers import get_mode
 from .utils.registry import _apply_smtp_tests, _smtp_parse_test_codes, smtp_auto_suite
 from .utils.engine import SmtpEngine
 from .utils.report import SmtpReport
@@ -32,8 +29,6 @@ class SMTP(BaseMain):
             )
         _apply_smtp_tests(args)
         SmtpEngine._validate_smtp_args(args)
-        if not getattr(args, "module_threads", None):
-            args.module_threads = 1
         self.report = SmtpReport()
         self.engine = SmtpEngine(args, ptjsonlib=ptjsonlib, report=self.report)
         codes = _smtp_parse_test_codes(getattr(args, "tests", None))
@@ -51,7 +46,7 @@ class SMTP(BaseMain):
         return "OPENREL"
 
     def _run_module(self, code: str, discovered, extras: dict) -> None:
-        """Heading now; ``-vv`` live; verdicts through ``ctx.out`` (IMAP/POP3)."""
+        """One test, serial. ``ctx.debug`` logs every note and prints it on ``-vv``."""
         if (
             self.engine.run_all_mode
             and code in ("OPENREL", "RELANON")
@@ -59,30 +54,14 @@ class SMTP(BaseMain):
         ):
             return
         entry = discovered[code]
-        lock = printlock.PrintLock()
-        ctx = self._make_context(lock, extras)
-        if not self.use_json:
-            def live_debug(string="", *, indent=4):
-                if not ctx.verbose:
-                    return
-                line = out_if(string, "ADDITIONS", True, colortext=True, indent=indent)
-                if line:
-                    sys.stdout.write(line if line.endswith("\n") else line + "\n")
-                    sys.stdout.flush()
-            ctx.debug = live_debug
-        if entry.label.strip() and not self.use_json:
-            sys.stdout.write(out_if(entry.label, "INFO", True, colortext=True) + "\n")
-            sys.stdout.flush()
+        ctx = self._make_context(extras)
+        ctx.module_code = code
+        if entry.label.strip():
+            ctx.out(entry.label, "INFO", colortext=True)
         try:
             entry.module.run(ctx)
         except Exception as e:
             ctx.out(f"Error in module {code}: {e}", "ERROR")
-        chunk = lock.get_output_string()
-        if chunk and not self.use_json:
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-        with self._lock:
-            self._outputs[code] = "" if not self.use_json else chunk
 
     def _prepare_target(self) -> None:
         target = self.args.target
@@ -128,6 +107,11 @@ class SMTP(BaseMain):
             "report": self.report,
             "rate_limit_adapter": banner_tcp_adapter(self.target[0], self.target[1], self.args),
         }
+
+    def run(self) -> None:
+        mode = "TLS" if (self.args.tls or self.args.target.port == 465) else get_mode(self.args)
+        end_if_target_unreachable(self, mode=mode, smtp_port_hint=True)
+        super().run()
 
     def output(self) -> None:
         if self.report.connect_error and self.use_json and not getattr(self.engine.results, "info_error", None):

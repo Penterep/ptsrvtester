@@ -9,20 +9,6 @@ __MODULECODE__ = "NOOP2"
 __ORDER__ = 86
 
 
-def _flush_ctx(ctx) -> None:
-    if getattr(ctx, "json", False):
-        return
-    lock = getattr(ctx, "print_lock", None)
-    if lock is None:
-        return
-    chunk = lock.get_output_string()
-    if chunk:
-        import sys
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
-        lock.output_string = ""
-
-
 def _emit_noop2_result(ctx, result) -> None:
     from ..utils.results import (
         NOOP2_AVG_TIME_OK_MAX_SECONDS,
@@ -82,7 +68,6 @@ def _emit_noop2_result(ctx, result) -> None:
                     "TEXT",
                     indent=8,
                 )
-    _flush_ctx(ctx)
 
 
 def _maybe_add_conn_limit_vuln(ctx, result, vuln_code: str, phase: str) -> None:

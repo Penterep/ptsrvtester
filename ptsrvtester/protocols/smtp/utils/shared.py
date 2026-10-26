@@ -178,10 +178,10 @@ class SharedMixin:
         if info and getattr(info, "ehlo", None):
             host = _get_hostname_from_ehlo_raw(info.ehlo)
             if host and "." in host:
-                psl_domain = _registrable_domain_psl(host)
-                if psl_domain:
-                    return psl_domain, "ehlo"
-                return host, "ehlo"
+                    psl_domain = _registrable_domain_psl(host)
+                    if psl_domain:
+                        return psl_domain, "ehlo"
+                    return host, "ehlo"
         if self.fqdn and "." in self.fqdn and "pentereptools" not in self.fqdn.lower():
             psl_domain = _registrable_domain_psl(self.fqdn)
             if psl_domain:

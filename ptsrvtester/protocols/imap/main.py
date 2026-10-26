@@ -4,15 +4,11 @@ from __future__ import annotations
 import argparse
 import importlib
 import socket
-import sys
-
-from ptlibs.ptprinthelper import out_if
-from ptlibs.threads import printlock
 
 from .._base import BaseArgs, BaseMain
-from .._shared.utils.connection import banner_tcp_adapter
+from .._shared.utils.connection import banner_tcp_adapter, end_if_target_unreachable
 from .utils.cli import IMAPArgs, validate_imap_selection
-from .utils.helpers import apply_default_brute_creds
+from .utils.helpers import apply_default_brute_creds, get_mode
 from .utils.engine import ImapEngine
 from .utils.registry import IMAP_DEFAULT_SUITE
 from .utils.report import ImapReport
@@ -36,8 +32,6 @@ class IMAP(BaseMain):
         codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
         if "BRUTE" in codes and "ALL" not in codes:
             apply_default_brute_creds(args)
-        if not getattr(args, "module_threads", None):
-            args.module_threads = 1
         self.report = ImapReport()
         self.engine = ImapEngine(args, report=self.report)
         super().__init__(args, ptjsonlib)
@@ -46,32 +40,16 @@ class IMAP(BaseMain):
         return importlib.import_module(f"ptsrvtester.protocols.imap.modules.{name}")
 
     def _run_module(self, code: str, discovered, extras: dict) -> None:
-        """Heading now; ``-vv`` live; verdicts when the test finishes."""
+        """One test, serial. ``ctx.debug`` logs every note and prints it on ``-vv``."""
         entry = discovered[code]
-        lock = printlock.PrintLock()
-        ctx = self._make_context(lock, extras)
-        if not self.use_json:
-            def live_debug(string="", *, indent=4):
-                if not ctx.verbose:
-                    return
-                line = out_if(string, "ADDITIONS", True, colortext=True, indent=indent)
-                if line:
-                    sys.stdout.write(line if line.endswith("\n") else line + "\n")
-                    sys.stdout.flush()
-            ctx.debug = live_debug
-        if entry.label.strip() and not self.use_json:
-            sys.stdout.write(out_if(entry.label, "INFO", True, colortext=True) + "\n")
-            sys.stdout.flush()
+        ctx = self._make_context(extras)
+        ctx.module_code = code
+        if entry.label.strip():
+            ctx.out(entry.label, "INFO", colortext=True)
         try:
             entry.module.run(ctx)
         except Exception as e:
             ctx.out(f"Error in module {code}: {e}", "ERROR")
-        chunk = lock.get_output_string()
-        if chunk and not self.use_json:
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-        with self._lock:
-            self._outputs[code] = "" if not self.use_json else chunk
 
     def _prepare_target(self) -> None:
         target = self.args.target
@@ -113,6 +91,10 @@ class IMAP(BaseMain):
             "report": self.report,
             "rate_limit_adapter": banner_tcp_adapter(self.target[0], self.target[1], self.args),
         }
+
+    def run(self) -> None:
+        end_if_target_unreachable(self, mode=get_mode(self.args))
+        super().run()
 
     def output(self) -> None:
         if self.report.connect_error and self.use_json:

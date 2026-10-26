@@ -4,23 +4,19 @@ from __future__ import annotations
 import argparse
 import importlib
 import socket
-import sys
-
-from ptlibs.ptprinthelper import out_if
-from ptlibs.threads import printlock
 
 from .._base import BaseArgs, BaseMain
-from .._shared.utils.connection import banner_tcp_adapter
+from .._shared.utils.connection import banner_tcp_adapter, end_if_target_unreachable
 from .utils.cli import POP3Args, validate_brute_selection
 from .utils.helpers import (
     apply_default_brute_creds,
-    brute_discovered_description,
     brute_sorted_creds,
     brute_weak_request,
     brute_weak_response,
+    get_mode,
 )
 from .utils.results import VULNS
-from .utils.connection import ServerInfoCache, connect_pop3
+from .utils.connection import ServerInfoCache, _pop3_default_account, connect_pop3
 from .utils.registry import POP3_DEFAULT_SUITE
 from .utils.report import Pop3Report
 
@@ -43,9 +39,6 @@ class POP3(BaseMain):
         codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
         if "BRUTE" in codes and "ALL" not in codes:
             apply_default_brute_creds(args)
-        # Ensure serial module runs unless operator overrides.
-        if not getattr(args, "module_threads", None):
-            args.module_threads = 1
         self.report = Pop3Report()
         super().__init__(args, ptjsonlib)
 
@@ -58,35 +51,19 @@ class POP3(BaseMain):
         return importlib.import_module(f"ptsrvtester.protocols.pop3.modules.{name}")
 
     def _run_module(self, code: str, discovered, extras: dict) -> None:
-        """Heading now; ``-vv`` live; verdicts when the test finishes.
+        """One test, serial. ``ctx.debug`` logs every note and prints it on ``-vv``.
 
         CAPA uses an empty label (it prints its own ``[+] CAPA command …`` titles).
         """
         entry = discovered[code]
-        lock = printlock.PrintLock()
-        ctx = self._make_context(lock, extras)
-        if not self.use_json:
-            def live_debug(string="", *, indent=4):
-                if not ctx.verbose:
-                    return
-                line = out_if(string, "ADDITIONS", True, colortext=True, indent=indent)
-                if line:
-                    sys.stdout.write(line if line.endswith("\n") else line + "\n")
-                    sys.stdout.flush()
-            ctx.debug = live_debug
-        if entry.label.strip() and not self.use_json:
-            sys.stdout.write(out_if(entry.label, "INFO", True, colortext=True) + "\n")
-            sys.stdout.flush()
+        ctx = self._make_context(extras)
+        ctx.module_code = code
+        if entry.label.strip():
+            ctx.out(entry.label, "INFO", colortext=True)
         try:
             entry.module.run(ctx)
         except Exception as e:
             ctx.out(f"Error in module {code}: {e}", "ERROR")
-        chunk = lock.get_output_string()
-        if chunk and not self.use_json:
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-        with self._lock:
-            self._outputs[code] = "" if not self.use_json else chunk
 
     def _prepare_target(self) -> None:
         target = self.args.target
@@ -140,14 +117,22 @@ class POP3(BaseMain):
     def _brute_vuln_entries(self) -> list[dict]:
         vulns: list[dict] = []
         if self.report.properties.get("pop3PasswordGuessing") == "not_limited":
-            vulns.append({"vuln_code": VULNS.Brute.value})
+            vulns.append({"vuln_code": VULNS.AuthBlock.value})
         creds = brute_sorted_creds(self.report.brute_creds)
         if creds:
-            vulns.append({
-                "vuln_code": VULNS.WeakCreds.value,
-                "vuln_request": brute_weak_request(self.args),
-                "vuln_response": brute_weak_response(creds),
-            })
+            request = brute_weak_request(self.args)
+            response = brute_weak_response(creds)
+            codes = [VULNS.WeakCredentials.value, VULNS.WeakCreds.value]
+            if any(_pop3_default_account(c.user, c.passw)[0] for c in creds):
+                codes.append(VULNS.DefAcc.value)
+            if any(_pop3_default_account(c.user, c.passw)[1] for c in creds):
+                codes.append(VULNS.DefAccPw.value)
+            for code in codes:
+                vulns.append({
+                    "vuln_code": code,
+                    "vuln_request": request,
+                    "vuln_response": response,
+                })
         return vulns
 
     def _add_brute_account_nodes(self) -> None:
@@ -160,16 +145,29 @@ class POP3(BaseMain):
             )
             self.ptjsonlib.add_node(node)
 
+    def _add_vulns(self, vulns: list[dict], *, node_key: str | None = None) -> None:
+        for entry in vulns:
+            stamped = dict(entry)
+            if not stamped.get("poc"):
+                poc = self.report.poc_for(stamped.get("vuln_code"))
+                if poc:
+                    stamped["poc"] = poc
+            if node_key:
+                self.ptjsonlib.add_vulnerability(node_key=node_key, **stamped)
+            else:
+                self.ptjsonlib.add_vulnerability(**stamped)
+
     def _emit_brute_json(self) -> None:
-        self.ptjsonlib.add_properties({
-            "description": brute_discovered_description(self.report.brute_creds),
-        })
         self._add_brute_account_nodes()
-        for vuln in self._brute_vuln_entries():
-            self.ptjsonlib.add_vulnerability(**vuln)
+        self._add_vulns(self._brute_vuln_entries())
         self.ptjsonlib.set_status("finished", "")
         if self.use_json:
             print(self.ptjsonlib.get_result_json())
+
+    def run(self) -> None:
+        mode = "TLS" if (self.args.tls or self.args.target.port == 995) else get_mode(self.args)
+        end_if_target_unreachable(self, mode=mode)
+        super().run()
 
     def output(self) -> None:
         """Emit one software node + collected vulnerabilities (JSON mode)."""
@@ -183,11 +181,9 @@ class POP3(BaseMain):
         node = self.ptjsonlib.create_node_object("software", None, None, self.report.properties)
         self.ptjsonlib.add_node(node)
         node_key = node["key"]
-        for vuln in self.report.vulns:
-            self.ptjsonlib.add_vulnerability(node_key=node_key, **vuln)
+        self._add_vulns(self.report.vulns, node_key=node_key)
         self._add_brute_account_nodes()
-        for vuln in self._brute_vuln_entries():
-            self.ptjsonlib.add_vulnerability(**vuln)
+        self._add_vulns(self._brute_vuln_entries())
 
         self.ptjsonlib.set_status("finished", "")
         if self.use_json:

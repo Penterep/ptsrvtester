@@ -115,7 +115,6 @@ def _run_noop_duration_loop(e, smtp, *, authenticated: bool, duration: float, de
             return
         clear_live()
         e.debug(msg)
-        e._flush_terminal()
 
     paint()
 
@@ -198,7 +197,6 @@ def test_noop_duration_preauth(e) -> NoopDurationResult:
         f"NOOP duration test: connecting... "
         f"(duration={duration:.0f}s, delay={delay:.0f}s)"
     )
-    e._flush_terminal()
     try:
         smtp = _smtp_noop_open(e)
         smtp.sock.settimeout(SMTP_NOOP_PREAUTH_DUR_TIMEOUT_SECONDS)

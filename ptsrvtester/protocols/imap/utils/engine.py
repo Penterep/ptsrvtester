@@ -152,8 +152,10 @@ class ImapEngine:
         self.out = out or (lambda *a, **k: None)
         self.debug = debug or (lambda *a, **k: None)
         self.report = report
+        self.ptjsonlib = None
         self.imap = None
         self.use_json = bool(getattr(args, "json", False))
+        self._vuln_poc: dict[str, str] = {}
         self.do_brute = check_if_brute(args)
         self._output_lock = threading.Lock()
         self._ntlm_transient_init_emitted = False
@@ -197,24 +199,10 @@ class ImapEngine:
         self.debug = ctx.debug
         self.report = getattr(ctx, "report", self.report)
         self.use_json = bool(ctx.json)
+        if getattr(ctx, "ptjsonlib", None) is not None:
+            self.ptjsonlib = ctx.ptjsonlib
         self._ctx = ctx
         return self
-
-    def _flush_terminal(self) -> None:
-        """Flush PrintLock so verdicts appear before the next live -vv line."""
-        if self.use_json:
-            return
-        ctx = getattr(self, "_ctx", None)
-        if ctx is None:
-            return
-        lock = getattr(ctx, "print_lock", None)
-        if lock is None:
-            return
-        chunk = lock.get_output_string()
-        if chunk:
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            lock.output_string = ""
 
     @staticmethod
     def _snip(text: str | bytes | None, limit: int = 160) -> str:
@@ -232,22 +220,50 @@ class ImapEngine:
         """Folder for APPEND/SELECT (--mailbox, default INBOX)."""
         return (getattr(self.args, "mailbox", None) or "INBOX").strip() or "INBOX"
 
+    def _add_to_json_log(self, line: str) -> None:
+        if not self.use_json or not line:
+            return
+        ptjsonlib = getattr(self, "ptjsonlib", None)
+        add_to_log = getattr(ptjsonlib, "add_to_log", None) if ptjsonlib is not None else None
+        if callable(add_to_log):
+            add_to_log(line)
+
+    def note_poc(self, code: str, *pairs: tuple[str, str]) -> None:
+        """Remember the Send/Receive lines that prove one vulnerability."""
+        if not code or code in self._vuln_poc or not pairs:
+            return
+        lines: list[str] = []
+        for send, recv in pairs:
+            if not send:
+                continue
+            recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
+            lines.append(f"Send: {send}")
+            lines.append(f"Receive: {recv_s}")
+        if lines:
+            self._vuln_poc[code] = "\r\n".join(lines)
+
     def _dbg(self, msg: str, *, indent: int = 4) -> None:
-        """Verbose-only (-vv) line via ctx.debug / ADDITIONS."""
-        try:
-            self.debug(msg, indent=indent)
-        except TypeError:
-            self.debug(msg)
+        """Breadcrumb. ``ctx.debug`` logs it always and prints it on ``-vv``."""
+        ctx = getattr(self, "_ctx", None)
+        dbg = getattr(ctx, "debug", None) if ctx is not None else None
+        if callable(dbg):
+            try:
+                dbg(msg, indent=indent)
+            except TypeError:
+                dbg(msg)
+            return
+        if self.use_json:
+            for line in (str(msg).splitlines() or [str(msg)]):
+                if line:
+                    self._add_to_json_log(line)
 
     def _imap_vv_io(self, send: str | None, recv: str | None) -> None:
-        """INVCMD-style Send/Receive immediately above the next verdict line."""
-        if self.use_json or not getattr(self.args, "debug", False):
-            return
+        """Send/Receive on -vv, and into results.log when -j."""
         if not send:
             return
+        recv_s = "(no reply)" if recv in (None, "") else recv
         self._dbg(f"Send: {send}")
-        self._dbg(f"Receive: {recv if recv not in (None, '') else '(no reply)'}")
-        self._flush_terminal()
+        self._dbg(f"Receive: {recv_s}")
 
     def _dbg_capa_list(self, title: str, capa: list[str] | None, *, indent: int = 4) -> None:
         self._dbg(title, indent=indent)
@@ -265,8 +281,6 @@ class ImapEngine:
         *,
         output=None,
     ) -> None:
-        if not getattr(self.args, "debug", False) or self.use_json:
-            return
         user = row.username
         if row.error:
             msg = f"{method} {user!r}: connect/error {self._snip(row.error)}"
@@ -277,6 +291,11 @@ class ImapEngine:
                 f"{method} {user!r}: {self._snip(row.reply_raw)} "
                 f"(norm={row.reply_normalized!r} t={row.elapsed_ms}ms)"
             )
+        if self.use_json:
+            self._dbg(msg)
+            return
+        if not getattr(self.args, "debug", False):
+            return
         if output is not None:
             line = out_if(msg, "ADDITIONS", True, colortext=True, indent=0)
             if line:
@@ -599,8 +618,6 @@ class ImapEngine:
                     sys.stdout.flush()
                     _live_dirty = False
             self._dbg(msg, indent=indent)
-            if verbose:
-                self._flush_terminal()
 
         def _print_verdict(is_vuln: bool, text: str) -> None:
             nonlocal _live_dirty
@@ -2050,6 +2067,7 @@ class ImapEngine:
         port = self.args.target.port
         timeout = 10.0
         plaintext_ok = False
+        plaintext_banner: str | None = None
         starttls_ok = False
         tls_ok = False
         _ssl_ctx = ssl._create_unverified_context()
@@ -2059,9 +2077,15 @@ class ImapEngine:
             try:
                 imap = imaplib.IMAP4(host, port)
                 imap.sock.settimeout(timeout)
-                _ = imap.welcome
+                welcome = imap.welcome
+                if isinstance(welcome, (bytes, bytearray)):
+                    plaintext_banner = welcome.decode(errors="replace").strip()
+                elif welcome:
+                    plaintext_banner = str(welcome).strip()
                 plaintext_ok = True
                 self._dbg(f"Cleartext welcome: {self._snip(imap.welcome)}")
+                if plaintext_banner:
+                    self.note_poc(VULNS.Sniffable.value, ("(connect)", plaintext_banner))
                 imap.logout()
             except Exception as e:
                 self._dbg(f"Cleartext test failed: {e}")
@@ -2116,7 +2140,7 @@ class ImapEngine:
         except Exception as e:
             self._dbg(f"Implicit TLS test failed: {e}")
 
-        return EncryptionResult(plaintext_ok, starttls_ok, tls_ok)
+        return EncryptionResult(plaintext_ok, starttls_ok, tls_ok, plaintext_banner)
 
     @staticmethod
     def _auth_methods_from_capa(capability: list[str] | None) -> list[str]:
@@ -2213,7 +2237,6 @@ class ImapEngine:
         if self.use_json:
             return
         self._ptprint_raw(label, bullet_type="TITLE", condition=True, indent=4)
-        self._flush_terminal()
         self._authlist_terminal_emitted = True
 
     def _authlist_unavailable_text(self, path: str, *, connected: bool) -> str:
@@ -2232,7 +2255,6 @@ class ImapEngine:
             colortext=False,
             indent=8,
         )
-        self._flush_terminal()
         self._authlist_terminal_emitted = True
 
     def _authlist_emit_method_row(self, path: str, row: ImapAuthMechRow) -> None:
@@ -2240,7 +2262,6 @@ class ImapEngine:
             return
         bullet, text = self._authlist_row_display(path, row)
         self._ptprint_raw(text, bullet_type=bullet, condition=True, indent=8)
-        self._flush_terminal()
         self._authlist_terminal_emitted = True
 
     def _authlist_scan_path(self, path: str, timeout: float) -> ImapAuthListPath:
@@ -2281,6 +2302,11 @@ class ImapEngine:
             outcome, reply = self._probe_authenticate_on_path(path, m, timeout=timeout)
             usable = outcome == "continuation"
             dangerous = IMAP_AUTH_METHOD_LEVEL.get(m, "OK") == "ERROR"
+            if path == "cleartext" and dangerous and usable:
+                self.note_poc(
+                    VULNS.AuthMethods.value,
+                    (f"AUTHENTICATE {m}", reply or ""),
+                )
             row = ImapAuthMechRow(name=m, usable=usable, outcome=outcome, dangerous=dangerous)
             rows.append(row)
             if outcome == "io_error":
@@ -2399,6 +2425,11 @@ class ImapEngine:
                     detail = str(data)[:200]
             self._dbg(f"SELECT INBOX → {typ} {self._snip(detail)}")
             select_ok = str(typ).upper() == "OK"
+            if select_ok:
+                self.note_poc(
+                    VULNS.Sniffable.value,
+                    ("SELECT INBOX", f"{typ} {detail}".strip()),
+                )
             return SniffableResult(
                 skipped=False,
                 skip_reason=None,
@@ -2683,7 +2714,6 @@ class ImapEngine:
             if not self.use_json:
                 self._inv_comm_emit_one(t)
                 self._inv_comm_terminal_emitted = True
-                self._flush_terminal()
         cases_t = tuple(cases)
         if cases_t and all(t.outcome == "connect_error" for t in cases_t):
             err = (cases_t[0].reply_snippet or "Could not connect to the server").rstrip(".")
@@ -2803,7 +2833,9 @@ class ImapEngine:
                 except Exception:
                     extra = ""
             ok = typ == "OK"
+            shown = f"{typ} {extra}".strip()
             if ok:
+                self.note_poc(VULNS.Anonymous.value, ("AUTHENTICATE ANONYMOUS", shown))
                 return True, extra
             return False, extra or str(typ)
         except Exception as e:
@@ -2817,8 +2849,9 @@ class ImapEngine:
             return False, self._anon_detail(e) or "connect failed"
         try:
             try:
-                imap.login(user, password)
-                return True, "OK"
+                typ, dat = imap.login(user, password)
+                reply = self._anon_detail(dat[0] if dat else "") or str(typ)
+                return True, f"{typ} {reply}".strip()
             except Exception as e:
                 return False, self._anon_detail(e) or "rejected"
         finally:
@@ -2903,7 +2936,10 @@ class ImapEngine:
 
     def test_anonymous_access(self) -> AnonymousAccessResult:
         """
-        Probe anonymous and weak default IMAP logins (PTV-SVC-IMAP-ANON).
+        Probe anonymous login and default accounts.
+        SASL ANONYMOUS or LOGIN anonymous with an empty password is PTV-SVC-ANONYMOUS.
+        guest/public (and anonymous with the password "anonymous") is PTV-SVC-AUTH-DEFACC.
+        A matching default password on that account is also PTV-SVC-AUTH-DEFACCPW.
         RFC 4505 (SASL ANONYMOUS); pre-auth CAPABILITY may list AUTH=ANONYMOUS (RFC 3501).
         """
         self._anonymous_live = False
@@ -2977,10 +3013,16 @@ class ImapEngine:
                 self._anonymous_emit_login(user, password, hit, detail)
             if not hit:
                 continue
+            shown_pw = password if password else '""'
+            pair = (f"LOGIN {user} {shown_pw}", detail or "OK")
             if user == "anonymous" and password == "":
                 login_anonymous_empty_ok = True
+                self.note_poc(VULNS.Anonymous.value, pair)
             else:
                 weak_hits.append(f"{user} / {password if password else '<empty>'}")
+                self.note_poc(VULNS.DefAcc.value, pair)
+                if password and password == user:
+                    self.note_poc(VULNS.DefAccPw.value, pair)
 
         vulnerable = bool(
             authenticate_anonymous_ok or login_anonymous_empty_ok or weak_hits
@@ -3113,7 +3155,6 @@ class ImapEngine:
             imap = _login()
             with self._output_lock:
                 self._dbg(f"LOGIN {user!r} → OK")
-                self._flush_terminal()
             self._eicar_live = True
             for label, payload in self._eicar_payloads():
                 if imap is None:
@@ -3236,6 +3277,10 @@ class ImapEngine:
     ) -> None:
         """Per-variant terminal block — same layout as SMTP ZIPXXE."""
         if self.use_json:
+            if stream_trace:
+                for line in v.imap_trace:
+                    if not line.startswith("---"):
+                        self._dbg(line, indent=8)
             return
         pp = ptprint
         pp(self._imap_zipxxe_variant_title(v.variant), bullet_type="TITLE", condition=True, indent=4)
@@ -5452,6 +5497,9 @@ class ImapEngine:
             cmd_show = f'{cmd} ""' if cred.passw == "" else cmd
             self._imap_brute_line(output, f"{shown!r}: {cmd_show} {self._imap_brute_reply(typ, raw)}")
             if kind == "ok":
+                recv = self._imap_brute_reply(typ, raw)
+                self.note_poc(VULNS.WeakCredentials.value, (cmd, recv))
+                self.note_poc(VULNS.WeakCreds.value, (cmd, recv))
                 self._imap_brute_line(output, f"user:{' ' * 5}{cred.user}", "VULN", colortext=False)
                 self._imap_brute_line(
                     output,
@@ -5792,7 +5840,6 @@ class ImapEngine:
         show = not self.use_json
         self._dbg(f"Send: {t.send_text}")
         self._dbg(f"Receive: {t.reply_snippet or '(no reply)'}")
-        self._flush_terminal()
         time_str = f" ({t.response_time_sec:.2f}s)" if t.response_time_sec is not None else ""
         msg = f"{t.command_display:<{_INVCOMM_LABEL_WIDTH}}{t.outcome}{time_str}"
         if t.probe_vulnerable:
@@ -5819,7 +5866,6 @@ class ImapEngine:
             and not t.probe_vulnerable
         ):
             pp("CAPABILITY follow-up failed (session unstable)", bullet_type="WARNING", condition=show, indent=8)
-        self._flush_terminal()
 
     def _inv_comm_emit_terminal(self, ic: InvCommImapResult) -> None:
         """Shared text layout for invalid-command audit (stream + output replay)."""
@@ -5875,16 +5921,12 @@ class ImapEngine:
     _ANON_LABEL_W = len('Use LOGIN "anonymous" and password "anonymous":')
 
     def _anonymous_vv(self, text: str) -> None:
-        if self.use_json:
-            return
         self._dbg(text)
-        self._flush_terminal()
 
     def _anonymous_verdict(self, text: str, bullet: str) -> None:
         if self.use_json:
             return
         self._ptprint_raw(text, bullet_type=bullet, condition=True, indent=4)
-        self._flush_terminal()
 
     def _anonymous_aligned(self, label: str, value: str, bullet: str) -> None:
         self._anonymous_verdict(f"{label:<{self._ANON_LABEL_W}} {value}", bullet)
@@ -5989,14 +6031,19 @@ class ImapEngine:
             self._anonymous_emit_terminal(ar)
 
     def _eicar_emit_variant(self, mailbox: str, v: EicarVariantResult) -> None:
-        if self.use_json:
-            return
         recv = v.append_detail or v.append_typ or ""
+        if self.use_json:
+            if v.accepted:
+                self._dbg(f"APPEND {mailbox!r} {v.label} → {v.append_typ or ''} {self._snip(recv)}".strip())
+            else:
+                self._dbg(
+                    f"APPEND {mailbox!r} {v.label} → failed: {self._snip(recv) or v.append_typ or 'rejected'}"
+                )
+            return
         if v.accepted:
             self._dbg(f"APPEND {mailbox!r} {v.label} → {v.append_typ or 'OK'} {self._snip(recv)}")
         else:
             self._dbg(f"APPEND {mailbox!r} {v.label} → failed: {self._snip(recv) or v.append_typ or 'rejected'}")
-        self._flush_terminal()
         if v.accepted:
             self._ptprint_raw(
                 f"APPEND accepted {v.label}",
@@ -6018,7 +6065,6 @@ class ImapEngine:
                 condition=True,
                 indent=4,
             )
-        self._flush_terminal()
 
     def _eicar_emit_terminal(self, er: EicarAppendResult) -> None:
         pp = self._ptprint_raw
@@ -6125,6 +6171,14 @@ class ImapEngine:
         quota_root_detail: str | None,
     ) -> None:
         if self.use_json:
+            if io_login:
+                self._imap_vv_io(*io_login)
+            if io_select:
+                self._imap_vv_io(*io_select)
+            if io_capability:
+                self._imap_vv_io(*io_capability)
+            for send, recv in io_quota:
+                self._imap_vv_io(send, recv)
             return
         if io_login:
             self._imap_vv_io(*io_login)
@@ -6139,7 +6193,6 @@ class ImapEngine:
             self._ptprint_raw(f"QUOTA advertised{extra}", bullet_type="TITLE", condition=True, indent=4)
         else:
             self._ptprint_raw("QUOTA not advertised in CAPABILITY", bullet_type="TITLE", condition=True, indent=4)
-        self._flush_terminal()
 
     def _imap_resource_load_emit_phase(
         self,
@@ -6148,6 +6201,8 @@ class ImapEngine:
         io_pair: tuple[str, str] | None,
     ) -> None:
         if self.use_json:
+            if io_pair:
+                self._imap_vv_io(*io_pair)
             return
         if io_pair:
             self._imap_vv_io(*io_pair)
@@ -6195,7 +6250,6 @@ class ImapEngine:
                 condition=show,
                 indent=4,
             )
-        self._flush_terminal()
 
     def _imap_resource_load_emit_tail(
         self,
@@ -6207,11 +6261,12 @@ class ImapEngine:
         detail: str,
     ) -> None:
         if self.use_json:
+            if io_cleanup:
+                self._imap_vv_io(*io_cleanup)
             return
         pp = self._ptprint_raw
         if search_skipped_reason:
             pp(f"SEARCH note: {search_skipped_reason}", bullet_type="TITLE", condition=True, indent=4)
-            self._flush_terminal()
         if cleanup_detail:
             if io_cleanup:
                 self._imap_vv_io(*io_cleanup)
@@ -6221,10 +6276,8 @@ class ImapEngine:
                 condition=True,
                 indent=4,
             )
-            self._flush_terminal()
         if not vulnerable:
             pp(detail, bullet_type="NOTVULN", condition=True, indent=4)
-            self._flush_terminal()
 
     def _imap_resource_load_emit_terminal(self, lr: ImapResourceLoadResult) -> None:
         if lr.skipped:
@@ -6407,7 +6460,6 @@ class ImapEngine:
         def _out(send: str | None, recv: str | None, text: str, bullet: str) -> None:
             self._imap_vv_io(send, recv)
             pp(text, bullet_type=bullet, condition=show, indent=4)
-            self._flush_terminal()
 
         self._imap_vv_io(mr.login_send, mr.login_recv)
         _out(
@@ -6581,7 +6633,6 @@ class ImapEngine:
             return
         with self._output_lock:
             self._imap_usrenum_emit_terminal(ur)
-        self._flush_terminal()
 
     def _stream_imap_usrenum_plain_result(self) -> None:
         """Stream AUTHENTICATE PLAIN user enumeration result (thread-safe)."""
@@ -6598,7 +6649,6 @@ class ImapEngine:
             return
         with self._output_lock:
             self._imap_usrenum_emit_terminal(ur)
-        self._flush_terminal()
 
     def _stream_ntlm_result(self) -> None:
         """Stream NTLM info result immediately (thread-safe)."""
@@ -6703,13 +6753,20 @@ class ImapEngine:
     def _brute_vuln_entries(self) -> list[dict]:
         vulns: list[dict] = []
         if getattr(self, "_brute_guessing", None) == "not_limited":
-            vulns.append({"vuln_code": VULNS.Brute.value})
+            vulns.append({"vuln_code": VULNS.AuthBlock.value})
         creds = brute_sorted_creds(self.results.creds)
         if creds:
+            request = brute_weak_request(self.args)
+            response = brute_weak_response(creds)
+            vulns.append({
+                "vuln_code": VULNS.WeakCredentials.value,
+                "vuln_request": request,
+                "vuln_response": response,
+            })
             vulns.append({
                 "vuln_code": VULNS.WeakCreds.value,
-                "vuln_request": brute_weak_request(self.args),
-                "vuln_response": brute_weak_response(creds),
+                "vuln_request": request,
+                "vuln_response": response,
             })
         return vulns
 
@@ -6723,18 +6780,249 @@ class ImapEngine:
             )
             ptjsonlib.add_node(node)
 
+    def _poc_pair(self, send: str, recv) -> str:
+        recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
+        return f"Send: {send}\r\nReceive: {recv_s}"
+
+    def _usrenum_poc(self, ur, command: str) -> str:
+        if ur is None or not ur.vulnerable:
+            return ""
+        names = set(ur.enumerated_usernames)
+        baseline = next(
+            (p for p in ur.probes if p.probe_kind == "control_invalid" and p.reply_raw),
+            None,
+        )
+        hit = next((p for p in ur.probes if p.username in names and p.reply_raw), None)
+        blocks: list[str] = []
+        if baseline is not None:
+            blocks.append(self._poc_pair(f"{command} {baseline.username}", baseline.reply_raw))
+        if hit is not None:
+            blocks.append(self._poc_pair(f"{command} {hit.username}", hit.reply_raw))
+        return "\r\n".join(blocks)
+
+    def _poc_for(self, code: str | None) -> str:
+        """Proving exchange only. Empty when the result has no server reply."""
+        if not code:
+            return ""
+        noted = self._vuln_poc.get(code)
+        if noted:
+            return noted
+        if code == "PTV-SVC-BANNER":
+            info = self.results.info
+            if info is not None and info.banner:
+                return self._poc_pair("(connect)", info.banner)
+            return ""
+        if code == VULNS.AuthMethods.value:
+            al = getattr(self.results, "imap_authlist", None)
+            if al is None:
+                return ""
+            for path in al.paths:
+                if path.path != "cleartext":
+                    continue
+                for row in path.methods:
+                    if row.dangerous and row.usable:
+                        return self._poc_pair("CAPABILITY", f"AUTH={row.name}")
+            return ""
+        if code == VULNS.Sniffable.value:
+            sn = self.results.sniffable
+            if sn is None or not sn.vulnerable:
+                return ""
+            recv = f"{sn.select_typ or ''} {sn.select_detail or ''}".strip()
+            return self._poc_pair("SELECT INBOX", recv) if recv else ""
+        if code == VULNS.InvComm.value:
+            ic = self.results.inv_comm
+            if ic is None:
+                return ""
+            blocks = [
+                self._poc_pair(test.send_text or test.command_display, test.reply_snippet or "")
+                for test in ic.tests
+                if test.probe_vulnerable and (test.send_text or test.reply_snippet)
+            ]
+            return "\r\n".join(blocks)
+        if code in (VULNS.Anonymous.value, VULNS.DefAcc.value, VULNS.DefAccPw.value):
+            return self._anon_poc(code)
+        if code == VULNS.Eicar.value:
+            er = self.results.eicar
+            if er is None:
+                return ""
+            for variant in er.variants:
+                if not variant.accepted:
+                    continue
+                recv = f"{variant.append_typ or ''} {variant.append_detail or ''}".strip()
+                if recv:
+                    return self._poc_pair(f"APPEND {er.mailbox} ({variant.label})", recv)
+            return ""
+        if code == VULNS.NTLM.value:
+            ntlm = self.results.ntlm
+            info = getattr(ntlm, "ntlm", None) if ntlm is not None else None
+            if info is None:
+                return ""
+            recv = (
+                f"NetBios domain: {info.netbios_domain}; "
+                f"DNS computer: {info.dns_computer}"
+            )
+            return self._poc_pair("AUTHENTICATE NTLM", recv)
+        if code == VULNS.UserEnumLogin.value:
+            blocks = [
+                self._usrenum_poc(self.results.imap_usrenum, "LOGIN"),
+                self._usrenum_poc(self.results.imap_usrenum_plain, "AUTHENTICATE PLAIN"),
+            ]
+            return "\r\n".join(b for b in blocks if b)
+        if code == VULNS.AuthzBypass.value:
+            miso = getattr(self.results, "imap_mailbox_iso", None)
+            if miso is None or not miso.vulnerable:
+                return ""
+            blocks = []
+            for probe in miso.select_probes:
+                if probe.ok_selected and probe.mailbox != miso.own_mailbox and probe.send_text:
+                    blocks.append(self._poc_pair(probe.send_text, probe.recv_text or probe.detail or probe.typ or ""))
+            for row in miso.acl_folder_probes:
+                if row.overbroad_world and (row.send_text or row.raw):
+                    blocks.append(
+                        self._poc_pair(row.send_text or f"GETACL {row.mailbox}", row.recv_text or row.raw or "")
+                    )
+            return "\r\n".join(blocks)
+        if code == VULNS.ResourceLoad.value:
+            rl = self.results.imap_resource_load
+            if rl is None or not rl.vulnerable:
+                return ""
+            blocks = []
+            if (
+                rl.append is not None
+                and rl.io_append
+                and ((rl.append.hit_cap and not rl.append.limit_enforced) or rl.append.disconnected)
+            ):
+                blocks.append(self._poc_pair(*rl.io_append))
+            if (
+                rl.search is not None
+                and rl.io_search
+                and ((rl.search.hit_cap and not rl.search.limit_enforced) or rl.search.disconnected)
+            ):
+                blocks.append(self._poc_pair(*rl.io_search))
+            return "\r\n".join(blocks)
+        if code == VULNS.TlsAudit.value:
+            ta = self.results.imap_tls_audit
+            if ta is None:
+                return ""
+            for probe in ta.probes:
+                bad = (
+                    probe.weak_tls_version
+                    or probe.weak_cipher
+                    or probe.cert_expired
+                    or probe.expires_within_vuln_days
+                    or probe.cert_trust_ok is False
+                )
+                if not bad:
+                    continue
+                recv = " ".join(
+                    part
+                    for part in (probe.tls_version, probe.cipher_name, probe.handshake_error)
+                    if part
+                )
+                if recv:
+                    return self._poc_pair(f"TLS {probe.mode}", recv)
+            return ""
+        return ""
+
+    def _add_vulns(self, ptjsonlib, vulns: list[dict], *, node_key: str | None = None) -> None:
+        for entry in vulns:
+            stamped = dict(entry)
+            if not stamped.get("poc"):
+                poc = self._poc_for(stamped.get("vuln_code"))
+                if poc:
+                    stamped["poc"] = poc
+            if node_key:
+                ptjsonlib.add_vulnerability(node_key=node_key, **stamped)
+            else:
+                ptjsonlib.add_vulnerability(**stamped)
+
     def _emit_brute_json(self, ptjsonlib) -> None:
-        ptjsonlib.add_properties({
-            "description": brute_discovered_description(self.results.creds),
-        })
         self._add_brute_account_nodes(ptjsonlib)
-        for vuln in self._brute_vuln_entries():
-            ptjsonlib.add_vulnerability(**vuln)
+        self._add_vulns(ptjsonlib, self._brute_vuln_entries())
         ptjsonlib.set_status("finished", "")
         self._ptprint(ptjsonlib.get_result_json(), json=True)
 
+    def _anon_poc(self, code: str) -> str:
+        """One proving exchange for the ANON finding named by ``code``."""
+        ar = self.results.anonymous
+        if ar is None:
+            return ""
+        if code == VULNS.Anonymous.value:
+            if ar.authenticate_anonymous_ok and ar.authenticate_detail:
+                return self._poc_pair("AUTHENTICATE ANONYMOUS", ar.authenticate_detail)
+            for probe in ar.login_attempts:
+                if (
+                    probe.accepted
+                    and probe.username == "anonymous"
+                    and probe.password == ""
+                    and probe.detail
+                ):
+                    return self._poc_pair('LOGIN anonymous ""', probe.detail)
+            return ""
+        if code == VULNS.DefAcc.value:
+            for probe in ar.login_attempts:
+                if not probe.accepted or not probe.detail:
+                    continue
+                if probe.username == "anonymous" and probe.password == "":
+                    continue
+                pw = probe.password if probe.password else '""'
+                return self._poc_pair(f"LOGIN {probe.username} {pw}", probe.detail)
+            return ""
+        if code == VULNS.DefAccPw.value:
+            for probe in ar.login_attempts:
+                if (
+                    probe.accepted
+                    and probe.password
+                    and probe.password == probe.username
+                    and probe.detail
+                ):
+                    return self._poc_pair(f"LOGIN {probe.username} {probe.password}", probe.detail)
+            return ""
+        return ""
+
+    def _anon_vuln_entries(self, ar) -> list[dict]:
+        """Checklist codes for one ANON run. Empty when nothing was accepted."""
+        if ar is None or not ar.vulnerable:
+            return []
+        entries: list[dict] = []
+        if ar.authenticate_anonymous_ok or ar.login_anonymous_empty_ok:
+            bits: list[str] = []
+            if ar.authenticate_anonymous_ok:
+                bits.append("AUTHENTICATE ANONYMOUS completed (OK)")
+            if ar.login_anonymous_empty_ok:
+                bits.append("LOGIN anonymous with empty password succeeded")
+            entries.append({
+                "vuln_code": VULNS.Anonymous.value,
+                "vuln_request": "AUTHENTICATE ANONYMOUS / LOGIN anonymous",
+                "vuln_response": "; ".join(bits),
+            })
+        defacc: list[str] = []
+        defaccpw: list[str] = []
+        for probe in ar.login_attempts:
+            if not probe.accepted:
+                continue
+            if probe.username == "anonymous" and probe.password == "":
+                continue
+            label = f"{probe.username} / {probe.password if probe.password else '<empty>'}"
+            defacc.append(label)
+            if probe.password and probe.password == probe.username:
+                defaccpw.append(label)
+        if defacc:
+            entries.append({
+                "vuln_code": VULNS.DefAcc.value,
+                "vuln_request": "LOGIN anonymous|guest|public",
+                "vuln_response": "Default accounts: " + "; ".join(defacc),
+            })
+        if defaccpw:
+            entries.append({
+                "vuln_code": VULNS.DefAccPw.value,
+                "vuln_request": "LOGIN with the default password of a default account",
+                "vuln_response": "Default passwords: " + "; ".join(defaccpw),
+            })
+        return entries
+
     def _is_anon_only_output(self) -> bool:
-        """``-ts ANON`` alone: description, and PTV-SVC-IMAP-ANON when access succeeded."""
+        """``-ts ANON`` alone: one vuln code per finding the probes actually confirmed."""
         raw = getattr(self.args, "tests", None) or ""
         codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
         return codes == {"ANON"}
@@ -6742,15 +7030,10 @@ class ImapEngine:
     def _emit_anon_json(self, ptjsonlib) -> None:
         ar = self.results.anonymous
         err = getattr(self.results, "anonymous_error", None)
-        if ar is not None:
-            description = self._anonymous_description(ar)
-        elif err:
-            description = f"Anonymous probe error: {err}"
-        else:
-            description = "Anonymous access was not tested."
-        ptjsonlib.add_properties({"description": description})
+        if err:
+            self._add_to_json_log(f"Anonymous probe error: {err}")
         if ar is not None and ar.vulnerable:
-            ptjsonlib.add_vulnerability(vuln_code=VULNS.Anonymous.value)
+            self._add_vulns(ptjsonlib, self._anon_vuln_entries(ar))
         ptjsonlib.set_status("finished", "")
         self._ptprint(ptjsonlib.get_result_json(), json=True)
 
@@ -6783,15 +7066,10 @@ class ImapEngine:
     def _emit_ntlm_json(self, ptjsonlib) -> None:
         ntlm = self.results.ntlm
         err = getattr(self.results, "ntlm_error", None)
-        if ntlm is not None:
-            description = self._ntlm_description(ntlm)
-        elif err:
-            description = f"NTLM probe error: {err}"
-        else:
-            description = "NTLM was not tested."
-        ptjsonlib.add_properties({"description": description})
+        if err:
+            self._add_to_json_log(f"NTLM probe error: {err}")
         if ntlm is not None and ntlm.success and ntlm.ntlm is not None:
-            ptjsonlib.add_vulnerability(vuln_code=VULNS.NTLM.value)
+            self._add_vulns(ptjsonlib, [{"vuln_code": VULNS.NTLM.value}])
         ptjsonlib.set_status("finished", "")
         self._ptprint(ptjsonlib.get_result_json(), json=True)
 
@@ -6819,20 +7097,16 @@ class ImapEngine:
     def _emit_authlist_json(self, ptjsonlib) -> None:
         al = getattr(self.results, "imap_authlist", None)
         err = getattr(self.results, "imap_authlist_error", None)
-        if al is not None:
-            description = self._authlist_description(al)
-        elif err:
-            description = f"AUTHLIST failed: {err}"
-        else:
-            description = "AUTH methods were not tested."
-        ptjsonlib.add_properties({"description": description})
+        if err:
+            self._add_to_json_log(f"AUTHLIST failed: {err}")
         if al is not None and al.vulnerable:
-            ptjsonlib.add_vulnerability(vuln_code=VULNS.AuthMethods.value)
+            self._add_vulns(ptjsonlib, [{"vuln_code": VULNS.AuthMethods.value}])
         ptjsonlib.set_status("finished", "")
         self._ptprint(ptjsonlib.get_result_json(), json=True)
 
     def build_json(self, ptjsonlib) -> None:
         """Build JSON node(s). Terminal output is streamed from run()."""
+        self.ptjsonlib = ptjsonlib
         if (info_error := getattr(self.results, "info_error", None)) is not None:
             if self.use_json:
                 ptjsonlib.end_error(info_error, self.use_json)
@@ -6902,6 +7176,12 @@ class ImapEngine:
                     }
                 }
             )
+            if enc.plaintext_ok:
+                deferred_vulns.append({
+                    "vuln_code": VULNS.Sniffable.value,
+                    "vuln_request": "Cleartext IMAP greeting",
+                    "vuln_response": enc.plaintext_banner or "",
+                })
         # AUTHLIST (PTV-SVC-IMAP-AUTHMETHODS)
         if (al_err := getattr(self.results, "imap_authlist_error", None)) is not None:
             properties.update({"authListError": al_err})
@@ -7123,7 +7403,7 @@ class ImapEngine:
         if (catch_all := getattr(self.results, "catch_all", None)) is not None:
             if catch_all == "indeterminate":
                 properties.update({"catchAll": "indeterminate"})
-        # Anonymous / weak default access (PTV-SVC-IMAP-ANON)
+        # Anonymous login and default accounts (PTV-SVC-ANONYMOUS / AUTH-DEFACC / AUTH-DEFACCPW)
         if (ar := self.results.anonymous) is not None:
             properties.update(
                 {
@@ -7140,13 +7420,7 @@ class ImapEngine:
                 }
             )
             if ar.vulnerable:
-                deferred_vulns.append(
-                    {
-                        "vuln_code": VULNS.Anonymous.value,
-                        "vuln_request": "AUTHENTICATE ANONYMOUS / LOGIN anonymous|guest|public",
-                        "vuln_response": ar.detail,
-                    }
-                )
+                deferred_vulns.extend(self._anon_vuln_entries(ar))
         # EICAR APPEND / antivirus ingress (PTV-SVC-IMAP-EICAR)
         if (er := self.results.eicar) is not None:
             properties.update(
@@ -7566,11 +7840,11 @@ class ImapEngine:
         )
         ptjsonlib.add_node(imap_node)
         node_key = imap_node["key"]
-        for v in deferred_vulns:
-            ptjsonlib.add_vulnerability(node_key=node_key, **v)
+        self._add_vulns(ptjsonlib, deferred_vulns, node_key=node_key)
         self._add_brute_account_nodes(ptjsonlib)
-        for vuln in self._brute_vuln_entries():
-            ptjsonlib.add_vulnerability(**vuln)
+        self._add_vulns(ptjsonlib, self._brute_vuln_entries())
+        if self.report is not None and self.report.vulns:
+            self._add_vulns(ptjsonlib, list(self.report.vulns))
 
         ptjsonlib.set_status("finished", "")
         self._ptprint(ptjsonlib.get_result_json(), json=True)
@@ -7707,7 +7981,6 @@ class ImapEngine:
                 return
             clear_live()
             self.debug(msg)
-            self._flush_terminal()
 
         if show_progress and not verbose:
             write_live("Test started, sending first NOOP...")
@@ -7796,7 +8069,6 @@ class ImapEngine:
             f"NOOP duration test (pre-auth): connecting... "
             f"(duration={duration:.0f}s, delay={delay:.0f}s)"
         )
-        self._flush_terminal()
         try:
             imap = self._make_imap_connection(trace=False)
             imap.sock.settimeout(IMAP_NOOP_PREAUTH_DUR_TIMEOUT_SECONDS)
@@ -7818,7 +8090,6 @@ class ImapEngine:
             f"NOOP duration test (post-auth): connecting and logging in as {username!r}... "
             f"(duration={duration:.0f}s, delay={delay:.0f}s)"
         )
-        self._flush_terminal()
         try:
             imap = self._make_imap_connection(trace=False)
             imap.sock.settimeout(IMAP_NOOP_POSTAUTH_DUR_TIMEOUT_SECONDS)
@@ -7942,7 +8213,6 @@ class ImapEngine:
         self.out(f"Refused at connect {est_disc} connections", "TITLE", indent=4)
         self.out(f"Timeouts during connecting {est_timeout}", "TITLE", indent=4)
         self.out(f"Dropped while idle {reaped} connections", "TITLE", indent=4)
-        self._flush_terminal()
 
     def _noop2_wait_delay(self, sock, delay: float, stop_event: threading.Event) -> str:
         """Wait ``delay`` seconds between NOOPs. Return ok / disconnected / stopped."""
@@ -8152,7 +8422,6 @@ class ImapEngine:
         if show_progress:
             kind, text = conn_limit_count_verdict(established, max_connections)
             self.out(text, kind, indent=4)
-            self._flush_terminal()
 
         if storm_pool == 0:
             self.debug(

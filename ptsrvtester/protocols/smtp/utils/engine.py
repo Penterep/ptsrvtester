@@ -97,6 +97,7 @@ class SmtpEngine(
         self.out = lambda *a, **k: None
         self.debug = lambda *a, **k: None
         self.results = SMTPResults()
+        self._vuln_poc: dict[str, str] = {}
 
     def bind_ctx(self, ctx) -> "SmtpEngine":
         """Rebind output sinks for the current module PrintLock (IMAP/POP3)."""
@@ -126,7 +127,6 @@ class SmtpEngine(
             cat = out.value if hasattr(out, "value") else str(out)
             color = cat == "INFO"
         self.out(string, cat, colortext=color, indent=indent)
-        self._flush_terminal()
 
     def _ptprint_raw(self, string="", category="TEXT", *args, **kwargs):
         """ptprinthelper.ptprint → ctx.out (bullet_type / condition / indent)."""
@@ -146,23 +146,6 @@ class SmtpEngine(
         cat = category if isinstance(category, str) else str(category)
         color = kwargs.get("colortext", cat == "INFO")
         self.out(string, cat, colortext=color, indent=indent)
-        self._flush_terminal()
-
-    def _flush_terminal(self) -> None:
-        """Flush PrintLock so verdicts appear before the next live -vv line."""
-        if self.use_json:
-            return
-        ctx = getattr(self, "_ctx", None)
-        if ctx is None:
-            return
-        lock = getattr(ctx, "print_lock", None)
-        if lock is None:
-            return
-        chunk = lock.get_output_string()
-        if chunk:
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-            lock.output_string = ""
 
     @staticmethod
     def _smtp_text_is_timeout(text: str | None) -> bool:
@@ -281,6 +264,33 @@ class SmtpEngine(
             self.ptjsonlib.end_error(msg, self.use_json)
         raise SystemExit
 
+    def note_poc(self, code: str, *pairs: tuple[str, str]) -> None:
+        """Remember the Send/Receive lines that prove one vulnerability.
+
+        Later pairs for the same code are ignored. The full session stays in
+        ``results.log``; this is only the proving snippet.
+        """
+        if not code or code in self._vuln_poc or not pairs:
+            return
+        lines: list[str] = []
+        for send, recv in pairs:
+            if not send:
+                continue
+            recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
+            lines.append(f"Send: {send}")
+            lines.append(f"Receive: {recv_s}")
+        if lines:
+            self._vuln_poc[code] = "\r\n".join(lines)
+
+    def _add_to_json_log(self, line: str) -> None:
+        """Append one line to results.log when -j is active (ptjsonlib.add_to_log)."""
+        if not self.use_json or not line:
+            return
+        ptjsonlib = getattr(self, "ptjsonlib", None)
+        add_to_log = getattr(ptjsonlib, "add_to_log", None) if ptjsonlib is not None else None
+        if callable(add_to_log):
+            add_to_log(line)
+
     def ptdebug(
         self,
         string: str,
@@ -290,15 +300,21 @@ class SmtpEngine(
         *,
         indent_override: Optional[int] = None,
     ) -> None:
-        """-vv via ctx.debug (live in ``_run_module``). Non-newline ``end`` stays on stdout."""
-        if not getattr(self.args, "debug", False) or self.use_json:
-            return
-
-        indent = 4 if indent_override is None else indent_override
+        """Hand the line to ``ctx.debug``: always logged, printed only on ``-vv``."""
         lines = string.splitlines() or [string]
+        indent = 4 if indent_override is None else indent_override
 
         if end != "\n":
+            ctx = getattr(self, "_ctx", None)
+            log = getattr(ctx, "log", None) if ctx is not None else None
+            show = bool(getattr(self.args, "debug", False)) and not self.use_json
             for i, line in enumerate(lines):
+                if line and callable(log):
+                    log(line)
+                elif line and self.use_json:
+                    self._add_to_json_log(line)
+                if not show:
+                    continue
                 last = i == len(lines) - 1
                 ptprinthelper.ptprint(
                     line,
@@ -311,24 +327,26 @@ class SmtpEngine(
                 )
             return
 
-        dbg = getattr(self, "debug", None)
+        ctx = getattr(self, "_ctx", None)
+        dbg = getattr(ctx, "debug", None) if ctx is not None else None
         for line in lines:
+            if not line:
+                continue
             if callable(dbg):
                 try:
                     dbg(line, indent=indent)
                 except TypeError:
                     dbg(line)
+            elif self.use_json:
+                self._add_to_json_log(line)
 
     def _smtp_vv_io(self, send: str | None, recv: str | None, *, indent: int = 4) -> None:
-        """-vv: real SMTP line, then Receive, immediately above the next result."""
-        if self.use_json or not getattr(self.args, "debug", False):
-            return
+        """Real SMTP line, then Receive. Logged always; printed on ``-vv``."""
         if not send:
             return
         recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
         self.ptdebug(f"Send: {send}", indent_override=indent)
         self.ptdebug(f"Receive: {recv_s}", indent_override=indent)
-        self._flush_terminal()
 
     def ptprint(
         self,

@@ -11,7 +11,6 @@ def _section(ctx, e, title: str) -> None:
     if getattr(ctx, "json", False):
         return
     ctx.out(title, "INFO", colortext=True)
-    e._flush_terminal()
 
 
 def run(ctx):
@@ -23,7 +22,6 @@ def run(ctx):
         catch_all = e._test_catch_all()
     except Exception as ex:
         ctx.out(f"Catch-all failed: {ex}", "ERROR", indent=4)
-        e._flush_terminal()
         return
 
     e.results.catch_all = catch_all
@@ -39,7 +37,6 @@ def run(ctx):
             "WARNING",
             indent=4,
         )
-        e._flush_terminal()
         return
     elif catch_all == "disabled":
         ctx.out(
@@ -47,12 +44,10 @@ def run(ctx):
             "WARNING",
             indent=4,
         )
-        e._flush_terminal()
         return
     else:
         ctx.out("Not configured (server rejects invalid creds)", "NOTVULN", indent=4)
 
-    e._flush_terminal()
     _section(ctx, e, "Guessing (credential bruteforce)")
     e.login_bruteforce()
     e._stream_brute_result()

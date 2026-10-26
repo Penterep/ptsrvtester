@@ -1,5 +1,6 @@
 """ENCRYPT — plaintext / STLS / implicit TLS probes."""
 from ..utils.connection import test_encryption
+from ..utils.results import VULNS
 
 __MODULELABEL__ = "Encryption"
 __MODULECODE__ = "ENCRYPT"
@@ -17,6 +18,14 @@ def run(ctx):
     ctx.report.update_properties(
         encryption={"plaintext": enc.plaintext_ok, "stls": enc.stls_ok, "tls": enc.tls_ok}
     )
+    if enc.plaintext_ok:
+        if enc.plaintext_banner:
+            ctx.report.note_poc(VULNS.Sniffable.value, ("(connect)", enc.plaintext_banner))
+        ctx.report.add_vulnerability(
+            vuln_code=VULNS.Sniffable.value,
+            vuln_request="Cleartext POP3 greeting",
+            vuln_response=enc.plaintext_banner or "",
+        )
     plaintext_only = enc.plaintext_ok and not enc.stls_ok and not enc.tls_ok
     any_ok = enc.plaintext_ok or enc.stls_ok or enc.tls_ok
     if plaintext_only:

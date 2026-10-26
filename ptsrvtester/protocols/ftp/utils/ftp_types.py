@@ -265,6 +265,7 @@ class EncryptionResult(NamedTuple):
     plaintext_incomplete: bool = False
     auth_tls_incomplete: bool = False
     tls_incomplete: bool = False
+    plaintext_banner: str | None = None
 
 
 class ModesResult(NamedTuple):
@@ -668,17 +669,30 @@ class FTPResults:
 
 
 class VULNS(Enum):
-    Anonymous = "PTL-SVC-FTP-ANONYMOUS"
-    Bounce = "PTV-FTP-BOUNCE"
-    WeakCreds = "PTV-GENERAL-WEAKCREDENTIALS"
-    FtpActivePolicy = "PTL-SVC-FTP-ACTIVE"
-    FtpCmdSurface = "PTL-SVC-FTP-CMD"
-    FtpInvalidCommandHandling = "PTL-SVC-FTP-INVCOMM"
+    Anonymous = "PTV-SVC-ANONYMOUS"
+    DefAcc = "PTV-SVC-AUTH-DEFACC"
+    DefAccPw = "PTV-SVC-AUTH-DEFACCPW"
+    Bounce = "PTV-SVC-FTP-BOUNCE"
+    WeakCredentials = "PTV-SVC-WEAKCREDENTIALS"
+    WeakCreds = "PTV-SVC-AUTH-WEAK"
+    AuthBlock = "PTV-SVC-AUTH-BLOCK"
+    AuthEnum = "PTV-SVC-AUTH-ENUM"
+    Sniffable = "PTV-SVC-SNIFFABLE"
+    FtpActivePolicy = "PTV-SVC-FTP-ACTIVE"
+    CmdExec = "PTV-SVC-FTP-CMDEXEC"
+    CmdChmod = "PTV-SVC-FTP-CMDCHMOD"
+    CmdChown = "PTV-SVC-FTP-CMDCHOWN"
+    CmdCopy = "PTV-SVC-FTP-CMDCOPY"
+    CmdUmask = "PTV-SVC-FTP-CMDUMASK"
+    CmdLn = "PTV-SVC-FTP-CMDLN"
+    FtpInvalidCommandHandling = "PTV-SVC-FTP-INVCOMM"
     FtpObsoleteTls = "PTL-SVC-FTP-OLD-TLS"
-    FtpUserEnumeration = "PTL-SVC-FTP-USRENUM"
-    FtpPassivePortRange = "PTL-SVC-FTP-PASIVE"
-    FtpConnectionLimits = "PTL-SVC-FTP-CONN"
-    FtpChrootIsolation = "PTL-SVC-FTP-CHROOT"
+    FtpPassivePortRange = "PTV-SVC-FTP-PASIVE"
+    ConnCntIp = "PTV-SVC-FTP-CONNCNTIP"
+    ConnLong = "PTV-SVC-FTP-CONNLONG"
+    ConnRate = "PTV-SVC-FTP-CONNRATE"
+    FtpChrootIsolation = "PTV-SVC-FTP-CHROOT"
+    Wordlist = "PTV-SVC-FTP-WORDLIST"
     FtpAntivirusEicar = "PTL-SVC-FTP-ANTIVIRUS"
     FtpProcessingResilience = "PTL-SVC-FTP-PROC-DOS"
 

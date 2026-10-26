@@ -130,15 +130,10 @@ class ReportingMixin:
     def _emit_helo_bypass_json(self) -> None:
         hb = self.results.helo_bypass
         err = self.results.helo_bypass_error
-        if err is not None:
-            description = f"HELO bypass test error: {err}"
-        elif hb is not None:
-            description = self._helo_bypass_description(hb)
-        else:
-            description = "HELO bypass test"
-        self.ptjsonlib.add_properties({"description": description})
+        if err:
+            self._add_to_json_log(f"HELO bypass test error: {err}")
         if hb is not None and hb.vulnerable and not hb.irrelevant_open_relay:
-            self.ptjsonlib.add_vulnerability(vuln_code=VULNS.HeloBypass.value)
+            self._add_vulns([{"vuln_code": VULNS.HeloBypass.value}])
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)
 
@@ -164,30 +159,20 @@ class ReportingMixin:
     def _emit_auth_downgrade_json(self) -> None:
         ad = self.results.auth_downgrade
         err = self.results.auth_downgrade_error
-        if err is not None:
-            description = f"AUTH downgrade test error: {err}"
-        elif ad is not None:
-            description = self._auth_downgrade_description(ad)
-        else:
-            description = "No authentication downgrade detected"
-        self.ptjsonlib.add_properties({"description": description})
+        if err:
+            self._add_to_json_log(f"AUTH downgrade test error: {err}")
         if ad is not None and ad.vulnerable:
-            self.ptjsonlib.add_vulnerability(vuln_code=VULNS.AuthDowngrade.value)
+            self._add_vulns([{"vuln_code": VULNS.AuthDowngrade.value}])
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)
 
     def _emit_helo_only_json(self) -> None:
         ho = self.results.helo_only
         err = self.results.helo_only_error
-        if err is not None:
-            description = f"HELO-only test error: {err}"
-        elif ho is not None:
-            description = self._helo_only_description(ho)
-        else:
-            description = "HELO-only test"
-        self.ptjsonlib.add_properties({"description": description})
+        if err:
+            self._add_to_json_log(f"HELO-only test error: {err}")
         if ho is not None and ho.vulnerable:
-            self.ptjsonlib.add_vulnerability(vuln_code=VULNS.HeloOnly.value)
+            self._add_vulns([{"vuln_code": VULNS.HeloOnly.value}])
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)
 
@@ -211,15 +196,278 @@ class ReportingMixin:
     def _emit_domfill_json(self) -> None:
         df = self.results.domfill
         err = self.results.domfill_error
-        if err is not None:
-            description = f"Sender domain autofill error: {err}"
-        elif df is not None:
-            description = self._domfill_description(df)
-        else:
-            description = "Domain name was not disclosed"
-        self.ptjsonlib.add_properties({"description": description})
+        if err:
+            self._add_to_json_log(f"Sender domain autofill error: {err}")
         if df is not None and df.vulnerable:
-            self.ptjsonlib.add_vulnerability(vuln_code=VULNS.Domfill.value)
+            self._add_vulns([{"vuln_code": VULNS.Domfill.value}])
+        self.ptjsonlib.set_status("finished", "")
+        self.ptprint(self.ptjsonlib.get_result_json(), json=True)
+
+    def _is_ehlo_only_output(self) -> bool:
+        """``-ts EHLO`` alone: results.log + code/poc vulns, no description."""
+        if getattr(self, "run_all_mode", False):
+            return False
+        raw = getattr(self.args, "tests", None) or ""
+        codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
+        return codes == {"EHLO"}
+
+    def _poc_pair(self, send: str, recv) -> str:
+        recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
+        return f"Send: {send}\r\nReceive: {recv_s}"
+
+    def _ehlo_raw_line(self, keyword: str, *, cleartext_only: bool = False) -> tuple[str, str]:
+        """``(EHLO command, the one 250-line that advertises keyword)``."""
+        info = self.results.info
+        if info is None:
+            return "", ""
+        blobs: list[str] = []
+        if info.ehlo:
+            blobs.append(info.ehlo)
+        if not cleartext_only and info.ehlo_starttls:
+            blobs.append(info.ehlo_starttls)
+        key = keyword.upper()
+        for raw in blobs:
+            for line in str(raw).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                line = " ".join(line.split())
+                if line.startswith("250-") or line.startswith("250 "):
+                    body = line[4:].strip()
+                else:
+                    body = line
+                token = body.split()[0].upper() if body else ""
+                if token == key:
+                    fqdn = getattr(self, "fqdn", None) or "example.com"
+                    return f"EHLO {fqdn}", line
+        return "", ""
+
+    def _banner_poc(self) -> str:
+        info = self.results.info
+        if info is None or not info.banner:
+            return ""
+        banner = " ".join(str(info.banner).split())
+        if not banner.startswith("220"):
+            banner = f"220 {banner}"
+        return self._poc_pair("(connect)", banner)
+
+    def _data_accept_poc(self, traces) -> str:
+        """DATA reply that accepted the message. Payload lines stay in the log."""
+        for entry in traces or ():
+            text = str(entry)
+            if not text.startswith("DATA:"):
+                continue
+            reply = ""
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped and stripped[0].isdigit():
+                    reply = stripped
+            if reply.startswith("2"):
+                return self._poc_pair("DATA", reply)
+        return ""
+
+    def _poc_for(self, code: str | None) -> str:
+        """Proving exchange for one vuln code. Empty when we have no real reply."""
+        if not code:
+            return ""
+        noted = (getattr(self, "_vuln_poc", None) or {}).get(code)
+        if noted:
+            return noted
+        cmd = {
+            VULNS.CmdATRN.value: "ATRN",
+            VULNS.CmdDEBUG.value: "DEBUG",
+            VULNS.CmdETRN.value: "ETRN",
+            VULNS.CmdEXPN.value: "EXPN",
+            VULNS.CmdSAML.value: "SAML",
+            VULNS.CmdSEND.value: "SEND",
+            VULNS.CmdSOML.value: "SOML",
+            VULNS.CmdTURN.value: "TURN",
+            VULNS.CmdVERB.value: "VERB",
+            VULNS.CmdVRFY.value: "VRFY",
+        }.get(code)
+        if cmd:
+            send, recv = self._ehlo_raw_line(cmd)
+            return self._poc_pair(send, recv) if send else ""
+        if code == VULNS.BigSize.value:
+            send, recv = self._ehlo_raw_line("SIZE")
+            return self._poc_pair(send, recv) if send else ""
+        if code == VULNS.AuthMethods.value:
+            send, recv = self._ehlo_raw_line("AUTH", cleartext_only=True)
+            return self._poc_pair(send, recv) if send else ""
+        if code == VULNS.NoStarttls.value:
+            fqdn = getattr(self, "fqdn", None) or "example.com"
+            return self._poc_pair(f"EHLO {fqdn}", "STARTTLS not advertised")
+        if code in (VULNS.Banner.value, VULNS.CryptOnly.value):
+            return self._banner_poc()
+        if code == VULNS.Domfill.value:
+            df = self.results.domfill
+            if df is not None and df.vulnerable:
+                status = "" if df.status is None else str(df.status)
+                return self._poc_pair("MAIL FROM:<test>", f"{status} {df.reply}".strip())
+            return ""
+        if code == VULNS.HeloOnly.value:
+            ho = self.results.helo_only
+            if ho is None:
+                return ""
+            recv = f"{'' if ho.ehlo_status is None else ho.ehlo_status} {ho.ehlo_reply or ''}".strip()
+            fqdn = getattr(self, "fqdn", None) or "example.com"
+            return self._poc_pair(f"EHLO {fqdn}", recv)
+        if code == VULNS.AuthDowngrade.value:
+            ad = self.results.auth_downgrade
+            if ad is None or not ad.vulnerable:
+                return ""
+            blocks = [self._poc_pair("EHLO", f"AUTH {' '.join(ad.methods_before)}".strip())]
+            if ad.server_response:
+                blocks.append(self._poc_pair(f"AUTH {ad.auth_method_used}".strip(), ad.server_response))
+            blocks.append(self._poc_pair("EHLO", f"AUTH {' '.join(ad.methods_after)}".strip()))
+            return "\r\n".join(blocks)
+        if code == VULNS.InvComm.value:
+            ic = self.results.inv_comm
+            if ic is None:
+                return ""
+            blocks = []
+            for test in ic.tests:
+                if not test.vulnerable:
+                    continue
+                status = "" if test.status is None else str(test.status)
+                blocks.append(self._poc_pair(test.command_display, f"{status} {test.reply or ''}".strip()))
+            return "\r\n".join(blocks)
+        if code == VULNS.UserEnumAUTH.value:
+            ae = self.results.auth_enum
+            if ae is None or not ae.vulnerable:
+                return ""
+            blocks = []
+            if ae.invalid_user_responses:
+                blocks.append(self._poc_pair(f"AUTH {ae.method_tested}", ae.invalid_user_responses[0]))
+            user = ae.enumerated_users[0] if ae.enumerated_users else ""
+            if ae.valid_user_response:
+                send = f"AUTH {ae.method_tested} {user}".strip()
+                blocks.append(self._poc_pair(send, ae.valid_user_response))
+            return "\r\n".join(blocks)
+        enum_send = {
+            VULNS.UserEnumEXPN.value: "EXPN",
+            VULNS.UserEnumVRFY.value: "VRFY",
+            VULNS.UserEnumRCPT.value: "RCPT TO",
+        }.get(code)
+        if enum_send and self.results.enum_results:
+            want = {"EXPN": "EXPN", "VRFY": "VRFY", "RCPT TO": "RCPT"}[enum_send]
+            for item in self.results.enum_results:
+                if item.method.upper() != want or not item.vulnerable or not item.server_reply:
+                    continue
+                user = item.results[0] if item.results else ""
+                send = f"{enum_send}:<{user}>" if enum_send == "RCPT TO" else f"{enum_send} {user}".strip()
+                return self._poc_pair(send, item.server_reply)
+            return ""
+        if code == VULNS.NTLM.value:
+            ntlm = self.results.ntlm
+            info = getattr(ntlm, "ntlm", None) if ntlm is not None else None
+            if info is None:
+                return ""
+            recv = (
+                f"NetBios domain: {info.netbios_domain}; "
+                f"DNS computer: {info.dns_computer}"
+            )
+            return self._poc_pair("AUTH NTLM", recv)
+        if code == VULNS.Blacklist.value:
+            listed = self.results.blacklist
+            if listed is None or not listed.results:
+                return ""
+            return "\r\n".join(
+                self._poc_pair(f"DNS {row.blacklist.strip()}", row.reason)
+                for row in listed.results
+            )
+        if code == VULNS.ManyRcptReject.value:
+            rlim = self.results.rcpt_limit
+            if rlim is None or not rlim.server_response:
+                return ""
+            return self._poc_pair("RCPT TO", rlim.server_response)
+        if code == VULNS.RcptDuplicate.value:
+            rd = self.results.rcpt_duplicate
+            if rd is None:
+                return ""
+            blocks = [
+                self._poc_pair(f"RCPT TO:<{rd.recipient}>", f"{status} {reply}")
+                for status, reply in rd.rcpt_replies
+                if 200 <= status < 300
+            ]
+            return "\r\n".join(blocks)
+        if code == VULNS.BounceReplay.value:
+            br = self.results.bounce_replay
+            return self._data_accept_poc(getattr(br, "smtp_trace", None))
+        if code == VULNS.Bomb.value:
+            mb = self.results.mail_bomb
+            return self._data_accept_poc(getattr(mb, "smtp_trace", None))
+        if code == VULNS.Antivirus.value:
+            av = self.results.antivirus
+            if av is None:
+                return ""
+            for category in av.categories:
+                if category.accepted:
+                    poc = self._data_accept_poc(category.smtp_trace)
+                    if poc:
+                        return poc
+            return ""
+        if code == VULNS.SpoofHeader.value:
+            sh = self.results.spoof_header
+            if sh is None:
+                return ""
+            for variant in sh.variants:
+                if variant.accepted:
+                    poc = self._data_accept_poc(variant.smtp_trace)
+                    if poc:
+                        return poc
+            return ""
+        if code == VULNS.Size.value:
+            flood = self.results.flood
+            return self._data_accept_poc(getattr(flood, "smtp_trace", None))
+        return ""
+
+    def _add_vulns(self, vulns: list[dict]) -> None:
+        for entry in vulns:
+            stamped = dict(entry)
+            if not stamped.get("poc"):
+                poc = self._poc_for(stamped.get("vuln_code"))
+                if poc:
+                    stamped["poc"] = poc
+            self.ptjsonlib.add_vulnerability(**stamped)
+
+    def _ehlo_vulns_with_poc(self) -> list[dict]:
+        """Command-extension vulns for standalone EHLO JSON, each with poc."""
+        _CMD_VULN_MAP = {
+            "ATRN": VULNS.CmdATRN.value,
+            "DEBUG": VULNS.CmdDEBUG.value,
+            "ETRN": VULNS.CmdETRN.value,
+            "EXPN": VULNS.CmdEXPN.value,
+            "SAML": VULNS.CmdSAML.value,
+            "SEND": VULNS.CmdSEND.value,
+            "SOML": VULNS.CmdSOML.value,
+            "TURN": VULNS.CmdTURN.value,
+            "VERB": VULNS.CmdVERB.value,
+            "VRFY": VULNS.CmdVRFY.value,
+        }
+        vulns: list[dict] = []
+        info = self.results.info
+        if info is None:
+            return vulns
+        seen: set[str] = set()
+        for raw, encrypted in ((info.ehlo, False), (info.ehlo_starttls, True)):
+            if not raw:
+                continue
+            for display, level in _parse_ehlo_commands(raw, connection_encrypted=encrypted):
+                key = display.split()[0].upper() if display else ""
+                if key == "AUTH":
+                    continue
+                vc = _CMD_VULN_MAP.get(key)
+                if vc is None and key == "SIZE" and level == "ERROR":
+                    vc = VULNS.BigSize.value
+                if vc is None and key == "STARTTLS" and "is not allowed" in display:
+                    vc = VULNS.NoStarttls.value
+                if not vc or vc in seen:
+                    continue
+                seen.add(vc)
+                vulns.append({"vuln_code": vc})
+        return vulns
+
+    def _emit_ehlo_json(self) -> None:
+        """Standalone ``-ts EHLO -j``: empty properties, log already filled, vulns with poc."""
+        self._add_vulns(self._ehlo_vulns_with_poc())
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)
 
@@ -257,13 +505,9 @@ class ReportingMixin:
             self.ptjsonlib.add_node(node)
 
     def _emit_brute_json(self) -> None:
-        """``-ts BRUTE``: description, userAccount nodes, global vuln codes."""
-        self.ptjsonlib.add_properties({
-            "description": brute_discovered_description(self.results.creds),
-        })
+        """``-ts BRUTE``: userAccount nodes and global vuln codes with poc."""
         self._add_brute_account_nodes()
-        for vuln in self._brute_vuln_entries():
-            self.ptjsonlib.add_vulnerability(**vuln)
+        self._add_vulns(self._brute_vuln_entries())
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)
 
@@ -1064,15 +1308,18 @@ class ReportingMixin:
             self._emit_domfill_json()
             return
 
+        if self._is_ehlo_only_output():
+            self._emit_ehlo_json()
+            return
+
         # ── Flat output: no nodes, global properties + global vulnerabilities ──
         if not self._is_node_based_output():
-            description = self._build_flat_description()
             flat_vulns = self._collect_flat_vulns()
             _, _rcpt_vulns = self._rcpt_limit_for_json()
             flat_vulns.extend(_rcpt_vulns)
             _rdd_p, _rdd_v = self._rcpt_duplicate_for_json()
             flat_vulns.extend(_rdd_v)
-            props: dict = {"description": description}
+            props: dict = {}
             props.update(_rdd_p)
             if (ad := self.results.auth_downgrade) is not None:
                 props["authDowngrade"] = {
@@ -1393,9 +1640,9 @@ class ReportingMixin:
             _adp_props = self._accepted_domain_probe_props_json()
             if _adp_props:
                 props.update(_adp_props)
-            self.ptjsonlib.add_properties(props)
-            for v in flat_vulns:
-                self.ptjsonlib.add_vulnerability(**v)
+            if props:
+                self.ptjsonlib.add_properties(props)
+            self._add_vulns(flat_vulns)
             self.ptjsonlib.set_status("finished", "")
             self.ptprint(self.ptjsonlib.get_result_json(), json=True)
             return
@@ -1413,7 +1660,7 @@ class ReportingMixin:
                     ),
                     "unreachable": "CatchAll timed out (not confirmed)",
                 }
-                props["description"] = desc_map.get(catch_all, f"CatchAll {catch_all}")
+                self._add_to_json_log(desc_map.get(catch_all, f"CatchAll {catch_all}"))
             if catch_all == "configured":
                 props["enumerationNotes"] = (
                     "Results unreliable: Catch-all configured - all methods report as indeterminate (useless for enumeration)"
@@ -1449,7 +1696,7 @@ class ReportingMixin:
                     if vulnerable:
                         vc = _ENUM_VULN_MAP.get(e.method.upper())
                         if vc:
-                            self.ptjsonlib.add_vulnerability(vuln_code=vc)
+                            self._add_vulns([{"vuln_code": vc}])
             self.ptjsonlib.set_status("finished", "")
             self.ptprint(self.ptjsonlib.get_result_json(), json=True)
             return
@@ -2231,8 +2478,7 @@ class ReportingMixin:
         self._add_brute_account_nodes()
 
         # All vulnerabilities go to global results.vulnerabilities[]
-        for v in global_vulns:
-            self.ptjsonlib.add_vulnerability(**v)
+        self._add_vulns(global_vulns)
 
         self.ptjsonlib.set_status("finished", "")
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)

@@ -29,6 +29,7 @@ class EncryptionResult(NamedTuple):
     plaintext_ok: bool
     stls_ok: bool
     tls_ok: bool
+    plaintext_banner: str | None = None
 
 
 CatchAllResult = str  # "not_configured" | "indeterminate"
@@ -218,12 +219,16 @@ class NoopConnectionCountResult(NamedTuple):
 
 
 class VULNS(Enum):
-    Anonymous = "PTV-GENERAL-ANONYMOUS"
-    NTLM = "PTV-GENERAL-NTLMINFO"
+    Anonymous = "PTV-SVC-ANONYMOUS"
+    NTLM = "PTV-SVC-NTLMINFO"
+    DefAcc = "PTV-SVC-AUTH-DEFACC"
+    DefAccPw = "PTV-SVC-AUTH-DEFACCPW"
+    WeakCredentials = "PTV-SVC-WEAKCREDENTIALS"
     WeakCreds = "PTV-SVC-AUTH-WEAK"
-    Brute = "PTV-SVC-AUTH-BRUTE"
+    AuthBlock = "PTV-SVC-AUTH-BLOCK"
+    Sniffable = "PTV-SVC-SNIFFABLE"
+    AuthPlain = "PTV-SVC-POP3-AUTHPLAIN"
+    AuthWeak = "PTV-SVC-POP3-AUTHWEAK"
     Banner = "PTV-SVC-BANNER"
-    NoopDurationPreauth = "PTV-SVC-POP3-NOOPLIMDUR-PREAUTH"
-    NoopDurationPostauth = "PTV-SVC-POP3-NOOPLIMDUR-POSTAUTH"
-    NoopConnCountPreauth = "PTV-SVC-POP3-NOOPLIMCONN-PREAUTH"
-    NoopConnCountPostauth = "PTV-SVC-POP3-NOOPLIMCONN-POSTAUTH"
+    ConnCntIp = "PTV-SVC-POP3-CONNCNTIP"
+    ConnLong = "PTV-SVC-POP3-CONNLONG"

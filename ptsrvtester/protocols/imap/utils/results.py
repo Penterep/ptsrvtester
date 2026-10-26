@@ -28,6 +28,7 @@ class EncryptionResult(NamedTuple):
     plaintext_ok: bool
     starttls_ok: bool
     tls_ok: bool
+    plaintext_banner: str | None = None
 
 
 class ImapAuthMechRow(NamedTuple):
@@ -806,10 +807,13 @@ class IMAPResults:
 
 
 class VULNS(Enum):
-    Anonymous = "PTV-SVC-IMAP-ANON"
+    Anonymous = "PTV-SVC-ANONYMOUS"
+    DefAcc = "PTV-SVC-AUTH-DEFACC"
+    DefAccPw = "PTV-SVC-AUTH-DEFACCPW"
     NTLM = "PTV-SVC-NTLMINFO"
     WeakCreds = "PTV-SVC-AUTH-WEAK"
-    Brute = "PTV-SVC-AUTH-BRUTE"
+    WeakCredentials = "PTV-SVC-WEAKCREDENTIALS"
+    AuthBlock = "PTV-SVC-AUTH-BLOCK"
     AuthMethods = "PTV-SVC-IMAP-AUTHMETHODS"
     Sniffable = "PTV-SVC-SNIFFABLE"
     InvComm = "PTV-SVC-IMAP-INVCOMM"

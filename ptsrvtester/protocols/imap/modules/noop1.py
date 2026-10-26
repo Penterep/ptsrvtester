@@ -108,7 +108,6 @@ def run(ctx):
     )
 
     ctx.out("Pre-authentication", "TITLE", indent=4)
-    e._flush_terminal()
 
     try:
         result_preauth = e.test_noop_duration_preauth()
@@ -136,7 +135,6 @@ def run(ctx):
     password = first_cli_password(ctx.args.password)
     if user and password:
         ctx.out("Post-authentication", "TITLE", indent=4)
-        e._flush_terminal()
 
         try:
             result_postauth = e.test_noop_duration_postauth(user, password)

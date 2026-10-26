@@ -120,7 +120,6 @@ def _noop2_print_ramp(e, established, est_err, est_disc, est_timeout, reaped) ->
     e.out(f"Refused at connect {est_disc} connections", "TITLE", indent=4)
     e.out(f"Timeouts during connecting {est_timeout}", "TITLE", indent=4)
     e.out(f"Dropped while idle {reaped} connections", "TITLE", indent=4)
-    e._flush_terminal()
 
 def _noop2_wait_delay(e, sock, delay: float, stop_event: threading.Event) -> str:
     """Wait ``delay`` seconds between NOOPs. Return ok / disconnected / stopped."""
@@ -337,7 +336,6 @@ def _noop2_conn_count_test(
     if show_progress:
         kind, text = conn_limit_count_verdict(established, max_connections)
         e.out(text, kind, indent=4)
-        e._flush_terminal()
 
     if storm_pool == 0:
         e.debug(
@@ -565,20 +563,6 @@ __MODULECODE__ = "NOOP2"
 __ORDER__ = 86
 
 
-def _flush_ctx(ctx) -> None:
-    if getattr(ctx, "json", False):
-        return
-    lock = getattr(ctx, "print_lock", None)
-    if lock is None:
-        return
-    chunk = lock.get_output_string()
-    if chunk:
-        import sys
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
-        lock.output_string = ""
-
-
 def _emit_noop2_result(ctx, result) -> None:
     from ..utils.results import (
         NOOP2_AVG_TIME_OK_MAX_SECONDS,
@@ -638,7 +622,6 @@ def _emit_noop2_result(ctx, result) -> None:
                     "TEXT",
                     indent=8,
                 )
-    _flush_ctx(ctx)
 
 
 def _maybe_add_conn_limit_vuln(ctx, result, vuln_code: str, phase: str) -> None:

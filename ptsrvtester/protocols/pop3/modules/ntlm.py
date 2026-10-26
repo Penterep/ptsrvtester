@@ -35,6 +35,13 @@ def run(ctx):
             ctx.out(part, "TEXT", indent=8)
 
     ctx.report.update_properties(ntlmInfoStatus="ok")
+    parts = []
+    if result.ntlm.netbios_domain:
+        parts.append(f"NetBios domain: {result.ntlm.netbios_domain}")
+    if result.ntlm.dns_computer:
+        parts.append(f"DNS computer: {result.ntlm.dns_computer}")
+    if parts:
+        ctx.report.note_poc(VULNS.NTLM.value, ("AUTH NTLM", "; ".join(parts)))
     ctx.report.add_vulnerability(
         vuln_code=VULNS.NTLM.value,
         vuln_request="ntlm authentication",

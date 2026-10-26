@@ -31,6 +31,8 @@ def emit_banner(ctx, info) -> None:
         )
         if sid.version is not None:
             ctx.report.add_vulnerability(vuln_code=VULNS.Banner.value)
+            if info.banner:
+                ctx.report.note_poc(VULNS.Banner.value, ("(connect)", info.banner))
     else:
         ctx.report.update_properties(description=f"Banner: {info.banner}")
 

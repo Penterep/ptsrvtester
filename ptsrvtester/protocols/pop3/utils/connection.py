@@ -26,6 +26,7 @@ from .results import (
     InfoResult,
     NOOP2_DEFAULT_CONNECTIONS,
     NTLMResult,
+    VULNS,
     NoopConnectionCountResult,
     NoopDurationResult,
     NOOP1_PROGRESS_EVERY,
@@ -267,6 +268,7 @@ def test_encryption(args, *, debug: DebugFn | None = None) -> EncryptionResult:
     port = args.target.port
     timeout = 10.0
     plaintext_ok = stls_ok = tls_ok = False
+    plaintext_banner: str | None = None
     _ssl_ctx = ssl._create_unverified_context()
     tls_only_port = port == 995
 
@@ -279,6 +281,7 @@ def test_encryption(args, *, debug: DebugFn | None = None) -> EncryptionResult:
             pop3 = poplib.POP3(host, port, timeout=timeout)
             try:
                 welcome = bytes_to_text(pop3.welcome)
+                plaintext_banner = (welcome or "").strip() or None
                 plaintext_ok = True
                 _dbg(f"Plaintext welcome: {_snip(welcome)}")
             finally:
@@ -351,7 +354,7 @@ def test_encryption(args, *, debug: DebugFn | None = None) -> EncryptionResult:
     except Exception as e:
         _dbg(f"Implicit TLS test failed: {e}")
 
-    return EncryptionResult(plaintext_ok, stls_ok, tls_ok)
+    return EncryptionResult(plaintext_ok, stls_ok, tls_ok, plaintext_banner)
 
 
 def _text_is_timeout(text: object) -> bool:
@@ -363,24 +366,29 @@ def auth_anonymous(
     pop3: poplib.POP3 | poplib.POP3_SSL,
     *,
     debug: DebugFn | None = None,
-) -> bool | None:
-    """True = accepted, False = rejected, None = timed out / not confirmed."""
+) -> tuple[bool | None, list[tuple[str, str]]]:
+    """True = accepted, False = rejected, None = timed out / not confirmed.
+
+    The second value is the Send/Receive pairs from this probe.
+    """
     try:
         res: bytes = pop3._shortcmd("AUTH ANONYMOUS")
+        pairs = [("AUTH ANONYMOUS", _pop3_line(res))]
         if debug:
             debug(f"AUTH ANONYMOUS → {_snip(res)}")
         if len(res.strip()) == 1:
             cont = b64encode(b"HELLO").decode()
             res2 = pop3._shortcmd(cont)
+            pairs.append((cont, _pop3_line(res2)))
             if debug:
                 debug(f"AUTH ANONYMOUS continuation → {_snip(res2)}")
-        return True
+        return True, pairs
     except Exception as e:
         if debug:
             debug(f"AUTH ANONYMOUS failed: {e}")
         if _text_is_timeout(e):
-            return None
-        return False
+            return None, []
+        return False, []
 
 
 def auth_ntlm(args, *, debug: DebugFn | None = None) -> NTLMResult:
@@ -455,8 +463,16 @@ _POP3_BRUTE_LOCK_RE = re.compile(
 def _pop3_brute_line(
     output, msg: str, category: str = "ADDITIONS", *,
     debug: bool = False, json_mode: bool = False, colortext: bool = True, indent: int = 0,
+    log=None,
 ) -> None:
-    if output is None or json_mode:
+    if category == "ADDITIONS" and callable(log) and msg:
+        log(msg)
+        return
+    if json_mode:
+        if callable(log) and msg:
+            log(msg)
+        return
+    if output is None:
         return
     if category == "ADDITIONS" and not debug:
         return
@@ -501,20 +517,23 @@ def _pop3_brute_block_paren(text: str) -> str | None:
     return None
 
 
-def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: bool) -> tuple[str, str | None, str | None]:
-    """One USER/PASS (RFC 1939). ok, fail, blocked, down, or unsupported."""
+def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: bool, log=None) -> tuple[str, str | None, str | None, tuple[str, str] | None]:
+    """One USER/PASS (RFC 1939). ok, fail, blocked, down, or unsupported.
+
+    The last value is the real USER and PASS reply lines when login succeeded.
+    """
     if stop.is_set():
-        return "skip", None, None
+        return "skip", None, None, None
     shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
 
     def trace(msg: str, category: str = "ADDITIONS", **kwargs) -> None:
-        _pop3_brute_line(output, msg, category, debug=debug, json_mode=json_mode, **kwargs)
+        _pop3_brute_line(output, msg, category, debug=debug, json_mode=json_mode, log=log, **kwargs)
 
     try:
         pop3 = connect_pop3(args)
     except OSError as e:
         trace(f"{shown!r}: connect failed {_snip(str(e))}")
-        return "down", None, None
+        return "down", None, None, None
     try:
         try:
             urep = _pop3_line(pop3.user(cred.user))
@@ -524,10 +543,10 @@ def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: 
             trace(f"{shown!r}: USER {urep}")
             note = "USER/PASS is not offered. Password guessing was not tested." if kind == "unsupported" else None
             block = _pop3_brute_block_paren(urep) if kind == "blocked" else None
-            return kind, note, block
+            return kind, note, block, None
         except (OSError, TimeoutError) as e:
             trace(f"{shown!r}: USER failed {_snip(str(e))}")
-            return "down", None, None
+            return "down", None, None, None
         try:
             prep = _pop3_line(pop3.pass_(cred.passw))
             kind = "ok"
@@ -536,7 +555,7 @@ def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: 
             kind = _pop3_brute_kind(prep)
         except (OSError, TimeoutError) as e:
             trace(f"{shown!r}: USER {urep}; PASS failed {_snip(str(e))}")
-            return "down", None, None
+            return "down", None, None, None
         pass_label = 'PASS ""' if cred.passw == "" else "PASS"
         trace(f"{shown!r}: USER {urep}; {pass_label} {prep}")
         if kind == "ok":
@@ -544,12 +563,26 @@ def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: 
             trace(f"password: {shown_password(cred.passw)}", "TEXT", colortext=False, indent=4)
         note = "USER/PASS is not offered. Password guessing was not tested." if kind == "unsupported" else None
         block = _pop3_brute_block_paren(prep) if kind == "blocked" else None
-        return kind, note, block
+        exchange = (urep, prep) if kind == "ok" else None
+        return kind, note, block, exchange
     finally:
         try:
             pop3.close()
         except Exception:
             pass
+
+
+_POP3_DEFAULT_USERS = frozenset({"anonymous", "ftp", "guest", "admin", "root", "postmaster"})
+
+
+def _pop3_default_account(user: str, password: str) -> tuple[bool, bool]:
+    """Default account name, and whether the password is the paired default."""
+    name = (user or "").strip().lower()
+    secret = (password or "").strip().lower()
+    if name not in _POP3_DEFAULT_USERS:
+        return False, False
+    classic = secret in {"", name, "anonymous", "ftp", "guest", "email", "postmaster"}
+    return True, classic
 
 
 def login_bruteforce(ctx) -> set[Creds]:
@@ -585,7 +618,19 @@ def login_bruteforce(ctx) -> set[Creds]:
     lock = threading.Lock()
 
     def work(cred: Creds, output) -> str:
-        kind, note, block = _pop3_brute_one(args, cred, output, stop, debug=debug, json_mode=json_mode)
+        kind, note, block, exchange = _pop3_brute_one(
+            args, cred, output, stop, debug=debug, json_mode=json_mode, log=ctx.debug,
+        )
+        if kind == "ok" and exchange:
+            urep, prep = exchange
+            pairs = ((f"USER {cred.user}", urep), ("PASS", prep))
+            ctx.report.note_poc(VULNS.WeakCredentials.value, *pairs)
+            ctx.report.note_poc(VULNS.WeakCreds.value, *pairs)
+            is_default, classic_pw = _pop3_default_account(cred.user, cred.passw)
+            if is_default:
+                ctx.report.note_poc(VULNS.DefAcc.value, *pairs)
+            if classic_pw:
+                ctx.report.note_poc(VULNS.DefAccPw.value, *pairs)
         with lock:
             if kind in ("ok", "fail", "blocked"):
                 state["tried"] += 1
@@ -646,10 +691,11 @@ def try_login(args, creds, *, debug: DebugFn | None = None) -> object | None:
     try:
         if debug:
             debug(f"USER {creds.user!r}")
-        pop3.user(creds.user)
-        pop3.pass_(creds.passw)
+        urep = pop3.user(creds.user)
+        prep = pop3.pass_(creds.passw)
         if debug:
-            debug(f"PASS → +OK (valid: {creds.user!r})")
+            debug(f"USER → {_snip(urep)}")
+            debug(f"PASS → {_snip(prep)}")
         return creds
     except Exception as e:
         if debug:
@@ -666,10 +712,9 @@ def try_login(args, creds, *, debug: DebugFn | None = None) -> object | None:
 
 
 def _pop3_noop_safe(pop3: poplib.POP3 | poplib.POP3_SSL) -> tuple[bool, str | None]:
-    """Send NOOP and return (success, error_msg)."""
+    """Send NOOP. On success the second value is the server reply; on failure, the error."""
     try:
-        pop3._shortcmd("NOOP")  # Sends NOOP and expects +OK
-        return (True, None)
+        return (True, _pop3_line(pop3._shortcmd("NOOP")))
     except Exception as e:
         return (False, _noop2_failure_detail(e))
 
@@ -787,12 +832,15 @@ def _run_noop_duration_loop(
         live_line_dirty = False
 
     def emit_vv(msg: str) -> None:
-        """Print a -vv snapshot as its own line (never onto the live \\r row)."""
-        if not verbose or not debug:
+        """Print a -vv snapshot as its own line (never onto the live \\r row).
+
+        With -j the same line goes to results.log even without -vv.
+        """
+        if not debug or not (verbose or not show_progress):
             return
         clear_live()
         debug(msg)
-        if flush:
+        if flush and show_progress:
             flush()
 
     if show_progress and not verbose:
@@ -807,7 +855,7 @@ def _run_noop_duration_loop(
 
             noops_sent += 1
             t0 = time.perf_counter()
-            success, error = _pop3_noop_safe(pop3)
+            success, detail = _pop3_noop_safe(pop3)
             rt = time.perf_counter() - t0
             if success:
                 noops_ok += 1
@@ -821,14 +869,14 @@ def _run_noop_duration_loop(
                     write_live(f"NOOPs sent: {noops_sent} ({elapsed_min}m {elapsed_sec}s elapsed)")
                 if noops_sent % NOOP1_PROGRESS_EVERY == 0:
                     emit_vv(
-                        f"NOOP #{noops_sent}: +OK rt={rt:.3f}s "
+                        f"NOOP #{noops_sent}: {detail} rt={rt:.3f}s "
                         f"(elapsed: {int(time.perf_counter() - start_time)}s)"
                     )
             else:
                 noops_error += 1
                 disconnected = True
                 disconnect_after_seconds = time.perf_counter() - start_time
-                emit_vv(f"NOOP #{noops_sent}: failed — {error}")
+                emit_vv(f"NOOP #{noops_sent}: failed — {detail}")
                 break
 
             wait_state = _noop1_wait_idle(

@@ -7,7 +7,7 @@ optional ``aioquic`` package to be tested.
 """
 from ptsrvtester.protocols.dns.utils import fingerprint_core as fp
 
-__MODULELABEL__ = "Supported transports (UDP/TCP/DoT/DoH/DoQ)"
+__MODULELABEL__ = "Supported transports"
 __MODULECODE__ = "TRANSPORT"
 __ORDER__ = 30
 
@@ -20,18 +20,16 @@ def run(ctx):
     ip, port = target
     host = getattr(ctx, "host", None)
 
-    ctx.debug(f"probing UDP/53, TCP/53, DoT/853, DoH/443 and DoQ/853 on {ip} with a benign query")
     results = fp.transports(host, ip, port)
-    ctx.debug("transport probing complete; summarizing which transports answered")
-    supported: list[str] = []
     for name in ("UDP/53", "TCP/53", "DoT/853", "DoH/443", "DoQ/853"):
         res = results.get(name)
         if res is None:
             continue
+        ctx.debug(f"Send ... to {ip} ({name})")
+        ctx.debug("Response: ...")
         if res.state is True:
             ctx.out(f"{name:<10} supported", "OK", indent=4)
-            supported.append(name)
         elif res.state is False:
-            ctx.out(f"{name:<10} not available ({res.detail})", "TEXT", indent=4)
+            ctx.out(f"{name:<10} not available ({res.detail})", "WARNING", indent=4)
         else:
             ctx.out(f"{name:<10} not tested ({res.detail})", "WARNING", indent=4)

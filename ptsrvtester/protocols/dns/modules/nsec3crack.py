@@ -36,20 +36,21 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"collecting NSEC3 hashes and parameters for {domain}")
+        ctx.debug(f"Send NSEC3 collection queries for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
         params, hashes = zw.collect_nsec3(servers, domain)
+        ctx.debug(f"Response: {len(hashes)} NSEC3 hash(es), params {'found' if params else 'none'}")
         if params is None or not hashes:
             ctx.out("Zone does not use NSEC3 (or no hashes collected) — nothing to crack.", "OK", indent=8)
             continue
 
         ctx.out(f"NSEC3 alg {params.algorithm}, iterations {params.iterations}, salt {params.salt_hex}; "
                 f"{len(hashes)} hashes collected; trying {wordlist_note}.", "TEXT", indent=8)
-        ctx.debug(f"hashing {len(labels)} candidate label(s) with the zone's NSEC3 parameters and matching against {len(hashes)} collected hash(es)")
+        ctx.debug(f"Hashing {len(labels)} candidate label(s) against {len(hashes)} collected hash(es)")
         revealed = zw.crack_nsec3(hashes, params, domain, labels)
 
         if not revealed:

@@ -22,9 +22,14 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
-    ctx.debug(f"sending an EDNS query carrying an 8-byte client cookie to {ip}:{port} (RFC 7873)")
+    ctx.debug(f"Send EDNS query + 8-byte client cookie to {ip}:{port} (RFC 7873)")
     info = pc.cookie_probe(ip, port)
-    ctx.debug("cookie probe complete; checking whether the server returned a server cookie")
+    ctx.debug(
+        "Response: " + (info["error"] if "error" in info
+                        else "server cookie returned" if info.get("server_cookie")
+                        else "client cookie only" if info.get("present")
+                        else "no cookie")
+    )
     if "error" in info:
         ctx.out(f"Cookie probe failed: {info['error']}", "WARNING", indent=4)
         return

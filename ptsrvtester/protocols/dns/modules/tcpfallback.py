@@ -28,19 +28,20 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"finding authoritative servers for {domain}")
+        ctx.debug(f"Resolving authoritative servers for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
-        ctx.debug(f"probing {servers[0]} with a 512-byte UDP buffer, then retrying over TCP/53")
+        ctx.debug(f"Send a 512-byte-buffer UDP query + TCP/53 retry to {servers[0]}")
         res = dos.tcp_fallback(servers[0], domain)
+        ctx.debug(f"Response: UDP TC={res.udp_truncated}, TCP ok={res.tcp_ok}")
 
         if res.udp_truncated is True:
             ctx.out(f"UDP (bufsize 512): TC set — server truncates large responses correctly.", "OK", indent=8)
         elif res.udp_truncated is False:
-            ctx.out(f"UDP (bufsize 512): no TC (response {res.udp_size} B fit, or record small — inconclusive).", "TEXT", indent=8)
+            ctx.out(f"UDP (bufsize 512): no TC (response {res.udp_size} B fit, or record small — inconclusive).", "WARNING", indent=8)
         else:
             ctx.out("UDP truncation probe got no response.", "WARNING", indent=8)
 

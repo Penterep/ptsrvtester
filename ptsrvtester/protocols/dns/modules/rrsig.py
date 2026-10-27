@@ -32,9 +32,10 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"fetching RRSIG expiration times for {domain}")
+        ctx.debug(f"Send DNSKEY/SOA RRSIG query for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         sigs = dc.rrsig_expiry(servers, domain) if servers else []
+        ctx.debug(f"Response: {len(sigs)} RRSIG(s)")
         if not sigs:
             ctx.out("No RRSIG found (zone not signed, or signatures unavailable).", "WARNING", indent=8)
             continue

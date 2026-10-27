@@ -21,8 +21,9 @@ def run(ctx):
     ctx.debug(f"fetching WHOIS registration data for {len(domains)} domain(s)")
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"querying WHOIS for {domain}")
+        ctx.debug(f"Send WHOIS query for {domain}")
         text = ec.whois_lookup(domain)
+        ctx.debug(f"Response: {'data received' if text else 'no data'}")
         if not text:
             ctx.out("No WHOIS data (lookup failed, rate-limited, or TLD not supported).", "WARNING", indent=8)
             continue

@@ -9,15 +9,51 @@ its own ``{"vulnCode": ...}`` entry. No ``software`` node and no ``properties``
 are emitted. Mirrors ``ssh/main.py``.
 """
 import argparse
+import json
 import socket
 import threading
 
 from ptlibs.ptjsonlib import PtJsonLib
+from ptlibs.ptprinthelper import ptprint
 
-from .._base import BaseMain, BaseArgs
+from .._base import BaseMain, BaseArgs, ModuleContext
 from .utils.cli import DNSArgs
 
 DNS_DEFAULT_PORT = 53
+
+
+class DnsModuleContext(ModuleContext):
+    """DNS ``ctx`` that mirrors the ``-vv`` screen into ``results.log``.
+
+    Leaves ``_base.py`` untouched: it subclasses :class:`ModuleContext` and is
+    wired in via :meth:`DNS._make_context`. Every ``out()`` / ``debug()`` line is
+    appended to ``results.log`` as the plain message text only — indent + text,
+    WITHOUT the leading ``[✓]`` / ``[!]`` / ``[+]`` bullet shown on the terminal —
+    concatenated straight onto one string with NO separator between entries (no
+    ``\\r\\n`` and no ``\\n``). Any non-ASCII in the text stays literal because
+    ``PtsrvtesterJsonLib.get_result_json`` dumps with ``ensure_ascii=False``.
+    """
+
+    def out(self, string="", category="TEXT", *, colortext=False, indent=0, condition=None):
+        super().out(string, category, colortext=colortext, indent=indent, condition=condition)
+        self._mirror(string, indent)
+
+    def debug(self, string="", *, indent=4):
+        if string != "":
+            self._mirror(string, indent)
+        if self.verbose and not self.json:
+            ptprint(string, "ADDITIONS", True, colortext=True, indent=indent)
+
+    def _mirror(self, string, indent) -> None:
+        """Append the plain message text of a line to results.log.
+
+        Mirrors the terminal content WITHOUT the leading bullet icons
+        (``[✓]`` / ``[!]`` / ``[+]`` …): just the indentation + the message text.
+        Entries are concatenated with no ``\\r\\n`` / ``\\n``, so the indents are
+        the only gaps between them.
+        """
+        results = self.ptjsonlib.json_object["results"]
+        results["log"] = results.get("log", "") + f"{' ' * indent}{string}"
 
 
 class DNS(BaseMain):
@@ -32,6 +68,21 @@ class DNS(BaseMain):
         super().__init__(args, ptjsonlib)
         self._deferred_vulns: list[dict] = []
         self._results_lock = threading.Lock()
+
+    def _make_context(self, extras: dict) -> ModuleContext:
+        """Build a :class:`DnsModuleContext` (mirrors the -vv screen into the log).
+
+        Same wiring as ``BaseMain._make_context`` but with the DNS-specific
+        context class — so the log-mirroring lives here, not in ``_base.py``.
+        """
+        ctx = DnsModuleContext(
+            args=self.args,
+            ptjsonlib=self.ptjsonlib,
+            target=self.target,
+        )
+        for key, value in extras.items():
+            setattr(ctx, key, value)
+        return ctx
 
     def _prepare_target(self) -> None:
         """Resolve the DNS server target (``-tg``) to ``(ip, port)`` for the modules.
@@ -88,10 +139,15 @@ class DNS(BaseMain):
         ``add_vulnerability`` (which de-duplicates by code, so the same code seen
         for several domains collapses to one entry). No ``software`` node and no
         ``properties`` are written; besides the log, nothing else goes into the JSON.
+
+        The JSON is dumped here with ``ensure_ascii=False`` (instead of ptlibs'
+        ``get_result_json``, whose json default would escape any non-ASCII text in
+        the log to ``\\uXXXX``) so the mirrored log stays literal. Kept here in the
+        DNS main so neither ``ptsrvtester.py`` nor ``_base.py`` is touched.
         """
         for v in self._deferred_vulns:
             self.ptjsonlib.add_vulnerability(vuln_code=v["vuln_code"])
 
         self.ptjsonlib.set_status("finished", "")
         if self.use_json:
-            print(self.ptjsonlib.get_result_json())
+            print(json.dumps(self.ptjsonlib.json_object, indent=4, ensure_ascii=False))

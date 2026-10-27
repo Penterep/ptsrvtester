@@ -41,7 +41,7 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"resolving the primary/authoritative servers for {domain}")
+        ctx.debug(f"Resolving the primary/authoritative servers for {domain}")
         servers = du.primary_ips(resolver, domain)
         if not servers:
             ctx.out("Could not resolve the zone's primary/authoritative servers.", "WARNING", indent=8)
@@ -50,8 +50,9 @@ def run(ctx):
 
         # First confirm the key is accepted at all.
         base = du.test_name(domain)
-        ctx.debug(f"confirming the TSIG key is accepted with a signed UPDATE to {ip}")
+        ctx.debug(f"Send a signed TSIG UPDATE to {ip} (confirm key accepted)")
         rcode = du.add_txt(ip, domain, base, tsig=tsig)
+        ctx.debug(f"Response: {dns.rcode.to_text(rcode) if rcode is not None else 'no response'}")
         if rcode is None:
             ctx.out(f"No response to the TSIG update from {ip}.", "WARNING", indent=8)
             continue
@@ -68,7 +69,7 @@ def run(ctx):
         ctx.out("TSIG key accepted and can add records — now testing name scope.", "TEXT", indent=8)
 
         # Now test whether the key can write ARBITRARY/unrelated names (broad ACL).
-        ctx.debug(f"probing whether the key can write {len(PROBE_LABELS)} arbitrary/unrelated name(s)")
+        ctx.debug(f"Send signed UPDATEs for {len(PROBE_LABELS)} arbitrary/unrelated name(s)")
         writable = []
         for label in PROBE_LABELS:
             name = f"{label}.{domain.rstrip('.')}"

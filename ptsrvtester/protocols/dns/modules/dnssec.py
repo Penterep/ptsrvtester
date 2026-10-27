@@ -27,13 +27,16 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"finding authoritative servers for {domain} and fetching its DNSKEY rrset")
+        ctx.debug(f"Resolving authoritative servers for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
+        ctx.debug(f"Send DNSKEY query for {domain} to {len(servers)} authoritative server(s)")
         keys = dc.get_dnskey(servers, domain)
+        ctx.debug(f"Response: {'DNSKEY present' if keys.dnskey else 'no DNSKEY'}"
+                  + (", self-signature valid" if keys.dnskey and keys.valid else ""))
         if keys.dnskey is None:
             ctx.out("DNSSEC not deployed (no DNSKEY) — responses are not authenticated.", "VULN", indent=8)
             summary[domain] = "unsigned"

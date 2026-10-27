@@ -30,14 +30,15 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"finding authoritative servers for {domain}")
+        ctx.debug(f"Resolving authoritative servers for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
-        ctx.debug(f"firing an identical-query burst at {servers[0]} and watching for drops / TC-slip")
+        ctx.debug(f"Send identical-query burst to {servers[0]}")
         res = dos.rrl_probe(servers[0], domain)
+        ctx.debug(f"Response: {res.error if res.error else f'sent {res.sent}, received {res.received}, slip {res.truncated}'}")
         if res.error:
             ctx.out(f"RRL probe failed: {res.error}", "WARNING", indent=8)
             continue

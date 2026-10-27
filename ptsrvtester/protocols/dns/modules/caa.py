@@ -26,8 +26,9 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"querying CAA for {domain}")
+        ctx.debug(f"Send CAA? {domain} to resolver")
         records = ec.caa_records(resolver, domain)
+        ctx.debug(f"Response: {len(records)} CAA record(s)")
         summary[domain] = records
         if records:
             for rec in records:

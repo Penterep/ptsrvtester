@@ -28,15 +28,16 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"requesting authenticated-denial records for a bogus name under {domain}")
+        ctx.debug(f"Send a query for a bogus name under {domain} to inspect NSEC/NSEC3")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         info = dc.denial_of_existence(servers, domain) if servers else dc.DenialInfo(error="no authoritative servers")
+        ctx.debug(f"Response: {info.error if info.error else (info.kind or 'no NSEC/NSEC3')}")
 
         if info.error:
             ctx.out(f"Could not determine denial type: {info.error}", "WARNING", indent=8)
             continue
         if info.kind is None:
-            ctx.out("No NSEC/NSEC3 records seen (zone may be unsigned or uses minimal responses).", "TEXT", indent=8)
+            ctx.out("No NSEC/NSEC3 records seen (zone may be unsigned or uses minimal responses).", "WARNING", indent=8)
             summary[domain] = "none"
             continue
 

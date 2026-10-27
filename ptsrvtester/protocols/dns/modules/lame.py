@@ -27,8 +27,9 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"querying each NS of {domain} directly for the zone SOA")
+        ctx.debug(f"Send RD=0 SOA query to each NS of {domain}")
         results = ig.lame_delegations(resolver, domain)
+        ctx.debug(f"Response: {len(results)} NS checked, {sum(1 for r in results if not r.ok)} lame")
         if not results:
             ctx.out("No NS records found for the domain.", "WARNING", indent=8)
             continue

@@ -33,14 +33,15 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"finding authoritative servers for {domain}")
+        ctx.debug(f"Resolving authoritative servers for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
-        ctx.debug(f"sending ANY/DNSKEY/TXT probes to {len(servers)} authoritative server(s) for {domain}")
+        ctx.debug(f"Send ANY/DNSKEY/TXT probes to {len(servers)} authoritative server(s) for {domain}")
         measures = dos.amplification_factors(servers, domain)
+        ctx.debug(f"Response: {len(measures)} measurement(s)")
         if not measures:
             ctx.out("No response to amplification probes.", "OK", indent=8)
             continue

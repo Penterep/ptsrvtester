@@ -30,16 +30,17 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"resolving the primary/authoritative servers for {domain}")
+        ctx.debug(f"Resolving the primary/authoritative servers for {domain}")
         servers = du.primary_ips(resolver, domain)
         if not servers:
             ctx.out("Could not resolve the zone's primary/authoritative servers.", "WARNING", indent=8)
             continue
         ip = servers[0]
 
-        ctx.debug(f"sending a non-writing prerequisite-only UPDATE (RFC 2136 §2.4) to {ip}")
+        ctx.debug(f"Send a non-writing prerequisite-only UPDATE (RFC 2136 §2.4) to {ip}")
         rcode = du.prereq_probe(ip, domain)
         rtext = dns.rcode.to_text(rcode) if rcode is not None else "no response"
+        ctx.debug(f"Response: {rtext}")
 
         if rcode is None:
             ctx.out("No response to the (non-writing) prerequisite probe.", "WARNING", indent=8)

@@ -24,8 +24,10 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"resolving {', '.join(rtypes)} for {domain}")
+        ctx.debug(f"Send {', '.join(rtypes)}? {domain} to resolver")
         records = ec.lookup_records(resolver, domain, rtypes)
+        ctx.debug(f"Response: {sum(len(v or []) for v in records.values())} record(s) "
+                  f"across {len(rtypes)} type(s)")
         any_found = False
         for rtype in rtypes:
             values = records.get(rtype) or []

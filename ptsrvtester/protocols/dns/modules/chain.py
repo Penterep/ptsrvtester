@@ -27,11 +27,12 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"fetching DNSKEY for {domain} and DS from its parent, then matching digests")
+        ctx.debug(f"Send DNSKEY query for {domain} + DS query to its parent")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         keys = dc.get_dnskey(servers, domain) if servers else None
         dnskey = keys.dnskey if keys else None
         matches, ds_present = dc.chain_of_trust(servers, resolver, domain, dnskey)
+        ctx.debug(f"Response: DS {'present' if ds_present else 'absent'}, {len(matches)} DS↔DNSKEY pair(s)")
 
         if not ds_present:
             if dnskey is not None:

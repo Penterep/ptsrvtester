@@ -26,8 +26,9 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"querying a random non-existent label under {domain}")
+        ctx.debug(f"Send a random non-existent label query under {domain}")
         wc = ec.wildcard_detect(resolver, domain)
+        ctx.debug(f"Response: {'wildcard present' if wc.present else 'no wildcard'}")
         if not wc.present:
             ctx.out("No wildcard record (random labels do not resolve).", "OK", indent=8)
             summary[domain] = {"wildcard": False}

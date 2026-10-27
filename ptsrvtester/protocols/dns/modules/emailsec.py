@@ -28,8 +28,10 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"querying SPF (TXT), DMARC (_dmarc TXT) and DKIM selectors for {domain}")
+        ctx.debug(f"Send SPF/DMARC/DKIM queries for {domain}")
         info = ec.email_security(resolver, domain, selectors)
+        ctx.debug(f"Response: SPF {'present' if info.spf else 'absent'}, "
+                  f"DMARC {'present' if info.dmarc else 'absent'}, DKIM {len(info.dkim)} selector(s)")
         vulns: list[dict] = []
 
         # SPF
@@ -62,7 +64,7 @@ def run(ctx):
             for selector, record in info.dkim.items():
                 ctx.out(f"DKIM     {selector}._domainkey: {record[:80]}{'…' if len(record) > 80 else ''}", "OK", indent=8)
         else:
-            ctx.out(f"DKIM     none found for tried selectors ({len(selectors)}); may use custom selectors", "TEXT", indent=8)
+            ctx.out(f"DKIM     none found for tried selectors ({len(selectors)}); may use custom selectors", "WARNING", indent=8)
 
         summary[domain] = {
             "spf": info.spf, "spf_all": info.spf_all,

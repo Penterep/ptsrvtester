@@ -26,8 +26,9 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"querying each authoritative NS of {domain} for its SOA serial and NS set")
+        ctx.debug(f"Send SOA/NS queries to each authoritative NS of {domain}")
         views, consistent, notes = ig.ns_consistency(resolver, domain)
+        ctx.debug(f"Response: {len(views)} NS view(s), {'consistent' if consistent else 'inconsistent'}")
         if not views:
             ctx.out("No NS records found for the domain.", "WARNING", indent=8)
             continue

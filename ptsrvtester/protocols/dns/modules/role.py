@@ -21,9 +21,13 @@ def run(ctx):
         return
     ip, port = target
 
-    ctx.debug(f"sending a recursive (RD=1) probe for an external name to {ip}:{port} to classify the server role")
+    ctx.debug(f"Send A? example.com (RD=1) to {ip}:{port}")
     info = fp.role_probe(ip, port)
-    ctx.debug("role probe complete; reading RA/AA flags and the answer")
+    ctx.debug(
+        f"Response: {info.error}" if info.error
+        else f"Response: rcode {info.rcode}, RA={'1' if info.recursion_available else '0'}, "
+             f"AA={'1' if info.authoritative else '0'}"
+    )
     if info.error:
         ctx.out(f"Role probe failed: {info.error}", "WARNING", indent=4)
         return
@@ -42,7 +46,7 @@ def run(ctx):
                 "distinguished remotely.", "TEXT", indent=4)
     elif info.recursion_available:
         role = "Recursion advertised but not resolving for us (possibly restricted by ACL)"
-        ctx.out(role, "TEXT", indent=4)
+        ctx.out(role, "OK", indent=4)
     else:
         role = "Authoritative-only / recursion not available"
         ctx.out(role, "OK", indent=4)

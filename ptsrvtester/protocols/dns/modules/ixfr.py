@@ -29,21 +29,23 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"discovering authoritative name servers and current serial for {domain}")
+        ctx.debug(f"Resolving authoritative name servers + serial for {domain}")
         servers, primary, serial = zc.transfer_targets(resolver, domain, extra)
         if not servers:
             ctx.out("No NS records found for the domain (cannot try IXFR).", "WARNING", indent=8)
             continue
         since = (serial - 1) if serial and serial > 1 else 1
-        ctx.debug(f"requesting IXFR since serial {since} from {len(servers)} name server(s)")
+        ctx.debug(f"Response: {len(servers)} name server(s) found; will request IXFR since serial {since}")
 
         for ns in servers:
             role = "primary" if ns.is_primary else "secondary"
             if not ns.ips:
-                ctx.out(f"{ns.host.rstrip('.'):<32} [{role}] no A/AAAA — skipped", "TEXT", indent=8)
+                ctx.out(f"{ns.host.rstrip('.'):<32} [{role}] no A/AAAA — skipped", "WARNING", indent=8)
                 continue
             for ip in ns.ips:
+                ctx.debug(f"Send IXFR {domain} (since {since}) to {ip} ({ns.host.rstrip('.')})")
                 res = zc.try_ixfr(ip, domain, ns.host, ns.is_primary, since)
+                ctx.debug(f"Response: {'allowed, ' + str(res.record_count) + ' records' if res.allowed else 'refused (' + str(res.error) + ')'}")
                 if res.allowed:
                     kind = "incremental delta" if res.incremental else "full AXFR-style fallback"
                     ctx.out(f"{res.server} [{role}] IXFR ALLOWED — {res.record_count} records ({kind})", "VULN", indent=8)

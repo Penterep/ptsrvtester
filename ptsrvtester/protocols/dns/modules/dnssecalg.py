@@ -27,9 +27,10 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"fetching DNSKEY algorithms for {domain}")
+        ctx.debug(f"Send DNSKEY query for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         keys = dc.get_dnskey(servers, domain) if servers else None
+        ctx.debug(f"Response: {len(keys.dnskey) if keys and keys.dnskey else 0} DNSKEY(s)")
         if not keys or keys.dnskey is None:
             ctx.out("No DNSKEY (zone not signed) — nothing to assess.", "WARNING", indent=8)
             continue
@@ -43,7 +44,7 @@ def run(ctx):
             elif a.modern:
                 ctx.out(f"{a.role} tag {a.key_tag}: {a.name} (alg {a.algorithm}) — modern", "OK", indent=8)
             else:
-                ctx.out(f"{a.role} tag {a.key_tag}: {a.name} (alg {a.algorithm}) — acceptable (ECDSA/EdDSA recommended)", "TEXT", indent=8)
+                ctx.out(f"{a.role} tag {a.key_tag}: {a.name} (alg {a.algorithm}) — acceptable (ECDSA/EdDSA recommended)", "OK", indent=8)
         summary[domain] = [f"{a.name}(alg {a.algorithm},{a.role})" for a in algs]
 
         if deprecated:

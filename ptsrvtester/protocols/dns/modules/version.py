@@ -19,19 +19,19 @@ def run(ctx):
         return
     ip, port = target
 
-    ctx.debug(f"querying CHAOS-class TXT records ({', '.join(fp.CHAOS_NAMES)}) on {ip}:{port}")
+    ctx.debug(f"Send CHAOS TXT? {', '.join(fp.CHAOS_NAMES)} to {ip}:{port}")
     chaos = fp.collect_chaos(ip, port)
     disclosed = {name: vals for name, vals in chaos.items() if vals}
-    ctx.debug(f"CHAOS query complete; {len(disclosed)} of {len(fp.CHAOS_NAMES)} name(s) disclosed information")
+    ctx.debug(f"Response: {len(disclosed)} of {len(fp.CHAOS_NAMES)} name(s) disclosed information")
 
     for name in fp.CHAOS_NAMES:
         vals = chaos.get(name)
         if vals:
             ctx.out(f"{name:<15} {', '.join(vals)}", "VULN", indent=4)
         elif vals == []:
-            ctx.out(f"{name:<15} refused / not set", "TEXT", indent=4)
+            ctx.out(f"{name:<15} refused / not set", "OK", indent=4)
         else:
-            ctx.out(f"{name:<15} no response", "TEXT", indent=4)
+            ctx.out(f"{name:<15} no response", "WARNING", indent=4)
 
     if not disclosed:
         ctx.out("No CHAOS TXT information disclosed.", "OK", indent=4)

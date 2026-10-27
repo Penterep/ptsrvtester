@@ -30,20 +30,22 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"discovering authoritative name servers for {domain}")
+        ctx.debug(f"Resolving authoritative name servers for {domain}")
         servers, primary, _ = zc.transfer_targets(resolver, domain, extra)
         if not servers:
             ctx.out("No NS records found for the domain (cannot try AXFR).", "WARNING", indent=8)
             continue
 
-        ctx.debug(f"{len(servers)} name server(s) found for {domain}; trying AXFR against each")
+        ctx.debug(f"Response: {len(servers)} name server(s) found for {domain}")
         for ns in servers:
             role = "primary" if ns.is_primary else "secondary"
             if not ns.ips:
-                ctx.out(f"{ns.host.rstrip('.'):<32} [{role}] no A/AAAA — skipped", "TEXT", indent=8)
+                ctx.out(f"{ns.host.rstrip('.'):<32} [{role}] no A/AAAA — skipped", "WARNING", indent=8)
                 continue
             for ip in ns.ips:
+                ctx.debug(f"Send AXFR {domain} to {ip} ({ns.host.rstrip('.')})")
                 res = zc.try_axfr(ip, domain, ns.host, ns.is_primary)
+                ctx.debug(f"Response: {'allowed, ' + str(res.record_count) + ' records' if res.allowed else 'refused (' + str(res.error) + ')'}")
                 if res.allowed:
                     ctx.out(f"{res.server} [{role}] AXFR ALLOWED — {res.record_count} records", "VULN", indent=8)
                     for name in res.sample:

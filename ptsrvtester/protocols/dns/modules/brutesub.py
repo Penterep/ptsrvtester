@@ -37,14 +37,15 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"detecting a wildcard for {domain} before brute forcing")
+        ctx.debug(f"Send wildcard-probe queries for {domain}")
         wildcard = ec.wildcard_detect(resolver, domain)
         if wildcard.present:
             baseline = ", ".join(sorted(wildcard.a | wildcard.aaaa | wildcard.cname)) or "?"
             ctx.out(f"Wildcard detected ({baseline}); matching hits are filtered out.", "WARNING", indent=8)
 
-        ctx.debug(f"resolving {len(labels)} candidate label(s) under {domain}")
+        ctx.debug(f"Send {len(labels)} candidate label(s) under {domain} to resolver")
         found, filtered = ec.brute_subdomains(resolver, domain, labels, threads, wildcard)
+        ctx.debug(f"Response: {len(found)} resolved, {filtered} wildcard-filtered")
         for fqdn, recs in found:
             summary = ", ".join(f"{rt}={','.join(v)}" for rt, v in recs.items() if v)
             ctx.out(f"{fqdn:<45} {summary}", "OK", indent=8)

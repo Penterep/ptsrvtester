@@ -32,13 +32,15 @@ def run(ctx):
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"finding authoritative servers for {domain} and detecting the authenticated-denial type")
+        ctx.debug(f"Resolving authoritative servers for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
+        ctx.debug(f"Send a bogus-name query to detect the authenticated-denial type for {domain}")
         denial = dc.denial_of_existence(servers, domain)
+        ctx.debug(f"Response: denial type {denial.kind or 'none'}" + (f" ({denial.error})" if denial.error else ""))
         if denial.error or denial.kind is None:
             ctx.out("No NSEC/NSEC3 seen — zone is unsigned or does not expose authenticated denial.", "OK", indent=8)
             continue
@@ -48,8 +50,9 @@ def run(ctx):
                 ctx.out("Minimal-covering NSEC ('black lies') — the zone is NOT walkable.", "OK", indent=8)
                 summary[domain] = "NSEC (not walkable)"
                 continue
-            ctx.debug(f"walking the NSEC next-chain from the apex of {domain}")
+            ctx.debug(f"Send NSEC next-chain walk from the apex of {domain}")
             names, truncated = zw.walk_nsec(servers, domain)
+            ctx.debug(f"Response: {len(names)} name(s){' (truncated)' if truncated else ''}")
             for n in names[:SAMPLE]:
                 ctx.out(n, "TEXT", indent=8)
             if len(names) > SAMPLE:
@@ -62,7 +65,9 @@ def run(ctx):
             continue
 
         # NSEC3
+        ctx.debug(f"Send NSEC3 hash-chain collection for {domain}")
         params, hashes = zw.collect_nsec3(servers, domain)
+        ctx.debug(f"Response: {len(hashes)} hash(es)")
         if not hashes or params is None:
             ctx.out("NSEC3 in use but no hashes collected.", "WARNING", indent=8)
             continue

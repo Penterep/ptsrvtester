@@ -48,10 +48,10 @@ def run(ctx):
                 res = zc.try_axfr(ip, domain, ns.host, ns.is_primary)
                 if res.allowed:
                     ctx.out(f"{res.server} [{role}] AXFR ALLOWED — {res.record_count} records", "VULN", indent=8)
-                    for name in res.sample:
-                        ctx.out(f"    {name}", "TEXT", indent=8)
-                    if res.record_count and res.record_count > len(res.sample):
-                        ctx.out(f"    … (+{res.record_count - len(res.sample)} more)", "TEXT", indent=8)
+                    for line in res.sample:
+                        ctx.out(f"    {line}", "TEXT", indent=8)
+                    if res.total_rrs and res.total_rrs > len(res.sample):
+                        ctx.out(f"    … (+{res.total_rrs - len(res.sample)} more)", "TEXT", indent=8)
                     exposed.append(f"{domain}@{res.server}[{role}]")
                 else:
                     ctx.out(f"{res.server} [{role}] refused ({res.error})", "OK", indent=8)

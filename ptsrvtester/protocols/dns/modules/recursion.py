@@ -20,9 +20,11 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
-    ctx.debug(f"Send RD=1 queries for {len(rc.EXTERNAL_NAMES)} out-of-zone name(s) to {ip}:{port}")
+    ctx.debug(f"Querying {len(rc.EXTERNAL_NAMES)} out-of-zone name(s) with recursion desired (RD=1) on {ip}:{port}")
     is_open, probes = rc.open_recursion(ip, port)
-    ctx.debug(f"Response: {'open recursion detected' if is_open else 'did not recurse external names for this client'}")
+
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     for p in probes:
         ra = "yes" if p.ra else "no"
         if p.answered and not p.authoritative:

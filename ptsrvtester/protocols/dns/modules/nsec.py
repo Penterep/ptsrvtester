@@ -24,14 +24,13 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, str] = {}
-    ctx.debug(f"querying a random non-existent name per domain to inspect NSEC/NSEC3 authenticated denial ({len(domains)} domain(s))")
+    ctx.debug(f"Querying a random non-existent name per domain to inspect NSEC/NSEC3 authenticated denial ({len(domains)} domain(s))")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"Send a query for a bogus name under {domain} to inspect NSEC/NSEC3")
+        ctx.debug(f"Querying a bogus name under {domain} to inspect NSEC/NSEC3")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         info = dc.denial_of_existence(servers, domain) if servers else dc.DenialInfo(error="no authoritative servers")
-        ctx.debug(f"Response: {info.error if info.error else (info.kind or 'no NSEC/NSEC3')}")
 
         if info.error:
             ctx.out(f"Could not determine denial type: {info.error}", "WARNING", indent=8)
@@ -41,6 +40,8 @@ def run(ctx):
             summary[domain] = "none"
             continue
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if info.kind == "NSEC":
             if info.nsec_walkable:
                 ctx.out(f"Classic NSEC in use (owner {info.nsec_owner} → next {info.nsec_next}) — "

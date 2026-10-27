@@ -26,7 +26,7 @@ def run(ctx):
     resolver = ec.resolver_for(ctx, timeout=zc.XFR_TIMEOUT)
     extra = (ctx.host, ctx.ip) if getattr(ctx, "ip", None) else None
     exposed: list[str] = []
-    ctx.debug(f"attempting AXFR for {len(domains)} domain(s) against each authoritative name server over TCP")
+    ctx.debug(f"Attempting AXFR for {len(domains)} domain(s) against each authoritative name server over TCP")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
@@ -36,16 +36,16 @@ def run(ctx):
             ctx.out("No NS records found for the domain (cannot try AXFR).", "WARNING", indent=8)
             continue
 
-        ctx.debug(f"Response: {len(servers)} name server(s) found for {domain}")
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         for ns in servers:
             role = "primary" if ns.is_primary else "secondary"
             if not ns.ips:
                 ctx.out(f"{ns.host.rstrip('.'):<32} [{role}] no A/AAAA — skipped", "WARNING", indent=8)
                 continue
             for ip in ns.ips:
-                ctx.debug(f"Send AXFR {domain} to {ip} ({ns.host.rstrip('.')})")
+                ctx.debug(f"Attempting AXFR of {domain} from {ip} ({ns.host.rstrip('.')})")
                 res = zc.try_axfr(ip, domain, ns.host, ns.is_primary)
-                ctx.debug(f"Response: {'allowed, ' + str(res.record_count) + ' records' if res.allowed else 'refused (' + str(res.error) + ')'}")
                 if res.allowed:
                     ctx.out(f"{res.server} [{role}] AXFR ALLOWED — {res.record_count} records", "VULN", indent=8)
                     for name in res.sample:

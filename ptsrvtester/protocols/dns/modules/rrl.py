@@ -26,7 +26,7 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
-    ctx.debug(f"probing for Response Rate Limiting on {len(domains)} domain(s) with a small bounded query burst")
+    ctx.debug(f"Probing for Response Rate Limiting on {len(domains)} domain(s) with a small bounded query burst")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
@@ -36,13 +36,14 @@ def run(ctx):
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
-        ctx.debug(f"Send identical-query burst to {servers[0]}")
+        ctx.debug(f"Firing an identical-query burst at {servers[0]}")
         res = dos.rrl_probe(servers[0], domain)
-        ctx.debug(f"Response: {res.error if res.error else f'sent {res.sent}, received {res.received}, slip {res.truncated}'}")
         if res.error:
             ctx.out(f"RRL probe failed: {res.error}", "WARNING", indent=8)
             continue
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         ctx.out(f"Sent {res.sent}, received {res.received} (truncated/slip {res.truncated}).", "TEXT", indent=8)
         if res.rrl_detected:
             ctx.out("Response Rate Limiting appears active (drops / TC-slip observed).", "OK", indent=8)

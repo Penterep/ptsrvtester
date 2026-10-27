@@ -28,7 +28,7 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, object] = {}
-    ctx.debug(f"attempting zone walking via NSEC/NSEC3 for {len(domains)} domain(s)")
+    ctx.debug(f"Attempting zone walking via NSEC/NSEC3 for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
@@ -38,21 +38,21 @@ def run(ctx):
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
-        ctx.debug(f"Send a bogus-name query to detect the authenticated-denial type for {domain}")
+        ctx.debug(f"Querying a bogus name to detect the authenticated-denial type for {domain}")
         denial = dc.denial_of_existence(servers, domain)
-        ctx.debug(f"Response: denial type {denial.kind or 'none'}" + (f" ({denial.error})" if denial.error else ""))
         if denial.error or denial.kind is None:
             ctx.out("No NSEC/NSEC3 seen — zone is unsigned or does not expose authenticated denial.", "OK", indent=8)
             continue
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if denial.kind == "NSEC":
             if not denial.nsec_walkable:
                 ctx.out("Minimal-covering NSEC ('black lies') — the zone is NOT walkable.", "OK", indent=8)
                 summary[domain] = "NSEC (not walkable)"
                 continue
-            ctx.debug(f"Send NSEC next-chain walk from the apex of {domain}")
+            ctx.debug(f"Walking the NSEC next-chain from the apex of {domain}")
             names, truncated = zw.walk_nsec(servers, domain)
-            ctx.debug(f"Response: {len(names)} name(s){' (truncated)' if truncated else ''}")
             for n in names[:SAMPLE]:
                 ctx.out(n, "TEXT", indent=8)
             if len(names) > SAMPLE:
@@ -65,9 +65,8 @@ def run(ctx):
             continue
 
         # NSEC3
-        ctx.debug(f"Send NSEC3 hash-chain collection for {domain}")
+        ctx.debug(f"Collecting the NSEC3 hash chain for {domain}")
         params, hashes = zw.collect_nsec3(servers, domain)
-        ctx.debug(f"Response: {len(hashes)} hash(es)")
         if not hashes or params is None:
             ctx.out("NSEC3 in use but no hashes collected.", "WARNING", indent=8)
             continue

@@ -20,13 +20,15 @@ def run(ctx):
     ip, port = target
     host = getattr(ctx, "host", None)
 
+    ctx.debug(f"Querying supported transports (UDP/53, TCP/53, DoT/853, DoH/443, DoQ/853) on {ip}")
     results = fp.transports(host, ip, port)
+
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     for name in ("UDP/53", "TCP/53", "DoT/853", "DoH/443", "DoQ/853"):
         res = results.get(name)
         if res is None:
             continue
-        ctx.debug(f"Send ... to {ip} ({name})")
-        ctx.debug("Response: ...")
         if res.state is True:
             ctx.out(f"{name:<10} supported", "OK", indent=4)
         elif res.state is False:

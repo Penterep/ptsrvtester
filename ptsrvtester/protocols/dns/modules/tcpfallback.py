@@ -24,7 +24,7 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
-    ctx.debug(f"checking UDP truncation (TC bit) and TCP/53 fallback for {len(domains)} domain(s)")
+    ctx.debug(f"Checking UDP truncation (TC bit) and TCP/53 fallback for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
@@ -34,10 +34,11 @@ def run(ctx):
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
-        ctx.debug(f"Send a 512-byte-buffer UDP query + TCP/53 retry to {servers[0]}")
+        ctx.debug(f"Probing truncation (512-byte UDP) and TCP/53 fallback at {servers[0]}")
         res = dos.tcp_fallback(servers[0], domain)
-        ctx.debug(f"Response: UDP TC={res.udp_truncated}, TCP ok={res.tcp_ok}")
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if res.udp_truncated is True:
             ctx.out(f"UDP (bufsize 512): TC set — server truncates large responses correctly.", "OK", indent=8)
         elif res.udp_truncated is False:

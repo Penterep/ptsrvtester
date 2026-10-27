@@ -37,7 +37,7 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
-    ctx.debug(f"testing TSIG-authenticated update ACL scoping against {len(domains)} domain(s)")
+    ctx.debug(f"Testing TSIG-authenticated update ACL scoping against {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
@@ -50,13 +50,15 @@ def run(ctx):
 
         # First confirm the key is accepted at all.
         base = du.test_name(domain)
-        ctx.debug(f"Send a signed TSIG UPDATE to {ip} (confirm key accepted)")
+        ctx.debug(f"Sending a signed TSIG UPDATE to {ip} (confirm key accepted)")
         rcode = du.add_txt(ip, domain, base, tsig=tsig)
-        ctx.debug(f"Response: {dns.rcode.to_text(rcode) if rcode is not None else 'no response'}")
         if rcode is None:
             ctx.out(f"No response to the TSIG update from {ip}.", "WARNING", indent=8)
             continue
         rtext = dns.rcode.to_text(rcode)
+
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if rcode == dns.rcode.NOTAUTH:
             ctx.out("TSIG key rejected (NOTAUTH) — bad key/algorithm or not permitted.", "OK", indent=8)
             continue

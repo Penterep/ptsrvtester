@@ -33,19 +33,20 @@ def run(ctx):
     resolver = ec.resolver_for(ctx)
     threads = getattr(ctx.args, "threads", 10) or 10
     discovered: dict[str, list[str]] = {}
-    ctx.debug(f"brute-forcing {len(labels)} label(s) against {len(domains)} domain(s) with {threads} thread(s)")
+    ctx.debug(f"Brute-forcing {len(labels)} label(s) against {len(domains)} domain(s) with {threads} thread(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"Send wildcard-probe queries for {domain}")
+        ctx.debug(f"Querying a wildcard probe for {domain}")
         wildcard = ec.wildcard_detect(resolver, domain)
         if wildcard.present:
             baseline = ", ".join(sorted(wildcard.a | wildcard.aaaa | wildcard.cname)) or "?"
             ctx.out(f"Wildcard detected ({baseline}); matching hits are filtered out.", "WARNING", indent=8)
 
-        ctx.debug(f"Send {len(labels)} candidate label(s) under {domain} to resolver")
+        ctx.debug(f"Querying {len(labels)} candidate label(s) under {domain}")
         found, filtered = ec.brute_subdomains(resolver, domain, labels, threads, wildcard)
-        ctx.debug(f"Response: {len(found)} resolved, {filtered} wildcard-filtered")
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         for fqdn, recs in found:
             summary = ", ".join(f"{rt}={','.join(v)}" for rt, v in recs.items() if v)
             ctx.out(f"{fqdn:<45} {summary}", "OK", indent=8)

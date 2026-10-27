@@ -29,7 +29,7 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
-    ctx.debug(f"measuring the amplification factor (ANY/DNSKEY/TXT) for {len(domains)} domain(s)")
+    ctx.debug(f"Measuring the amplification factor (ANY/DNSKEY/TXT) for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
@@ -39,13 +39,14 @@ def run(ctx):
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
-        ctx.debug(f"Send ANY/DNSKEY/TXT probes to {len(servers)} authoritative server(s) for {domain}")
+        ctx.debug(f"Querying ANY/DNSKEY/TXT for {domain}")
         measures = dos.amplification_factors(servers, domain)
-        ctx.debug(f"Response: {len(measures)} measurement(s)")
         if not measures:
             ctx.out("No response to amplification probes.", "OK", indent=8)
             continue
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         for m in measures:
             note = " (ANY minimised — RFC 8482)" if m.minimized else ""
             state = "answered" if m.answered else "no data"

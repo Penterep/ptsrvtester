@@ -28,18 +28,19 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
-    ctx.debug(f"reading RRSIG expiration for the DNSKEY and SOA rrsets of {len(domains)} domain(s)")
+    ctx.debug(f"Reading RRSIG expiration for the DNSKEY and SOA rrsets of {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"Send DNSKEY/SOA RRSIG query for {domain}")
+        ctx.debug(f"Querying DNSKEY/SOA RRSIG for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         sigs = dc.rrsig_expiry(servers, domain) if servers else []
-        ctx.debug(f"Response: {len(sigs)} RRSIG(s)")
         if not sigs:
             ctx.out("No RRSIG found (zone not signed, or signatures unavailable).", "WARNING", indent=8)
             continue
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         expired = [s for s in sigs if s.expired]
         expiring = [s for s in sigs if s.expiring]
         for s in sigs:

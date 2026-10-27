@@ -24,26 +24,23 @@ def run(ctx):
         return
     host = getattr(ctx, "host", None) or ip
 
-    ctx.debug(f"Send TLS handshake (ALPN dot) to {ip}:853")
+    ctx.debug(f"Querying DNS-over-TLS (TLS handshake + query) on {ip}:853")
     probe = tt.tls_probe(ip, 853, host, alpn=["dot"])
-    ctx.debug(f"Response: {probe.tls_version}, {probe.cipher}" if probe.connected
-              else f"Response: {probe.error}")
     if not probe.connected:
         ctx.out(f"DoT/853 not available ({probe.error}).", "WARNING", indent=4)
         return
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     ctx.out(f"DoT/853 available — {probe.tls_version}, {probe.cipher} ({probe.cipher_bits}-bit)"
             + (f", ALPN {probe.alpn}" if probe.alpn else ""), "OK", indent=4)
 
     qname = host if "." in host else "example.com"
-    ctx.debug(f"Send A? {qname} over TLS to {ip}:853")
     try:
         dns.query.tls(dns.message.make_query(qname, dns.rdatatype.A),
                       ip, port=853, timeout=6, server_hostname=host)
-        ctx.debug("Response: answer received")
         ctx.out("Confirmed: answers DNS over TLS.", "OK", indent=4)
     except Exception as e:
-        ctx.debug(f"Response: {type(e).__name__}")
         ctx.out(f"TLS handshake works but DNS-over-TLS query failed: {type(e).__name__}", "WARNING", indent=4)
 
     tt.report_tls(ctx, "DoT", host, probe)

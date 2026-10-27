@@ -24,13 +24,14 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
-    ctx.debug(f"Send small RD=1 queries (TXT/DNSKEY/ANY) for out-of-zone names to {ip}:{port}")
+    ctx.debug(f"Querying out-of-zone names with small RD=1 queries (TXT/DNSKEY/ANY) on {ip}:{port}")
     results = rc.amplification(ip, port)
-    ctx.debug(f"Response: {len(results)} response(s) received")
     if not results:
         ctx.out("No response to any amplification probe.", "OK", indent=4)
         return
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     for r in results:
         if r.reflectable:
             state = "recursed"

@@ -19,9 +19,11 @@ def run(ctx):
         return
     ip, port = target
 
-    ctx.debug(f"Send EDNS query + empty NSID option (option 3) to {ip}:{port}")
+    ctx.debug(f"Querying the EDNS NSID option (option 3) on {ip}:{port}")
     raw = fp.nsid(ip, port)
-    ctx.debug(f"Response: {'NSID echoed' if raw is not None else 'no NSID option returned'}")
+
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     if raw is None:
         ctx.out("Server does not return an NSID (no instance identity disclosed).", "OK", indent=4)
         return

@@ -23,26 +23,23 @@ def run(ctx):
         return
     host = getattr(ctx, "host", None) or ip
 
-    ctx.debug(f"Send TLS handshake (ALPN h2/http1.1) to {ip}:443")
+    ctx.debug(f"Querying DNS-over-HTTPS (TLS handshake + query) on {ip}:443")
     probe = tt.tls_probe(ip, 443, host, alpn=["h2", "http/1.1"])
-    ctx.debug(f"Response: {probe.tls_version}, {probe.cipher}, ALPN {probe.alpn}" if probe.connected
-              else f"Response: {probe.error}")
     if not probe.connected:
         ctx.out(f"DoH/443 not available ({probe.error}).", "WARNING", indent=4)
         return
 
     http2 = probe.alpn == "h2"
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     ctx.out(f"DoH/443 available — {probe.tls_version}, {probe.cipher} ({probe.cipher_bits}-bit); "
             f"HTTP/2: {'yes' if http2 else 'no (' + str(probe.alpn or 'HTTP/1.1') + ')'}", "OK", indent=4)
 
     url = f"https://{host}/dns-query"
-    ctx.debug(f"Send A? example.com over HTTPS to {url}")
     try:
         dns.query.https(dns.message.make_query("example.com", dns.rdatatype.A), url, timeout=6)
-        ctx.debug("Response: answer received")
         ctx.out(f"Confirmed: answers DNS over HTTPS at {url}.", "OK", indent=4)
     except Exception as e:
-        ctx.debug(f"Response: {type(e).__name__}")
         ctx.out(f"TLS works but DoH query to /dns-query failed: {type(e).__name__}", "WARNING", indent=4)
 
     tt.report_tls(ctx, "DoH", host, probe)

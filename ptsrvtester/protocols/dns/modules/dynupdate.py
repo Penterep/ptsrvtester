@@ -26,7 +26,7 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
-    ctx.debug(f"testing unauthenticated RFC 2136 dynamic update against {len(domains)} domain(s)")
+    ctx.debug(f"Testing unauthenticated RFC 2136 dynamic update against {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
@@ -38,15 +38,16 @@ def run(ctx):
 
         ip = servers[0]
         name = du.test_name(domain)
-        ctx.debug(f"Send unauthenticated UPDATE adding TXT {name} to {ip}")
+        ctx.debug(f"Sending an unauthenticated UPDATE adding TXT {name} to {ip}")
         rcode = du.add_txt(ip, domain, name)
-        ctx.debug(f"Response: {dns.rcode.to_text(rcode) if rcode is not None else 'no response'}")
 
         if rcode is None:
             ctx.out(f"No response to the update from {ip}.", "WARNING", indent=8)
             continue
         rtext = dns.rcode.to_text(rcode)
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if rcode != dns.rcode.NOERROR:
             hint = {"NOTAUTH": "authentication required (TSIG/GSS-TSIG)",
                     "REFUSED": "refused by ACL",

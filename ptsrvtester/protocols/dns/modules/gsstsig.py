@@ -26,7 +26,7 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
-    ctx.debug(f"probing secure-update (GSS-TSIG) enforcement for {len(domains)} domain(s) with a non-writing prerequisite update")
+    ctx.debug(f"Probing secure-update (GSS-TSIG) enforcement for {len(domains)} domain(s) with a non-writing prerequisite update")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
@@ -37,11 +37,12 @@ def run(ctx):
             continue
         ip = servers[0]
 
-        ctx.debug(f"Send a non-writing prerequisite-only UPDATE (RFC 2136 §2.4) to {ip}")
+        ctx.debug(f"Sending a non-writing prerequisite-only UPDATE (RFC 2136 §2.4) to {ip}")
         rcode = du.prereq_probe(ip, domain)
         rtext = dns.rcode.to_text(rcode) if rcode is not None else "no response"
-        ctx.debug(f"Response: {rtext}")
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if rcode is None:
             ctx.out("No response to the (non-writing) prerequisite probe.", "WARNING", indent=8)
         elif rcode == dns.rcode.NOTIMP:

@@ -20,11 +20,12 @@ def run(ctx):
         return
     port = getattr(ctx, "port", None) or 53
 
-    ctx.debug(f"Send RD=0 (non-recursive) queries for popular names to {ip}:{port}")
+    ctx.debug(f"Querying popular names non-recursively (RD=0) on {ip}:{port}")
     results = rc.cache_snoop(ip, port)
     cached = [r for r in results if r.cached]
-    ctx.debug(f"Response: {len(cached)} of {len(results)} name(s) answered from cache")
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     for r in results:
         if r.cached:
             ctx.out(f"{r.name:<18} in cache (TTL {r.ttl})", "VULN", indent=4)

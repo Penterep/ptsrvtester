@@ -30,15 +30,15 @@ def run(ctx):
         ctx.out("DoQ not tested — the optional 'aioquic' package is not installed.", "WARNING", indent=4)
         return
 
-    ctx.debug(f"Send A? example.com over QUIC to {ip}:853")
+    ctx.debug(f"Querying DNS-over-QUIC on {ip}:853")
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     try:
         dns.query.quic(dns.message.make_query("example.com", dns.rdatatype.A),
                        ip, port=853, timeout=6, server_hostname=host)
-        ctx.debug("Response: answer received")
         ctx.out("DoQ/853 available — DNS over QUIC answers (QUIC mandates TLS 1.3).", "OK", indent=4)
         if tt.is_ip(host):
             ctx.out("Target is an IP address — pass the full hostname (-tg <fqdn>) to validate the "
                     "certificate name.", "TEXT", indent=4)
     except Exception as e:
-        ctx.debug(f"Response: {type(e).__name__}")
         ctx.out(f"DoQ/853 not available ({type(e).__name__}).", "WARNING", indent=4)

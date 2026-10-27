@@ -28,12 +28,14 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     findings: list[str] = []
-    ctx.debug(f"checking {len(domains)} domain(s)" + (f" plus {len(labels)} sub-label(s)" if labels else "") + " for dangling CNAMEs to unclaimed cloud services")
+    ctx.debug(f"Checking {len(domains)} domain(s)" + (f" plus {len(labels)} sub-label(s)" if labels else "") + " for dangling CNAMEs to unclaimed cloud services")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
         names = [domain] + [f"{l}.{domain.rstrip('.')}" for l in labels]
-        ctx.debug(f"Send CNAME + takeover-fingerprint checks for {len(names)} name(s) under {domain}")
+        ctx.debug(f"Querying CNAME + takeover fingerprints for {len(names)} name(s) under {domain}")
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         any_cname = False
         for name in names:
             res = ig.takeover_check(resolver, name)

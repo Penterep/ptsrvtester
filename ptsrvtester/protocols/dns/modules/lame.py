@@ -23,17 +23,18 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
-    ctx.debug(f"checking each delegated NS for authoritative answers (RD=0 SOA) across {len(domains)} domain(s)")
+    ctx.debug(f"Checking each delegated NS for authoritative answers (RD=0 SOA) across {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"Send RD=0 SOA query to each NS of {domain}")
+        ctx.debug(f"Querying each delegated NS of {domain} for the zone SOA (RD=0)")
         results = ig.lame_delegations(resolver, domain)
-        ctx.debug(f"Response: {len(results)} NS checked, {sum(1 for r in results if not r.ok)} lame")
         if not results:
             ctx.out("No NS records found for the domain.", "WARNING", indent=8)
             continue
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         lame = [r for r in results if not r.ok]
         for r in results:
             where = f" ({r.ip})" if r.ip else ""

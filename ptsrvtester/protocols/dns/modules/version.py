@@ -5,7 +5,6 @@ A server that answers leaks its software and often the exact build/OS, which
 helps an attacker target known vulnerabilities — reported as a finding.
 """
 from ptsrvtester.protocols.dns.utils import fingerprint_core as fp
-from ptsrvtester.protocols.dns.utils.results import VULNS
 
 __MODULELABEL__ = "Software version disclosure (CHAOS TXT)"
 __MODULECODE__ = "VERSION"
@@ -19,11 +18,12 @@ def run(ctx):
         return
     ip, port = target
 
-    ctx.debug(f"Send CHAOS TXT? {', '.join(fp.CHAOS_NAMES)} to {ip}:{port}")
+    ctx.debug(f"Querying CHAOS-class TXT records ({', '.join(fp.CHAOS_NAMES)}) on {ip}:{port}")
     chaos = fp.collect_chaos(ip, port)
     disclosed = {name: vals for name, vals in chaos.items() if vals}
-    ctx.debug(f"Response: {len(disclosed)} of {len(fp.CHAOS_NAMES)} name(s) disclosed information")
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     for name in fp.CHAOS_NAMES:
         vals = chaos.get(name)
         if vals:
@@ -40,4 +40,4 @@ def run(ctx):
     ctx.out("Server discloses software/build information via CHAOS TXT.", "VULN", indent=4)
 
     with ctx.results_lock:
-        ctx.deferred_vulns.append({"vuln_code": VULNS.VersionDisclosure.value})
+        ctx.deferred_vulns.append({"vuln_code": "PTV-SVC-DNS-CHAOS"})

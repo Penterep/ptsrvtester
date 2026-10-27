@@ -23,18 +23,19 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, list[str]] = {}
-    ctx.debug(f"inspecting DNSKEY algorithms for {len(domains)} domain(s) and flagging deprecated ones")
+    ctx.debug(f"Inspecting DNSKEY algorithms for {len(domains)} domain(s) and flagging deprecated ones")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"Send DNSKEY query for {domain}")
+        ctx.debug(f"Querying DNSKEY algorithms for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         keys = dc.get_dnskey(servers, domain) if servers else None
-        ctx.debug(f"Response: {len(keys.dnskey) if keys and keys.dnskey else 0} DNSKEY(s)")
         if not keys or keys.dnskey is None:
             ctx.out("No DNSKEY (zone not signed) — nothing to assess.", "WARNING", indent=8)
             continue
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         algs = dc.key_algorithms(keys.dnskey)
         deprecated: list[str] = []
         for a in algs:

@@ -32,22 +32,23 @@ def run(ctx):
         wordlist_note = f"built-in {len(labels)} common labels (use -sub for more)"
 
     resolver = ec.resolver_for(ctx)
-    ctx.debug(f"attempting offline NSEC3 hash cracking for {len(domains)} domain(s) using {wordlist_note}")
+    ctx.debug(f"Attempting offline NSEC3 hash cracking for {len(domains)} domain(s) using {wordlist_note}")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"Send NSEC3 collection queries for {domain}")
+        ctx.debug(f"Querying NSEC3 hash chain for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
         params, hashes = zw.collect_nsec3(servers, domain)
-        ctx.debug(f"Response: {len(hashes)} NSEC3 hash(es), params {'found' if params else 'none'}")
         if params is None or not hashes:
             ctx.out("Zone does not use NSEC3 (or no hashes collected) — nothing to crack.", "OK", indent=8)
             continue
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         ctx.out(f"NSEC3 alg {params.algorithm}, iterations {params.iterations}, salt {params.salt_hex}; "
                 f"{len(hashes)} hashes collected; trying {wordlist_note}.", "TEXT", indent=8)
         ctx.debug(f"Hashing {len(labels)} candidate label(s) against {len(hashes)} collected hash(es)")

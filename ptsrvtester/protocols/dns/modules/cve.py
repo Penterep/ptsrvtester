@@ -20,6 +20,9 @@ def run(ctx):
         ctx.out("This test needs a target DNS server; pass -tg <server>.", "WARNING", indent=4)
         return
     ip, port = target
+    if fp.server_reachable(ctx) is False:
+        ctx.out(fp.unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
     ctx.debug(f"Querying version.bind (CHAOS TXT) on {ip}:{port}")
     values = fp.chaos_txt(ip, port, "version.bind")

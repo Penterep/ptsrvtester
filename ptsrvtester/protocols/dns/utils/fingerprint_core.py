@@ -34,6 +34,46 @@ def server_target(ctx) -> tuple[str, int] | None:
     return (ip, port) if ip else None
 
 
+def unreachable_message(ip: str, port: int) -> str:
+    """The standard 'nothing to test' line for a target server that does not answer."""
+    return (f"{ip} is not answering DNS queries on {port}/udp or {port}/tcp — not a reachable "
+            "DNS server, so there is nothing meaningful to test here.")
+
+
+def _answers_basic_query(ip: str, port: int, timeout: float = TRANSPORT_TIMEOUT) -> bool:
+    """True if *ip* returns ANY DNS response (even REFUSED/SERVFAIL) on UDP or TCP."""
+    for send in (lambda q: dns.query.udp(q, ip, port=port, timeout=timeout),
+                 lambda q: dns.query.tcp(q, ip, port=port, timeout=timeout)):
+        try:
+            send(_probe_query())
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def server_reachable(ctx) -> bool | None:
+    """Whether the ``-tg`` target answers basic DNS on UDP or TCP (``None`` = no ``-tg``).
+
+    Pure recon for the modules' "is there anything to test here?" guard. The
+    verdict is probed once and cached on the run-shared ``ctx.reach_cache`` dict,
+    so only the first module that asks pays the round-trip; TRANSPORT seeds the
+    cache when it runs, and every later module reads it for free.
+    """
+    target = server_target(ctx)
+    if target is None:
+        return None
+    ip, port = target
+    cache = getattr(ctx, "reach_cache", None)
+    key = (ip, port)
+    if cache is not None and key in cache:
+        return cache[key]
+    reachable = _answers_basic_query(ip, port)
+    if cache is not None:
+        cache[key] = reachable
+    return reachable
+
+
 def _txt_values(response) -> list[str]:
     out: list[str] = []
     for rrset in response.answer:

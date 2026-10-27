@@ -20,6 +20,9 @@ def run(ctx):
         ctx.out("This test needs a target DNS server; pass -tg <server>.", "WARNING", indent=4)
         return
     ip, port = target
+    if fp.server_reachable(ctx) is False:
+        ctx.out(fp.unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
     ctx.debug(f"Classifying the server role via a recursive (RD=1) probe on {ip}:{port}")
     info = fp.role_probe(ip, port)

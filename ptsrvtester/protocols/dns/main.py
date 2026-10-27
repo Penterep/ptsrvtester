@@ -93,6 +93,7 @@ class DNS(BaseMain):
         super().__init__(args, ptjsonlib)
         self._deferred_vulns: list[dict] = []
         self._results_lock = threading.Lock()
+        self._reach_cache: dict = {}   # (ip, port) -> bool, shared target-reachability verdict
 
     def _make_context(self, extras: dict) -> ModuleContext:
         """Build a :class:`DnsModuleContext` (mirrors the -vv screen into the log).
@@ -160,6 +161,7 @@ class DNS(BaseMain):
             "port": self.target[1],
             "deferred_vulns": self._deferred_vulns,
             "results_lock": self._results_lock,
+            "reach_cache": self._reach_cache,
         }
 
     def output(self) -> None:

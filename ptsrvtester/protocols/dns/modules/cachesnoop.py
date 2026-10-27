@@ -5,6 +5,7 @@ query from cache (instead of refusing/deferring) reveals which names its clients
 have recently looked up (PTV-DNS-CACHESNOOP) — an information leak about user
 behaviour. The remaining TTL hints at how recently the name was resolved.
 """
+from ptsrvtester.protocols.dns.utils import fingerprint_core as fp
 from ptsrvtester.protocols.dns.utils import recursion_core as rc
 from ptsrvtester.protocols.dns.utils.results import VULNS
 
@@ -19,6 +20,9 @@ def run(ctx):
         ctx.out("This test needs a target DNS server; pass -tg <server>.", "WARNING", indent=4)
         return
     port = getattr(ctx, "port", None) or 53
+    if fp.server_reachable(ctx) is False:
+        ctx.out(fp.unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
     ctx.debug(f"Querying popular names non-recursively (RD=0) on {ip}:{port}")
     results = rc.cache_snoop(ip, port)

@@ -5,6 +5,7 @@ sets RA and returns answers, it is an open resolver: it recurses for arbitrary
 external clients (PTV-DNS-OPENRECURSION), which enables cache poisoning targeting
 and reflection/amplification abuse (quantified by the AMPLIFICATION test).
 """
+from ptsrvtester.protocols.dns.utils import fingerprint_core as fp
 from ptsrvtester.protocols.dns.utils import recursion_core as rc
 from ptsrvtester.protocols.dns.utils.results import VULNS
 
@@ -19,6 +20,9 @@ def run(ctx):
         ctx.out("This test needs a target DNS server; pass -tg <server>.", "WARNING", indent=4)
         return
     port = getattr(ctx, "port", None) or 53
+    if fp.server_reachable(ctx) is False:
+        ctx.out(fp.unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
     ctx.debug(f"Querying {len(rc.EXTERNAL_NAMES)} out-of-zone name(s) with recursion desired (RD=1) on {ip}:{port}")
     is_open, probes = rc.open_recursion(ip, port)

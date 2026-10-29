@@ -25,29 +25,38 @@ Contract:
     aborting the other selected modules.
 """
 
-__MODULELABEL__ = "The dialects used by the target system"
+__MODULELABEL__ = "Dialects used by target"
 __MODULECODE__ = "DIALECTS"
 __ORDER__ = 11
 
-from ..smb_utils.helpers import SMBContext
 from ..smb_utils.server_connection import ServerConnection
+from ..smb_utils.helpers import SMBResults
+from ptsrvtester.protocols._base import ModuleContext
 
 
-def run(ctx: SMBContext) -> None:
+def run(ctx: ModuleContext) -> None:
+    ctx.debug("Running test: " + __MODULECODE__)
     ip, port = ctx.target
-    # ctx.out(f"Would check {ip}:{port} here.", "TEXT")
-    # For JSON mode, add structured findings instead of text, e.g.:
-    #   ctx.ptjsonlib.add_vulnerability("PTV-SMTP-...")
+    output: SMBResults = ctx.output
 
     sc = ServerConnection(ctx)
-    out = {}
-    for dialect in ctx.mapping.keys():
-        if ctx.mapping[dialect]:
-            continue
-        out = sc.connect(dialect, try_login=False, parse_info=False)
-        if out is not None:
-            ctx.successful_dialects.append(sc.dial_str_converter(dialect))
+    if not output.has_ran:
+        ctx.out(f"IP address:              {ip}", "INFO", indent=4)
+        ctx.out(f"Port:                    {port}", "INFO", indent=4)
+        sc.connect()
     
-    for dialect in ctx.successful_dialects:
-        ctx.out(dialect, category="VULN" if dialect == "SMBv1" else "NOTVULN",
-                condition=True, indent=4)
+    if output.had_error:
+        ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
+        return
+    
+    for dialect, supported in output.open_dialects.items():
+        if not supported:
+            continue
+
+        if dialect == "SMBv1":
+            cat = "VULN"
+        elif dialect in ["SMBv2.0", "SMBv2.1"]:
+            cat = "WARNING"
+        else:
+            cat = "NOTVULN"
+        ctx.out(dialect, category=cat, condition=True, indent=4)

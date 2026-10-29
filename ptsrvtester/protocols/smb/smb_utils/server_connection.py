@@ -8,6 +8,8 @@ from impacket.smbconnection import (
 )
 
 from .helpers import get_if_available
+from .helpers import SMBResults, SMBv1Flags, SMBv23Flags
+import nmap
 
 
 class ServerConnection():
@@ -24,7 +26,24 @@ class ServerConnection():
         "SMBv2.0":      SMB2_DIALECT_002,
         "SMBv2.1":      SMB2_DIALECT_21,
         "SMBv3.0":      SMB2_DIALECT_30,
+        "SMBv3.0.2":    SMB2_DIALECT_30,
         "SMBv3.1.1":    SMB2_DIALECT_311,
+        # nmap strings:
+        'NT LM 0.12 (SMBv1) [dangerous, but default]':  SMB_DIALECT,
+        '2.0.2':                                        SMB2_DIALECT_002,
+        '2.1':                                          SMB2_DIALECT_21,
+        '3.0':                                          SMB2_DIALECT_30,
+        '3.0.2':                                        SMB2_DIALECT_30,
+        '3.1.1':                                        SMB2_DIALECT_311,
+    }
+
+    nm_to_std = {
+        'NT LM 0.12 (SMBv1) [dangerous, but default]':  "SMBv1",
+        '2.0.2':                                        "SMBv2.0",
+        '2.1':                                          "SMBv2.1",
+        '3.0':                                          "SMBv3.0",
+        '3.0.2':                                        "SMBv3.0.2",
+        '3.1.1':                                        "SMBv3.1.1",
     }
     
     def __init__(self, ctx) -> None:
@@ -43,68 +62,128 @@ class ServerConnection():
             return self.int_to_dialect[input]
         else:
             return None
-    
-    def connect(self, dialect: int, try_login = True, parse_info = True, parse_encryption = False) -> dict | None:
-        output = {}
-        success = False
-        
+
+    def login(self, smb_client: SMBConnection, username: str, password: str) -> bool:
+        anon = username == password and username == ""
+        if anon:
+            self.ctx.debug(f"Trying empty login")
+        else: 
+            self.ctx.debug(f"Trying login u:{username} p:{password}")
+
         try:
-            ip, port = self.ctx.target
+            smb_client.login(username, password)
+            self.ctx.debug("Successful NULL session login" if anon else f"Successful login on u:{username} p:{password}")
+            return True
+        except Exception as e:
+            self.ctx.debug(f"Login failed")
+        return False
+    
+    def try_tree_connection(self, smb_client: SMBConnection, share = "IPC$") -> bool:
+        # TODO: Add ability to connect to specific folder
+        self.ctx.debug(f"Attempting connection to: {share}")
+        try:
+            tree_id = smb_client.connectTree("IPC$")
+            self.ctx.debug(f"Tree connection success! Tree ID: {str(tree_id)}")
+            return True
+        except Exception as e:
+            self.ctx.debug("Tree connection failed: " + str(e))
+        return False
+
+
+    def connect(self, timeout = 3) -> None:
+        username, password = self.ctx.userpass
+        empty_login: bool = username == password and username == ""
+        output: SMBResults = SMBResults()
+        smb_client: SMBConnection
+        output = self.ctx.output
+        output.has_ran = True
+        ip, port = self.ctx.target
+        
+        self.ctx.debug("Running nmap scan to determine supported dialects")
+        nm_dialects = []
+        nm = nmap.PortScanner()
+        try:
+            nm.scan(str(ip), str(port), "--script smb-protocols")
+            output.nmap_status = str(nm[ip]['tcp'][port]['state'])
+            nm_dialects = str(nm._scan_result['scan'][ip]['hostscript'][0]['output']).split("\n    ")[1:]
+
+        except Exception as e:
+            self.ctx.debug("Ran into an error: " + str(e))
+            output.had_error = True
+            output.error_info = "error during dialect scan: " + str(e)
+            return
+
+        self.ctx.debug("Found supported dialects")
+
+        for dialect in nm_dialects:
+            output.open_dialects[self.nm_to_std[dialect]] = True
+
+        self.ctx.debug("Communicating with server")
+        try:
             smb_client = SMBConnection(
                 remoteName="*SMBSERVER",
                 remoteHost=ip,
                 sess_port=port,
-                preferredDialect=dialect,
-                timeout=5
+                # TODO: check if I might have to try more dialects than the first accepted
+                preferredDialect=self.dial_str_converter(nm_dialects[0]), # lowest accepted dialect
+                timeout=timeout
             )
-            if try_login:    
-                try:
-                    smb_client.login('', '')
-                except Exception:
-                    pass
-            
-            getters = {
-                # smb_client.getSMBServer: "SMBServer_object",
-                smb_client.getDialect: "dialect",
-                smb_client.getServerName: "server_name",
-                smb_client.getClientName: "client_name",
-                smb_client.getRemoteName: "remote_name",
-                smb_client.getServerDomain: "server_domain",
-                smb_client.getServerDNSDomainName: "server_DNS_domain_name",
-                smb_client.getServerDNSHostName: "server_DNS_hostname",
-                smb_client.getServerOS: "server_OS",
-                smb_client.getServerOSMajor: "server_OS_major",
-                smb_client.getServerOSMinor: "server_OS_minor",
-                smb_client.getServerOSBuild: "server_OS_build",
-                smb_client.doesSupportNTLMv2: "does_support_NTLMv2",
-                smb_client.isLoginRequired: "is_login_required",
-                smb_client.isSigningRequired: "is_signing_required",
-                smb_client.getCredentials: "credentials",
-                # smb_client.getIOCapabilities: "IO_capabilities",
-            }
-            
-            if parse_encryption:
-                if dialect in [SMB2_DIALECT_30, SMB2_DIALECT_311]:
-                    server = smb_client.getSMBServer()
-                    # NOTE: sensitive to impacket changes
-                    status = "Supported" if server._Connection['SupportsEncryption'] else "Unsupported"
-                    if dialect == SMB2_DIALECT_30:
-                        output["v30_encryption"] = status
-                    else:
-                        output["v311_encryption"] = status
 
-            if parse_info:
-                for getter in getters.keys():
-                    result = get_if_available(getter)
-                    if result is not None and result != "":
-                        output[getters[getter]] = result
-                    else:
-                        output[getters[getter]] = "unknown"
-            
-            success = True
+            if self.login(smb_client, username, password):
+                output.successful_login = True
+                output.guest_session = bool(smb_client.isGuestSession())
+                self.try_tree_connection(smb_client)
+            elif not empty_login:
+                self.login(smb_client, "", "")
+                output.successful_login = True
+                output.guest_session = bool(smb_client.isGuestSession())
+                self.try_tree_connection(smb_client)
+
+            smb_client.close()
         except Exception as e:
-            error_str = str(e)
+            self.ctx.debug("Ran into an error: " + str(e))
+            output.had_error = True
+            output.error_info = str(e) + " (main scan)"
+            return
         
-        return output if success else None
+        self.ctx.debug("Server communication successful")
         
+        getters = {
+            # "SMBServer_object":         smb_client.getSMBServer,
+            # "dialect":                  smb_client.getDialect,
+            "server_name":              smb_client.getServerName,
+            "client_name":              smb_client.getClientName,
+            "remote_name":              smb_client.getRemoteName,
+            "server_domain":            smb_client.getServerDomain,
+            "dns_domain_name":          smb_client.getServerDNSDomainName,
+            "dns_hostname":             smb_client.getServerDNSHostName,
+            "server_OS":                smb_client.getServerOS,
+            "server_OS_major":          smb_client.getServerOSMajor,
+            "server_OS_minor":          smb_client.getServerOSMinor,
+            "server_OS_build":          smb_client.getServerOSBuild,
+            "does_support_NTLMv2":      smb_client.doesSupportNTLMv2,
+            "is_login_required":        smb_client.isLoginRequired,
+            "is_signing_required":      smb_client.isSigningRequired,
+            # "credentials":              smb_client.getCredentials,
+            # "IO_capabilities":          smb_client.getIOCapabilities,
+        }
+
+        self.ctx.debug("Parsing found server info")
+
+        for name, getter in getters.items():
+            setattr(output, name, get_if_available(getter))
+
+        output.used_dialect = self.dial_str_converter(smb_client.getDialect())
         
+        if smb_client.getDialect() == SMB_DIALECT:
+            flags1, flags2 = smb_client.getSMBServer().get_flags()
+            security_mode = smb_client._SMBConnection._dialects_parameters.fields.get('SecurityMode', None)
+            capabilities = smb_client._SMBConnection._dialects_parameters.fields.get('Capabilities', None)
+            output.v1_flags = (flags1, flags2, security_mode, capabilities)
+        else:
+            security_mode = smb_client._SMBConnection._Connection.get('ServerSecurityMode', None)
+            capabilities = smb_client._SMBConnection._Connection.get('ServerCapabilities', None)
+            session_flags = smb_client._SMBConnection._Session.get('SessionFlags', None)
+            output.v23_flags = (security_mode, capabilities, session_flags)
+            
+        self.ctx.debug("Server connection done")

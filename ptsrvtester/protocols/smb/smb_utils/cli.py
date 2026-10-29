@@ -13,16 +13,20 @@ class SMBArgs(BaseArgs):
             {"description": ["SMB Testing Module"]},
             {"usage": ["ptsrvtester smb <IP:PORT> <command> <options>"]},
             {"usage_example": [
-                "ptsrvtester smb 192.168.1.1 -ts info,dialects",
-                "ptsrvtester smb localhost:1234 -ts encryption"
+                "ptsrvtester smb -tg 192.168.1.1 -ts all -u gest -p 1234",
+                "ptsrvtester smb -tg localhost:1234 -ts encryption"
                 "ptsrvtester smb -h",
             ]},
             {"options": [
                 ["-h", "--help", "", "Prints this menu"],
-                ["-ts", "--tests", "<test>", "Comma-separated test codes (e.g. info,dialects) or ALL", "Options: info, dialects, encryption"]
+                ["-tg", "--target", "<target>", "IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 445 is default"],
+                ["-ts", "--tests", "<test>", "Comma-separated test codes (e.g. info,dialects) or ALL", "Options: info, dialects, security"],
+                ["-u", "--username", "<username>", "Username used for login attempt"],
+                ["-p", "--password", "<password>", "Password used for login attempt"],
             ]},
         ]
 
+    # TODO: add password and login options
     def add_subparser(self, name: str, subparsers) -> None:
         examples = """ptsrvtester smb 192.168.1.1 -ts info
 ptsrvtester smb -h"""
@@ -37,17 +41,25 @@ ptsrvtester smb -h"""
             raise TypeError
         
         parser.add_argument(
-            "target",
+            "-tg", "--target",
             type=valid_target_smb,
             help="""IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 445 is default""",
         )
         
-        tests = parser.add_argument_group(
-            "TESTING TOOLS",
-            "Toolbox of non-invasive tests on a specified target server"
-        )
+        # tests = parser.add_argument_group(
+        #     "TESTING TOOLS",
+        #     "Toolbox of non-invasive tests on a specified target server"
+        # )
         
-        tests.add_argument(
+        parser.add_argument(
             "-ts", "--tests", type=str, default=None, metavar="<test>", dest="tests",
             help="Comma-separated test codes (e.g. info,dialects) or ALL. Options: info, dialects, encryption",
+        )
+        
+        parser.add_argument(
+            "-u", "--username", type=str, default="", required=False
+        )
+
+        parser.add_argument(
+            "-p", "--password", type=str, default="", required=False
         )

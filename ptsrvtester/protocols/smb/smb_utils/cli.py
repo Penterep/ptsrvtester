@@ -13,13 +13,16 @@ class SMBArgs(BaseArgs):
             {"description": ["SMB Testing Module"]},
             {"usage": ["ptsrvtester smb <IP:PORT> <command> <options>"]},
             {"usage_example": [
-                "ptsrvtester smb 192.168.1.1 -ts info,dialects",
-                "ptsrvtester smb localhost:1234 -ts encryption"
+                "ptsrvtester smb -tg 192.168.1.1 -ts all -u gest -p 1234",
+                "ptsrvtester smb -tg localhost:1234 -ts encryption"
                 "ptsrvtester smb -h",
             ]},
             {"options": [
                 ["-h", "--help", "", "Prints this menu"],
-                ["-ts", "--tests", "<test>", "Comma-separated test codes (e.g. info,dialects) or ALL", "Options: info, dialects, encryption"]
+                ["-tg", "--target", "<target>", "IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 445 is default"],
+                ["-ts", "--tests", "<test>", "Comma-separated test codes (e.g. info,dialects) or ALL", "Options: info, dialects, security"],
+                ["-u", "--username", "<username>", "Username used for login attempt"],
+                ["-p", "--password", "<password>", "Password used for login attempt"],
             ]},
         ]
 
@@ -56,6 +59,7 @@ ptsrvtester smb -h"""
         parser.add_argument(
             "-u", "--username", type=str, default="", required=False
         )
+
         parser.add_argument(
             "-p", "--password", type=str, default="", required=False
         )

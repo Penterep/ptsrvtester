@@ -29,7 +29,6 @@ class SMB(BaseMain):
     @staticmethod
     def module_args() -> BaseArgs:
         return SMBArgs()
-        raise NotImplementedError
 
     def _import_module_file(self, name: str, path: str):
         """Import as a real package member so ``from ..smb_utils`` works in modules.
@@ -63,6 +62,7 @@ class SMB(BaseMain):
                 )
         self.target_host = host
         self.target = (ip, target.port)
+        self.userpass = (self.args.username, self.args.password)
 
     def build_context(self) -> dict:
         """Protocol handles injected onto every module's ``ctx`` (besides core fields).
@@ -71,5 +71,6 @@ class SMB(BaseMain):
         """
         return {
             "host": self.target_host,
+            "userpass": self.userpass,
             "output": SMBResults()
         }

@@ -63,7 +63,8 @@ class ServerConnection():
         else:
             return None
 
-    def connect(self, username = "", password = "", timeout = 3) -> None:
+    def connect(self, timeout = 3) -> None:
+        username, password = self.ctx.userpass
         empty_login: bool = username == password and username == ""
         output: SMBResults = SMBResults()
         smb_client: SMBConnection
@@ -101,7 +102,6 @@ class ServerConnection():
                 timeout=timeout
             )
 
-            # TODO: implement login interaction
             try:
                 self.ctx.debug("Trying empty login to get more info" if empty_login else "Trying login")
                 smb_client.login(username, password)  # if login fails, the code continues in the exception

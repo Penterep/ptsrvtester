@@ -43,12 +43,19 @@ ptsrvtester smb -h"""
             help="""IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 445 is default""",
         )
         
-        tests = parser.add_argument_group(
-            "TESTING TOOLS",
-            "Toolbox of non-invasive tests on a specified target server"
-        )
+        # tests = parser.add_argument_group(
+        #     "TESTING TOOLS",
+        #     "Toolbox of non-invasive tests on a specified target server"
+        # )
         
-        tests.add_argument(
+        parser.add_argument(
             "-ts", "--tests", type=str, default=None, metavar="<test>", dest="tests",
             help="Comma-separated test codes (e.g. info,dialects) or ALL. Options: info, dialects, encryption",
+        )
+        
+        parser.add_argument(
+            "-u", "--username", type=str, default="", required=False
+        )
+        parser.add_argument(
+            "-p", "--password", type=str, default="", required=False
         )

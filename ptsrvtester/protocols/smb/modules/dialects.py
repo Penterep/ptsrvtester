@@ -43,7 +43,6 @@ def run(ctx: ModuleContext) -> None:
     if not output.has_ran:
         ctx.out(f"IP address:              {ip}", "INFO", indent=4)
         ctx.out(f"Port:                    {port}", "INFO", indent=4)
-        # TODO: add login and password check
         sc.connect()
     
     if output.had_error:

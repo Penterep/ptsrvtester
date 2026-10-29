@@ -63,6 +63,33 @@ class ServerConnection():
         else:
             return None
 
+    def login(self, smb_client: SMBConnection, username: str, password: str) -> bool:
+        anon = username == password and username == ""
+        if anon:
+            self.ctx.debug(f"Trying empty login")
+        else: 
+            self.ctx.debug(f"Trying login u:{username} p:{password}")
+
+        try:
+            smb_client.login(username, password)
+            self.ctx.debug("Successful NULL session login" if anon else f"Successful login on u:{username} p:{password}")
+            return True
+        except Exception as e:
+            self.ctx.debug(f"Login failed")
+        return False
+    
+    def try_tree_connection(self, smb_client: SMBConnection, share = "IPC$") -> bool:
+        # TODO: Add ability to connect to specific folder
+        self.ctx.debug(f"Attempting connection to: {share}")
+        try:
+            tree_id = smb_client.connectTree("IPC$")
+            self.ctx.debug(f"Tree connection success! Tree ID: {str(tree_id)}")
+            return True
+        except Exception as e:
+            self.ctx.debug("Tree connection failed: " + str(e))
+        return False
+
+
     def connect(self, timeout = 3) -> None:
         username, password = self.ctx.userpass
         empty_login: bool = username == password and username == ""
@@ -102,25 +129,16 @@ class ServerConnection():
                 timeout=timeout
             )
 
-            try:
-                self.ctx.debug("Trying empty login to get more info" if empty_login else "Trying login")
-                smb_client.login(username, password)  # if login fails, the code continues in the exception
-
-                self.ctx.debug("Login successful")
+            if self.login(smb_client, username, password):
                 output.successful_login = True
-                
                 output.guest_session = bool(smb_client.isGuestSession())
+                self.try_tree_connection(smb_client)
+            elif not empty_login:
+                self.login(smb_client, "", "")
+                output.successful_login = True
+                output.guest_session = bool(smb_client.isGuestSession())
+                self.try_tree_connection(smb_client)
 
-                # TODO: Add ability to connect to specific folder
-                self.ctx.debug("Attempting to connect to IPC$ (should usually be available with access)")
-                try:
-                    tree_id = smb_client.connectTree("IPC$")
-                    self.ctx.debug("Tree connection success: " + str(tree_id))
-                except Exception as e:
-                    self.ctx.debug("Tree connection failed: " + str(e))
-
-            except Exception as e:
-                self.ctx.debug("Login failed: " + str(e))
             smb_client.close()
         except Exception as e:
             self.ctx.debug("Ran into an error: " + str(e))

@@ -63,7 +63,7 @@ def run(ctx: ModuleContext) -> None:
     ctx.out(f"Used dialect:            {output.used_dialect}", category, indent=4)
 
     if output.used_dialect == "SMBv1" and output.v1_flags:
-        ctx.out("SMBv1 should be disabled unless you know what you're doing", "WARNING", indent=4)
+        ctx.out("SMBv1 is generally considered unsafe", "WARNING", indent=4)
         ctx.debug("Reading SMBv1 flags:")
         flags1, flags2, security_mode, capabilities = output.v1_flags
 

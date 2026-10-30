@@ -320,7 +320,7 @@ def _render(ctx, r):
     elif obs.eicar_persisted_intact is False:
         ctx.out("EICAR removed/altered after upload — antivirus appears active", "OK", indent=8)
     else:
-        ctx.out("EICAR result inconclusive", "TEXT", indent=8)
+        ctx.out("EICAR result inconclusive", "WARNING", indent=8)
 
     # Content-processing DoS
     ctx.out("Content-processing DoS (ZIP bomb / XXE)", "INFO", colortext=True, indent=4)

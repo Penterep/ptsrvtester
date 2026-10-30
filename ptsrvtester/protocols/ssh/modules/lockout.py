@@ -234,7 +234,7 @@ def _render(ctx, r, user):
             ctx.out(f"Account lockout: NOT enforced (account '{user}' still authenticated "
                     f"after {r.attempts_made} failed attempts)", "VULN", indent=4)
     elif r.valid_baseline_ok is None:
-        ctx.out("Account lockout: not tested (no -p/--password supplied)", "TEXT", indent=4)
+        ctx.out("Account lockout: not tested (no -p/--password supplied)", "WARNING", indent=4)
     else:
         ctx.out("Account lockout: could not be determined", "WARNING", indent=4)
 

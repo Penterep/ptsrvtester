@@ -243,7 +243,7 @@ def _render_files(ctx, r):
     ctx.out("Filesystem access (sensitive paths)", "INFO", colortext=True, indent=4)
     present = [p for p in r.perms if p.present]
     if not present:
-        ctx.out("(none of the probed sensitive paths are present/visible)", "TEXT", indent=8)
+        ctx.out("None of the probed sensitive paths are present/visible", "OK", indent=8)
     for p in present:
         cat = "VULN" if p.is_finding else "TEXT"
         ctx.out(f"{p.mode_str()}  {p.path}  ({p.label})", cat, indent=8)

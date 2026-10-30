@@ -385,7 +385,7 @@ def _render(ctx, r):
     elif obs.ads_supported is False:
         ctx.out("ADS write not possible (non-NTFS server or rejected)", "OK", indent=8)
     else:
-        ctx.out("ADS write could not be determined", "TEXT", indent=8)
+        ctx.out("ADS write could not be determined", "WARNING", indent=8)
 
     for n in r.notes:
         ctx.debug(n)

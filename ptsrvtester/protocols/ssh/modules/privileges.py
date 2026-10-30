@@ -122,6 +122,10 @@ def _run_script(client, script: str, timeout: float = _PROBE_TIMEOUT) -> tuple[s
 def run(ctx):
     a = ctx.args
     ip, port = ctx.target
+    from ptsrvtester.protocols.ssh.utils.ssh_helpers import service_reachable, unreachable_message
+    if service_reachable(ctx) is False:
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
     account = a.user if (isinstance(a.user, str) and a.user) else (
         a.user[0] if isinstance(a.user, list) and a.user else None)
@@ -138,14 +142,14 @@ def run(ctx):
     ctx.out(f"Enumerating privileges for '{account}' on {ip}:{port} "
             f"({len(creds)} secret(s))", "INFO", colortext=True, indent=4)
 
-    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
+    ctx.debug(f"Authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
-    ctx.debug("login succeeded" if client is not None
-              else "login failed with the supplied secret(s)")
+    ctx.debug("Login succeeded" if client is not None
+              else "Login failed with the supplied secret(s)")
 
     have_password = bool(getattr(a, "password", None) or getattr(a, "passwords", None))
 
@@ -239,7 +243,7 @@ def _render_files(ctx, r):
     ctx.out("Filesystem access (sensitive paths)", "INFO", colortext=True, indent=4)
     present = [p for p in r.perms if p.present]
     if not present:
-        ctx.out("(none of the probed sensitive paths are present/visible)", "TEXT", indent=8)
+        ctx.out("None of the probed sensitive paths are present/visible", "OK", indent=8)
     for p in present:
         cat = "VULN" if p.is_finding else "TEXT"
         ctx.out(f"{p.mode_str()}  {p.path}  ({p.label})", cat, indent=8)

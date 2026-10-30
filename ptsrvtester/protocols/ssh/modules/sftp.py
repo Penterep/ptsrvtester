@@ -251,6 +251,10 @@ def _probe_capabilities(client, transport, port: int, obs: SftpObservations) -> 
 def run(ctx):
     a = ctx.args
     ip, port = ctx.target
+    from ptsrvtester.protocols.ssh.utils.ssh_helpers import service_reachable, unreachable_message
+    if service_reachable(ctx) is False:
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
     account = a.user if (isinstance(a.user, str) and a.user) else (
         a.user[0] if isinstance(a.user, list) and a.user else None)
@@ -267,14 +271,14 @@ def run(ctx):
     ctx.out(f"Testing SFTP confinement for '{account}' on {ip}:{port} "
             f"({len(creds)} secret(s))", "INFO", colortext=True, indent=4)
 
-    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
+    ctx.debug(f"Authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
-    ctx.debug("login succeeded" if client is not None
-              else "login failed with the supplied secret(s)")
+    ctx.debug("Login succeeded" if client is not None
+              else "Login failed with the supplied secret(s)")
 
     obs = SftpObservations()
     if client is None:
@@ -381,7 +385,7 @@ def _render(ctx, r):
     elif obs.ads_supported is False:
         ctx.out("ADS write not possible (non-NTFS server or rejected)", "OK", indent=8)
     else:
-        ctx.out("ADS write could not be determined", "TEXT", indent=8)
+        ctx.out("ADS write could not be determined", "WARNING", indent=8)
 
     for n in r.notes:
         ctx.debug(n)

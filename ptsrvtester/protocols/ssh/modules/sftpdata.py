@@ -229,6 +229,10 @@ def _cleanup(sftp, created: list, obs: SftpDataObservations) -> None:
 def run(ctx):
     a = ctx.args
     ip, port = ctx.target
+    from ptsrvtester.protocols.ssh.utils.ssh_helpers import service_reachable, unreachable_message
+    if service_reachable(ctx) is False:
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
     account = a.user if (isinstance(a.user, str) and a.user) else (
         a.user[0] if isinstance(a.user, list) and a.user else None)
@@ -251,14 +255,14 @@ def run(ctx):
     ctx.out("aggressive test — uploads bounded test files (all cleaned up afterwards)",
             "WARNING", indent=4)
 
-    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
+    ctx.debug(f"Authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
-    ctx.debug("login succeeded" if client is not None
-              else "login failed with the supplied secret(s)")
+    ctx.debug("Login succeeded" if client is not None
+              else "Login failed with the supplied secret(s)")
 
     obs = SftpDataObservations()
     if client is None:
@@ -316,7 +320,7 @@ def _render(ctx, r):
     elif obs.eicar_persisted_intact is False:
         ctx.out("EICAR removed/altered after upload — antivirus appears active", "OK", indent=8)
     else:
-        ctx.out("EICAR result inconclusive", "TEXT", indent=8)
+        ctx.out("EICAR result inconclusive", "WARNING", indent=8)
 
     # Content-processing DoS
     ctx.out("Content-processing DoS (ZIP bomb / XXE)", "INFO", colortext=True, indent=4)

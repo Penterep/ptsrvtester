@@ -163,6 +163,10 @@ def _clamp(value, lo, hi, default):
 def run(ctx):
     a = ctx.args
     ip, port = ctx.target
+    from ptsrvtester.protocols.ssh.utils.ssh_helpers import service_reachable, unreachable_message
+    if service_reachable(ctx) is False:
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
     valid_user = a.user if isinstance(a.user, str) else (a.user[0] if a.user else None)
     if not valid_user:
@@ -192,7 +196,7 @@ def run(ctx):
     )
 
     ctx.debug(
-        f"calibrating the timing oracle on '{valid_user}' vs {baseline_n} random "
+        f"Calibrating the timing oracle on '{valid_user}' vs {baseline_n} random "
         f"names, {samples} samples each (sigma {sigma})"
     )
     # Password auth is the measured path; warn early if the server does not offer it.
@@ -251,7 +255,7 @@ def _render(ctx, result, valid_user, candidates):
 
     gap_ms = abs(cal.gap) * 1000
     ctx.debug(
-        f"valid '{valid_user}' median {_ms(cal.valid_center)}; invalid baseline "
+        f"Valid '{valid_user}' median {_ms(cal.valid_center)}; invalid baseline "
         f"{_ms(cal.invalid_center)} (spread {_ms(cal.invalid_spread)}); gap {gap_ms:.1f} ms "
         f"= {cal.observed_sigma:.1f}σ (threshold {cal.sigma:g}σ)"
     )

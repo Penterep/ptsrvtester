@@ -24,11 +24,11 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, str] = {}
-    ctx.debug(f"querying a random non-existent name per domain to inspect NSEC/NSEC3 authenticated denial ({len(domains)} domain(s))")
+    ctx.debug(f"Querying a random non-existent name per domain to inspect NSEC/NSEC3 authenticated denial ({len(domains)} domain(s))")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"requesting authenticated-denial records for a bogus name under {domain}")
+        ctx.debug(f"Querying a bogus name under {domain} to inspect NSEC/NSEC3")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         info = dc.denial_of_existence(servers, domain) if servers else dc.DenialInfo(error="no authoritative servers")
 
@@ -36,10 +36,12 @@ def run(ctx):
             ctx.out(f"Could not determine denial type: {info.error}", "WARNING", indent=8)
             continue
         if info.kind is None:
-            ctx.out("No NSEC/NSEC3 records seen (zone may be unsigned or uses minimal responses).", "TEXT", indent=8)
+            ctx.out("No NSEC/NSEC3 records seen (zone may be unsigned or uses minimal responses).", "WARNING", indent=8)
             summary[domain] = "none"
             continue
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if info.kind == "NSEC":
             if info.nsec_walkable:
                 ctx.out(f"Classic NSEC in use (owner {info.nsec_owner} → next {info.nsec_next}) — "

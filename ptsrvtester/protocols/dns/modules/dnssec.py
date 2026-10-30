@@ -23,17 +23,20 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, str] = {}
-    ctx.debug(f"checking whether {len(domains)} domain(s) are DNSSEC-signed and self-signatures validate")
+    ctx.debug(f"Checking whether {len(domains)} domain(s) are DNSSEC-signed and self-signatures validate")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"finding authoritative servers for {domain} and fetching its DNSKEY rrset")
+        ctx.debug(f"Resolving authoritative servers for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
+        ctx.debug(f"Querying DNSKEY for {domain}")
         keys = dc.get_dnskey(servers, domain)
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if keys.dnskey is None:
             ctx.out("DNSSEC not deployed (no DNSKEY) — responses are not authenticated.", "VULN", indent=8)
             summary[domain] = "unsigned"

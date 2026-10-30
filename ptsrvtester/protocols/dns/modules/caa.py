@@ -22,13 +22,15 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, list[str]] = {}
-    ctx.debug(f"querying CAA records for {len(domains)} domain(s)")
+    ctx.debug(f"Querying CAA records for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"querying CAA for {domain}")
+        ctx.debug(f"Querying CAA records for {domain}")
         records = ec.caa_records(resolver, domain)
         summary[domain] = records
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if records:
             for rec in records:
                 ctx.out(rec, "OK", indent=8)

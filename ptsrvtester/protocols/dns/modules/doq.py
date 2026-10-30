@@ -25,12 +25,14 @@ def run(ctx):
         return
     host = getattr(ctx, "host", None) or ip
 
-    ctx.debug(f"attempting a DNS-over-QUIC query to {ip}:853 (requires the optional aioquic package)")
     have_quic = getattr(getattr(dns, "quic", None), "have_quic", False)
     if not have_quic:
         ctx.out("DoQ not tested — the optional 'aioquic' package is not installed.", "WARNING", indent=4)
         return
 
+    ctx.debug(f"Querying DNS-over-QUIC on {ip}:853")
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     try:
         dns.query.quic(dns.message.make_query("example.com", dns.rdatatype.A),
                        ip, port=853, timeout=6, server_hostname=host)
@@ -39,4 +41,4 @@ def run(ctx):
             ctx.out("Target is an IP address — pass the full hostname (-tg <fqdn>) to validate the "
                     "certificate name.", "TEXT", indent=4)
     except Exception as e:
-        ctx.out(f"DoQ/853 not available ({type(e).__name__}).", "TEXT", indent=4)
+        ctx.out(f"DoQ/853 not available ({type(e).__name__}).", "WARNING", indent=4)

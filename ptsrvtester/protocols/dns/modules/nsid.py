@@ -18,10 +18,15 @@ def run(ctx):
         ctx.out("This test needs a target DNS server; pass -tg <server>.", "WARNING", indent=4)
         return
     ip, port = target
+    if fp.server_reachable(ctx) is False:
+        ctx.out(fp.unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
-    ctx.debug(f"sending an EDNS query with an empty NSID option (option 3) to {ip}:{port}")
+    ctx.debug(f"Querying the EDNS NSID option (option 3) on {ip}:{port}")
     raw = fp.nsid(ip, port)
-    ctx.debug("server echoed an NSID value; decoding it" if raw is not None else "server returned no NSID option")
+
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     if raw is None:
         ctx.out("Server does not return an NSID (no instance identity disclosed).", "OK", indent=4)
         return

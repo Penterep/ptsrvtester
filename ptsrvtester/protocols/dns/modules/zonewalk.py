@@ -28,27 +28,30 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, object] = {}
-    ctx.debug(f"attempting zone walking via NSEC/NSEC3 for {len(domains)} domain(s)")
+    ctx.debug(f"Attempting zone walking via NSEC/NSEC3 for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"finding authoritative servers for {domain} and detecting the authenticated-denial type")
+        ctx.debug(f"Resolving authoritative servers for {domain}")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         if not servers:
             ctx.out("Could not find authoritative servers for the domain.", "WARNING", indent=8)
             continue
 
+        ctx.debug(f"Querying a bogus name to detect the authenticated-denial type for {domain}")
         denial = dc.denial_of_existence(servers, domain)
         if denial.error or denial.kind is None:
             ctx.out("No NSEC/NSEC3 seen — zone is unsigned or does not expose authenticated denial.", "OK", indent=8)
             continue
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if denial.kind == "NSEC":
             if not denial.nsec_walkable:
                 ctx.out("Minimal-covering NSEC ('black lies') — the zone is NOT walkable.", "OK", indent=8)
                 summary[domain] = "NSEC (not walkable)"
                 continue
-            ctx.debug(f"walking the NSEC next-chain from the apex of {domain}")
+            ctx.debug(f"Walking the NSEC next-chain from the apex of {domain}")
             names, truncated = zw.walk_nsec(servers, domain)
             for n in names[:SAMPLE]:
                 ctx.out(n, "TEXT", indent=8)
@@ -62,6 +65,7 @@ def run(ctx):
             continue
 
         # NSEC3
+        ctx.debug(f"Collecting the NSEC3 hash chain for {domain}")
         params, hashes = zw.collect_nsec3(servers, domain)
         if not hashes or params is None:
             ctx.out("NSEC3 in use but no hashes collected.", "WARNING", indent=8)

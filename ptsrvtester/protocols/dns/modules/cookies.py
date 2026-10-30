@@ -7,6 +7,7 @@ gap). Note: this observes the CLIENT-facing side; a recursive resolver that does
 not offer cookies to clients may still use them upstream toward authoritative
 servers, which is not observable here.
 """
+from ptsrvtester.protocols.dns.utils import fingerprint_core as fp
 from ptsrvtester.protocols.dns.utils import poisoning_core as pc
 from ptsrvtester.protocols.dns.utils.results import VULNS
 
@@ -21,14 +22,18 @@ def run(ctx):
         ctx.out("This test needs a target DNS server; pass -tg <server>.", "WARNING", indent=4)
         return
     port = getattr(ctx, "port", None) or 53
+    if fp.server_reachable(ctx) is False:
+        ctx.out(fp.unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
-    ctx.debug(f"sending an EDNS query carrying an 8-byte client cookie to {ip}:{port} (RFC 7873)")
+    ctx.debug(f"Querying DNS cookie support with an EDNS client cookie on {ip}:{port} (RFC 7873)")
     info = pc.cookie_probe(ip, port)
-    ctx.debug("cookie probe complete; checking whether the server returned a server cookie")
     if "error" in info:
         ctx.out(f"Cookie probe failed: {info['error']}", "WARNING", indent=4)
         return
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     if info.get("server_cookie"):
         ctx.out(f"DNS cookies supported — server cookie returned ({info['length']} bytes).", "OK", indent=4)
         return

@@ -20,8 +20,11 @@ def run(ctx):
         ctx.out("This test needs a target DNS server; pass -tg <server>.", "WARNING", indent=4)
         return
     ip, port = target
+    if fp.server_reachable(ctx) is False:
+        ctx.out(fp.unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
-    ctx.debug(f"reading version.bind (CHAOS TXT) from {ip}:{port} to match against the known-CVE table")
+    ctx.debug(f"Querying version.bind (CHAOS TXT) on {ip}:{port}")
     values = fp.chaos_txt(ip, port, "version.bind")
     version_string = values[0] if values else None
     if not version_string:
@@ -30,6 +33,8 @@ def run(ctx):
         return
 
     product, version, note = fp.identify_product(version_string)
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     ctx.out(f"{'Advertised':<12} {version_string}", "TEXT", indent=4)
     ctx.out(f"{'Product':<12} {product or 'unknown'}" + (f"  ({note})" if note else ""), "TEXT", indent=4)
     ctx.out(f"{'Version':<12} {'.'.join(str(p) for p in version) if version else 'unparsed'}", "TEXT", indent=4)
@@ -38,7 +43,7 @@ def run(ctx):
         ctx.out("Could not identify product/version from the banner — no CVE match attempted.", "WARNING", indent=4)
         return
 
-    ctx.debug(f"checking {product} {'.'.join(str(p) for p in version)} against the seed CVE table")
+    ctx.debug(f"Matching {product} {'.'.join(str(p) for p in version)} against the seed CVE table")
     matches = fp.match_cves(product, version)
     if not matches:
         ctx.out("No seed-table CVE matches the advertised version (table is not exhaustive).", "OK", indent=4)

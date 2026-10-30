@@ -20,14 +20,18 @@ def run(ctx):
         ctx.out("This test needs a target DNS server; pass -tg <server>.", "WARNING", indent=4)
         return
     ip, port = target
+    if fp.server_reachable(ctx) is False:
+        ctx.out(fp.unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
-    ctx.debug(f"sending a recursive (RD=1) probe for an external name to {ip}:{port} to classify the server role")
+    ctx.debug(f"Classifying the server role via a recursive (RD=1) probe on {ip}:{port}")
     info = fp.role_probe(ip, port)
-    ctx.debug("role probe complete; reading RA/AA flags and the answer")
     if info.error:
         ctx.out(f"Role probe failed: {info.error}", "WARNING", indent=4)
         return
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     ctx.out(f"{'Recursion available (RA)':<28} {'yes' if info.recursion_available else 'no'}", "TEXT", indent=4)
     ctx.out(f"{'Resolved external name':<28} {'yes' if info.recursion_answered else 'no'} (rcode {info.rcode})", "TEXT", indent=4)
     ctx.out(f"{'Authoritative answer (AA)':<28} {'yes' if info.authoritative else 'no'}", "TEXT", indent=4)
@@ -42,7 +46,7 @@ def run(ctx):
                 "distinguished remotely.", "TEXT", indent=4)
     elif info.recursion_available:
         role = "Recursion advertised but not resolving for us (possibly restricted by ACL)"
-        ctx.out(role, "TEXT", indent=4)
+        ctx.out(role, "OK", indent=4)
     else:
         role = "Authoritative-only / recursion not available"
         ctx.out(role, "OK", indent=4)

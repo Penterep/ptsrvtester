@@ -7,6 +7,7 @@ query, it can be abused as a DDoS reflector/amplifier (PTV-DNS-AMPLIFICATION):
 an attacker spoofs a victim's source address and the big answers flood the
 victim.
 """
+from ptsrvtester.protocols.dns.utils import fingerprint_core as fp
 from ptsrvtester.protocols.dns.utils import recursion_core as rc
 from ptsrvtester.protocols.dns.utils.results import VULNS
 
@@ -23,14 +24,18 @@ def run(ctx):
         ctx.out("This test needs a target DNS server; pass -tg <server>.", "WARNING", indent=4)
         return
     port = getattr(ctx, "port", None) or 53
+    if fp.server_reachable(ctx) is False:
+        ctx.out(fp.unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
-    ctx.debug(f"sending small RD=1 queries (TXT/DNSKEY/ANY) for out-of-zone names to {ip}:{port} and measuring response size")
+    ctx.debug(f"Querying out-of-zone names with small RD=1 queries (TXT/DNSKEY/ANY) on {ip}:{port}")
     results = rc.amplification(ip, port)
-    ctx.debug(f"amplification probe complete; {len(results)} response(s) received")
     if not results:
         ctx.out("No response to any amplification probe.", "OK", indent=4)
         return
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     for r in results:
         if r.reflectable:
             state = "recursed"

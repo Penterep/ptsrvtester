@@ -14,14 +14,14 @@ def run(ctx):
         return
 
     ip, port = ctx.target
-    ctx.debug(f"fetching the host key from {ip}:{port}")
+    ctx.debug(f"Fetching the host key from {ip}:{port}")
     try:
         host_key = get_host_key(ip, port)
     except Exception as e:
         ctx.out(f"Failed to fetch host key from {ip}:{port}: {e}", "VULN", indent=4)
         return
 
-    ctx.debug(f"comparing the host key against known-bad public keys in {path}")
+    ctx.debug(f"Comparing the host key against known-bad public keys in {path}")
     try:
         result = check_bad_pubkey(path, host_key)
     except OSError as e:

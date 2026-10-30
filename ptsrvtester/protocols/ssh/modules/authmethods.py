@@ -1,5 +1,9 @@
 """AUTHM — supported SSH authentication methods."""
-from ptsrvtester.protocols.ssh.utils.ssh_helpers import get_auth_methods
+from ptsrvtester.protocols.ssh.utils.ssh_helpers import (
+    get_auth_methods,
+    service_reachable,
+    unreachable_message,
+)
 
 __MODULELABEL__ = "Authentication methods"
 __MODULECODE__ = "AUTHM"
@@ -9,7 +13,11 @@ __ORDER__ = 30
 
 def run(ctx):
     ip, port = ctx.target
-    ctx.debug(f"querying the authentication methods offered by {ip}:{port}")
+    if service_reachable(ctx) is False:
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
+
+    ctx.debug(f"Querying the authentication methods offered by {ip}:{port}")
     try:
         methods = get_auth_methods(ip, port)
     except Exception as e:
@@ -20,8 +28,10 @@ def run(ctx):
         ctx.out("Server did not report authentication methods", "NOTVULN", indent=4)
         return
 
-    ctx.debug(f"server offers: {', '.join(methods)}")
+    ctx.debug(f"Server offers: {', '.join(methods)}")
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     has_kb_interactive = False
     for method in methods:
         if method.lower() == "keyboard-interactive":

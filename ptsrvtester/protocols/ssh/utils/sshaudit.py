@@ -319,12 +319,18 @@ def report_algorithm_section(ctx, section: str) -> None:
     with its OK/WARNING/VULN status, and (if any weak algorithms were found)
     records one vulnerability for the running module (PTV-SVC-<MODULECODE>).
     """
+    from ptsrvtester.protocols.ssh.utils.ssh_helpers import service_reachable, unreachable_message
+    if service_reachable(ctx) is False:
+        ip, port = ctx.target
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
+
     if ctx.ssh_audit.done:
-        ctx.debug(f"reusing the shared ssh-audit scan for the {section} section")
+        ctx.debug(f"Reusing the shared ssh-audit scan for the {section} section")
     else:
-        ctx.debug(f"running ssh-audit against {ctx.ip}:{ctx.port} (shared crypto scan)")
+        ctx.debug(f"Running ssh-audit against {ctx.ip}:{ctx.port} (shared crypto scan)")
     run = ctx.ssh_audit.get()
-    ctx.debug(f"parsing {section} algorithms from the ssh-audit result")
+    ctx.debug(f"Parsing {section} algorithms from the ssh-audit result")
     if not run.ok:
         ctx.out(f"ssh-audit did not run: {run.error}", "WARNING", indent=4)
         return
@@ -336,6 +342,8 @@ def report_algorithm_section(ctx, section: str) -> None:
 
     from ptlibs.ptprinthelper import get_colored_text
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     weak: list[str] = []
     for entry in entries:
         alg = entry.get("algorithm", "?")

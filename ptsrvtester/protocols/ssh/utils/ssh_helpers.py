@@ -162,6 +162,32 @@ def grab_banner(ip: str, port: int) -> str:
             pass
 
 
+def unreachable_message(ip: str, port: int) -> str:
+    """The standard 'nothing to test' line for a target that is not a live SSH service."""
+    return (f"{ip}:{port} is not reachable as an SSH service (no SSH banner) — "
+            "there is nothing meaningful to test here.")
+
+
+def service_reachable(ctx) -> bool | None:
+    """Run-shared SSH-service reachability verdict, or ``None`` if not yet known.
+
+    SSH analogue of DNS ``fingerprint_core.server_reachable``, but it NEVER opens
+    its own probe connection: BANNER (``__ORDER__ = 10``) seeds ``ctx.reach_cache``
+    from the banner it already grabs, and every later service test reads the verdict
+    here for free. Returns ``None`` when no verdict has been recorded — e.g. a single
+    module run in isolation without BANNER — so the per-module guard
+    (``if service_reachable(ctx) is False``) then does nothing and the module runs as
+    before. We deliberately avoid re-probing per module: an SSH connect is heavy and
+    some servers serve only one session at a time, so an extra probe could disrupt
+    the very connection the test then needs.
+    """
+    cache = getattr(ctx, "reach_cache", None)
+    target = getattr(ctx, "target", None)
+    if cache is None or not target or not target[0]:
+        return None
+    return cache.get((target[0], target[1] or 22))
+
+
 SSH_MSG_KEXINIT = 20
 _KEXINIT_NAMELIST_KEYS = (
     "kex", "server_host_key", "enc_c2s", "enc_s2c", "mac_c2s", "mac_s2c",

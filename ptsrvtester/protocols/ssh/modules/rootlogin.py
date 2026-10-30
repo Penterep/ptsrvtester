@@ -55,6 +55,10 @@ def _attempt_login(ip: str, port: int, creds_list: list[SSHCreds]):
 def run(ctx):
     a = ctx.args
     ip, port = ctx.target
+    from ptsrvtester.protocols.ssh.utils.ssh_helpers import service_reachable, unreachable_message
+    if service_reachable(ctx) is False:
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
     account = a.user if (isinstance(a.user, str) and a.user) else "root"
 
@@ -62,17 +66,17 @@ def run(ctx):
             "INFO", colortext=True, indent=4)
 
     # (1) Behavioural probe: methods for root vs an ordinary (random) name.
-    ctx.debug(f"probing advertised auth methods for '{account}' vs a random baseline name")
+    ctx.debug(f"Probing advertised auth methods for '{account}' vs a random baseline name")
     try:
         root_methods = ssh_helpers.get_auth_methods_for(ip, port, account)
     except Exception as e:
-        ctx.debug(f"root methods probe failed: {e}")
+        ctx.debug(f"Root methods probe failed: {e}")
         root_methods = None
     try:
         baseline_name = "ptuser_" + secrets.token_hex(5)
         baseline_methods = ssh_helpers.get_auth_methods_for(ip, port, baseline_name)
     except Exception as e:
-        ctx.debug(f"baseline methods probe failed: {e}")
+        ctx.debug(f"Baseline methods probe failed: {e}")
         baseline_methods = None
 
     # (2) Optional credentialed confirmation.
@@ -80,8 +84,8 @@ def run(ctx):
     if creds_list:
         ctx.out(f"Credentials supplied — attempting a real login as '{account}' "
                 f"({len(creds_list)} secret(s))", "WARNING", indent=4)
-    ctx.debug(f"attempting a real login as '{account}' with {len(creds_list)} secret(s)"
-              if creds_list else "no credentials supplied — behavioural verdict only")
+    ctx.debug(f"Attempting a real login as '{account}' with {len(creds_list)} secret(s)"
+              if creds_list else "No credentials supplied — behavioural verdict only")
     login_succeeded, login_attempted = _attempt_login(ip, port, creds_list)
 
     result = assess_root_login(

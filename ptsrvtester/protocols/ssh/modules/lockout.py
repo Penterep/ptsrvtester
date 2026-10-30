@@ -144,6 +144,10 @@ def _first_user(a) -> str | None:
 def run(ctx):
     a = ctx.args
     ip, port = ctx.target
+    from ptsrvtester.protocols.ssh.utils.ssh_helpers import service_reachable, unreachable_message
+    if service_reachable(ctx) is False:
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
     user = _first_user(a)
     if not user:
@@ -168,7 +172,7 @@ def run(ctx):
         )
 
     ctx.debug(
-        f"lockout probe on {ip}:{port} as '{user}': {attempts} failed attempt(s), "
+        f"Lockout probe on {ip}:{port} as '{user}': {attempts} failed attempt(s), "
         f"cooldown {cooldown:.0f}s, account-lockout {'enabled' if valid_password else 'skipped'}"
     )
     # Heads-up if the server does not offer password auth (failed passwords may
@@ -217,7 +221,7 @@ def _render(ctx, r, user):
             ctx.out(n, "TEXT", indent=8)
         return
 
-    ctx.debug(f"attempts made: {r.attempts_made}; outcomes: "
+    ctx.debug(f"Attempts made: {r.attempts_made}; outcomes: "
               + ", ".join(o.value for o in r.outcomes))
 
     # --- Account lockout ---

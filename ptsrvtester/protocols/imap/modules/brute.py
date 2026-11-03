@@ -1,53 +1,10 @@
-"""BRUTE — catch-all + LOGIN bruteforce."""
-from ..utils.helpers import apply_default_brute_creds
-from ._common import eng
+"""BRUTE — server does not stop a guessing attack (PTV-SVC-AUTH-BRUTE)."""
+from ._authguess import run_auth_guess
 
-__MODULELABEL__ = ""
+__MODULELABEL__ = "Blocking guessing attack"
 __MODULECODE__ = "BRUTE"
 __ORDER__ = 100
 
 
-def _section(ctx, e, title: str) -> None:
-    if getattr(ctx, "json", False):
-        return
-    ctx.out(title, "INFO", colortext=True)
-
-
 def run(ctx):
-    e = eng(ctx)
-    apply_default_brute_creds(ctx.args)
-
-    _section(ctx, e, "Catch-all test")
-    try:
-        catch_all = e._test_catch_all()
-    except Exception as ex:
-        ctx.out(f"Catch-all failed: {ex}", "ERROR", indent=4)
-        return
-
-    e.results.catch_all = catch_all
-    if catch_all == "indeterminate":
-        ctx.out(
-            "Server accepted invalid credentials (indeterminate). Results may be false positives.",
-            "WARNING",
-            indent=4,
-        )
-    elif catch_all == "unreachable":
-        ctx.out(
-            "Catch-all timed out or could not connect. Not confirmed.",
-            "WARNING",
-            indent=4,
-        )
-        return
-    elif catch_all == "disabled":
-        ctx.out(
-            "LOGIN is disabled and AUTH=PLAIN is not offered. Password guessing was not tested.",
-            "WARNING",
-            indent=4,
-        )
-        return
-    else:
-        ctx.out("Not configured (server rejects invalid creds)", "NOTVULN", indent=4)
-
-    _section(ctx, e, "Guessing (credential bruteforce)")
-    e.login_bruteforce()
-    e._stream_brute_result()
+    run_auth_guess(ctx, "BRUTE")

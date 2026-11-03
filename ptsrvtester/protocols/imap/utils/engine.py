@@ -29,6 +29,7 @@ from enum import Enum
 from string import ascii_letters
 from typing import Any, Callable, NamedTuple
 
+from .poc import format_poc
 from .helpers import (
     ArgsWithBruteforce,
     Creds,
@@ -232,15 +233,9 @@ class ImapEngine:
         """Remember the Send/Receive lines that prove one vulnerability."""
         if not code or code in self._vuln_poc or not pairs:
             return
-        lines: list[str] = []
-        for send, recv in pairs:
-            if not send:
-                continue
-            recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
-            lines.append(f"Send: {send}")
-            lines.append(f"Receive: {recv_s}")
-        if lines:
-            self._vuln_poc[code] = "\r\n".join(lines)
+        text = format_poc(*pairs)
+        if text:
+            self._vuln_poc[code] = text
 
     def _dbg(self, msg: str, *, indent: int = 4) -> None:
         """Breadcrumb. ``ctx.debug`` logs it always and prints it on ``-vv``."""
@@ -257,11 +252,32 @@ class ImapEngine:
                 if line:
                     self._add_to_json_log(line)
 
+    @staticmethod
+    def _imap_error_reply(exc: BaseException) -> str:
+        """Server reply from an imaplib error, without the library's wrapper."""
+        text = _imap_login_exception_text(exc).strip()
+        marker = " command error: "
+        idx = text.find(marker)
+        if idx < 0:
+            return text or "(no reply)"
+        rest = text[idx + len(marker):].strip()
+        code, _, payload = rest.partition(" ")
+        payload = payload.strip()
+        if payload.startswith("[") and payload.endswith("]"):
+            inner = payload[1:-1].strip()
+            if len(inner) >= 3 and inner[0] == "b" and inner[1] in "'\"" and inner[-1] == inner[1]:
+                inner = inner[2:-1]
+            payload = inner
+        return f"{code} {payload}".strip() if payload else (code or text)
+
     def _imap_vv_io(self, send: str | None, recv: str | None) -> None:
         """Send/Receive on -vv, and into results.log when -j."""
         if not send:
             return
-        recv_s = "(no reply)" if recv in (None, "") else recv
+        if recv in (None, ""):
+            recv_s = "(no reply)"
+        else:
+            recv_s = str(recv).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
         self._dbg(f"Send: {send}")
         self._dbg(f"Receive: {recv_s}")
 
@@ -283,25 +299,12 @@ class ImapEngine:
     ) -> None:
         user = row.username
         if row.error:
-            msg = f"{method} {user!r}: connect/error {self._snip(row.error)}"
-        elif row.unexpected_ok:
-            msg = f"{method} {user!r}: unexpected OK"
+            reply = row.error
+        elif row.reply_raw:
+            reply = row.reply_raw
         else:
-            msg = (
-                f"{method} {user!r}: {self._snip(row.reply_raw)} "
-                f"(norm={row.reply_normalized!r} t={row.elapsed_ms}ms)"
-            )
-        if self.use_json:
-            self._dbg(msg)
-            return
-        if not getattr(self.args, "debug", False):
-            return
-        if output is not None:
-            line = out_if(msg, "ADDITIONS", True, colortext=True, indent=0)
-            if line:
-                output.add_string_to_output(line.rstrip("\n"))
-            return
-        self._dbg(msg)
+            reply = "(no reply)"
+        self._imap_vv_io(f"{method} {user}", reply)
 
     def _emit_section_heading(self, title: str) -> None:
         """Print section title before work starts (align with SMTP/FTP progressive terminal UX)."""
@@ -337,27 +340,24 @@ class ImapEngine:
     def _make_imap_connection(self, *, trace: bool = False) -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
         """New IMAP session using current TLS/STARTTLS mode (for probes independent of self.imap)."""
         t = _IMAP_CONNECT_TIMEOUT_SEC
-        mode = get_mode(self.args)
-        if trace:
-            self._dbg(f"Connecting to {self.args.target.ip}:{self.args.target.port} ({mode})")
         try:
             if self.args.tls:
                 imap = imaplib.IMAP4_SSL(self.args.target.ip, self.args.target.port, timeout=t)
             else:
                 imap = imaplib.IMAP4(self.args.target.ip, self.args.target.port, timeout=t)
-                if self.args.starttls:
-                    if trace:
-                        self._dbg("Sending STARTTLS (explicit upgrade)")
-                    imap.starttls()
-                    if trace:
-                        self._dbg("STARTTLS upgrade OK")
         except Exception as e:
             if trace:
-                self._dbg(f"Connect failed: {e}")
+                self._imap_vv_io("(connect)", str(e))
             raise
         if trace:
             banner = imap.welcome.decode(errors="replace") if imap.welcome else ""
-            self._dbg(f"Banner: {self._snip(banner)}")
+            self._imap_vv_io("(connect)", banner)
+        if not self.args.tls and self.args.starttls:
+            if trace:
+                self._dbg("Sending STARTTLS (explicit upgrade)")
+            imap.starttls()
+            if trace:
+                self._dbg("STARTTLS upgrade OK")
         return imap
 
     def _imap_single_known_login(self) -> tuple[str, str] | None:
@@ -366,9 +366,12 @@ class ImapEngine:
         p = getattr(self.args, "password", None)
         uf = getattr(self.args, "users", None)
         pf = getattr(self.args, "passwords", None)
-        if u and p and not uf and not pf:
-            return (u, str(p))
-        return None
+        if not u or p is None or uf or pf:
+            return None
+        values = list(brute_passwords(p, None))
+        if len(values) != 1:
+            return None
+        return (u, values[0])
 
     def _imap_usrenum_names_from_cli(self) -> list[str]:
         """Candidate usernames for USRENUM / USRENUMPLAIN from -u / -U (same as BRUTE)."""
@@ -1397,28 +1400,27 @@ class ImapEngine:
         fake_user = "".join(random.choices(string.ascii_letters + string.digits, k=24))
         fake_pass = "".join(random.choices(string.ascii_letters + string.digits, k=24))
         cmd = "AUTHENTICATE PLAIN" if method == "PLAIN" else "LOGIN"
-        self._dbg(f"Catch-all {cmd} {fake_user!r}")
+        sent = f"{cmd} {fake_user} {fake_pass}"
         try:
             imap = self.connect()
         except Exception as e:
-            self._dbg(f"Catch-all: connect failed: {e}")
+            self._imap_vv_io("(connect)", str(e))
             return "unreachable"
         try:
             if method == "PLAIN":
                 typ, raw, _ms = self._imap_usrenum_measure_plain(imap, fake_user, fake_pass)
+                self._imap_vv_io(sent, self._imap_brute_reply(typ, raw))
                 if typ == "OK":
-                    self._dbg(f"Catch-all {cmd} → accepted (indeterminate)")
                     return "indeterminate"
-                self._dbg(f"Catch-all rejected (not configured): {self._snip(raw)}")
                 if self._imap_text_is_timeout(raw):
                     return "unreachable"
                 return "not_configured"
             try:
                 imap.login(fake_user, fake_pass)
-                self._dbg(f"Catch-all {cmd} → accepted (indeterminate)")
+                self._imap_vv_io(sent, "OK")
                 return "indeterminate"
             except Exception as e:
-                self._dbg(f"Catch-all rejected (not configured): {self._snip(str(e))}")
+                self._imap_vv_io(sent, _imap_login_exception_text(e))
                 if self._imap_text_is_timeout(str(e)):
                     return "unreachable"
                 return "not_configured"
@@ -1444,10 +1446,16 @@ class ImapEngine:
         capability = None
 
         if get_commands:
-            capa_from_imap = [str(c) for c in imap.capabilities] if imap.capabilities else []
+            try:
+                _typ, dat = imap.capability()
+                body = _imap_dat_to_text(dat)
+                capa_from_imap = body.split() if body else []
+                self._imap_vv_io("CAPABILITY", f"* CAPABILITY {body}" if body else "(no reply)")
+            except Exception as e:
+                capa_from_imap = [str(c) for c in imap.capabilities] if imap.capabilities else []
+                self._imap_vv_io("CAPABILITY", self._imap_error_reply(e))
             capa_from_banner = _extract_capabilities_from_banner(banner)
             capability = list(dict.fromkeys(capa_from_imap + capa_from_banner)) or capa_from_imap or capa_from_banner
-            self._dbg_capa_list("CAPABILITY response:", capability)
 
             try:
                 typ, dat = imap.xatom("ID")
@@ -1459,11 +1467,13 @@ class ImapEngine:
                     elif id_ is not None:
                         id_val = str(id_)
                 if id_val:
-                    self._dbg(f"ID → {self._snip(id_val)}")
+                    recv = id_val if str(id_val).lstrip().startswith("*") else f"* ID {id_val}"
+                    self._imap_vv_io("ID", recv)
                 else:
-                    self._dbg("ID: not advertised / empty")
+                    tagged = _imap_dat_to_text(dat)
+                    self._imap_vv_io("ID", f"{typ} {tagged}".strip() if tagged else (typ or "(no reply)"))
             except Exception as e:
-                self._dbg(f"ID failed: {self._snip(str(e))}")
+                self._imap_vv_io("ID", self._imap_error_reply(e))
 
         return InfoResult(banner, id_val, capability, None)
 
@@ -2083,31 +2093,35 @@ class ImapEngine:
                 elif welcome:
                     plaintext_banner = str(welcome).strip()
                 plaintext_ok = True
-                self._dbg(f"Cleartext welcome: {self._snip(imap.welcome)}")
+                self._imap_vv_io("(connect)", plaintext_banner or "")
                 if plaintext_banner:
                     self.note_poc(VULNS.Sniffable.value, ("(connect)", plaintext_banner))
                 imap.logout()
             except Exception as e:
-                self._dbg(f"Cleartext test failed: {e}")
+                self._imap_vv_io("(connect)", str(e))
 
             try:
                 imap = imaplib.IMAP4(host, port)
                 imap.sock.settimeout(timeout)
-                _ = imap.welcome
-                self._dbg(f"STARTTLS probe welcome: {self._snip(imap.welcome)}")
-                caps = [str(c).upper() for c in (imap.capabilities or [])]
-                self._dbg("STARTTLS probe CAPABILITY: " + ", ".join(caps[:12] or ["(none)"]))
+                welcome = imap.welcome.decode(errors="replace") if isinstance(imap.welcome, (bytes, bytearray)) else (str(imap.welcome) if imap.welcome else "")
+                self._imap_vv_io("(connect)", welcome)
+                _typ, dat = imap.capability()
+                body = _imap_dat_to_text(dat)
+                caps = [part.upper() for part in body.split()] if body else []
+                self._imap_vv_io("CAPABILITY", f"* CAPABILITY {body}" if body else "(no reply)")
                 if "STARTTLS" in caps:
-                    imap.starttls()
-                    _ = imap.capabilities
-                    post = [str(c) for c in (imap.capabilities or [])]
-                    self._dbg("CAPABILITY after STARTTLS wrap: " + ", ".join(post[:12] or ["(none)"]))
+                    replied = imap.starttls()
+                    if isinstance(replied, tuple) and len(replied) == 2:
+                        typ, dat = replied
+                        stls_body = _imap_dat_to_text(dat)
+                        self._imap_vv_io("STARTTLS", f"{typ} {stls_body}".strip() if stls_body else (typ or "(no reply)"))
+                    _typ, dat = imap.capability()
+                    post = _imap_dat_to_text(dat)
+                    self._imap_vv_io("CAPABILITY", f"* CAPABILITY {post}" if post else "(no reply)")
                     starttls_ok = True
-                else:
-                    self._dbg("STARTTLS not advertised in CAPABILITY")
                 imap.logout()
             except Exception as e:
-                self._dbg(f"STARTTLS test failed: {e}")
+                self._imap_vv_io("STARTTLS", self._imap_error_reply(e))
 
         _connect_timeout = 15.0 if tls_only_port else timeout
         try:
@@ -2126,19 +2140,14 @@ class ImapEngine:
                     sock_ssl.sendall(b"a001 CAPABILITY\r\n")
                     line = sock_ssl.recv(1024).decode(errors="replace")
                     sock_ssl.close()
+                    self._imap_vv_io("CAPABILITY", line.strip() or "(no reply)")
                     if line and ("OK" in line or "CAPABILITY" in line):
                         tls_ok = True
-                        self._dbg(
-                            f"Implicit TLS (SNI={_sni!r}) welcome: {self._snip(line)} → OK"
-                        )
                         break
-                    self._dbg(
-                        f"Implicit TLS (SNI={_sni!r}) welcome: {self._snip(line)} → FAIL"
-                    )
                 except Exception as e:
-                    self._dbg(f"Implicit TLS test failed (SNI={_sni!r}): {e}")
+                    self._imap_vv_io("(connect)", str(e))
         except Exception as e:
-            self._dbg(f"Implicit TLS test failed: {e}")
+            self._imap_vv_io("(connect)", str(e))
 
         return EncryptionResult(plaintext_ok, starttls_ok, tls_ok, plaintext_banner)
 
@@ -2271,18 +2280,21 @@ class ImapEngine:
         try:
             imap = self._imap_connect_auth_path(path, timeout)
             banner = imap.welcome.decode(errors="replace") if imap.welcome else ""
-            self._dbg(f"{label} welcome: {self._snip(banner)}", indent=8)
+            self._imap_vv_io("(connect)", banner)
+            capa_body = ""
             try:
-                imap.capability()
-            except Exception:
-                pass
-            capability = [str(c) for c in (imap.capabilities or [])]
-            self._dbg_capa_list(f"CAPABILITY ({label}):", capability, indent=8)
+                _typ, dat = imap.capability()
+                body = _imap_dat_to_text(dat)
+                capability = body.split() if body else []
+                capa_body = body
+                self._imap_vv_io("CAPABILITY", f"* CAPABILITY {body}" if body else "(no reply)")
+            except Exception as e:
+                capability = [str(c) for c in (imap.capabilities or [])]
+                capa_body = " ".join(capability)
+                self._imap_vv_io("CAPABILITY", self._imap_error_reply(e))
             methods = self._auth_methods_from_capa(capability)
-            if not methods:
-                self._dbg("no AUTH= in CAPABILITY", indent=8)
         except Exception as e:
-            self._dbg(f"{label} connect failed: {self._snip(str(e))}", indent=8)
+            self._imap_vv_io("(connect)", str(e))
             self._authlist_emit_unavailable(path, connected=False)
             return ImapAuthListPath(path=path, available=False, skip_reason=str(e)[:240], methods=tuple())
         finally:
@@ -2298,22 +2310,33 @@ class ImapEngine:
             self._authlist_emit_unavailable(path, connected=True)
             return ImapAuthListPath(path=path, available=True, skip_reason=None, methods=tuple())
         rows: list[ImapAuthMechRow] = []
+        proof: list[tuple[str, str]] = []
         for m in methods:
             outcome, reply = self._probe_authenticate_on_path(path, m, timeout=timeout)
             usable = outcome == "continuation"
             dangerous = IMAP_AUTH_METHOD_LEVEL.get(m, "OK") == "ERROR"
             if path == "cleartext" and dangerous and usable:
-                self.note_poc(
-                    VULNS.AuthMethods.value,
-                    (f"AUTHENTICATE {m}", reply or ""),
-                )
+                proof.append((m, reply or ""))
             row = ImapAuthMechRow(name=m, usable=usable, outcome=outcome, dangerous=dangerous)
             rows.append(row)
-            if outcome == "io_error":
-                self._dbg(f"AUTHENTICATE {m} failed: {reply}", indent=12)
-            else:
-                self._dbg(f"AUTHENTICATE {m} → {outcome} {reply}", indent=12)
+            self._imap_vv_io(f"AUTHENTICATE {m}", reply or "(no reply)")
             self._authlist_emit_method_row(path, row)
+        if proof:
+            marked = {
+                token.upper()
+                for token in capa_body.split()
+                if token.upper().startswith("AUTH=")
+                and token.split("=", 1)[-1].strip().upper() in {name for name, _reply in proof}
+            }
+            capa_lines = [
+                f"**{token}**" if token.upper() in marked else token
+                for token in capa_body.split()
+            ]
+            self.note_poc(
+                VULNS.AuthMethods.value,
+                ("CAPABILITY", "\n".join(capa_lines)),
+                *[(f"AUTHENTICATE {name}", reply) for name, reply in proof],
+            )
         return ImapAuthListPath(path=path, available=True, skip_reason=None, methods=tuple(rows))
 
     def test_imap_authlist(self) -> ImapAuthListResult:
@@ -2409,11 +2432,10 @@ class ImapEngine:
             imap = imaplib.IMAP4(host, port, timeout=timeout)
             imap.sock.settimeout(timeout)
             banner = imap.welcome.decode(errors="replace") if imap.welcome else ""
-            self._dbg(f"Cleartext welcome: {self._snip(banner)}")
-            self._dbg(f"LOGIN {user!r}")
-            imap.login(user, password)
+            self._imap_vv_io("(connect)", banner)
+            typ_login, dat_login = imap.login(user, password)
             login_ok = True
-            self._dbg("LOGIN → OK")
+            self._imap_vv_io(f"LOGIN {user} {password}", self._imap_load_fmt_reply(typ_login, dat_login))
             typ, data = imap.select("INBOX")
             detail = ""
             if data:
@@ -2423,7 +2445,7 @@ class ImapEngine:
                     )[:200]
                 except Exception:
                     detail = str(data)[:200]
-            self._dbg(f"SELECT INBOX → {typ} {self._snip(detail)}")
+            self._imap_vv_io("SELECT INBOX", f"{typ} {detail}".strip())
             select_ok = str(typ).upper() == "OK"
             if select_ok:
                 self.note_poc(
@@ -2446,7 +2468,10 @@ class ImapEngine:
             )
         except Exception as e:
             msg = _imap_login_exception_text(e)
-            self._dbg(f"{'LOGIN' if not login_ok else 'SELECT INBOX'} → {self._snip(msg)}")
+            if not login_ok:
+                self._imap_vv_io(f"LOGIN {user} {password}", msg)
+            else:
+                self._imap_vv_io("SELECT INBOX", msg)
             low = msg.lower()
             connect_fail = (
                 not login_ok
@@ -2773,9 +2798,8 @@ class ImapEngine:
             return None
         imap = None
         try:
-            imap = self._make_imap_connection()
-        except Exception as e:
-            self._dbg(f"STARTTLS / CAPABILITY after STARTTLS failed: {self._snip(str(e))}")
+            imap = self._make_imap_connection(trace=True)
+        except Exception:
             return None
         try:
             capa = [str(c) for c in imap.capabilities] if imap.capabilities else []
@@ -2783,15 +2807,21 @@ class ImapEngine:
             capa_banner = _extract_capabilities_from_banner(banner)
             capability = list(dict.fromkeys(capa + capa_banner)) or capa or capa_banner
             if "STARTTLS" not in [c.upper() for c in capability]:
-                self._dbg("STARTTLS not advertised in CAPABILITY")
                 return None
-            self._dbg("STARTTLS available — upgrading for post-STARTTLS CAPABILITY")
-            imap.starttls()
-            capability_starttls = [str(c) for c in imap.capabilities] if imap.capabilities else []
-            self._dbg_capa_list("CAPABILITY after STARTTLS:", capability_starttls)
-            return capability_starttls
+            replied = imap.starttls()
+            if isinstance(replied, tuple) and len(replied) == 2:
+                typ, dat = replied
+                body = _imap_dat_to_text(dat)
+                self._imap_vv_io("STARTTLS", f"{typ} {body}".strip() if body else (typ or "(no reply)"))
+            else:
+                self._imap_vv_io("STARTTLS", str(replied) if replied else "(no reply)")
+            _typ, dat = imap.capability()
+            body = _imap_dat_to_text(dat)
+            capability_starttls = body.split() if body else []
+            self._imap_vv_io("CAPABILITY", f"* CAPABILITY {body}" if body else "(no reply)")
+            return capability_starttls or None
         except Exception as e:
-            self._dbg(f"STARTTLS / CAPABILITY after STARTTLS failed: {self._snip(str(e))}")
+            self._imap_vv_io("STARTTLS", self._imap_error_reply(e))
             return None
         finally:
             if imap is not None:
@@ -3137,7 +3167,8 @@ class ImapEngine:
 
         def _login() -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
             cl = self.connect()
-            cl.login(user, password)
+            typ, dat = cl.login(user, password)
+            self._imap_vv_io(f"LOGIN {user} {password}", self._imap_load_fmt_reply(typ, dat))
             return cl
 
         def _fmt_append(typ, data) -> str:
@@ -3153,8 +3184,6 @@ class ImapEngine:
 
         try:
             imap = _login()
-            with self._output_lock:
-                self._dbg(f"LOGIN {user!r} → OK")
             self._eicar_live = True
             for label, payload in self._eicar_payloads():
                 if imap is None:
@@ -3200,9 +3229,10 @@ class ImapEngine:
                     self._eicar_emit_variant(mb, row)
         except Exception as e:
             if not variants:
+                self._imap_vv_io(f"LOGIN {user} {password}", _imap_login_exception_text(e))
                 return EicarAppendResult(
                     skipped=True,
-                    skip_reason=str(e),
+                    skip_reason=_imap_login_exception_text(e),
                     mailbox=mb,
                     append_typ=None,
                     append_detail=None,
@@ -3461,6 +3491,7 @@ class ImapEngine:
                         pass
                     try:
                         typ, data = imap.login(user, password)
+                        self._imap_vv_io(f"LOGIN {user} {password}", self._imap_load_fmt_reply(typ, data))
                         imap_trace.append(f"LOGIN: {typ} ({user})")
                         if typ != "OK":
                             err_count = 1
@@ -3469,7 +3500,9 @@ class ImapEngine:
                             auth_used = True
                     except Exception as e:
                         err_count = 1
-                        imap_trace.append(f"LOGIN: failed ({self._snip(str(e))})")
+                        text = _imap_login_exception_text(e)
+                        self._imap_vv_io(f"LOGIN {user} {password}", text)
+                        imap_trace.append(f"LOGIN: failed ({text})")
 
                     if err_count == 0:
                         typ, data = imap.append(mb, None, None, raw_msg)
@@ -3871,6 +3904,7 @@ class ImapEngine:
 
         def _io(send: str, recv: str, key: str | None = None) -> tuple[str, str]:
             _live_done()
+            self._imap_vv_io(send, recv)
             pair = (send, recv)
             if key:
                 io_rl[key] = pair
@@ -3884,7 +3918,7 @@ class ImapEngine:
                 typ, dat = cl.login(user, password)
                 _io(send, self._imap_load_fmt_reply(typ, dat), "login")
             except imaplib.IMAP4.error as e:
-                _io(send, self._snip(str(e)), "login")
+                _io(send, _imap_login_exception_text(e), "login")
                 raise
             sock = getattr(cl, "sock", None)
             if sock is not None:
@@ -4398,6 +4432,7 @@ class ImapEngine:
 
         def _io(send: str, recv: str, key: str | None = None) -> tuple[str, str]:
             _live_done()
+            self._imap_vv_io(send, recv)
             pair = (send, recv)
             if key:
                 io_cap[key] = pair
@@ -4439,7 +4474,7 @@ class ImapEngine:
                 typ_login, dat_login = imap.login(login_user, password)
                 _io(send_login, self._imap_load_fmt_reply(typ_login, dat_login), "login")
             except imaplib.IMAP4.error as e:
-                _io(send_login, self._snip(str(e)), "login")
+                _io(send_login, _imap_login_exception_text(e), "login")
                 raise
             sock = getattr(imap, "sock", None)
             if sock is not None:
@@ -5346,32 +5381,26 @@ class ImapEngine:
                 pass
             banner, merged = self._merged_preauth_capabilities(imap)
             auth_ntlm_advertised = self._capability_advertises_auth_ntlm(merged, banner)
-            self._dbg(f"AUTH=NTLM advertised={auth_ntlm_advertised}")
+            welcome = imap.welcome.decode(errors="replace") if isinstance(imap.welcome, (bytes, bytearray)) else (str(imap.welcome) if imap.welcome else "")
+            self._imap_vv_io("(connect)", welcome)
             tag = imap._new_tag().decode()
             imap.send(f"{tag} AUTHENTICATE NTLM\r\n".encode())
             res = imap.readline().strip()
-            self._dbg(f"AUTHENTICATE NTLM → {self._snip(res)}")
+            res_text = res.decode(errors="replace") if isinstance(res, bytes) else str(res)
+            self._imap_vv_io("AUTHENTICATE NTLM", res_text)
             if res.startswith(b"+"):
-                imap.send(b64encode(get_NegotiateMessage_data()) + b"\r\n")
+                blob = b64encode(get_NegotiateMessage_data())
+                imap.send(blob + b"\r\n")
                 res = imap.readline().strip()
-                self._dbg(f"AUTHENTICATE NTLM after negotiate → {self._snip(res)}")
+                res_text = res.decode(errors="replace") if isinstance(res, bytes) else str(res)
+                self._imap_vv_io(blob.decode(), res_text)
                 # Challenge line may contain '+' inside Base64 — preserve octets after first '+'
                 b64_ntlm_challenge = b"+".join(res.split(b"+")[1:])
                 ntlminfo = decode_ChallengeMessage_blob(b64decode(b64_ntlm_challenge))
-                self._dbg("NTLM challenge decoded OK")
-                if ntlminfo is not None:
-                    self._dbg(f"Target name: {ntlminfo.target_name}")
-                    self._dbg(f"NetBios domain name: {ntlminfo.netbios_domain}")
-                    self._dbg(f"NetBios computer name: {ntlminfo.netbios_computer}")
-                    self._dbg(f"DNS domain name: {ntlminfo.dns_domain}")
-                    self._dbg(f"DNS computer name: {ntlminfo.dns_computer}")
-                    self._dbg(f"DNS tree: {ntlminfo.dns_tree}")
-                    self._dbg(f"OS version: {ntlminfo.os_version}")
                 return NTLMResult(True, ntlminfo, auth_ntlm_advertised)
-            self._dbg("AUTHENTICATE NTLM: server did not return challenge (+)")
             return NTLMResult(False, None, auth_ntlm_advertised)
         except Exception as e:
-            self._dbg(f"AUTHENTICATE NTLM failed: {self._snip(str(e))}")
+            self._imap_vv_io("AUTHENTICATE NTLM", _imap_login_exception_text(e))
             if self._imap_text_is_timeout(str(e)):
                 return NTLMResult(False, None, auth_ntlm_advertised, incomplete=True)
             return NTLMResult(False, None, auth_ntlm_advertised)
@@ -5392,7 +5421,12 @@ class ImapEngine:
     def _imap_brute_line(
         self, output, msg: str, category: str = "ADDITIONS", *, colortext: bool = True, indent: int = 0,
     ) -> None:
-        if output is None or self.use_json:
+        if not msg:
+            return
+        if self.use_json:
+            self._dbg(msg, indent=indent)
+            return
+        if output is None:
             return
         if category == "ADDITIONS" and not getattr(self.args, "debug", False):
             return
@@ -5494,12 +5528,15 @@ class ImapEngine:
             else:
                 typ, raw, _ms = self._imap_usrenum_measure_login(imap, cred.user, cred.passw)
             kind = self._imap_brute_kind(typ, raw)
-            cmd_show = f'{cmd} ""' if cred.passw == "" else cmd
-            self._imap_brute_line(output, f"{shown!r}: {cmd_show} {self._imap_brute_reply(typ, raw)}")
+            recv = self._imap_brute_reply(typ, raw)
+            secret = '""' if cred.passw == "" else cred.passw
+            sent = f"{cmd} {cred.user} {secret}"
+            self._imap_vv_io(sent, recv)
+            if kind in ("ok", "fail"):
+                self._brute_proof = ((sent, recv),)
             if kind == "ok":
-                recv = self._imap_brute_reply(typ, raw)
-                self.note_poc(VULNS.WeakCredentials.value, (cmd, recv))
-                self.note_poc(VULNS.WeakCreds.value, (cmd, recv))
+                self.note_poc(VULNS.WeakCreds.value, (sent, recv))
+                self.note_poc(VULNS.Recykl.value, (sent, recv))
                 self._imap_brute_line(output, f"user:{' ' * 5}{cred.user}", "VULN", colortext=False)
                 self._imap_brute_line(
                     output,
@@ -5612,6 +5649,8 @@ class ImapEngine:
             )
         if self._brute_guessing in ("not_limited", "stopped") and state["tried"] < 50:
             self._brute_guessing = "insufficient"
+        if self._brute_guessing == "not_limited" and getattr(self, "_brute_proof", None):
+            self.note_poc(VULNS.Brute.value, *self._brute_proof)
         self.results.creds = found
         return found
 
@@ -5952,29 +5991,19 @@ class ImapEngine:
         return "not accepted", "NOTVULN"
 
     def _anonymous_emit_auth_capa(self, advertised: bool) -> None:
-        self._anonymous_vv(f"AUTH=ANONYMOUS advertised={advertised}")
         if advertised:
             self._anonymous_aligned("AUTH method ANONYMOUS:", "advertised", "WARNING")
         else:
             self._anonymous_aligned("AUTH method ANONYMOUS:", "not advertised", "NOTVULN")
 
     def _anonymous_emit_authenticate(self, ok: bool, detail: str | None) -> None:
-        extra = f": {detail}" if detail else ""
         value, bullet = self._anonymous_auth_value(ok, detail)
-        if ok:
-            self._anonymous_vv(f"AUTHENTICATE ANONYMOUS OK{extra}")
-        else:
-            self._anonymous_vv(f"AUTHENTICATE ANONYMOUS failed{extra}")
+        self._imap_vv_io("AUTHENTICATE ANONYMOUS", detail or ("OK" if ok else "(no reply)"))
         self._anonymous_aligned("Use AUTHENTICATE ANONYMOUS:", value, bullet)
 
     def _anonymous_emit_login(self, user: str, password: str, accepted: bool, detail: str | None) -> None:
-        pw_disp = '""' if not password else password
-        self._anonymous_vv(f"LOGIN {user} {pw_disp}")
         value, bullet = self._anonymous_login_value(accepted, detail)
-        if accepted:
-            self._anonymous_vv("OK")
-        else:
-            self._anonymous_vv(f"failed: {detail or value}")
+        self._imap_vv_io(f"LOGIN {user} {password}", detail or ("OK" if accepted else "(no reply)"))
         self._anonymous_aligned(self._anonymous_login_label(user, password), value, bullet)
 
     def _anonymous_description(self, ar: AnonymousAccessResult) -> str:
@@ -6683,14 +6712,16 @@ class ImapEngine:
                 for part in (line or "").replace("\r", "").splitlines():
                     pp(part, bullet_type="TEXT", condition=show, indent=8)
 
-    def _stream_brute_result(self) -> None:
-        """Found logins, then whether the server stopped password guessing."""
+    def _stream_brute_result(self, *, focus: str = "all") -> None:
+        """``block`` is BRUTE, ``creds`` is WEAK and RECYKL, ``all`` prints both."""
         creds = self.results.creds
         guessing = getattr(self, "_brute_guessing", None)
         if (not creds) and guessing is None:
             return
+        show_creds = focus in ("all", "creds")
+        show_block = focus in ("all", "block")
         with self._output_lock:
-            if creds:
+            if show_creds and creds:
                 n = len(creds)
                 word = "login" if n == 1 else "logins"
                 self._ptprint_raw(
@@ -6700,6 +6731,23 @@ class ImapEngine:
                     indent=4,
                     colortext=False,
                 )
+            elif show_creds and guessing in ("not_limited", "stopped", "insufficient"):
+                self._ptprint_raw(
+                    "No valid login found",
+                    bullet_type="NOTVULN",
+                    condition=not self.use_json,
+                    indent=4,
+                )
+            if not show_block:
+                if guessing == "not_tested":
+                    self._ptprint_raw(
+                        getattr(self, "_brute_guessing_detail", None)
+                        or "Could not connect. Password guessing was not tested.",
+                        bullet_type="WARNING",
+                        condition=not self.use_json,
+                        indent=4,
+                    )
+                return
             if guessing == "insufficient":
                 self._ptprint_raw(
                     "The test cannot be evaluated. At least 50 combinations must be tested.",
@@ -6748,26 +6796,35 @@ class ImapEngine:
     def _is_brute_only_output(self) -> bool:
         raw = getattr(self.args, "tests", None) or ""
         codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
-        return codes == {"BRUTE"}
+        return bool(codes) and codes <= {"BRUTE", "WEAK", "RECYKL"}
 
     def _brute_vuln_entries(self) -> list[dict]:
+        """One code per test that ran: BRUTE, WEAK, or RECYKL."""
         vulns: list[dict] = []
-        if getattr(self, "_brute_guessing", None) == "not_limited":
-            vulns.append({"vuln_code": VULNS.AuthBlock.value})
-        creds = brute_sorted_creds(self.results.creds)
-        if creds:
-            request = brute_weak_request(self.args)
-            response = brute_weak_response(creds)
-            vulns.append({
-                "vuln_code": VULNS.WeakCredentials.value,
-                "vuln_request": request,
-                "vuln_response": response,
-            })
-            vulns.append({
-                "vuln_code": VULNS.WeakCreds.value,
-                "vuln_request": request,
-                "vuln_response": response,
-            })
+        runs = getattr(self, "_auth_probe_runs", None) or {}
+        if not runs:
+            if getattr(self, "_brute_guessing", None) == "not_limited":
+                vulns.append({"vuln_code": VULNS.Brute.value})
+            creds = brute_sorted_creds(self.results.creds)
+            if creds:
+                vulns.append({
+                    "vuln_code": VULNS.WeakCreds.value,
+                    "vuln_request": brute_weak_request(self.args),
+                    "vuln_response": brute_weak_response(creds),
+                })
+            return vulns
+        hit_codes = {"WEAK": VULNS.WeakCreds.value, "RECYKL": VULNS.Recykl.value}
+        for test, run in runs.items():
+            if test == "BRUTE" and run.get("guessing") == "not_limited":
+                vulns.append({"vuln_code": VULNS.Brute.value})
+            code = hit_codes.get(test)
+            creds = brute_sorted_creds(run.get("creds"))
+            if code and creds:
+                vulns.append({
+                    "vuln_code": code,
+                    "vuln_request": brute_weak_request(self.args),
+                    "vuln_response": brute_weak_response(creds),
+                })
         return vulns
 
     def _add_brute_account_nodes(self, ptjsonlib) -> None:
@@ -6781,8 +6838,7 @@ class ImapEngine:
             ptjsonlib.add_node(node)
 
     def _poc_pair(self, send: str, recv) -> str:
-        recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
-        return f"Send: {send}\r\nReceive: {recv_s}"
+        return format_poc((send, recv))
 
     def _usrenum_poc(self, ur, command: str) -> str:
         if ur is None or not ur.vulnerable:
@@ -6927,6 +6983,8 @@ class ImapEngine:
     def _add_vulns(self, ptjsonlib, vulns: list[dict], *, node_key: str | None = None) -> None:
         for entry in vulns:
             stamped = dict(entry)
+            stamped.pop("vuln_request", None)
+            stamped.pop("vuln_response", None)
             if not stamped.get("poc"):
                 poc = self._poc_for(stamped.get("vuln_code"))
                 if poc:
@@ -7133,8 +7191,13 @@ class ImapEngine:
         }
         deferred_vulns = []
 
-        # Banner (skip terminal if streamed; always add to properties for JSON)
-        if (info := self.results.info) and info.banner is not None:
+        # Banner identification belongs on the software node only when BANNER ran.
+        # CAPA also reads the greeting; that must not invent a software node or PTV-SVC-BANNER.
+        if (
+            self.results.banner_requested
+            and (info := self.results.info)
+            and info.banner is not None
+        ):
             sid = identify_service(info.banner)
             vendor = vendor_from_cpe(sid.cpe) if sid else None
             version = sid.version if sid else None
@@ -7831,16 +7894,19 @@ class ImapEngine:
         if guessing is not None:
             properties.update({"imapPasswordGuessing": guessing})
 
-        # Create node at the end with all collected properties and bind vulnerabilities
-        imap_node = ptjsonlib.create_node_object(
-            "software",
-            None,
-            None,
-            properties,
-        )
-        ptjsonlib.add_node(imap_node)
-        node_key = imap_node["key"]
-        self._add_vulns(ptjsonlib, deferred_vulns, node_key=node_key)
+        # Software node only for BANNER identification. A found login is a
+        # userAccount. results.properties stays empty; findings stay in the
+        # global vulnerability list and the log.
+        node_keys = ("software_type", "name", "version", "vendor", "description", "cpe")
+        if self.results.banner_requested and properties.get("description"):
+            imap_node = ptjsonlib.create_node_object(
+                "software",
+                None,
+                None,
+                {key: properties.get(key) for key in node_keys},
+            )
+            ptjsonlib.add_node(imap_node)
+        self._add_vulns(ptjsonlib, deferred_vulns)
         self._add_brute_account_nodes(ptjsonlib)
         self._add_vulns(ptjsonlib, self._brute_vuln_entries())
         if self.report is not None and self.report.vulns:

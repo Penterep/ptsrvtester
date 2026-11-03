@@ -1294,6 +1294,7 @@ class VULNS(Enum):
     UserEnumRCPT = "PTV-SVC-SMTP-ENUMRCPT"
     WeakCreds = "PTV-SVC-AUTH-WEAK"
     Brute = "PTV-SVC-AUTH-BRUTE"
+    Recykl = "PTV-SVC-AUTH-RECYKL"
     HeloNoValidation = "PTV-SVC-SMTP-HELONOVAL"
     AuthDowngrade = "PTV-SVC-SMTP-DOWN"
     InvComm = "PTV-SVC-SMTP-INVCOMM"

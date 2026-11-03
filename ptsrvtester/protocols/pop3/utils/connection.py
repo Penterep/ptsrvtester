@@ -93,11 +93,37 @@ def _capa_lines(capa: dict | None) -> list[str]:
     return lines or ["(empty)"]
 
 
+def _pop3_vv(debug: DebugFn | None, send: str, recv) -> None:
+    """One real exchange. ``ctx.debug`` stores it and prints it on ``-vv``."""
+    if debug is None or not send:
+        return
+    if recv in (None, ""):
+        recv_s = "(no reply)"
+    else:
+        recv_s = str(recv).replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+    debug(f"Send: {send}")
+    debug(f"Receive: {recv_s}")
+
+
+def _pop3_read_capa(pop3: poplib.POP3 | poplib.POP3_SSL) -> tuple[dict, str]:
+    """CAPA as poplib's dict plus the status line and capability lines the server sent."""
+    resp, lines, _octets = pop3._longcmd("CAPA")
+    status = bytes_to_text(resp).strip()
+    raw = [status] if status else []
+    caps: dict = {}
+    for capline in lines:
+        text = bytes_to_text(capline).strip()
+        if not text:
+            continue
+        raw.append(text)
+        parts = text.split()
+        caps[parts[0]] = parts[1:]
+    return caps, "\n".join(raw)
+
+
 def connect_pop3(args, *, timeout: float = 10.0, debug: DebugFn | None = None) -> poplib.POP3 | poplib.POP3_SSL:
     """Open a fresh POP3 connection according to ``args.tls`` / ``--starttls`` / port 995."""
     mode = "TLS" if (args.tls or args.target.port == 995) else get_mode(args)
-    if debug:
-        debug(f"Connecting to {args.target.ip}:{args.target.port} ({mode})")
     try:
         if args.tls or args.target.port == 995:
             ctx = ssl._create_unverified_context()
@@ -113,14 +139,12 @@ def connect_pop3(args, *, timeout: float = 10.0, debug: DebugFn | None = None) -
                 if debug:
                     debug("STLS upgrade OK")
     except Exception as e:
-        if debug:
-            debug(f"Connect failed: {e}")
+        _pop3_vv(debug, "(connect)", str(e))
         raise OSError(
             f"Could not connect to the target server "
             f"{args.target.ip}:{args.target.port} ({mode}): {e}"
         ) from e
-    if debug:
-        debug(f"Banner: {_snip(pop3.welcome)}")
+    _pop3_vv(debug, "(connect)", bytes_to_text(pop3.welcome))
     return pop3
 
 
@@ -134,43 +158,40 @@ def fetch_info(
     """Banner + optional CAPA (post-STLS CAPA is fetched later by the CAPA module)."""
     banner = bytes_to_text(pop3.welcome)
     capability = None
-    capability_stls = None
+    capa_text = None
     if get_capa:
         try:
-            capability = pop3.capa()
-            if debug:
-                debug("CAPA response:")
-                for line in _capa_lines(capability):
-                    debug(line, indent=8)
+            capability, capa_text = _pop3_read_capa(pop3)
+            _pop3_vv(debug, "CAPA", capa_text)
         except poplib.error_proto as e:
             capability = None
-            if debug:
-                debug(f"CAPA failed: {e}")
-    return InfoResult(banner, capability, capability_stls)
+            capa_text = None
+            _pop3_vv(debug, "CAPA", str(e))
+    return InfoResult(banner, capability, None, capa_text)
 
 
 def fetch_capa_after_stls(args, *, debug: DebugFn | None = None) -> dict | None:
     """Reconnect, STLS-upgrade, and return post-STLS CAPA (None if unavailable)."""
     if args.tls or args.target.port == 995:
         return None
-    pop3 = connect_pop3(args)
+    pop3 = connect_pop3(args, debug=debug)
     try:
         try:
-            caps = pop3.capa()
-        except poplib.error_proto:
-            caps = None
-        if not caps or "STLS" not in caps:
-            if debug:
-                debug("STLS not advertised in CAPA")
+            caps, pre_text = _pop3_read_capa(pop3)
+            _pop3_vv(debug, "CAPA", pre_text)
+        except poplib.error_proto as e:
+            _pop3_vv(debug, "CAPA", str(e))
             return None
-        if debug:
-            debug("STLS available — upgrading for post-STLS CAPA")
-        pop3.stls()
-        capability_stls = pop3.capa()
-        if debug:
-            debug("CAPA after STLS:")
-            for line in _capa_lines(capability_stls):
-                debug(line, indent=8)
+        if not caps or "STLS" not in caps:
+            return None
+        resp = pop3._shortcmd("STLS")
+        _pop3_vv(debug, "STLS", bytes_to_text(resp))
+        context = ssl._create_unverified_context()
+        pop3.sock = context.wrap_socket(pop3.sock, server_hostname=pop3.host)
+        pop3.file = pop3.sock.makefile("rb")
+        pop3._tls_established = True
+        capability_stls, capa_text = _pop3_read_capa(pop3)
+        _pop3_vv(debug, "CAPA", capa_text)
         return capability_stls
     except Exception as e:
         if debug:
@@ -241,24 +262,15 @@ def fetch_help_info(
     try:
         resp = pop3._shortcmd("HELP")
         help_response = bytes_to_text(resp)
-        if debug:
-            debug(f"HELP → {_snip(help_response)}")
-            for line in (help_response or "").replace("\r", "").splitlines()[1:12]:
-                if line.strip():
-                    debug(line, indent=8)
+        _pop3_vv(debug, "HELP", help_response)
     except Exception as e:
         help_response = None
-        if debug:
-            debug(f"HELP failed: {e}")
+        _pop3_vv(debug, "HELP", _pop3_reply(e))
 
     implementation = None
     if capa and "IMPLEMENTATION" in capa:
         vals = capa.get("IMPLEMENTATION") or []
         implementation = " ".join(str(v) for v in vals) if vals else "IMPLEMENTATION"
-        if debug:
-            debug(f"IMPLEMENTATION (from CAPA): {implementation}")
-    elif debug:
-        debug("IMPLEMENTATION not advertised in CAPA")
     return HelpInfoResult(help_response, implementation)
 
 
@@ -283,21 +295,21 @@ def test_encryption(args, *, debug: DebugFn | None = None) -> EncryptionResult:
                 welcome = bytes_to_text(pop3.welcome)
                 plaintext_banner = (welcome or "").strip() or None
                 plaintext_ok = True
-                _dbg(f"Plaintext welcome: {_snip(welcome)}")
+                _pop3_vv(debug, "(connect)", welcome)
             finally:
                 pop3.close()
         except Exception as e:
-            _dbg(f"Plaintext test failed: {e}")
+            _pop3_vv(debug, "(connect)", str(e))
 
         try:
             pop3 = poplib.POP3(host, port, timeout=timeout)
             try:
-                _dbg(f"STLS probe welcome: {_snip(pop3.welcome)}")
-                caps = pop3.capa()
-                _dbg("STLS probe CAPA: " + ", ".join(_capa_lines(caps)[:12]))
+                _pop3_vv(debug, "(connect)", bytes_to_text(pop3.welcome))
+                caps, capa_text = _pop3_read_capa(pop3)
+                _pop3_vv(debug, "CAPA", capa_text)
                 if "STLS" in caps:
                     resp = pop3._shortcmd("STLS")
-                    _dbg(f"STLS → {_snip(resp)}")
+                    _pop3_vv(debug, "STLS", _pop3_line(resp))
                     if resp.startswith(b"+OK"):
                         try:
                             ipaddress.ip_address(host)
@@ -308,15 +320,13 @@ def test_encryption(args, *, debug: DebugFn | None = None) -> EncryptionResult:
                         pop3.sock = sock_ssl
                         pop3.file = sock_ssl.makefile("rb")
                         pop3._tls_established = True
-                        post = pop3.capa()
-                        _dbg("CAPA after STLS wrap: " + ", ".join(_capa_lines(post)[:12]))
+                        _post, post_text = _pop3_read_capa(pop3)
+                        _pop3_vv(debug, "CAPA", post_text)
                         stls_ok = True
-                else:
-                    _dbg("STLS not advertised in CAPA")
             finally:
                 pop3.close()
         except Exception as e:
-            _dbg(f"STLS test failed: {e}")
+            _pop3_vv(debug, "STLS", _pop3_reply(e))
 
     connect_timeout = 15.0 if tls_only_port else timeout
 
@@ -331,7 +341,7 @@ def test_encryption(args, *, debug: DebugFn | None = None) -> EncryptionResult:
             finally:
                 f.close()
             ok = bool(line and line.strip().startswith(b"+OK"))
-            _dbg(f"Implicit TLS (SNI={sni!r}) welcome: {_snip(line)} → {'OK' if ok else 'FAIL'}")
+            _pop3_vv(debug, "(connect)", _pop3_line(line) if line else "(no reply)")
             return ok
         finally:
             sock_ssl.close()
@@ -350,9 +360,9 @@ def test_encryption(args, *, debug: DebugFn | None = None) -> EncryptionResult:
                     tls_ok = True
                     break
             except Exception as e:
-                _dbg(f"Implicit TLS test failed (SNI={sni!r}): {e}")
+                _pop3_vv(debug, "(connect)", str(e))
     except Exception as e:
-        _dbg(f"Implicit TLS test failed: {e}")
+        _pop3_vv(debug, "(connect)", str(e))
 
     return EncryptionResult(plaintext_ok, stls_ok, tls_ok, plaintext_banner)
 
@@ -374,18 +384,15 @@ def auth_anonymous(
     try:
         res: bytes = pop3._shortcmd("AUTH ANONYMOUS")
         pairs = [("AUTH ANONYMOUS", _pop3_line(res))]
-        if debug:
-            debug(f"AUTH ANONYMOUS → {_snip(res)}")
+        _pop3_vv(debug, "AUTH ANONYMOUS", _pop3_line(res))
         if len(res.strip()) == 1:
             cont = b64encode(b"HELLO").decode()
             res2 = pop3._shortcmd(cont)
             pairs.append((cont, _pop3_line(res2)))
-            if debug:
-                debug(f"AUTH ANONYMOUS continuation → {_snip(res2)}")
+            _pop3_vv(debug, cont, _pop3_line(res2))
         return True, pairs
     except Exception as e:
-        if debug:
-            debug(f"AUTH ANONYMOUS failed: {e}")
+        _pop3_vv(debug, "AUTH ANONYMOUS", _pop3_reply(e))
         if _text_is_timeout(e):
             return None, []
         return False, []
@@ -395,24 +402,19 @@ def auth_ntlm(args, *, debug: DebugFn | None = None) -> NTLMResult:
     pop3 = connect_pop3(args, debug=debug)
     try:
         res: bytes = pop3._shortcmd("AUTH NTLM")
-        if debug:
-            debug(f"AUTH NTLM → {_snip(res)}")
+        first = _pop3_line(res)
+        _pop3_vv(debug, "AUTH NTLM", first)
         if res.strip().startswith(b"+"):
             b64_neg = b64encode(get_NegotiateMessage_data()).decode()
-            res = pop3._shortcmd(b64_neg).strip()
-            if debug:
-                debug(f"AUTH NTLM after negotiate → {_snip(res)}")
-            b64_chal = b"+".join(res.split(b"+")[1:])
+            chal = pop3._shortcmd(b64_neg).strip()
+            challenge = _pop3_line(chal)
+            _pop3_vv(debug, b64_neg, challenge)
+            b64_chal = b"+".join(chal.split(b"+")[1:])
             info = decode_ChallengeMessage_blob(b64decode(b64_chal))
-            if debug:
-                debug("NTLM challenge decoded OK")
-            return NTLMResult(True, info)
-        if debug:
-            debug("AUTH NTLM: server did not return challenge (+)")
+            return NTLMResult(True, info, (("AUTH NTLM", first), (b64_neg, challenge)))
         return NTLMResult(False, None)
     except Exception as e:
-        if debug:
-            debug(f"AUTH NTLM failed: {e}")
+        _pop3_vv(debug, "AUTH NTLM", _pop3_reply(e))
         if _text_is_timeout(e):
             raise
         return NTLMResult(False, None)
@@ -424,26 +426,25 @@ def test_catch_all(args, *, debug: DebugFn | None = None) -> str:
     """Return ``indeterminate``, ``not_configured``, or ``unreachable``."""
     try:
         pop3 = connect_pop3(args, debug=debug)
-    except Exception as e:
-        if debug:
-            debug(f"Catch-all: connect failed: {e}")
+    except Exception:
         return "unreachable"
     try:
         fake_user = "".join(random.choices(string.ascii_letters + string.digits, k=24))
         fake_pass = "".join(random.choices(string.ascii_letters + string.digits, k=24))
         if debug:
-            debug(f"Catch-all USER {fake_user!r}")
+            debug(f"Send: USER {fake_user}")
         try:
-            pop3.user(fake_user)
+            urep = pop3.user(fake_user)
             if debug:
-                debug(f"Catch-all USER → accepted, trying PASS")
-            pop3.pass_(fake_pass)
+                debug(f"Receive: {_pop3_reply(urep)}")
+                debug(f"Send: PASS {fake_pass}")
+            prep = pop3.pass_(fake_pass)
             if debug:
-                debug("Catch-all PASS → accepted (indeterminate)")
+                debug(f"Receive: {_pop3_reply(prep)}")
             return "indeterminate"
         except Exception as e:
             if debug:
-                debug(f"Catch-all rejected (not configured): {e}")
+                debug(f"Receive: {_pop3_reply(e)}")
             if _text_is_timeout(e):
                 return "unreachable"
             return "not_configured"
@@ -487,6 +488,20 @@ def _pop3_line(value) -> str:
     return " ".join(str(value or "").split())
 
 
+def _pop3_reply(value) -> str:
+    """Server text. Bytes and poplib's ``b'...'`` exception text are decoded."""
+    if isinstance(value, BaseException):
+        arg = value.args[0] if value.args else ""
+        if isinstance(arg, bytes):
+            value = arg
+        else:
+            value = arg or str(value)
+    text = _pop3_line(value)
+    if len(text) >= 3 and text[0] == "b" and text[1] in "'\"" and text[-1] == text[1]:
+        text = text[2:-1]
+    return text
+
+
 def _pop3_brute_kind(text: str) -> str:
     low = (text or "").lower()
     if _POP3_BRUTE_LOCK_RE.search(text or ""):
@@ -524,7 +539,6 @@ def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: 
     """
     if stop.is_set():
         return "skip", None, None, None
-    shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
 
     def trace(msg: str, category: str = "ADDITIONS", **kwargs) -> None:
         _pop3_brute_line(output, msg, category, debug=debug, json_mode=json_mode, log=log, **kwargs)
@@ -532,7 +546,8 @@ def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: 
     try:
         pop3 = connect_pop3(args)
     except OSError as e:
-        trace(f"{shown!r}: connect failed {_snip(str(e))}")
+        trace("Send: (connect)")
+        trace(f"Receive: {_snip(str(e))}")
         return "down", None, None, None
     try:
         try:
@@ -540,12 +555,14 @@ def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: 
         except poplib.error_proto as e:
             urep = _pop3_line(e.args[0] if e.args else e)
             kind = _pop3_brute_kind(urep)
-            trace(f"{shown!r}: USER {urep}")
+            trace(f"Send: USER {cred.user}")
+            trace(f"Receive: {urep}")
             note = "USER/PASS is not offered. Password guessing was not tested." if kind == "unsupported" else None
             block = _pop3_brute_block_paren(urep) if kind == "blocked" else None
             return kind, note, block, None
         except (OSError, TimeoutError) as e:
-            trace(f"{shown!r}: USER failed {_snip(str(e))}")
+            trace(f"Send: USER {cred.user}")
+            trace(f"Receive: {_snip(str(e))}")
             return "down", None, None, None
         try:
             prep = _pop3_line(pop3.pass_(cred.passw))
@@ -554,35 +571,29 @@ def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: 
             prep = _pop3_line(e.args[0] if e.args else e)
             kind = _pop3_brute_kind(prep)
         except (OSError, TimeoutError) as e:
-            trace(f"{shown!r}: USER {urep}; PASS failed {_snip(str(e))}")
+            trace(f"Send: USER {cred.user}")
+            trace(f"Receive: {urep}")
+            secret = '""' if cred.passw == "" else cred.passw
+            trace(f"Send: PASS {secret}")
+            trace(f"Receive: {_snip(str(e))}")
             return "down", None, None, None
-        pass_label = 'PASS ""' if cred.passw == "" else "PASS"
-        trace(f"{shown!r}: USER {urep}; {pass_label} {prep}")
+        secret = '""' if cred.passw == "" else cred.passw
+        trace(f"Send: USER {cred.user}")
+        trace(f"Receive: {urep}")
+        trace(f"Send: PASS {secret}")
+        trace(f"Receive: {prep}")
         if kind == "ok":
             trace(f"user:{' ' * 5}{cred.user}", "VULN", colortext=False)
             trace(f"password: {shown_password(cred.passw)}", "TEXT", colortext=False, indent=4)
         note = "USER/PASS is not offered. Password guessing was not tested." if kind == "unsupported" else None
         block = _pop3_brute_block_paren(prep) if kind == "blocked" else None
-        exchange = (urep, prep) if kind == "ok" else None
+        exchange = (urep, prep) if kind in ("ok", "fail") else None
         return kind, note, block, exchange
     finally:
         try:
             pop3.close()
         except Exception:
             pass
-
-
-_POP3_DEFAULT_USERS = frozenset({"anonymous", "ftp", "guest", "admin", "root", "postmaster"})
-
-
-def _pop3_default_account(user: str, password: str) -> tuple[bool, bool]:
-    """Default account name, and whether the password is the paired default."""
-    name = (user or "").strip().lower()
-    secret = (password or "").strip().lower()
-    if name not in _POP3_DEFAULT_USERS:
-        return False, False
-    classic = secret in {"", name, "anonymous", "ftp", "guest", "email", "postmaster"}
-    return True, classic
 
 
 def login_bruteforce(ctx) -> set[Creds]:
@@ -621,19 +632,21 @@ def login_bruteforce(ctx) -> set[Creds]:
         kind, note, block, exchange = _pop3_brute_one(
             args, cred, output, stop, debug=debug, json_mode=json_mode, log=ctx.debug,
         )
-        if kind == "ok" and exchange:
+        if exchange:
             urep, prep = exchange
-            pairs = ((f"USER {cred.user}", urep), ("PASS", prep))
-            ctx.report.note_poc(VULNS.WeakCredentials.value, *pairs)
-            ctx.report.note_poc(VULNS.WeakCreds.value, *pairs)
-            is_default, classic_pw = _pop3_default_account(cred.user, cred.passw)
-            if is_default:
-                ctx.report.note_poc(VULNS.DefAcc.value, *pairs)
-            if classic_pw:
-                ctx.report.note_poc(VULNS.DefAccPw.value, *pairs)
+            secret = '""' if cred.passw == "" else cred.passw
+            pairs = ((f"USER {cred.user}", urep), (f"PASS {secret}", prep))
+            state_pairs = pairs
+            if kind == "ok":
+                ctx.report.note_poc(VULNS.WeakCreds.value, *pairs)
+                ctx.report.note_poc(VULNS.Recykl.value, *pairs)
+        else:
+            state_pairs = None
         with lock:
             if kind in ("ok", "fail", "blocked"):
                 state["tried"] += 1
+            if state_pairs:
+                state["proof"] = state_pairs
             if kind == "ok":
                 found.add(cred)
                 state["saw_reply"] = True
@@ -676,6 +689,8 @@ def login_bruteforce(ctx) -> set[Creds]:
         ctx._brute_guessing_detail = state["note"] or "Could not connect. Password guessing was not tested."
     if ctx._brute_guessing in ("not_limited", "stopped") and state["tried"] < 50:
         ctx._brute_guessing = "insufficient"
+    if ctx._brute_guessing == "not_limited" and state.get("proof"):
+        ctx.report.note_poc(VULNS.Brute.value, *state["proof"])
     if ctx._brute_guessing is not None:
         ctx.report.update_properties(pop3PasswordGuessing=ctx._brute_guessing)
     return found
@@ -716,7 +731,7 @@ def _pop3_noop_safe(pop3: poplib.POP3 | poplib.POP3_SSL) -> tuple[bool, str | No
     try:
         return (True, _pop3_line(pop3._shortcmd("NOOP")))
     except Exception as e:
-        return (False, _noop2_failure_detail(e))
+        return (False, _pop3_reply(e))
 
 
 def _noop1_duration_delay(args, default_duration: float, default_delay: float) -> tuple[float, float]:
@@ -857,6 +872,8 @@ def _run_noop_duration_loop(
             t0 = time.perf_counter()
             success, detail = _pop3_noop_safe(pop3)
             rt = time.perf_counter() - t0
+            emit_vv("Send: NOOP")
+            emit_vv(f"Receive: {detail or '(no reply)'}")
             if success:
                 noops_ok += 1
                 rtts.append(rt)
@@ -867,16 +884,10 @@ def _run_noop_duration_loop(
                     elapsed_min = int(elapsed_now / 60)
                     elapsed_sec = int(elapsed_now % 60)
                     write_live(f"NOOPs sent: {noops_sent} ({elapsed_min}m {elapsed_sec}s elapsed)")
-                if noops_sent % NOOP1_PROGRESS_EVERY == 0:
-                    emit_vv(
-                        f"NOOP #{noops_sent}: {detail} rt={rt:.3f}s "
-                        f"(elapsed: {int(time.perf_counter() - start_time)}s)"
-                    )
             else:
                 noops_error += 1
                 disconnected = True
                 disconnect_after_seconds = time.perf_counter() - start_time
-                emit_vv(f"NOOP #{noops_sent}: failed — {detail}")
                 break
 
             wait_state = _noop1_wait_idle(
@@ -926,11 +937,6 @@ def test_noop_duration_preauth(args, *, debug: DebugFn | None = None, flush=None
     duration, delay = _noop1_duration_delay(
         args, POP3_NOOP_PREAUTH_DUR_TEST_SECONDS, POP3_NOOP_PREAUTH_DUR_INTERVAL_SECONDS,
     )
-    if debug:
-        debug(f"NOOP duration test (pre-auth): connecting... (duration={duration:.0f}s, delay={delay:.0f}s)")
-        if flush:
-            flush()
-
     try:
         pop3 = connect_pop3(args, timeout=POP3_NOOP_PREAUTH_DUR_TIMEOUT_SECONDS, debug=debug)
         pop3.sock.settimeout(POP3_NOOP_PREAUTH_DUR_TIMEOUT_SECONDS)
@@ -952,19 +958,13 @@ def test_noop_duration_postauth(
     duration, delay = _noop1_duration_delay(
         args, POP3_NOOP_POSTAUTH_DUR_TEST_SECONDS, POP3_NOOP_POSTAUTH_DUR_INTERVAL_SECONDS,
     )
-    if debug:
-        debug(
-            f"NOOP duration test (post-auth): connecting and logging in as {username!r}... "
-            f"(duration={duration:.0f}s, delay={delay:.0f}s)"
-        )
-        if flush:
-            flush()
-
     try:
         pop3 = connect_pop3(args, timeout=POP3_NOOP_POSTAUTH_DUR_TIMEOUT_SECONDS, debug=debug)
         pop3.sock.settimeout(POP3_NOOP_POSTAUTH_DUR_TIMEOUT_SECONDS)
-        pop3.user(username)
-        pop3.pass_(password)
+        urep = pop3.user(username)
+        _pop3_vv(debug, f"USER {username}", _pop3_line(urep))
+        prep = pop3.pass_(password)
+        _pop3_vv(debug, f"PASS {password}", _pop3_line(prep))
     except Exception as e:
         return _noop1_error_result(
             authenticated=True, duration=duration, delay=delay,
@@ -1394,6 +1394,10 @@ def _noop2_conn_count_test(
                     break
                 t0 = time.perf_counter()
                 success, error = _pop3_noop_safe(pop3)
+                if debug:
+                    with results_lock:
+                        debug("Send: NOOP")
+                        debug(f"Receive: {error or '(no reply)'}")
                 rt = time.perf_counter() - t0
                 local_sent += 1
                 if success:
@@ -1526,7 +1530,7 @@ def test_noop_conn_count_preauth(
     )
 
     def opener(_idx: int):
-        pop3 = connect_pop3(args, timeout=POP3_NOOP_PREAUTH_CONN_TIMEOUT_SECONDS, debug=None)
+        pop3 = connect_pop3(args, timeout=POP3_NOOP_PREAUTH_CONN_TIMEOUT_SECONDS, debug=debug)
         pop3.sock.settimeout(POP3_NOOP_PREAUTH_CONN_TIMEOUT_SECONDS)
         return pop3
 
@@ -1559,10 +1563,12 @@ def test_noop_conn_count_postauth(
     )
 
     def opener(_idx: int):
-        pop3 = connect_pop3(args, timeout=POP3_NOOP_POSTAUTH_CONN_TIMEOUT_SECONDS, debug=None)
+        pop3 = connect_pop3(args, timeout=POP3_NOOP_POSTAUTH_CONN_TIMEOUT_SECONDS, debug=debug)
         pop3.sock.settimeout(POP3_NOOP_POSTAUTH_CONN_TIMEOUT_SECONDS)
-        pop3.user(username)
-        pop3.pass_(password)
+        urep = pop3.user(username)
+        _pop3_vv(debug, f"USER {username}", _pop3_line(urep))
+        prep = pop3.pass_(password)
+        _pop3_vv(debug, f"PASS {password}", _pop3_line(prep))
         return pop3
 
     return _noop2_conn_count_test(

@@ -106,7 +106,7 @@ SMTP_SEND_SUITE: tuple[str, ...] = (
 # Left for an explicit -ts: INTERACT, IDAGG, NOOP1, NOOP2, RATELIMIT.
 SMTP_AUTH_SUITE: tuple[str, ...] = (
     "IDENTIFY", "AUTHLIST", "AUTHFMT", "HELOONLY", "HELOBYP", "INVCMD",
-    "DOMAIN", "AUTHENUM", "BRUTE", "RATELIM", "RCPTLIM",
+    "DOMAIN", "AUTHENUM", "BRUTE", "WEAK", "RECYKL", "RATELIM", "RCPTLIM",
 )
 
 # Ordered groups for the main help table
@@ -115,7 +115,7 @@ SMTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Authentication", ["AUTHFMT", "AUTHDN"]),
     ("Protocol & validation", ["HELOVAL", "HELOONLY", "HELOBYP", "INVCMD"]),
     ("Relay & addressing", ["OPENREL", "RELANON", "DOMFILL", "DOMAIN", "ALIAS", "BCC", "SPOOF", "BOUNCE"]),
-    ("Enumeration & credentials", ["ENUM", "AUTHENUM", "BRUTE"]),
+    ("Enumeration & credentials", ["ENUM", "AUTHENUM", "BRUTE", "WEAK", "RECYKL"]),
     ("Rate limiting & stress", ["RATELIM", "RATELIMIT", "RCPTLIM", "RCPTDUP", "NOOP1", "NOOP2", "BOMB", "SIZE"]),
     ("Content security", ["AV", "SSRF", "ZIPXXE"]),
     ("Indirect (no direct SMTP connection)", ["BLACKLIST", "SPF"]),
@@ -316,17 +316,43 @@ SMTP_TESTS: dict[str, dict] = {
         ],
     },
     "BRUTE": {
-        "desc": "Bruteforce credentials",
-        "long": ["Bruteforce SMTP AUTH. Without -u/-U or -p/-P, built-in lists are used.",
-                 "One AUTH per guess. Catch-all check first.",
-                 "Error when the server never stops it."],
+        "desc": "Blocking of a guessing attack",
+        "long": ["Try SMTP AUTH guesses and see whether the server stops them.",
+                 "Without -u/-U or -p/-P, built-in lists are used. Catch-all check first.",
+                 "No lockout is PTV-SVC-AUTH-BRUTE."],
         "mods": [
             ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
             ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
-            ["-t", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            ["-t", "--threads", "<n>", "Threads for bruteforce (default: 10)"],
+        ],
+    },
+    "WEAK": {
+        "desc": "Find credentials with the default wordlist",
+        "long": ["Same AUTH guesses as BRUTE. Without -u/-U or -p/-P, built-in lists are used.",
+                 "A valid login is PTV-SVC-AUTH-WEAK."],
+        "mods": [
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["-t", "--threads", "<n>", "Threads for bruteforce (default: 10)"],
+        ],
+    },
+    "RECYKL": {
+        "desc": "Find credentials (same probe as WEAK)",
+        "long": ["Alias of WEAK. The probe is the same, including the built-in lists.",
+                 "A valid login is PTV-SVC-AUTH-RECYKL."],
+        "mods": [
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["-t", "--threads", "<n>", "Threads for bruteforce (default: 10)"],
         ],
     },
     "RATELIM": {
@@ -605,8 +631,8 @@ def _apply_smtp_tests(args) -> None:
             if getattr(args, dest, None) is None and default is not None:
                 setattr(args, dest, default)
 
-    # Explicit -ts BRUTE uses the built-in lists when -u/-U or -p/-P was omitted.
-    if "BRUTE" in codes:
+    # Explicit credential tests use the built-in lists when -u/-U or -p/-P was omitted.
+    if any(code in codes for code in ("BRUTE", "WEAK", "RECYKL")):
         apply_default_brute_creds(args)
 
     # Every explicitly selected test must actually activate; otherwise report what is
@@ -614,7 +640,7 @@ def _apply_smtp_tests(args) -> None:
     inactive: list[tuple[str, list[str]]] = []
     for code in codes:
         spec = SMTP_TESTS[code]
-        if code == "BRUTE":
+        if code in ("BRUTE", "WEAK", "RECYKL"):
             active = check_if_brute(args)
         elif "flags" in spec:
             active = all(getattr(args, dest, None) for dest in spec["flags"])

@@ -1250,9 +1250,12 @@ class SharedMixin:
     def _smtp_brute_line(
         self, output, msg: str, category: str = "ADDITIONS", *, colortext: bool = True, indent: int = 0,
     ) -> None:
-        if output is None or (category == "ADDITIONS" and not getattr(self.args, "debug", False)):
+        if not msg:
             return
         if self.use_json:
+            self.ptdebug(msg, indent_override=indent)
+            return
+        if output is None or (category == "ADDITIONS" and not getattr(self.args, "debug", False)):
             return
         line = out_if(msg, category, True, colortext=colortext, indent=indent)
         if line:
@@ -1381,7 +1384,19 @@ class SharedMixin:
                 ) else "down"
             self._smtp_brute_line(output, f"Send: {send}")
             self._smtp_brute_line(output, f"Receive: {shown_reply}")
+            if kind in ("ok", "fail"):
+                secret = '""' if cred.passw == "" else cred.passw
+                self._brute_proof = ((f"AUTH {mech} {cred.user} {secret}", shown_reply),)
             if kind == "ok":
+                secret = '""' if cred.passw == "" else cred.passw
+                self.note_poc(
+                    VULNS.WeakCreds.value,
+                    (f"AUTH {mech} {cred.user} {secret}", shown_reply),
+                )
+                self.note_poc(
+                    VULNS.Recykl.value,
+                    (f"AUTH {mech} {cred.user} {secret}", shown_reply),
+                )
                 self._smtp_brute_line(output, f"user:{' ' * 5}{cred.user}", "VULN", colortext=False)
                 self._smtp_brute_line(
                     output,
@@ -1572,15 +1587,20 @@ class SharedMixin:
             return found
         if self._brute_guessing in ("not_limited", "stopped") and state["tried"] < 50:
             self._brute_guessing = "insufficient"
+        if self._brute_guessing == "not_limited" and getattr(self, "_brute_proof", None):
+            self.note_poc(VULNS.Brute.value, *self._brute_proof)
         self.results.creds = found
         return found
 
-    def _stream_brute_result(self) -> None:
+    def _stream_brute_result(self, *, focus: str = "all") -> None:
+        """``block`` is BRUTE, ``creds`` is WEAK and RECYKL, ``all`` prints both."""
         creds = self.results.creds
         guessing = getattr(self, "_brute_guessing", None)
         if (not creds) and guessing is None:
             return
-        if creds:
+        show_creds = focus in ("all", "creds")
+        show_block = focus in ("all", "block")
+        if show_creds and creds:
             n = len(creds)
             word = "login" if n == 1 else "logins"
             self._ptprint_raw(
@@ -1590,6 +1610,23 @@ class SharedMixin:
                 indent=4,
                 colortext=False,
             )
+        elif show_creds and guessing in ("not_limited", "stopped", "insufficient"):
+            self._ptprint_raw(
+                "No valid login found",
+                bullet_type="NOTVULN",
+                condition=not self.use_json,
+                indent=4,
+            )
+        if not show_block:
+            if guessing == "not_tested":
+                self._ptprint_raw(
+                    getattr(self, "_brute_guessing_detail", None)
+                    or "Could not connect. Password guessing was not tested.",
+                    bullet_type="WARNING",
+                    condition=not self.use_json,
+                    indent=4,
+                )
+            return
         if guessing == "insufficient":
             self._ptprint_raw(
                 "The test cannot be evaluated. At least 50 combinations must be tested.",

@@ -30,7 +30,7 @@ class IMAP(BaseMain):
         validate_imap_selection(args)
         raw = getattr(args, "tests", None) or ""
         codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
-        if "BRUTE" in codes and "ALL" not in codes:
+        if any(code in codes for code in ("BRUTE", "WEAK", "RECYKL")) and "ALL" not in codes:
             apply_default_brute_creds(args)
         self.report = ImapReport()
         self.engine = ImapEngine(args, report=self.report)

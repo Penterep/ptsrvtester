@@ -14,6 +14,7 @@ try:
 except ImportError:
     _HAS_CRYPTOGRAPHY = False
 
+from .poc import format_poc, smtp_multiline
 from .shared import SharedMixin
 from .helpers import *
 from .results import *
@@ -212,32 +213,35 @@ class ReportingMixin:
         return codes == {"EHLO"}
 
     def _poc_pair(self, send: str, recv) -> str:
-        recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
-        return f"Send: {send}\r\nReceive: {recv_s}"
+        return format_poc((send, recv))
 
-    def _ehlo_raw_line(self, keyword: str, *, cleartext_only: bool = False) -> tuple[str, str]:
-        """``(EHLO command, the one 250-line that advertises keyword)``."""
+    def _ehlo_body(self, keyword: str | None, *, cleartext_only: bool = False) -> str:
+        """Full EHLO body that contains ``keyword``. Empty when it is missing."""
         info = self.results.info
         if info is None:
-            return "", ""
+            return ""
         blobs: list[str] = []
         if info.ehlo:
             blobs.append(info.ehlo)
         if not cleartext_only and info.ehlo_starttls:
             blobs.append(info.ehlo_starttls)
+        if not keyword:
+            return blobs[0] if blobs else ""
         key = keyword.upper()
         for raw in blobs:
             for line in str(raw).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-                line = " ".join(line.split())
-                if line.startswith("250-") or line.startswith("250 "):
-                    body = line[4:].strip()
-                else:
-                    body = line
-                token = body.split()[0].upper() if body else ""
-                if token == key:
-                    fqdn = getattr(self, "fqdn", None) or "example.com"
-                    return f"EHLO {fqdn}", line
-        return "", ""
+                word = line.split()[0].upper() if line.split() else ""
+                if word == key:
+                    return raw
+        return ""
+
+    def _ehlo_poc(self, keyword: str | None, *, cleartext_only: bool = False) -> str:
+        """Full EHLO reply. The line for ``keyword`` is wrapped in ``**``."""
+        body = self._ehlo_body(keyword, cleartext_only=cleartext_only)
+        if not body:
+            return ""
+        fqdn = getattr(self, "fqdn", None) or "example.com"
+        return self._poc_pair(f"EHLO {fqdn}", smtp_multiline("250", body, keyword))
 
     def _banner_poc(self) -> str:
         info = self.results.info
@@ -283,17 +287,13 @@ class ReportingMixin:
             VULNS.CmdVRFY.value: "VRFY",
         }.get(code)
         if cmd:
-            send, recv = self._ehlo_raw_line(cmd)
-            return self._poc_pair(send, recv) if send else ""
+            return self._ehlo_poc(cmd)
         if code == VULNS.BigSize.value:
-            send, recv = self._ehlo_raw_line("SIZE")
-            return self._poc_pair(send, recv) if send else ""
+            return self._ehlo_poc("SIZE")
         if code == VULNS.AuthMethods.value:
-            send, recv = self._ehlo_raw_line("AUTH", cleartext_only=True)
-            return self._poc_pair(send, recv) if send else ""
+            return self._ehlo_poc("AUTH", cleartext_only=True)
         if code == VULNS.NoStarttls.value:
-            fqdn = getattr(self, "fqdn", None) or "example.com"
-            return self._poc_pair(f"EHLO {fqdn}", "STARTTLS not advertised")
+            return self._ehlo_poc(None, cleartext_only=True)
         if code in (VULNS.Banner.value, VULNS.CryptOnly.value):
             return self._banner_poc()
         if code == VULNS.Domfill.value:
@@ -422,6 +422,8 @@ class ReportingMixin:
     def _add_vulns(self, vulns: list[dict]) -> None:
         for entry in vulns:
             stamped = dict(entry)
+            stamped.pop("vuln_request", None)
+            stamped.pop("vuln_response", None)
             if not stamped.get("poc"):
                 poc = self._poc_for(stamped.get("vuln_code"))
                 if poc:
@@ -472,25 +474,40 @@ class ReportingMixin:
         self.ptprint(self.ptjsonlib.get_result_json(), json=True)
 
     def _is_brute_only_output(self) -> bool:
-        """``-ts BRUTE`` alone: description, userAccount nodes, global vuln codes."""
+        """``-ts`` is only BRUTE, WEAK and/or RECYKL: accounts and those vuln codes."""
         if getattr(self, "run_all_mode", False):
             return False
         raw = getattr(self.args, "tests", None) or ""
         codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
-        return codes == {"BRUTE"}
+        return bool(codes) and codes <= {"BRUTE", "WEAK", "RECYKL"}
 
     def _brute_vuln_entries(self) -> list[dict]:
-        """PTV-SVC-AUTH-BRUTE when guessing is not blocked, then PTV-SVC-AUTH-WEAK for hits."""
+        """One code per test that ran: BRUTE, WEAK, or RECYKL."""
         vulns: list[dict] = []
-        if getattr(self, "_brute_guessing", None) == "not_limited":
-            vulns.append({"vuln_code": VULNS.Brute.value})
-        creds = brute_sorted_creds(self.results.creds)
-        if creds:
-            vulns.append({
-                "vuln_code": VULNS.WeakCreds.value,
-                "vuln_request": brute_weak_request(self.args),
-                "vuln_response": brute_weak_response(creds),
-            })
+        runs = getattr(self, "_auth_probe_runs", None) or {}
+        if not runs:
+            if getattr(self, "_brute_guessing", None) == "not_limited":
+                vulns.append({"vuln_code": VULNS.Brute.value})
+            creds = brute_sorted_creds(self.results.creds)
+            if creds:
+                vulns.append({
+                    "vuln_code": VULNS.WeakCreds.value,
+                    "vuln_request": brute_weak_request(self.args),
+                    "vuln_response": brute_weak_response(creds),
+                })
+            return vulns
+        hit_codes = {"WEAK": VULNS.WeakCreds.value, "RECYKL": VULNS.Recykl.value}
+        for test, run in runs.items():
+            if test == "BRUTE" and run.get("guessing") == "not_limited":
+                vulns.append({"vuln_code": VULNS.Brute.value})
+            code = hit_codes.get(test)
+            creds = brute_sorted_creds(run.get("creds"))
+            if code and creds:
+                vulns.append({
+                    "vuln_code": code,
+                    "vuln_request": brute_weak_request(self.args),
+                    "vuln_response": brute_weak_response(creds),
+                })
         return vulns
 
     def _add_brute_account_nodes(self) -> None:

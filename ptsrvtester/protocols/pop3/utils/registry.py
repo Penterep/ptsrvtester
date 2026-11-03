@@ -5,7 +5,7 @@ from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
 
 POP3_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "NTLM", "HELPINFO"]),
-    ("Authentication & credentials", ["ANON", "BRUTE"]),
+    ("Authentication & credentials", ["ANON", "USRENUM", "BRUTE", "WEAK", "RECYKL"]),
     ("Connection limits & stress", ["NOOP1", "NOOP2"]),
     ("Connection rate limiting (aggressive)", ["RATELIMIT"]),
 ]
@@ -51,6 +51,20 @@ POP3_TESTS: dict[str, dict] = {
             "reveal software / version information disclosed by the server.",
         ],
     },
+    "USRENUM": {
+        "desc": "Username enumeration (USER + wrong PASS)",
+        "long": [
+            "Send USER and, when the server accepts it, one wrong PASS.",
+            "Compare each name with two names that cannot exist.",
+            "A finding is a different reply, or [AUTH] on USER (RFC 3206).",
+            "+OK alone is not a finding: RFC 1939 allows it for an unknown mailbox.",
+        ],
+        "mods": [
+            ["-u", "--user", "<name> …", "Candidate username(s). Default: admin, administrator, root, postmaster, webmaster, support"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-t", "--threads", "<n>", "Threads (default: 1)"],
+        ],
+    },
     "ANON": {
         "desc": "Check anonymous authentication",
         "long": [
@@ -59,11 +73,11 @@ POP3_TESTS: dict[str, dict] = {
         ],
     },
     "BRUTE": {
-        "desc": "Login bruteforce (USER/PASS)",
+        "desc": "Blocking of a guessing attack",
         "long": [
-            "Bruteforce POP3 USER/PASS. Without -u/-U or -p/-P, built-in lists are used.",
-            "Catch-all check first. Error when the server",
-            "never stops password guessing.",
+            "Try POP3 USER/PASS guesses and see whether the server stops them.",
+            "Without -u/-U or -p/-P, built-in lists are used. Catch-all check first.",
+            "No lockout is PTV-SVC-AUTH-BRUTE.",
         ],
         "mods": [
             ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
@@ -71,7 +85,37 @@ POP3_TESTS: dict[str, dict] = {
             ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
-            ["-t", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            ["-t", "--threads", "<n>", "Threads for bruteforce (default: 10)"],
+        ],
+    },
+    "WEAK": {
+        "desc": "Find credentials with the default wordlist",
+        "long": [
+            "Same USER/PASS guesses as BRUTE. Without -u/-U or -p/-P, built-in lists are used.",
+            "A valid login is PTV-SVC-AUTH-WEAK.",
+        ],
+        "mods": [
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["-t", "--threads", "<n>", "Threads for bruteforce (default: 10)"],
+        ],
+    },
+    "RECYKL": {
+        "desc": "Find credentials (same probe as WEAK)",
+        "long": [
+            "Alias of WEAK. The probe is the same, including the built-in lists.",
+            "A valid login is PTV-SVC-AUTH-RECYKL.",
+        ],
+        "mods": [
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["-t", "--threads", "<n>", "Threads for bruteforce (default: 10)"],
         ],
     },
     "NOOP1": {

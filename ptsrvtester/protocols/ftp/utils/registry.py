@@ -5,10 +5,10 @@ from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
 
 FTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "CMD", "ENCRYPT"]),
-    ("Authentication & access", ["ANON", "ACCESS", "BRUTE", "USRENUM"]),
+    ("Authentication & access", ["ANON", "ACCESS", "BRUTE", "WEAK", "RECYKL", "USRENUM"]),
     ("Enumeration", ["ENUMPATH"]),
     ("Data channel & modes", ["MODES", "PASVPORT", "ACTIVE", "ACTIVEFULL"]),
-    ("Command surface & validation", ["CMDAUDIT", "CMDAUDITACTIVE", "INVCMD"]),
+    ("Command surface & validation", ["CMDAUDITACTIVE", "INVCMD"]),
     ("Rate limiting & stress", ["CONNLIM", "RATELIMIT"]),
     ("Access control", ["CHROOT"]),
     ("Content security", ["EICAR", "DOS"]),
@@ -23,9 +23,9 @@ FTP_TESTS: dict[str, dict] = {
                  "version and CPE from the advertised software string."],
     },
     "CMD": {
-        "desc": "Grab HELP / SYST / STAT",
+        "desc": "Grab HELP / SYST / STAT and SITE extensions",
         "long": ["List commands from HELP, plus the SYST and STAT replies.",
-                 "Ordinary commands are ok. Risky or disclosing ones are flagged."],
+                 "When SITE is advertised, list the extensions from SITE HELP."],
     },
     "ENCRYPT": {
         "desc": "Test encryption options (plaintext / AUTH TLS / implicit TLS)",
@@ -49,10 +49,36 @@ FTP_TESTS: dict[str, dict] = {
         ],
     },
     "BRUTE": {
-        "desc": "Login bruteforce (USER/PASS)",
-        "long": ["Bruteforce FTP login. Without -u/-U or -p/-P, built-in lists are used.",
-                 "Catch-all check first.",
-                 "Error when the server never stops the guessing."],
+        "desc": "Blocking of a guessing attack",
+        "long": ["Try FTP USER/PASS guesses and see whether the server stops them.",
+                 "Without -u/-U or -p/-P, built-in lists are used.",
+                 "No lockout is PTV-SVC-AUTH-BRUTE."],
+        "mods": [
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["-t", "--threads", "<n>", "Threads (default: 10)"],
+        ],
+    },
+    "WEAK": {
+        "desc": "Find credentials with the default wordlist",
+        "long": ["Same USER/PASS guesses as BRUTE. Without -u/-U or -p/-P, built-in lists are used.",
+                 "A valid login is PTV-SVC-AUTH-WEAK."],
+        "mods": [
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["-t", "--threads", "<n>", "Threads (default: 10)"],
+        ],
+    },
+    "RECYKL": {
+        "desc": "Find credentials (same probe as WEAK)",
+        "long": ["Alias of WEAK. The probe is the same, including the built-in lists.",
+                 "A valid login is PTV-SVC-AUTH-RECYKL."],
         "mods": [
             ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
             ["-U", "--users", "<wordlist>", "Username wordlist"],
@@ -121,11 +147,6 @@ FTP_TESTS: dict[str, dict] = {
         "mods": [
             ["", "--active-audit-low-ports", "<list>", "Data ports <1000 to test (default: 80,443,21)"],
         ],
-    },
-    "CMDAUDIT": {
-        "desc": "HELP / FEAT / SITE command surface",
-        "long": ["Audit HELP, FEAT and SITE HELP/ALL; flag high-risk SITE",
-                 "extensions (passive, no login required)."],
     },
     "CMDAUDITACTIVE": {
         "desc": "Safe SITE probes post-login",

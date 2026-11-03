@@ -6,7 +6,7 @@ from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
 IMAP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "CAPA", "ENCRYPT", "AUTHLIST", "NTLM"]),
     ("Protocol & validation", ["SNIFF", "INVCMD"]),
-    ("Authentication & enumeration", ["ANON", "USRENUM", "USRENUMPLAIN", "BRUTE"]),
+    ("Authentication & enumeration", ["ANON", "USRENUM", "USRENUMPLAIN", "BRUTE", "WEAK", "RECYKL"]),
     ("Content security", ["EICAR", "XXESSRF", "XXEEXP", "ZIPBOMB"]),
     ("Connection limits & stress", ["NOOP1", "NOOP2", "CONNLIM", "RESLOAD"]),
     ("Access control & TLS", ["MBOXISO", "TLSAUDIT"]),
@@ -115,11 +115,11 @@ IMAP_TESTS: dict[str, dict] = {
         ],
     },
     "BRUTE": {
-        "desc": "Login bruteforce (USER/PASS)",
+        "desc": "Blocking of a guessing attack",
         "long": [
-            "Bruteforce IMAP login. Without -u/-U or -p/-P, built-in lists are used.",
-            "Uses AUTHENTICATE PLAIN when LOGIN is disabled.",
-            "Catch-all check first. Error when the server never stops guessing.",
+            "Try IMAP LOGIN guesses and see whether the server stops them.",
+            "Uses AUTHENTICATE PLAIN when LOGIN is disabled. Catch-all check first.",
+            "Without -u/-U or -p/-P, built-in lists are used. No lockout is PTV-SVC-AUTH-BRUTE.",
         ],
         "mods": [
             ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
@@ -127,7 +127,38 @@ IMAP_TESTS: dict[str, dict] = {
             ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
-            ["-t", "--brute-threads", "<n>", "Threads for bruteforce (default: 10)"],
+            ["-t", "--threads", "<n>", "Threads for bruteforce (default: 10)"],
+        ],
+    },
+    "WEAK": {
+        "desc": "Find credentials with the default wordlist",
+        "long": [
+            "Same LOGIN guesses as BRUTE, including AUTHENTICATE PLAIN when LOGIN is disabled.",
+            "Without -u/-U or -p/-P, built-in lists are used.",
+            "A valid login is PTV-SVC-AUTH-WEAK.",
+        ],
+        "mods": [
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["-t", "--threads", "<n>", "Threads for bruteforce (default: 10)"],
+        ],
+    },
+    "RECYKL": {
+        "desc": "Find credentials (same probe as WEAK)",
+        "long": [
+            "Alias of WEAK. The probe is the same, including the built-in lists.",
+            "A valid login is PTV-SVC-AUTH-RECYKL.",
+        ],
+        "mods": [
+            ["-u", "--user", "<name> …", "Username(s). Default: root, admin, demo, test, user, jane, john"],
+            ["-U", "--users", "<wordlist>", "Username wordlist"],
+            ["-p", "--password", "[password] …", "Password(s). Default: pass, pass123, Pass123, password, Pa$$w0rd, abcd, abcde, abcdef, 0000, 1234, 12345, 123456, Admin123, test, root, admin"],
+            ["-P", "--passwords", "<wordlist>", "Password wordlist"],
+            ["", "--spray", "", "Try one password against all users"],
+            ["-t", "--threads", "<n>", "Threads for bruteforce (default: 10)"],
         ],
     },
     "EICAR": {

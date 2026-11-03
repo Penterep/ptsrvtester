@@ -11,12 +11,14 @@ from .ptntlmauth.ptntlmauth import NTLMInfo
 class NTLMResult(NamedTuple):
     success: bool
     ntlm: NTLMInfo | None
+    proof: tuple[tuple[str, str], ...] = ()
 
 
 class InfoResult(NamedTuple):
     banner: str | None
     capability: dict[str, list[str]] | None
     capability_stls: dict[str, list[str]] | None = None
+    capa_text: str | None = None
 
 
 class HelpInfoResult(NamedTuple):
@@ -225,10 +227,13 @@ class VULNS(Enum):
     DefAccPw = "PTV-SVC-AUTH-DEFACCPW"
     WeakCredentials = "PTV-SVC-WEAKCREDENTIALS"
     WeakCreds = "PTV-SVC-AUTH-WEAK"
+    Brute = "PTV-SVC-AUTH-BRUTE"
+    Recykl = "PTV-SVC-AUTH-RECYKL"
     AuthBlock = "PTV-SVC-AUTH-BLOCK"
     Sniffable = "PTV-SVC-SNIFFABLE"
     AuthPlain = "PTV-SVC-POP3-AUTHPLAIN"
     AuthWeak = "PTV-SVC-POP3-AUTHWEAK"
+    UserEnum = "PTV-SVC-POP3-USRENUM"
     Banner = "PTV-SVC-BANNER"
     ConnCntIp = "PTV-SVC-POP3-CONNCNTIP"
     ConnLong = "PTV-SVC-POP3-CONNLONG"

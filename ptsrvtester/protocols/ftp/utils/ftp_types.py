@@ -634,6 +634,8 @@ class FTPResults:
     info_error: str | None = None  # When run-all info/connect fails
     banner_requested: bool = False
     commands_requested: bool = False
+    site_help: str | None = None
+    site_extensions: tuple[str, ...] = ()
     access: AccessCheckResult | None = None
     access_error: str | None = None  # When run-all access check fails
     anonymous: bool | None = None
@@ -675,6 +677,8 @@ class VULNS(Enum):
     Bounce = "PTV-SVC-FTP-BOUNCE"
     WeakCredentials = "PTV-SVC-WEAKCREDENTIALS"
     WeakCreds = "PTV-SVC-AUTH-WEAK"
+    Brute = "PTV-SVC-AUTH-BRUTE"
+    Recykl = "PTV-SVC-AUTH-RECYKL"
     AuthBlock = "PTV-SVC-AUTH-BLOCK"
     AuthEnum = "PTV-SVC-AUTH-ENUM"
     Sniffable = "PTV-SVC-SNIFFABLE"

@@ -8,6 +8,7 @@ __ORDER__ = 10
 
 
 def run(ctx):
+    ctx.report.banner_requested = True
     info = require_server_info(ctx)
     if info is None:
         return

@@ -12,6 +12,7 @@ from ptlibs import ptprinthelper
 from ptlibs.ptjsonlib import PtJsonLib
 
 from ..._base import Out
+from .poc import format_poc
 from .helpers import *
 from .results import *
 from .registry import *
@@ -272,15 +273,9 @@ class SmtpEngine(
         """
         if not code or code in self._vuln_poc or not pairs:
             return
-        lines: list[str] = []
-        for send, recv in pairs:
-            if not send:
-                continue
-            recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
-            lines.append(f"Send: {send}")
-            lines.append(f"Receive: {recv_s}")
-        if lines:
-            self._vuln_poc[code] = "\r\n".join(lines)
+        text = format_poc(*pairs)
+        if text:
+            self._vuln_poc[code] = text
 
     def _add_to_json_log(self, line: str) -> None:
         """Append one line to results.log when -j is active (ptjsonlib.add_to_log)."""

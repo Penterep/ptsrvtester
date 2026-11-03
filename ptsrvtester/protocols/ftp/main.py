@@ -30,7 +30,7 @@ class FTP(BaseMain):
         validate_ftp_selection(args)
         raw = getattr(args, "tests", None) or ""
         codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
-        if "BRUTE" in codes and "ALL" not in codes:
+        if any(code in codes for code in ("BRUTE", "WEAK", "RECYKL")) and "ALL" not in codes:
             apply_default_brute_creds(args)
         # Legacy engine/build_json still reads per-test dest flags; modules set them
         # when they run. Initialise missing ones so AttributeError cannot occur.

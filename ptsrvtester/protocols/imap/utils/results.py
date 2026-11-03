@@ -813,6 +813,8 @@ class VULNS(Enum):
     NTLM = "PTV-SVC-NTLMINFO"
     WeakCreds = "PTV-SVC-AUTH-WEAK"
     WeakCredentials = "PTV-SVC-WEAKCREDENTIALS"
+    Brute = "PTV-SVC-AUTH-BRUTE"
+    Recykl = "PTV-SVC-AUTH-RECYKL"
     AuthBlock = "PTV-SVC-AUTH-BLOCK"
     AuthMethods = "PTV-SVC-IMAP-AUTHMETHODS"
     Sniffable = "PTV-SVC-SNIFFABLE"

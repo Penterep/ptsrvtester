@@ -4,6 +4,8 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from .poc import format_poc
+
 
 class Pop3Report:
     """Modules update properties/vulns here; ``POP3.output()`` emits one software node."""
@@ -18,6 +20,7 @@ class Pop3Report:
             "description": None,
         }
         self.vulns: list[dict[str, Any]] = []
+        self.banner_requested: bool = False
         self.connect_error: str | None = None
         self.brute_creds = None
         self._vuln_poc: dict[str, str] = {}
@@ -50,16 +53,9 @@ class Pop3Report:
         """
         if not code or not pairs:
             return
-        lines: list[str] = []
-        for send, recv in pairs:
-            if not send:
-                continue
-            recv_s = "(no reply)" if recv in (None, "") else " ".join(str(recv).split())
-            lines.append(f"Send: {send}")
-            lines.append(f"Receive: {recv_s}")
-        if not lines:
+        text = format_poc(*pairs)
+        if not text:
             return
-        text = "\r\n".join(lines)
         with self._lock:
             if code not in self._vuln_poc:
                 self._vuln_poc[code] = text

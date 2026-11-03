@@ -16,7 +16,7 @@ from .utils.helpers import (
     get_mode,
 )
 from .utils.results import VULNS
-from .utils.connection import ServerInfoCache, _pop3_default_account, connect_pop3
+from .utils.connection import ServerInfoCache, connect_pop3
 from .utils.registry import POP3_DEFAULT_SUITE
 from .utils.report import Pop3Report
 
@@ -37,7 +37,7 @@ class POP3(BaseMain):
         validate_brute_selection(args)
         raw = getattr(args, "tests", None) or ""
         codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
-        if "BRUTE" in codes and "ALL" not in codes:
+        if any(code in codes for code in ("BRUTE", "WEAK", "RECYKL")) and "ALL" not in codes:
             apply_default_brute_creds(args)
         self.report = Pop3Report()
         super().__init__(args, ptjsonlib)
@@ -112,26 +112,23 @@ class POP3(BaseMain):
     def _brute_only(self) -> bool:
         raw = getattr(self.args, "tests", None) or ""
         codes = {c.strip().upper() for c in str(raw).split(",") if c.strip()}
-        return codes == {"BRUTE"}
+        return bool(codes) and codes <= {"BRUTE", "WEAK", "RECYKL"}
 
     def _brute_vuln_entries(self) -> list[dict]:
+        """One code per test that ran: BRUTE, WEAK, or RECYKL."""
         vulns: list[dict] = []
-        if self.report.properties.get("pop3PasswordGuessing") == "not_limited":
-            vulns.append({"vuln_code": VULNS.AuthBlock.value})
-        creds = brute_sorted_creds(self.report.brute_creds)
-        if creds:
-            request = brute_weak_request(self.args)
-            response = brute_weak_response(creds)
-            codes = [VULNS.WeakCredentials.value, VULNS.WeakCreds.value]
-            if any(_pop3_default_account(c.user, c.passw)[0] for c in creds):
-                codes.append(VULNS.DefAcc.value)
-            if any(_pop3_default_account(c.user, c.passw)[1] for c in creds):
-                codes.append(VULNS.DefAccPw.value)
-            for code in codes:
+        runs = getattr(self.report, "auth_probe_runs", None) or {}
+        hit_codes = {"WEAK": VULNS.WeakCreds.value, "RECYKL": VULNS.Recykl.value}
+        for test, run in runs.items():
+            if test == "BRUTE" and run.get("guessing") == "not_limited":
+                vulns.append({"vuln_code": VULNS.Brute.value})
+            code = hit_codes.get(test)
+            creds = brute_sorted_creds(run.get("creds"))
+            if code and creds:
                 vulns.append({
                     "vuln_code": code,
-                    "vuln_request": request,
-                    "vuln_response": response,
+                    "vuln_request": brute_weak_request(self.args),
+                    "vuln_response": brute_weak_response(creds),
                 })
         return vulns
 
@@ -148,6 +145,8 @@ class POP3(BaseMain):
     def _add_vulns(self, vulns: list[dict], *, node_key: str | None = None) -> None:
         for entry in vulns:
             stamped = dict(entry)
+            stamped.pop("vuln_request", None)
+            stamped.pop("vuln_response", None)
             if not stamped.get("poc"):
                 poc = self.report.poc_for(stamped.get("vuln_code"))
                 if poc:
@@ -170,7 +169,10 @@ class POP3(BaseMain):
         super().run()
 
     def output(self) -> None:
-        """Emit one software node + collected vulnerabilities (JSON mode)."""
+        """Software node only for BANNER. A found login is a userAccount.
+
+        results.properties stays empty. Findings stay in the global list and the log.
+        """
         if self.report.connect_error and self.use_json:
             self.ptjsonlib.end_error(self.report.connect_error, self.use_json)
             return
@@ -178,10 +180,17 @@ class POP3(BaseMain):
             self._emit_brute_json()
             return
 
-        node = self.ptjsonlib.create_node_object("software", None, None, self.report.properties)
-        self.ptjsonlib.add_node(node)
-        node_key = node["key"]
-        self._add_vulns(self.report.vulns, node_key=node_key)
+        props = self.report.properties
+        node_keys = ("software_type", "name", "version", "vendor", "description", "cpe")
+        if self.report.banner_requested and props.get("description"):
+            node = self.ptjsonlib.create_node_object(
+                "software",
+                None,
+                None,
+                {key: props.get(key) for key in node_keys},
+            )
+            self.ptjsonlib.add_node(node)
+        self._add_vulns(self.report.vulns)
         self._add_brute_account_nodes()
         self._add_vulns(self._brute_vuln_entries())
 

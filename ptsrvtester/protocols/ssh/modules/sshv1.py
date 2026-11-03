@@ -6,7 +6,11 @@ Reads the identification banner and decides whether the server still speaks SSH-
 a finding. See :mod:`..utils.protohygiene_core`. Safe and pre-auth, so it runs in
 the default sweep.
 """
-from ptsrvtester.protocols.ssh.utils.ssh_helpers import grab_banner
+from ptsrvtester.protocols.ssh.utils.ssh_helpers import (
+    grab_banner,
+    service_reachable,
+    unreachable_message,
+)
 from ptsrvtester.protocols.ssh.utils.protohygiene_core import assess_sshv1
 
 __MODULELABEL__ = "SSH protocol 1 (legacy)"
@@ -16,19 +20,25 @@ __ORDER__ = 15
 
 def run(ctx):
     ip, port = ctx.target
-    ctx.debug(f"reading the SSH banner from {ip}:{port} to detect protocol-1 support")
+    if service_reachable(ctx) is False:
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
+
+    ctx.debug(f"Reading the SSH banner from {ip}:{port} to detect protocol-1 support")
     try:
         banner = grab_banner(ip, port)
     except Exception as e:
         ctx.out(f"Could not read the SSH banner from {ip}:{port}: {e}", "WARNING", indent=4)
         return
 
-    ctx.debug("assessing the advertised protocol version")
+    ctx.debug("Assessing the advertised protocol version")
     r = assess_sshv1(banner)
     if r.protoversion is None:
         ctx.out(f"Unrecognised identification string: {banner}", "WARNING", indent=4)
         return
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     ctx.out(f"advertised protocol version: {r.protoversion}", "TEXT", indent=4)
     if r.only_v1:
         ctx.out("Server speaks SSH-1 ONLY (SSH-2 not offered) — legacy, cryptographically broken",

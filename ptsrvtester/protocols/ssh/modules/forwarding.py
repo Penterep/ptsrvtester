@@ -195,6 +195,10 @@ def _probe_agent(transport) -> tuple[State, str]:
 def run(ctx):
     a = ctx.args
     ip, port = ctx.target
+    from ptsrvtester.protocols.ssh.utils.ssh_helpers import service_reachable, unreachable_message
+    if service_reachable(ctx) is False:
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
     account = a.user if (isinstance(a.user, str) and a.user) else (
         a.user[0] if isinstance(a.user, list) and a.user else None)
@@ -211,14 +215,14 @@ def run(ctx):
     ctx.out(f"Testing forwarding capabilities for '{account}' on {ip}:{port} "
             f"({len(creds)} secret(s))", "INFO", colortext=True, indent=4)
 
-    ctx.debug(f"authenticating as '{account}' ({len(creds)} secret(s) to try)")
+    ctx.debug(f"Authenticating as '{account}' ({len(creds)} secret(s) to try)")
     client = None
     for c in creds:
         client = _connect(ip, port, c)
         if client is not None:
             break
-    ctx.debug("login succeeded" if client is not None
-              else "login failed with the supplied secret(s)")
+    ctx.debug("Login succeeded" if client is not None
+              else "Login failed with the supplied secret(s)")
 
     if client is None:
         _render(ctx, assess_forwarding(account=account, authenticated=False))
@@ -290,7 +294,7 @@ def _render(ctx, r):
             _cat(r.dynamic), indent=8)
     ctx.out(f"Remote forwarding (-R): {_word(r.remote)}", _cat(r.remote), indent=8)
     for p in r.local_probes:
-        ctx.debug(f"local probe {p.dest}: {p.state.value} — {p.detail}")
+        ctx.debug(f"Local probe {p.dest}: {p.state.value} — {p.detail}")
     if r.permitopen_restricted:
         ctx.out("PermitOpen restriction detected (allow-list filtering destinations)",
                 "WARNING", indent=8)

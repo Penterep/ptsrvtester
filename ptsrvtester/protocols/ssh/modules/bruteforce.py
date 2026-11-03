@@ -30,7 +30,7 @@ def run(ctx):
         return
 
     ctx.debug(
-        f"trying {len(creds)} credential(s) against {ip}:{port} "
+        f"Trying {len(creds)} credential(s) against {ip}:{port} "
         f"with {a.threads} thread(s)"
     )
     err = StringIO("")
@@ -40,7 +40,7 @@ def run(ctx):
         found = threaded_bruteforce(creds, lambda c: try_login(ip, port, c), a.threads)
     finally:
         sys.stderr.write = old_write
-    ctx.debug(f"bruteforce finished: {len(found)} valid credential(s) found")
+    ctx.debug(f"Bruteforce finished: {len(found)} valid credential(s) found")
     errors = len(err.getvalue()) > 0
     err.close()
 

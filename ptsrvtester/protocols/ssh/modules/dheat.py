@@ -61,6 +61,10 @@ def _progress(stop_event: threading.Event, ip: str, port: int, duration: float) 
 
 def run(ctx):
     ip, port = ctx.target
+    from ptsrvtester.protocols.ssh.utils.ssh_helpers import service_reachable, unreachable_message
+    if service_reachable(ctx) is False:
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
     dheat_arg = getattr(ctx.args, "dheat", None)
     duration = getattr(ctx.args, "dheat_duration", None) or DHEAT_DEFAULT_DURATION
 
@@ -70,7 +74,7 @@ def run(ctx):
         "WARNING", indent=4,
     )
 
-    ctx.debug(f"launching ssh-audit --dheat against {ip}:{port} for ~{duration:.0f}s")
+    ctx.debug(f"Launching ssh-audit --dheat against {ip}:{port} for ~{duration:.0f}s")
     show_progress = not ctx.json and sys.stdout.isatty()
     stop_event = threading.Event()
     spinner = None

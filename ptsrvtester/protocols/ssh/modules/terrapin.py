@@ -7,7 +7,11 @@ combined with no strict-kex countermeasure (``kex-strict-s-v00@openssh.com`` not
 advertised). See :mod:`..utils.protohygiene_core` for the verdict logic. Safe and
 pre-auth, so it runs in the default sweep.
 """
-from ptsrvtester.protocols.ssh.utils.ssh_helpers import read_kexinit
+from ptsrvtester.protocols.ssh.utils.ssh_helpers import (
+    read_kexinit,
+    service_reachable,
+    unreachable_message,
+)
 from ptsrvtester.protocols.ssh.utils.protohygiene_core import assess_terrapin
 
 __MODULELABEL__ = "Terrapin (CVE-2023-48795)"
@@ -17,14 +21,18 @@ __ORDER__ = 45
 
 def run(ctx):
     ip, port = ctx.target
-    ctx.debug(f"reading the server KEXINIT from {ip}:{port} (pre-auth)")
+    if service_reachable(ctx) is False:
+        ctx.out(unreachable_message(ip, port), "WARNING", indent=4)
+        return
+
+    ctx.debug(f"Reading the server KEXINIT from {ip}:{port} (pre-auth)")
     try:
         kexinit = read_kexinit(ip, port)
     except Exception as e:
         ctx.out(f"Could not read KEXINIT from {ip}:{port}: {e}", "WARNING", indent=4)
         return
 
-    ctx.debug("evaluating Terrapin exposure from the offered cipher modes and strict-kex")
+    ctx.debug("Evaluating Terrapin exposure from the offered cipher modes and strict-kex")
     r = assess_terrapin(kexinit)
     if not r.readable:
         ctx.out("Terrapin: could not evaluate (no SSH-2 KEXINIT)", "WARNING", indent=4)
@@ -32,6 +40,8 @@ def run(ctx):
             ctx.out(n, "TEXT", indent=8)
         return
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     ctx.out(f"strict kex (kex-strict-s-v00@openssh.com): "
             f"{'advertised' if r.strict_kex else 'NOT advertised'}",
             "OK" if r.strict_kex else "TEXT", indent=4)

@@ -5,6 +5,7 @@ query from cache (instead of refusing/deferring) reveals which names its clients
 have recently looked up (PTV-DNS-CACHESNOOP) — an information leak about user
 behaviour. The remaining TTL hints at how recently the name was resolved.
 """
+from ptsrvtester.protocols.dns.utils import fingerprint_core as fp
 from ptsrvtester.protocols.dns.utils import recursion_core as rc
 from ptsrvtester.protocols.dns.utils.results import VULNS
 
@@ -19,19 +20,23 @@ def run(ctx):
         ctx.out("This test needs a target DNS server; pass -tg <server>.", "WARNING", indent=4)
         return
     port = getattr(ctx, "port", None) or 53
+    if fp.server_reachable(ctx) is False:
+        ctx.out(fp.unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
-    ctx.debug(f"sending RD=0 (non-recursive) queries for popular names to {ip}:{port} to detect cached entries")
+    ctx.debug(f"Querying popular names non-recursively (RD=0) on {ip}:{port}")
     results = rc.cache_snoop(ip, port)
     cached = [r for r in results if r.cached]
-    ctx.debug(f"cache-snoop probe complete; {len(cached)} of {len(results)} name(s) answered from cache")
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     for r in results:
         if r.cached:
             ctx.out(f"{r.name:<18} in cache (TTL {r.ttl})", "VULN", indent=4)
         elif r.cached is None:
-            ctx.out(f"{r.name:<18} {r.rcode}", "TEXT", indent=4)
+            ctx.out(f"{r.name:<18} {r.rcode}", "WARNING", indent=4)
         else:
-            ctx.out(f"{r.name:<18} not cached / not disclosed (rcode {r.rcode})", "TEXT", indent=4)
+            ctx.out(f"{r.name:<18} not cached / not disclosed (rcode {r.rcode})", "OK", indent=4)
 
     if not cached:
         ctx.out("No cache contents disclosed via RD=0 (cache snooping not possible here).", "OK", indent=4)

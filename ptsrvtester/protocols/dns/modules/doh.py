@@ -23,18 +23,19 @@ def run(ctx):
         return
     host = getattr(ctx, "host", None) or ip
 
-    ctx.debug(f"handshaking TLS to {ip}:443 (ALPN h2/http1.1) to read TLS version, cipher, HTTP/2 and certificate")
+    ctx.debug(f"Querying DNS-over-HTTPS (TLS handshake + query) on {ip}:443")
     probe = tt.tls_probe(ip, 443, host, alpn=["h2", "http/1.1"])
     if not probe.connected:
-        ctx.out(f"DoH/443 not available ({probe.error}).", "TEXT", indent=4)
+        ctx.out(f"DoH/443 not available ({probe.error}).", "WARNING", indent=4)
         return
 
     http2 = probe.alpn == "h2"
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     ctx.out(f"DoH/443 available — {probe.tls_version}, {probe.cipher} ({probe.cipher_bits}-bit); "
             f"HTTP/2: {'yes' if http2 else 'no (' + str(probe.alpn or 'HTTP/1.1') + ')'}", "OK", indent=4)
 
     url = f"https://{host}/dns-query"
-    ctx.debug(f"confirming the server answers DNS over HTTPS at {url}")
     try:
         dns.query.https(dns.message.make_query("example.com", dns.rdatatype.A), url, timeout=6)
         ctx.out(f"Confirmed: answers DNS over HTTPS at {url}.", "OK", indent=4)

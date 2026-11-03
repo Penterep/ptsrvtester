@@ -26,11 +26,11 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
-    ctx.debug(f"testing unauthenticated RFC 2136 dynamic update against {len(domains)} domain(s)")
+    ctx.debug(f"Testing unauthenticated RFC 2136 dynamic update against {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"resolving the primary/authoritative servers for {domain}")
+        ctx.debug(f"Resolving the primary/authoritative servers for {domain}")
         servers = du.primary_ips(resolver, domain)
         if not servers:
             ctx.out("Could not resolve the zone's primary/authoritative servers.", "WARNING", indent=8)
@@ -38,7 +38,7 @@ def run(ctx):
 
         ip = servers[0]
         name = du.test_name(domain)
-        ctx.debug(f"sending an unauthenticated UPDATE adding TXT {name} to {ip}")
+        ctx.debug(f"Sending an unauthenticated UPDATE adding TXT {name} to {ip}")
         rcode = du.add_txt(ip, domain, name)
 
         if rcode is None:
@@ -46,6 +46,8 @@ def run(ctx):
             continue
         rtext = dns.rcode.to_text(rcode)
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if rcode != dns.rcode.NOERROR:
             hint = {"NOTAUTH": "authentication required (TSIG/GSS-TSIG)",
                     "REFUSED": "refused by ACL",
@@ -53,7 +55,7 @@ def run(ctx):
             ctx.out(f"Unauthenticated update rejected on {ip} — {rtext} ({hint}).", "OK", indent=8)
             continue
 
-        ctx.debug("update returned NOERROR; verifying the record exists, then deleting it for cleanup")
+        ctx.debug("Verifying the record exists, then deleting it for cleanup")
         present = du.verify_present(ip, name)
         du.delete_name(ip, domain, name)
         cleaned = not du.verify_present(ip, name)

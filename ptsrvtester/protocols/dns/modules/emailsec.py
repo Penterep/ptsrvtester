@@ -24,14 +24,16 @@ def run(ctx):
     selectors = getattr(ctx.args, "dkim_selectors", None) or ec.DEFAULT_DKIM_SELECTORS
     resolver = ec.resolver_for(ctx)
     summary: dict[str, dict] = {}
-    ctx.debug(f"checking email security for {len(domains)} domain(s); DKIM selectors tried: {', '.join(selectors)}")
+    ctx.debug(f"Checking email security for {len(domains)} domain(s); DKIM selectors tried: {', '.join(selectors)}")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"querying SPF (TXT), DMARC (_dmarc TXT) and DKIM selectors for {domain}")
+        ctx.debug(f"Querying SPF, DMARC and DKIM for {domain}")
         info = ec.email_security(resolver, domain, selectors)
         vulns: list[dict] = []
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         # SPF
         if not info.spf:
             ctx.out("SPF      missing — anyone can spoof mail from this domain", "VULN", indent=8)
@@ -62,7 +64,7 @@ def run(ctx):
             for selector, record in info.dkim.items():
                 ctx.out(f"DKIM     {selector}._domainkey: {record[:80]}{'…' if len(record) > 80 else ''}", "OK", indent=8)
         else:
-            ctx.out(f"DKIM     none found for tried selectors ({len(selectors)}); may use custom selectors", "TEXT", indent=8)
+            ctx.out(f"DKIM     none found for tried selectors ({len(selectors)}); may use custom selectors", "WARNING", indent=8)
 
         summary[domain] = {
             "spf": info.spf, "spf_all": info.spf_all,

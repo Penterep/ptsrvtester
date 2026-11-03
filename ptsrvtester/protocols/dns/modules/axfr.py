@@ -26,30 +26,32 @@ def run(ctx):
     resolver = ec.resolver_for(ctx, timeout=zc.XFR_TIMEOUT)
     extra = (ctx.host, ctx.ip) if getattr(ctx, "ip", None) else None
     exposed: list[str] = []
-    ctx.debug(f"attempting AXFR for {len(domains)} domain(s) against each authoritative name server over TCP")
+    ctx.debug(f"Attempting AXFR for {len(domains)} domain(s) against each authoritative name server over TCP")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"discovering authoritative name servers for {domain}")
+        ctx.debug(f"Resolving authoritative name servers for {domain}")
         servers, primary, _ = zc.transfer_targets(resolver, domain, extra)
         if not servers:
             ctx.out("No NS records found for the domain (cannot try AXFR).", "WARNING", indent=8)
             continue
 
-        ctx.debug(f"{len(servers)} name server(s) found for {domain}; trying AXFR against each")
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         for ns in servers:
             role = "primary" if ns.is_primary else "secondary"
             if not ns.ips:
-                ctx.out(f"{ns.host.rstrip('.'):<32} [{role}] no A/AAAA — skipped", "TEXT", indent=8)
+                ctx.out(f"{ns.host.rstrip('.'):<32} [{role}] no A/AAAA — skipped", "WARNING", indent=8)
                 continue
             for ip in ns.ips:
+                ctx.debug(f"Attempting AXFR of {domain} from {ip} ({ns.host.rstrip('.')})")
                 res = zc.try_axfr(ip, domain, ns.host, ns.is_primary)
                 if res.allowed:
                     ctx.out(f"{res.server} [{role}] AXFR ALLOWED — {res.record_count} records", "VULN", indent=8)
-                    for name in res.sample:
-                        ctx.out(f"    {name}", "TEXT", indent=8)
-                    if res.record_count and res.record_count > len(res.sample):
-                        ctx.out(f"    … (+{res.record_count - len(res.sample)} more)", "TEXT", indent=8)
+                    for line in res.sample:
+                        ctx.out(f"    {line}", "TEXT", indent=8)
+                    if res.total_rrs and res.total_rrs > len(res.sample):
+                        ctx.out(f"    … (+{res.total_rrs - len(res.sample)} more)", "TEXT", indent=8)
                     exposed.append(f"{domain}@{res.server}[{role}]")
                 else:
                     ctx.out(f"{res.server} [{role}] refused ({res.error})", "OK", indent=8)

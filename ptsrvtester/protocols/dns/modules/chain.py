@@ -23,16 +23,18 @@ def run(ctx):
         return
 
     resolver = ec.resolver_for(ctx)
-    ctx.debug(f"validating the DNSSEC chain of trust (parent DS ↔ child DNSKEY) for {len(domains)} domain(s)")
+    ctx.debug(f"Validating the DNSSEC chain of trust (parent DS ↔ child DNSKEY) for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"fetching DNSKEY for {domain} and DS from its parent, then matching digests")
+        ctx.debug(f"Querying DNSKEY for {domain} and DS from its parent")
         servers = dc.servers_for(resolver, domain, getattr(ctx, "ip", None))
         keys = dc.get_dnskey(servers, domain) if servers else None
         dnskey = keys.dnskey if keys else None
         matches, ds_present = dc.chain_of_trust(servers, resolver, domain, dnskey)
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if not ds_present:
             if dnskey is not None:
                 ctx.out("Zone is signed (DNSKEY present) but the parent publishes NO DS — "

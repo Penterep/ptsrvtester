@@ -19,20 +19,25 @@ def run(ctx):
         ctx.out("This test needs a target DNS server; pass -tg <server>.", "WARNING", indent=4)
         return
     ip, port = target
+    if fp.server_reachable(ctx) is False:
+        ctx.out(fp.unreachable_message(ip, port), "WARNING", indent=4)
+        return
 
-    ctx.debug(f"sending an EDNS(0) query with a client cookie to {ip}:{port} and reading the OPT record back")
+    ctx.debug(f"Querying EDNS(0) support, UDP payload and cookies on {ip}:{port}")
     info = fp.edns_probe(ip, port)
     if info.error:
         ctx.out(f"EDNS probe failed: {info.error}", "WARNING", indent=4)
         return
     if not info.supported:
-        ctx.out("Server does not support EDNS(0).", "TEXT", indent=4)
+        ctx.out("Server does not support EDNS(0).", "WARNING", indent=4)
         return
 
+    ctx.out("")
+    ctx.out("Returned information:", "TEXT", indent=4)
     ctx.out(f"{'EDNS version':<18} {info.version}", "OK", indent=4)
     ctx.out(f"{'UDP payload':<18} {info.udp_payload} bytes", "TEXT", indent=4)
     ctx.out(
         f"{'DNS cookies':<18} " + ("supported (server cookie echoed)" if info.cookie else "not observed"),
-        "OK" if info.cookie else "TEXT",
+        "OK" if info.cookie else "WARNING",
         indent=4,
     )

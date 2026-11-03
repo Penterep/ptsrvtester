@@ -17,7 +17,6 @@ import dns.name
 import dns.query
 import dns.rdatatype
 import dns.resolver
-import dns.zone
 
 XFR_TIMEOUT = 10.0
 SAMPLE_LIMIT = 25
@@ -36,8 +35,9 @@ class XfrResult:
     ip: str
     is_primary: bool
     allowed: bool
-    record_count: int | None = None
-    sample: list[str] = field(default_factory=list)
+    record_count: int | None = None          # distinct names (nodes) — the "N records" summary count
+    sample: list[str] = field(default_factory=list)   # formatted RR lines ("name TTL TYPE rdata"), capped
+    total_rrs: int | None = None             # total resource records, for the "+N more" tail
     incremental: bool | None = None
     error: str | None = None
 
@@ -72,15 +72,44 @@ def get_nameservers(resolver, domain: str, primary: str | None) -> list[NameServ
     return servers
 
 
+def _format_rr_lines(records: list[tuple[str, int, str, str]]) -> list[str]:
+    """Render ``(name, ttl, type, rdata)`` tuples as aligned ``dig``-style lines."""
+    if not records:
+        return []
+    name_w = max(len(name) for name, *_ in records) + 1
+    return [f"{name:<{name_w}}{ttl:<8}{rtype:<8}{value}"
+            for name, ttl, rtype, value in records]
+
+
 def try_axfr(ip: str, zone: str, host: str, is_primary: bool, timeout: float = XFR_TIMEOUT) -> XfrResult:
-    """Attempt a full AXFR of *zone* from *ip* over TCP."""
+    """Attempt a full AXFR of *zone* from *ip* over TCP.
+
+    On success the result carries the full resource records (``name TTL TYPE
+    rdata``) in the order the server streamed them, not just the node names:
+    ``record_count`` stays the number of distinct names (the "N records"
+    summary), ``sample`` holds the formatted RR lines (capped at
+    ``SAMPLE_LIMIT``) and ``total_rrs`` the full RR count for the "+N more" tail.
+    """
     label = f"{host.rstrip('.')} ({ip})"
     try:
-        xfr = dns.query.xfr(ip, zone, timeout=timeout, lifetime=timeout)
-        z = dns.zone.from_xfr(xfr)
-        names = sorted(n.to_text() for n in z.nodes.keys())
+        # relativize=False keeps absolute owner names (penterepmail.loc. rather than @/www).
+        xfr = dns.query.xfr(ip, zone, timeout=timeout, lifetime=timeout, relativize=False)
+        records: list[tuple[str, int, str, str]] = []
+        names: set[str] = set()
+        for msg in xfr:
+            for rrset in msg.answer:
+                name = rrset.name.to_text()
+                names.add(name)
+                rtype = dns.rdatatype.to_text(rrset.rdtype)
+                for rdata in rrset:
+                    records.append((name, rrset.ttl, rtype, rdata.to_text()))
+        # An AXFR brackets the zone with a leading and trailing SOA; drop the
+        # duplicate leading one so the SOA shows once, at the end (as dig does).
+        if len(records) >= 2 and records[0][2] == "SOA" and records[-1][2] == "SOA":
+            records = records[1:]
         return XfrResult(server=label, ip=ip, is_primary=is_primary, allowed=True,
-                         record_count=len(names), sample=names[:SAMPLE_LIMIT])
+                         record_count=len(names), total_rrs=len(records),
+                         sample=_format_rr_lines(records[:SAMPLE_LIMIT]))
     except Exception as e:
         return XfrResult(server=label, ip=ip, is_primary=is_primary, allowed=False,
                          error=f"{type(e).__name__}: {e}")

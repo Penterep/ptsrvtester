@@ -18,14 +18,16 @@ def run(ctx):
         return
 
     collected: dict[str, str] = {}
-    ctx.debug(f"fetching WHOIS registration data for {len(domains)} domain(s)")
+    ctx.debug(f"Fetching WHOIS registration data for {len(domains)} domain(s)")
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"querying WHOIS for {domain}")
+        ctx.debug(f"Querying WHOIS for {domain}")
         text = ec.whois_lookup(domain)
         if not text:
             ctx.out("No WHOIS data (lookup failed, rate-limited, or TLD not supported).", "WARNING", indent=8)
             continue
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         for line in text.strip().splitlines():
             ctx.out(line, "TEXT", indent=8)
         collected[domain] = text.strip()

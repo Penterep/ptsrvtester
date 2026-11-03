@@ -22,12 +22,14 @@ def run(ctx):
 
     resolver = ec.resolver_for(ctx)
     summary: dict[str, dict] = {}
-    ctx.debug(f"probing {len(domains)} domain(s) for wildcard records using random labels")
+    ctx.debug(f"Probing {len(domains)} domain(s) for wildcard records using random labels")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"querying a random non-existent label under {domain}")
+        ctx.debug(f"Querying a random non-existent label under {domain}")
         wc = ec.wildcard_detect(resolver, domain)
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         if not wc.present:
             ctx.out("No wildcard record (random labels do not resolve).", "OK", indent=8)
             summary[domain] = {"wildcard": False}

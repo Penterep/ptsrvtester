@@ -20,12 +20,14 @@ def run(ctx):
     rtypes = getattr(ctx.args, "records", None) or ec.DEFAULT_RECORD_TYPES
     resolver = ec.resolver_for(ctx)
     all_records: dict[str, dict[str, list[str]]] = {}
-    ctx.debug(f"enumerating record types {', '.join(rtypes)} for {len(domains)} domain(s)")
+    ctx.debug(f"Enumerating record types {', '.join(rtypes)} for {len(domains)} domain(s)")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"resolving {', '.join(rtypes)} for {domain}")
+        ctx.debug(f"Querying {', '.join(rtypes)} records for {domain}")
         records = ec.lookup_records(resolver, domain, rtypes)
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         any_found = False
         for rtype in rtypes:
             values = records.get(rtype) or []

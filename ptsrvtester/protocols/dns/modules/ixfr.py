@@ -25,24 +25,26 @@ def run(ctx):
     resolver = ec.resolver_for(ctx, timeout=zc.XFR_TIMEOUT)
     extra = (ctx.host, ctx.ip) if getattr(ctx, "ip", None) else None
     exposed: list[str] = []
-    ctx.debug(f"attempting IXFR for {len(domains)} domain(s) against each authoritative name server over TCP")
+    ctx.debug(f"Attempting IXFR for {len(domains)} domain(s) against each authoritative name server over TCP")
 
     for domain in domains:
         ctx.out(domain, "INFO", colortext=True, indent=4)
-        ctx.debug(f"discovering authoritative name servers and current serial for {domain}")
+        ctx.debug(f"Resolving authoritative name servers + serial for {domain}")
         servers, primary, serial = zc.transfer_targets(resolver, domain, extra)
         if not servers:
             ctx.out("No NS records found for the domain (cannot try IXFR).", "WARNING", indent=8)
             continue
         since = (serial - 1) if serial and serial > 1 else 1
-        ctx.debug(f"requesting IXFR since serial {since} from {len(servers)} name server(s)")
 
+        ctx.out("")
+        ctx.out("Returned information:", "TEXT", indent=8)
         for ns in servers:
             role = "primary" if ns.is_primary else "secondary"
             if not ns.ips:
-                ctx.out(f"{ns.host.rstrip('.'):<32} [{role}] no A/AAAA — skipped", "TEXT", indent=8)
+                ctx.out(f"{ns.host.rstrip('.'):<32} [{role}] no A/AAAA — skipped", "WARNING", indent=8)
                 continue
             for ip in ns.ips:
+                ctx.debug(f"Attempting IXFR of {domain} (since serial {since}) from {ip} ({ns.host.rstrip('.')})")
                 res = zc.try_ixfr(ip, domain, ns.host, ns.is_primary, since)
                 if res.allowed:
                     kind = "incremental delta" if res.incremental else "full AXFR-style fallback"

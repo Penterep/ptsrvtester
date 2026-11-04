@@ -127,6 +127,13 @@ class SMBResults:
     v311_encryption: str = ""
     v1_flags: tuple | None = None
     v23_flags: tuple | None = None
+    user_level_auth: bool | None = None
+    uses_challenge_response: bool | None = None
+    signing_support: bool | None = None
+    signing_requirement: bool | None = None
+    encryption_support: bool | None = None
+    session_encryption_requirement: bool | None = None
+    null_session: bool | None = None
 
 
 def get_if_available(getter):
@@ -138,6 +145,8 @@ def get_if_available(getter):
 def valid_target_smb(target: str) -> Target:
     return valid_target(target, domain_allowed=True)
 
+def get_flag(source: int, mask: int) -> bool:
+    return bool(source & mask)
 
 def valid_target(target: str, port_required: bool = False, domain_allowed: bool = False) -> Target:
     """

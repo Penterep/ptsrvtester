@@ -7,7 +7,7 @@ from impacket.smbconnection import (
     SMB2_DIALECT_311,
 )
 
-from .helpers import get_if_available
+from .helpers import get_flag, get_if_available
 from .helpers import SMBResults, SMBv1Flags, SMBv23Flags
 import nmap
 
@@ -89,6 +89,11 @@ class ServerConnection():
             self.ctx.debug("Tree connection failed: " + str(e))
         return False
 
+    @staticmethod
+    def _read_flag(source: int | None, mask: int) -> bool | None:
+        if isinstance(source, bool) or not isinstance(source, int):
+            return None
+        return get_flag(source, mask)
 
     def connect(self, timeout = 3) -> None:
         username, password = self.ctx.userpass
@@ -180,10 +185,47 @@ class ServerConnection():
             security_mode = smb_client._SMBConnection._dialects_parameters.fields.get('SecurityMode', None)
             capabilities = smb_client._SMBConnection._dialects_parameters.fields.get('Capabilities', None)
             output.v1_flags = (flags1, flags2, security_mode, capabilities)
+
+            output.signing_support = self._read_flag(
+                flags2, SMBv1Flags.FLAGS2_SMB_SECURITY_SIGNATURE)
+            output.signing_requirement = self._read_flag(
+                flags2, SMBv1Flags.FLAGS2_SMB_SECURITY_SIGNATURE_REQUIRED)
+            output.user_level_auth = self._read_flag(
+                security_mode, SMBv1Flags.NEGOTIATE_USER_SECURITY)
+            output.uses_challenge_response = self._read_flag(
+                security_mode, SMBv1Flags.NEGOTIATE_ENCRYPT_PASSWORDS)
+            output.null_session = output.successful_login
+
+            self.ctx.debug(f"user_level_auth = {output.user_level_auth}")
+            self.ctx.debug(f"uses_challenge_response = {output.uses_challenge_response}")
+            self.ctx.debug(f"does_support_NTLMv2 = {output.does_support_NTLMv2}")
+            self.ctx.debug(f"signing_support = {output.signing_support}")
+            self.ctx.debug(f"signing_requirement = {output.signing_requirement}")
+            self.ctx.debug(f"is_login_required = {output.is_login_required}")
+            self.ctx.debug(f"guest_session = {output.guest_session}")
         else:
             security_mode = smb_client._SMBConnection._Connection.get('ServerSecurityMode', None)
             capabilities = smb_client._SMBConnection._Connection.get('ServerCapabilities', None)
             session_flags = smb_client._SMBConnection._Session.get('SessionFlags', None)
             output.v23_flags = (security_mode, capabilities, session_flags)
+            output.signing_support = self._read_flag(
+                security_mode, SMBv23Flags.SMB2_NEGOTIATE_SIGNING_ENABLED)
+            output.signing_requirement = self._read_flag(
+                security_mode, SMBv23Flags.SMB2_NEGOTIATE_SIGNING_REQUIRED)
+            output.encryption_support = self._read_flag(
+                capabilities, SMBv23Flags.SMB2_GLOBAL_CAP_ENCRYPTION)
+            output.session_encryption_requirement = self._read_flag(
+                session_flags, SMBv23Flags.SMB2_SESSION_FLAG_ENCRYPT_DATA)
+            output.null_session = self._read_flag(
+                session_flags, SMBv23Flags.SMB2_SESSION_FLAG_IS_NULL)
             
+            self.ctx.debug(f"signing_support = {output.signing_support}")
+            self.ctx.debug(f"signing_requirement = {output.signing_requirement}")
+            self.ctx.debug(f"encryption_support = {output.encryption_support}")
+            self.ctx.debug(f"session_encryption_requirement = {output.session_encryption_requirement}")
+            self.ctx.debug(f"does_support_NTLMv2 = {output.does_support_NTLMv2}")
+            self.ctx.debug(f"is_login_required = {output.is_login_required}")
+            self.ctx.debug(f"null_session = {output.null_session}")
+            self.ctx.debug(f"guest_session = {output.guest_session}")
+
         self.ctx.debug("Server connection done")

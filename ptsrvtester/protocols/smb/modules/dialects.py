@@ -29,34 +29,26 @@ __MODULELABEL__ = "Dialects used by target"
 __MODULECODE__ = "DIALECTS"
 __ORDER__ = 11
 
-from ..smb_utils.server_connection import ServerConnection
-from ..smb_utils.helpers import SMBResults
 from ptsrvtester.protocols._base import ModuleContext
+from ._common import get_output
 
 
 def run(ctx: ModuleContext) -> None:
     ctx.debug("Running test: " + __MODULECODE__)
-    ip, port = ctx.target
-    output: SMBResults = ctx.output
-
-    sc = ServerConnection(ctx)
-    if not output.has_ran:
-        ctx.out(f"IP address:              {ip}", "INFO", indent=4)
-        ctx.out(f"Port:                    {port}", "INFO", indent=4)
-        sc.connect()
-    
-    if output.had_error:
-        ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
+    output = get_output(ctx)
+    if output is None:
         return
     
+    first = True
     for dialect, supported in output.open_dialects.items():
         if not supported:
             continue
-
         if dialect == "SMBv1":
             cat = "VULN"
         elif dialect in ["SMBv2.0", "SMBv2.1"]:
             cat = "WARNING"
         else:
             cat = "NOTVULN"
-        ctx.out(dialect, category=cat, condition=True, indent=4)
+        ctx.out(f"{dialect} {"(used for communication)" if first else ""}", category=cat, condition=True, indent=4)
+        ctx.out("SMBv1 is generally considered unsafe", "WARNING", indent=4, condition=dialect == "SMBv1")
+        first = False

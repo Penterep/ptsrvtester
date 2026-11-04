@@ -29,9 +29,8 @@ __MODULELABEL__ = "Information about target"
 __MODULECODE__ = "INFO"
 __ORDER__ = 10
 
-from ..smb_utils.server_connection import ServerConnection
-from ..smb_utils.helpers import SMBResults
 from ptsrvtester.protocols._base import ModuleContext
+from ._common import get_output
 
 
 def win_version_translate(ver: str) -> str:
@@ -113,19 +112,9 @@ def win_version_translate(ver: str) -> str:
 
 def run(ctx: ModuleContext) -> None:
     ctx.debug("Running test: " + __MODULECODE__)
-    ip, port = ctx.target
-    output: SMBResults = ctx.output
-
-    sc = ServerConnection(ctx)
-    if not output.has_ran:
-        ctx.out(f"IP address:              {ip}", "INFO", indent=4)
-        ctx.out(f"Port:                    {port}", "INFO", indent=4)
-        sc.connect()
-    
-    if output.had_error:
-        ctx.out(f"Could not connect to server: {output.error_info}", "ERROR", indent=4)
+    output = get_output(ctx)
+    if output is None:
         return
-
 
     ctx.debug("Parsing received OS version into one string")
     # OS version parsing
@@ -133,7 +122,7 @@ def run(ctx: ModuleContext) -> None:
     
     os_version = ""
     for piece in os_info:
-        if piece != "unknown":
+        if piece != "unknown" and piece:
             os_version += "." + str(piece)
         else:
             break

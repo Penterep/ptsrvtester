@@ -1,8 +1,9 @@
-"""SMB message-signing configuration."""
+"""SMB message-signing support."""
 
-__MODULELABEL__ = "Message signing"
+__MODULELABEL__ = "SMB message signing support"
 __MODULECODE__ = "SIGNING"
-__ORDER__ = 13
+__ORDER__ = 1
+__RUN_IN_ALL__ = False
 
 from ._common import get_output
 from ptsrvtester.protocols._base import ModuleContext
@@ -14,12 +15,16 @@ def run(ctx: ModuleContext) -> None:
     if output is None:
         return
 
-    if output.signing_requirement is True:
-        category, msg = "OK", "Mandatory"
-    elif output.signing_support is True:
-        category, msg = "WARNING", "Available but optional"
+    if output.signing_requirement:
+        category = "OK"
+        msg = "Mandatory"
+    elif output.signing_support:
+        category = "WARNING"
+        msg = "Available but optional"
     elif output.signing_requirement is None or output.signing_support is None:
-        category, msg = "WARNING", "Unknown"
+        category = "WARNING"
+        msg = "Unknown"
     else:
-        category, msg = "VULN", "Not supported or enforced"
+        category = "VULN"
+        msg = "Unsupported"
     ctx.out(f"Message signing:         {msg}", category, indent=4)

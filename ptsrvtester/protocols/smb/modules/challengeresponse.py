@@ -1,8 +1,9 @@
 """SMB1 challenge-response password support."""
 
-__MODULELABEL__ = "Challenge-response authentication"
+__MODULELABEL__ = "SMB challenge-response authentication"
 __MODULECODE__ = "CHALLENGERESPONSE"
-__ORDER__ = 17
+__ORDER__ = 1
+__RUN_IN_ALL__ = False
 
 from ._common import get_output
 from ptsrvtester.protocols._base import ModuleContext

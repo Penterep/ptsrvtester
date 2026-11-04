@@ -2,7 +2,8 @@
 
 __MODULELABEL__ = "Authentication level"
 __MODULECODE__ = "AUTHLEVEL"
-__ORDER__ = 16
+__ORDER__ = 1
+__RUN_IN_ALL__ = False
 
 from ._common import get_output
 from ptsrvtester.protocols._base import ModuleContext
@@ -15,8 +16,10 @@ def run(ctx: ModuleContext) -> None:
         return
 
     if output.used_dialect != "SMBv1":
-        ctx.out("Only relevant for SMBv1", "INFO", indent=4)
-    elif output.user_level_auth is None:
+        ctx.out("Authentication level:    Only relevant for SMBv1", "INFO", indent=4)
+        return
+
+    if output.user_level_auth is None:
         category = "WARNING"
         msg = "Unknown"
     elif output.user_level_auth:

@@ -20,7 +20,7 @@ class SMBArgs(BaseArgs):
             {"options": [
                 ["-h", "--help", "", "Prints this menu"],
                 ["-tg", "--target", "<target>", "IP[:PORT] or HOST[:PORT] (e.g. 127.0.0.1 or localhost:445); If PORT is left empty, 445 is default"],
-                ["-ts", "--tests", "<test>", "Comma-separated test codes (e.g. info,dialects) or ALL", "Options: info, dialects, security, signing, encryption, login, authlevel, challengeresponse"],
+                ["-ts", "--tests", "<test>", "Comma-separated test codes (e.g. info,dialects) or ALL", "Options: info, dialects, security, signing, encryption, ntlmv2, login, null, guest, authlevel, challenge"],
                 ["-u", "--username", "<username>", "Username used for login attempt"],
                 ["-p", "--password", "<password>", "Password used for login attempt"],
             ]},
@@ -53,7 +53,7 @@ ptsrvtester smb -h"""
         
         parser.add_argument(
             "-ts", "--tests", type=str, default=None, metavar="<test>", dest="tests",
-            help="Comma-separated test codes (e.g. info,dialects) or ALL. Options: info, dialects, security, signing, encryption, login, authlevel, challengeresponse",
+            help="Comma-separated test codes (e.g. info,dialects) or ALL. Options: info, dialects, security, signing, encryption, ntlmv2, login, null, guest, authlevel, challenge",
         )
         
         parser.add_argument(

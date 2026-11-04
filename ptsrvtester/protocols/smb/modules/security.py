@@ -43,17 +43,29 @@ from ._common import get_output
 
 def run(ctx: ModuleContext) -> None:
     ctx.debug("Running test: " + __MODULECODE__)
-    if get_output(ctx) is None:
+    output = get_output(ctx)
+    if output is None:
         return
 
-    for run_test in (
-        run_signing,
-        run_encryption,
-        run_ntlmv2,
-        run_login,
-        run_null,
-        run_guest,
-        run_authlevel,
-        run_challengeresponse,
-    ):
-        run_test(ctx)
+    smb_dialects = [
+        "SMBv1",
+        "SMBv2.0",
+        "SMBv2.1",
+        "SMBv3.0",
+        "SMBv3.0.2",
+        "SMBv3.1.1",
+    ]
+    tests = {
+        run_signing: smb_dialects,
+        run_encryption: ["SMBv3.0", "SMBv3.0.2", "SMBv3.1.1"],
+        run_ntlmv2: smb_dialects,
+        run_login: smb_dialects,
+        run_null: smb_dialects,
+        run_guest: smb_dialects,
+        run_authlevel: ["SMBv1"],
+        run_challengeresponse: ["SMBv1"],
+    }
+
+    for test, dialects in tests.items():
+        if output.used_dialect in dialects:
+            test(ctx)

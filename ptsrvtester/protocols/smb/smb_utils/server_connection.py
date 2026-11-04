@@ -118,6 +118,12 @@ class ServerConnection():
             output.error_info = "error during dialect scan: " + str(e)
             return
 
+        if nm_dialects == []:
+            self.ctx.debug("No supported dialects found")
+            output.had_error = True
+            output.error_info = "No supported dialects found"
+            return
+
         self.ctx.debug("Found supported dialects")
 
         for dialect in nm_dialects:
@@ -131,6 +137,7 @@ class ServerConnection():
                 sess_port=port,
                 # TODO: check if I might have to try more dialects than the first accepted
                 preferredDialect=self.dial_str_converter(nm_dialects[0]), # lowest accepted dialect
+                # TODO: add option to choose custom dialect
                 timeout=timeout
             )
 

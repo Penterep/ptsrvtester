@@ -147,9 +147,9 @@ def _get_server_info(ctx, src_mac: str, broadcast=False):
         sendp(discover, ctx.interface, verbose=False)
 
         sniffer.join()
-        res = sniffer.results
+        res = sniffer.results or []
 
-        if res is None or len(res) == 0:
+        if len(res) == 0:
             ctx.out("No DHCP server information accessible", "OK", indent=8)
         return res
 

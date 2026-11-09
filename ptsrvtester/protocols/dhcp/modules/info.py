@@ -50,15 +50,23 @@ def _is_packet_broadcast(pkt) -> str:
     return ""
         
 
+def to_int(s):
+    a, b, c, d = map(int, s.split("."))
+    return (a << 24) | (b << 16) | (c << 8) | d
 
-def _is_relay(offered_ip: str|None, server_ip: str, subnet_mask: str|None):
+def same_network(ip1, ip2, mask):
+    m = to_int(mask)
+    return (to_int(ip1) & m) == (to_int(ip2) & m)
+
+def _is_relay(server_id: str|None, src_ip: str, giaddr: str|None, offered_ip: str|None, subnet_mask: str):
     """Checks if the offered IP address is on the same network as the DHCP server"""
-    if offered_ip is None or subnet_mask is None:
+    if server_id is None or giaddr is None:
         return False
 
-    n_octets = len(list(filter(lambda a: a != '0', subnet_mask.split('.'))))
-
-    return offered_ip.split('.')[:n_octets] != server_ip.split('.')[:n_octets]
+    if src_ip != server_id or giaddr != "0.0.0.0" or not same_network(server_id, offered_ip, subnet_mask):
+        return True
+    
+    return False
 
 
 def _contact_server(ctx, src_mac: str, router_ip: str, server_ip, xid):
@@ -117,12 +125,21 @@ def _get_server_info(ctx, src_mac: str, broadcast=False):
                 options = packet[DHCP].options
                 delivery_method = _is_packet_broadcast(packet)
                 options.insert(1, ("delivery_method", delivery_method))
-                ctx.out(f"DHCP offer received DHCP Server Information:", "VULN", indent=8)
+                options.insert(2, ("offered_ip", offered_ip))
+                
+                b_type = "INFO"
+                if delivery_method == "BROADCAST" and not broadcast:
+                    b_type = "VULN"
+                    ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-DHCP-RELAY", 
+                                                    poc=f"The broadcast flag was not set and the destination MAC was: ff:ff:ff:ff:ff:ff\r\n")
+                    
+                
+                ctx.out(f"DHCP offer received DHCP Server Information:", b_type, indent=8)
                 print_dhcp_options(ctx, options, 8)
                 
                 if server_ip := get_option(options, "server_id"):   # Check if the server is a relay
-                    if _is_relay(offered_ip, server_ip, get_option(options, "subnet_mask")):
-                        ctx.out(f"DHCP relay detected", "INFO", indent=16)
+                    if _is_relay(server_ip, packet[IP].src, get_option(options, "giaddr"), offered_ip, get_option(options, "subnet_mask")):
+                        ctx.out(f"DHCP relay detected", "WARNING", indent=16)
                         ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-DHCP-RELAY", poc=f"Offered IP {offered_ip} in not on the server network {server_ip}")
                         _contact_server(ctx, src_mac, get_option(options, "router"),
                                         get_option(options, "server_id"), transaction_id)
@@ -147,9 +164,9 @@ def _get_server_info(ctx, src_mac: str, broadcast=False):
         sendp(discover, ctx.interface, verbose=False)
 
         sniffer.join()
-        res = sniffer.results
+        res = sniffer.results or []
 
-        if res is None or len(res) == 0:
+        if len(res) == 0:
             ctx.out("No DHCP server information accessible", "OK", indent=8)
         return res
 

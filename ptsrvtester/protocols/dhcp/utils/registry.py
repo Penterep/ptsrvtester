@@ -5,6 +5,7 @@ import re
 import argparse
 import netifaces as ni
 from ptlibs.ptjsonlib import PtJsonLib
+from ipaddress import ip_address
 
 # DHCP dependencies
 try:
@@ -218,13 +219,26 @@ def check_lease(lease) -> bool:
     """Checks if lease duration is 30 days or more"""
     return int(lease) >= 2592000
 
-
 def print_dhcp_options(ctx, options, base_indent) -> None:
+    def _is_global_ip(ip: str):
+        try:
+            parsed_ip = ip_address(ip)
+            return not parsed_ip.is_private
+        except Exception as e:
+            return False
+            
+    vuln_options = ["name_server"]
+    
     for o in range(1, len(options)):
-        b_type = "INFO"
-        if options[o] == "end":
-            break
+        b_type = "OK"
         option = options[o]
+        
+        if option in vuln_options:
+            b_type = "VULN"    
+        
+        if option == "end":
+            break
+        
         if isinstance(option, tuple):
             key, *values = option
             value_str = ", ".join(str(v) for v in values)
@@ -233,7 +247,14 @@ def print_dhcp_options(ctx, options, base_indent) -> None:
 
         if key == "lease_time" and check_lease(value_str):
             ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-DHCP-LEASE", poc=f"lease_time: {value_str}")
-            b_type = "WARN"
+            b_type = "VULN"
+        
+        if key in vuln_options:
+            b_type = "VULN"
+            
+        if _is_global_ip(value_str):
+            b_type = "VULN"
+            ctx.ptjsonlib.add_vulnerability(vuln_code="PTV-SVC-DHCP-EXT ", poc=f"{key}: {value_str}")
 
         option_num = get_option_number(key)
         numbered_key = f"{key} ({option_num})" if option_num else key

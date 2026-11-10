@@ -25,7 +25,17 @@ FTP_TESTS: dict[str, dict] = {
     "CMD": {
         "desc": "Grab HELP / SYST / STAT and SITE extensions",
         "long": ["List commands from HELP, plus the SYST and STAT replies.",
-                 "When SITE is advertised, list the extensions from SITE HELP."],
+                 "A 530 reply means login is required, not that the command is missing.",
+                 "With -A or -u/-p, read the list again after login.",
+                 "When SITE is advertised, list the extensions from SITE HELP.",
+                 "SITE CHMOD, CHOWN, CPFR/CPTO, SYMLINK and UMASK use their own codes.",
+                 "SITE EXEC is a finding only when command execution is shown.",
+                 "Other warning commands are reported as PTV-SVC-FTP-CMD."],
+        "mods": [
+            ["-A", "--anonymous", "", "Also read the command list after anonymous login"],
+            ["-u", "--user", "<name>", "Also read the command list after this login"],
+            ["-p", "--password", "[password]", "Password"],
+        ],
     },
     "ENCRYPT": {
         "desc": "Test encryption options (plaintext / AUTH TLS / implicit TLS)",
@@ -122,16 +132,24 @@ FTP_TESTS: dict[str, dict] = {
     },
     "MODES": {
         "desc": "Passive/active data modes + PASV IP leak",
-        "long": ["Test passive and active data mode availability and detect PASV",
-                 "IP address leakage."],
-        "requires": ["credentials (-A or -u/-p)"],
+        "long": ["Before login, check whether PASV, EPSV, PORT and EPRT are accepted.",
+                 "With -A or -u/-p, repeat them after login and try one data transfer.",
+                 "A 227 or 200 reply means the command is supported, not that data was transferred."],
+        "mods": [
+            ["-A", "--anonymous", "", "Also repeat the commands after anonymous login"],
+            ["-u", "--user", "<name>", "Also repeat the commands after this login"],
+            ["-p", "--password", "[password]", "Password"],
+        ],
     },
     "PASVPORT": {
         "desc": "Passive data port spread audit",
-        "long": ["Repeated passive LIST transfers to check whether data ports stay",
-                 "in a narrow, predictable range."],
-        "requires": ["credentials (-A or -u/-p)"],
+        "long": ["Read the data port from PASV 227 and EPSV 229, before login.",
+                 "With -A or -u/-p, repeat after login. A 530 reply assigns no port.",
+                 "LIST is not required to measure the range."],
         "mods": [
+            ["-A", "--anonymous", "", "Also measure the range after anonymous login"],
+            ["-u", "--user", "<name>", "Also measure the range after this login"],
+            ["-p", "--password", "[password]", "Password"],
             ["", "--pasv-port-audit-samples", "<n>", "Samples (default: 8, min 4)"],
             ["", "--pasv-port-audit-max-span", "<n>", "Max acceptable port span (default: 8192)"],
         ],
@@ -202,7 +220,7 @@ FTP_TESTS: dict[str, dict] = {
 
 # Login is required (-A or -u/-p). Shown in Options, not only in Requires.
 _FTP_CRED_TESTS = frozenset({
-    "ACCESS", "ENUMPATH", "MODES", "PASVPORT", "CMDAUDITACTIVE", "DOS", "CHROOT", "EICAR",
+    "ACCESS", "ENUMPATH", "CMDAUDITACTIVE", "DOS", "CHROOT", "EICAR",
 })
 _FTP_LOGIN_OPTS = (
     ["-A", "--anonymous", "", "Anonymous login"],

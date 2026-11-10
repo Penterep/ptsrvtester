@@ -7,12 +7,6 @@ from ..utils.helpers import apply_default_brute_creds
 from ._common import eng
 
 
-def _section(ctx, title: str) -> None:
-    if getattr(ctx, "json", False):
-        return
-    ctx.out(title, "INFO", colortext=True)
-
-
 def _remember(e, test: str) -> None:
     runs = getattr(e, "_auth_probe_runs", None)
     if runs is None:
@@ -36,7 +30,6 @@ def run_auth_guess(ctx, test: str) -> None:
 
     apply_default_brute_creds(ctx.args)
     e._auth_guess_done = True
-    _section(ctx, "Guessing (credential bruteforce)")
     e.login_bruteforce()
     _remember(e, test)
     e._stream_brute_result(focus=focus)

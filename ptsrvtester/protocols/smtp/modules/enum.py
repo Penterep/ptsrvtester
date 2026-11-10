@@ -1,6 +1,5 @@
 """ENUM — VRFY / EXPN / RCPT user enumeration."""
-import os, queue, random, re, smtplib, socket, sys, threading, time
-from typing import Callable
+import queue, random, re, smtplib, socket, sys, threading, time
 
 from ptlibs.ptprinthelper import out_if
 
@@ -214,34 +213,48 @@ def _expn_vrfy_result_strings(reply_str: str) -> list[str]:
     return []
 
 
-def _smtp_command_streaming(smtp, cmd: str, args: str, on_first_hit=None, debug: bool=False, dbg: Callable[[str], None] | None=None) -> tuple[int, bytes]:
+def _enum_reply_text(status: int, reply) -> str:
+    """One SMTP reply line from a ``docmd`` result. The code stays on the text."""
+    if isinstance(reply, bytes):
+        body = reply.decode('utf-8', errors='replace')
+    else:
+        body = str(reply or '')
+    body = body.replace('\r\n', '\n').replace('\r', '\n').strip()
+    if not body:
+        return str(status)
+    if body.startswith(str(status)):
+        return body
+    return f'{status} {body}'
+
+
+def _enum_vv_exchange(e, send: str, lines: list[str]) -> None:
+    """``-vv`` only. The lines are the reply the server actually sent."""
+    if not getattr(e.args, 'debug', False):
+        return
+    e._enum_progress_newline()
+    e.ptdebug(f'Send: {send}')
+    if not lines:
+        e.ptdebug('Receive: (no reply)')
+        return
+    e.ptdebug(f'Receive: {lines[0]}')
+    for line in lines[1:]:
+        e.ptdebug(line)
+
+
+def _smtp_command_streaming(smtp, cmd: str, args: str, on_first_hit=None, raw_lines: list[str] | None=None) -> tuple[int, bytes]:
     """Send SMTP command and call on_first_hit(line_bytes) on the very first positive
         (non-5xx) response line – before reading continuation lines.
         Returns (errcode, reply_bytes) identical to smtplib.SMTP.docmd.
         Falls back to smtp.docmd when the underlying file object is not accessible.
-
-        debug=True (-vv) enables timestamped tracing; pass ``dbg`` as ``self.ptdebug``
-        so lines use the same ADDITIONS styling and indent as other verbose output.
-        If ``dbg`` is omitted, falls back to writing raw bytes to stderr (fd 2)."""
+        ``raw_lines`` receives each server line, including the reply code."""
     _MAXLINE: int = getattr(smtplib, '_MAXLINE', 8192)
-
-    def _dbg(msg: str) -> None:
-        if debug:
-            ts = time.perf_counter()
-            text = f'[DBG enum {ts:.3f}] {msg}'
-            if dbg is not None:
-                dbg(text)
-            else:
-                os.write(2, (text + '\n').encode('utf-8', errors='replace'))
     file = getattr(smtp, 'file', None)
     if file is None:
-        _dbg(f'no file object, falling back to docmd({cmd!r})')
         status, reply = smtp.docmd(cmd, args)
+        if raw_lines is not None:
+            raw_lines.append(_enum_reply_text(status, reply))
         if on_first_hit is not None and (not 500 <= status <= 599):
-            _dbg('calling on_first_hit (docmd fallback)')
-            t0 = time.perf_counter()
             on_first_hit(reply[:512] if isinstance(reply, bytes) else reply)
-            _dbg(f'on_first_hit done ({time.perf_counter() - t0:.3f}s)')
             try:
                 sys.stdout.flush()
             except Exception:
@@ -254,32 +267,26 @@ def _smtp_command_streaming(smtp, cmd: str, args: str, on_first_hit=None, debug:
     except (OSError, AttributeError):
         pass
     smtp.putcmd(cmd, args)
-    _dbg(f'putcmd sent: {cmd} {args!r}')
     resp: list[bytes] = []
     first_hit_fired = False
     code = -1
-    line_no = 0
     while True:
-        line_no += 1
-        t_rl = time.perf_counter()
         try:
             line = file.readline(_MAXLINE + 1)
         except (TimeoutError, socket.timeout):
-            _dbg(f'readline #{line_no} TIMEOUT after {time.perf_counter() - t_rl:.3f}s (resp so far: {len(resp)} lines)')
             if resp:
                 break
             raise smtplib.SMTPServerDisconnected('SMTP readline timed out')
         except OSError as ex:
-            _dbg(f'readline #{line_no} OSError after {time.perf_counter() - t_rl:.3f}s: {ex}')
             raise smtplib.SMTPServerDisconnected(f'Connection unexpectedly closed: {ex}')
-        _dbg(f'readline #{line_no} took {time.perf_counter() - t_rl:.3f}s → {repr(line[:40])}')
         if not line:
-            _dbg(f'readline #{line_no} returned empty (server closed connection)')
             if resp:
                 break
             raise smtplib.SMTPServerDisconnected('Connection unexpectedly closed')
         if len(line) > _MAXLINE:
             raise smtplib.SMTPResponseException(500, b'Line too long')
+        if raw_lines is not None:
+            raw_lines.append(line.rstrip(b'\r\n').decode('utf-8', errors='replace'))
         resp.append(line[4:].strip(b' \t\r\n'))
         try:
             code = int(line[:3])
@@ -287,19 +294,13 @@ def _smtp_command_streaming(smtp, cmd: str, args: str, on_first_hit=None, debug:
             code = -1
         if not first_hit_fired and on_first_hit is not None and (code != -1) and (not 500 <= code <= 599):
             first_hit_fired = True
-            _dbg(f'calling on_first_hit (code={code})')
-            t0 = time.perf_counter()
             on_first_hit(line[4:].strip(b' \t\r\n'))
-            _dbg(f'on_first_hit done ({time.perf_counter() - t0:.3f}s)')
             try:
                 sys.stdout.flush()
             except Exception:
                 pass
-        is_last = line[3:4] != b'-'
-        _dbg(f'line #{line_no} code={code} last={is_last} char4={repr(line[3:4])}')
-        if is_last:
+        if line[3:4] != b'-':
             break
-    _dbg(f'streaming done: code={code} lines={len(resp)}')
     return (code, b'\n'.join(resp))
 
 
@@ -329,12 +330,6 @@ def _rcpt_reply_has_unknown(reply) -> bool:
     if isinstance(reply, bytes):
         return b'UNKNOWN' in reply.upper()
     return 'UNKNOWN' in str(reply).upper()
-
-
-def _enum_vv_dbg(e, msg: str) -> None:
-    """Print one -vv enum trace on its own line. Drop the live progress row first."""
-    e._enum_progress_newline()
-    e.ptdebug(msg)
 
 
 def _enum_finding_text(payload: str, *, detail: bool = False, indent: int | None = None) -> str:
@@ -389,8 +384,7 @@ def expn_vrfy_enumeration(e, method, smtp) -> list[str]:
                 smtp.command_encoding = 'utf-8'
             reconnect_after = getattr(e.args, 'enum_reconnect_after', None)
             consecutive_failures = 0
-            _enum_stream_debug = getattr(e.args, 'debug', False)
-            _enum_stream_dbg = (lambda m: _enum_vv_dbg(e, m)) if _enum_stream_debug else None
+            show_vv = bool(getattr(e.args, 'debug', False))
 
             def _do_enum_reconnect() -> None:
                 """Reconnect to reset accumulated teergrube / rate-limit state.
@@ -424,17 +418,25 @@ def expn_vrfy_enumeration(e, method, smtp) -> list[str]:
                     _first_preview.append(display)
                     if not e.use_json:
                         _enum_streaming_emit_first_finding(e, _i, wl_total, display)
+                lines: list[str] = []
+                sent = f'{method} {user}'
+                early_hit = None if (e.use_json or show_vv) else _on_first_hit
+                completed = False
                 try:
-                    status, reply = _smtp_command_streaming(smtp, method, user, on_first_hit=None if e.use_json else _on_first_hit, debug=_enum_stream_debug, dbg=_enum_stream_dbg)
+                    status, reply = _smtp_command_streaming(smtp, method, user, on_first_hit=early_hit, raw_lines=lines)
+                    completed = True
                 except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as ex:
+                    _enum_vv_exchange(e, sent, lines)
                     e.ptdebug(f'{method} enumeration interrupted (connection closed/reset): {ex}', Out.INFO)
                     _first_preview.clear()
+                    lines = []
                     try:
                         smtp = e.get_smtp_handler(timeout=10.0)
                         smtp.docmd('EHLO', f'{e.fqdn}')
                         if supports_smtputf8:
                             smtp.command_encoding = 'utf-8'
-                        status, reply = _smtp_command_streaming(smtp, method, user, on_first_hit=None if e.use_json else _on_first_hit, debug=_enum_stream_debug, dbg=_enum_stream_dbg)
+                        status, reply = _smtp_command_streaming(smtp, method, user, on_first_hit=early_hit, raw_lines=lines)
+                        completed = True
                         try:
                             smtp.sock.settimeout(15.0)
                         except Exception:
@@ -451,6 +453,8 @@ def expn_vrfy_enumeration(e, method, smtp) -> list[str]:
                 finally:
                     if not e.use_json and enum_threads <= 1:
                         e._enum_wait_end()
+                if completed:
+                    _enum_vv_exchange(e, sent, lines)
                 if status != 550:
                     preview = _first_preview[0] if _first_preview else _expn_vrfy_quick_display(reply, user)
                     if not _first_preview and (not e.use_json):
@@ -488,8 +492,6 @@ def expn_vrfy_enumeration(e, method, smtp) -> list[str]:
                 user_queue.put(None)
             result_lock = threading.Lock()
             progress = ThreadedProgress(work_total, enabled=not e.use_json)
-            _enum_stream_debug = getattr(e.args, 'debug', False)
-            _enum_stream_dbg = (lambda m: _enum_vv_dbg(e, m)) if _enum_stream_debug else None
 
             def worker() -> None:
                 conn = None
@@ -508,17 +510,22 @@ def expn_vrfy_enumeration(e, method, smtp) -> list[str]:
                                     conn.command_encoding = 'utf-8'
                             except Exception:
                                 continue
+                        lines: list[str] = []
+                        sent = f'{method} {user}'
                         try:
-                            status, reply = _smtp_command_streaming(conn, method, user, on_first_hit=None, debug=_enum_stream_debug, dbg=_enum_stream_dbg)
+                            status, reply = _smtp_command_streaming(conn, method, user, on_first_hit=None, raw_lines=lines)
                         except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
+                            _enum_vv_exchange(e, sent, lines)
                             try:
                                 conn = e.get_smtp_handler()
                                 conn.docmd('EHLO', f'{e.fqdn}')
                                 if supports_smtputf8:
                                     conn.command_encoding = 'utf-8'
                                 status, reply = conn.docmd(method, user)
+                                lines = [_enum_reply_text(status, reply)]
                             except Exception:
                                 continue
+                        _enum_vv_exchange(e, sent, lines)
                         if status != 550:
                             preview = _expn_vrfy_quick_display(reply, user)
                             reply_str = e.bytes_to_str(reply)
@@ -851,19 +858,27 @@ def rcpt_enumeration(e, smtp) -> list[str]:
                 if _skip(local):
                     continue
                 label = f'{local}@{domain}'
+                sent = f'RCPT TO:<{local}@{domain}>'
+                rcpt_arg = f'<{local}@{domain}>'
                 if not e.use_json:
                     e._enum_wait_begin(idx, wl_total, local)
+                lines: list[str] = []
+                completed = False
                 try:
-                    status, reply = smtp.docmd('RCPT TO:', f'<{local}@{domain}>')
+                    status, reply = _smtp_command_streaming(smtp, 'RCPT TO:', rcpt_arg, raw_lines=lines)
+                    completed = True
                 except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError) as ex:
+                    _enum_vv_exchange(e, sent, lines)
                     e.ptdebug(f'RCPT enumeration interrupted (connection closed/reset): {ex}', Out.INFO)
+                    lines = []
                     try:
                         smtp = e.get_smtp_handler(timeout=10.0)
                         smtp.docmd('EHLO', f'{e.fqdn}')
                         if supports_smtputf8:
                             smtp.command_encoding = 'utf-8'
                         e._try_mail_from_for_rcpt_probe(smtp, domain)
-                        status, reply = smtp.docmd('RCPT TO:', f'<{local}@{domain}>')
+                        status, reply = _smtp_command_streaming(smtp, 'RCPT TO:', rcpt_arg, raw_lines=lines)
+                        completed = True
                         try:
                             smtp.sock.settimeout(15.0)
                         except Exception:
@@ -881,6 +896,8 @@ def rcpt_enumeration(e, smtp) -> list[str]:
                 finally:
                     if not e.use_json and enum_threads <= 1:
                         e._enum_wait_end()
+                if completed:
+                    _enum_vv_exchange(e, sent, lines)
                 if status != 550 and (not _rcpt_reply_has_unknown(reply)):
                     if not e.use_json:
                         _print_enum_finding(e, idx, wl_total, label)
@@ -925,18 +942,24 @@ def rcpt_enumeration(e, smtp) -> list[str]:
                                 e._try_mail_from_for_rcpt_probe(conn, domain)
                             except Exception:
                                 continue
+                        lines: list[str] = []
+                        sent = f'RCPT TO:<{local}@{domain}>'
+                        rcpt_arg = f'<{local}@{domain}>'
                         try:
-                            status, reply = conn.docmd('RCPT TO:', f'<{local}@{domain}>')
+                            status, reply = _smtp_command_streaming(conn, 'RCPT TO:', rcpt_arg, raw_lines=lines)
                         except (smtplib.SMTPServerDisconnected, ConnectionResetError, OSError):
+                            _enum_vv_exchange(e, sent, lines)
                             try:
                                 conn = e.get_smtp_handler()
                                 conn.docmd('EHLO', f'{e.fqdn}')
                                 if supports_smtputf8:
                                     conn.command_encoding = 'utf-8'
                                 e._try_mail_from_for_rcpt_probe(conn, domain)
-                                status, reply = conn.docmd('RCPT TO:', f'<{local}@{domain}>')
+                                lines = []
+                                status, reply = _smtp_command_streaming(conn, 'RCPT TO:', rcpt_arg, raw_lines=lines)
                             except Exception:
                                 continue
+                        _enum_vv_exchange(e, sent, lines)
                         if status != 550 and (not _rcpt_reply_has_unknown(reply)):
                             if e.use_json:
                                 e.ptdebug(label)

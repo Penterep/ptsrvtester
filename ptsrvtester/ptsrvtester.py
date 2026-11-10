@@ -31,7 +31,6 @@ from .protocols._shared.utils.cli import add_shared_rate_limit_args
 from ._version import __version__
 from .protocols._base import BaseArgs
 
-
 SCRIPTNAME = "ptsrvtester"
 
 MODULES: dict[str, tuple[str, str]] = {
@@ -64,10 +63,7 @@ class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
     """Keep fatal errors structured and allow informational communication output.
 
     Default errors include an 'Error:' prefix. TITLE uses a plain message and an
-    information bullet. Only ``end_error`` (the fatal path) is customised for the
-    terminal output; all JSON state is held and mutated through the inherited
-    ``ptlibs.ptjsonlib.PtJsonLib`` object and its methods (``set_status``,
-    ``add_node``, ``add_vulnerability``, ``add_to_log``, …).
+    information bullet; both retain JSON status=error and empty result objects.
     """
 
     def end_error(self, message, condition, details=None, *, category="ERROR"):
@@ -83,7 +79,11 @@ class PtsrvtesterJsonLib(ptjsonlib.PtJsonLib):
         if details:
             from ptlibs.ptprinthelper import get_colored_text
             ptprint("    " + out_ifnot(f"{get_colored_text(details, 'ADDITIONS')}", "TEXT", condition))
-        self.set_status("error", full_msg)
+        self.json_object["status"] = "error"
+        self.json_object["message"] = full_msg
+        self.json_object["results"]["nodes"] = []
+        self.json_object["results"]["properties"] = {}
+        self.json_object["results"]["vulnerabilities"] = []
         ptprint(out_if(self.get_result_json(), None, condition))
         if not condition:
             sys.stdout.write("\033[?25h")
@@ -212,9 +212,22 @@ def _print_module_help(name: str, argv: list[str]) -> None:
     ptprinthelper.help_print(help_obj, f"{SCRIPTNAME} {name}", __version__)
 
 
+def _json_requested(argv: list[str]) -> bool:
+    """True when -j/--json is present. Parsing may have failed before args exist."""
+    return any(tok in ("-j", "--json") for tok in argv)
+
+
+def _json_error(message: str) -> None:
+    """Return a fatal error as JSON and stop. Does not return."""
+    PtsrvtesterJsonLib().end_error(message, True)
+
+
 def _error_unknown_module(name: str) -> None:
+    message = f"Unknown module '{name}'"
+    if _json_requested(sys.argv[1:]):
+        _json_error(message)
     ptprinthelper.print_banner(SCRIPTNAME, __version__, False)
-    print(f"\n\033[31m[✗]\033[0m Error: Unknown module '{name}'")
+    print(f"\n\033[31m[✗]\033[0m Error: {message}")
     print(f"\nAvailable modules: {', '.join(MODULES.keys())}")
     print(f"\nUse 'ptsrvtester -h' for help.\n")
 
@@ -305,8 +318,11 @@ def parse_args() -> BaseArgs:
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else 2
         if code != 0:
+            message = _friendly_error(_LAST_ERROR["message"])
+            if _json_requested(argv):
+                _json_error(message)
             ptprinthelper.print_banner(SCRIPTNAME, __version__, False)
-            print(f"\n\033[31m[✗]\033[0m Error: {_friendly_error(_LAST_ERROR['message'])}")
+            print(f"\n\033[31m[✗]\033[0m Error: {message}")
             print()
         sys.exit(code)
 
@@ -321,10 +337,14 @@ def main() -> None:
     try:
         script.run()
     except argparse.ArgumentError as e:
+        if getattr(args, "json", False):
+            _json_error(str(e.message))
         print(f"\n\033[31m[✗]\033[0m Error: {e.message}")
         print()
         sys.exit(2)
     except OSError as e:
+        if getattr(args, "json", False):
+            _json_error(str(e))
         print(f"\n\033[31m[✗]\033[0m {e}")
         print()
         sys.exit(1)

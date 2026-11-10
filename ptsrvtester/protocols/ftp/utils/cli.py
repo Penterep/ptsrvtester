@@ -187,7 +187,7 @@ def validate_ftp_selection(args) -> None:
             depth = 1
         if int(depth) < 1:
             raise argparse.ArgumentError(None, "--depth must be >= 1")
-    need_creds = {"ACCESS", "ENUMPATH", "MODES", "PASVPORT", "CMDAUDITACTIVE", "DOS", "CHROOT", "EICAR"} & set(codes)
+    need_creds = {"ACCESS", "ENUMPATH", "CMDAUDITACTIVE", "DOS", "CHROOT", "EICAR"} & set(codes)
     # ACCESS/EICAR etc. may rely on -ts ANON in the same run (results.anonymous) — allow ANON+ACCESS
     if need_creds and not _has_creds(args) and "ANON" not in codes:
         raise argparse.ArgumentError(

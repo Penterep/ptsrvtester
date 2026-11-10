@@ -268,13 +268,29 @@ class EncryptionResult(NamedTuple):
     plaintext_banner: str | None = None
 
 
+class ModeCommandProbe(NamedTuple):
+    """One PASV, EPSV, PORT or EPRT reply, before or after login."""
+
+    phase: str
+    command: str
+    code: int | None
+    reply: str | None
+    kind: str
+
+
 class ModesResult(NamedTuple):
-    """Result of passive/active mode availability test."""
-    passive_ok: bool
-    active_ok: bool
-    pasv_ip_leak: str | None = None  # leaked internal IP from 227 if differs from target
-    passive_error: str | None = None
-    active_error: str | None = None
+    """Command support, then a data transfer only after a successful login."""
+
+    probes: tuple[ModeCommandProbe, ...] = ()
+    passive_transfer: str | None = None
+    active_transfer: str | None = None
+    passive_transfer_reply: str | None = None
+    active_transfer_reply: str | None = None
+    active_transfer_timeout: bool = False
+    pasv_ip_leak: str | None = None
+    pasv_leak_reply: str | None = None
+    login_note: str | None = None
+    connect_error: str | None = None
 
 
 class ActiveAuditStep(NamedTuple):
@@ -443,32 +459,42 @@ class FtpUserEnumResult:
 
 
 @dataclass
-class PasvPortRangeProbe:
-    """One sample in PTL-SVC-FTP-PASIVE passive data-port spread check."""
+class PasvPortSample:
+    """One PASV or EPSV reply. The port comes from 227 or 229, not from LIST."""
 
+    phase: str
+    command: str
     sample_index: int
+    code: int | None
+    reply: str | None
     data_port: int | None
-    error: str | None
+    kind: str
+
+
+@dataclass
+class PasvPortPhase:
+    """Ports allocated in one phase, before login or after it."""
+
+    phase: str
+    samples: tuple[PasvPortSample, ...]
+    ports: tuple[int, ...]
+    min_port: int | None
+    max_port: int | None
+    observed_span: int | None
+    wide: bool
+    status: str
+    detail: str
 
 
 @dataclass
 class PasvPortRangeResult:
-    """
-    Repeated PASV + LIST samples on separate control sessions (PTL-SVC-FTP-PASIVE).
-    wide_passive_range: observed max-min across successful samples exceeds threshold
-    (firewall-unfriendly spread in this run).
-    """
+    """PASV/EPSV port spread. A 530 reply means no port was assigned."""
 
-    probes: tuple[PasvPortRangeProbe, ...]
-    successful_ports: tuple[int, ...]
-    min_port: int | None
-    max_port: int | None
-    observed_span: int | None
+    phases: tuple[PasvPortPhase, ...]
     max_span_threshold: int
     min_samples_for_verdict: int
-    wide_passive_range: bool
-    inconclusive: bool
-    detail: str
+    login_note: str | None = None
+    connect_error: str | None = None
 
 
 @dataclass
@@ -636,6 +662,7 @@ class FTPResults:
     commands_requested: bool = False
     site_help: str | None = None
     site_extensions: tuple[str, ...] = ()
+    command_warnings: tuple[str, ...] = ()
     access: AccessCheckResult | None = None
     access_error: str | None = None  # When run-all access check fails
     anonymous: bool | None = None
@@ -683,6 +710,7 @@ class VULNS(Enum):
     AuthEnum = "PTV-SVC-AUTH-ENUM"
     Sniffable = "PTV-SVC-SNIFFABLE"
     FtpActivePolicy = "PTV-SVC-FTP-ACTIVE"
+    Cmd = "PTV-SVC-FTP-CMD"
     CmdExec = "PTV-SVC-FTP-CMDEXEC"
     CmdChmod = "PTV-SVC-FTP-CMDCHMOD"
     CmdChown = "PTV-SVC-FTP-CMDCHOWN"

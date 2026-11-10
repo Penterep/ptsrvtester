@@ -29,7 +29,7 @@ from enum import Enum
 from string import ascii_letters
 from typing import Any, Callable, NamedTuple
 
-from .poc import format_poc
+from .poc import format_brute_poc, format_poc
 from .helpers import (
     ArgsWithBruteforce,
     Creds,
@@ -5512,16 +5512,19 @@ class ImapEngine:
             return reason
         return None
 
-    def _imap_brute_one(self, cred: Creds, output, method: str) -> tuple[str, str | None, str | None]:
+    def _imap_brute_one(self, cred: Creds, output, method: str) -> tuple[str, str | None, str | None, tuple | None]:
         if self._brute_stop.is_set():
-            return "skip", None, None
+            return "skip", None, None, None
         shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
         cmd = "AUTHENTICATE PLAIN" if method == "PLAIN" else "LOGIN"
         try:
             imap = self.connect()
         except Exception as e:
-            self._imap_brute_line(output, f"{shown!r}: connect failed {self._snip(str(e))}")
-            return "down", None, None
+            raw = str(e)
+            self._imap_brute_line(output, f"{shown!r}: connect failed {self._snip(raw)}")
+            if "connection refused" in raw.lower() or getattr(e, "errno", None) == 111:
+                return "down", None, "connection refused", None
+            return "down", None, None, None
         try:
             if method == "PLAIN":
                 typ, raw, _ms = self._imap_usrenum_measure_plain(imap, cred.user, cred.passw)
@@ -5532,8 +5535,7 @@ class ImapEngine:
             secret = '""' if cred.passw == "" else cred.passw
             sent = f"{cmd} {cred.user} {secret}"
             self._imap_vv_io(sent, recv)
-            if kind in ("ok", "fail"):
-                self._brute_proof = ((sent, recv),)
+            proof = ((sent, recv),) if kind in ("ok", "fail") else None
             if kind == "ok":
                 self.note_poc(VULNS.WeakCreds.value, (sent, recv))
                 self.note_poc(VULNS.Recykl.value, (sent, recv))
@@ -5549,7 +5551,7 @@ class ImapEngine:
             if kind == "unsupported":
                 note = "LOGIN is disabled. Password guessing was not tested."
             block = self._imap_brute_block_paren(typ, raw) if kind == "blocked" else None
-            return kind, note, block
+            return kind, note, block, proof
         finally:
             try:
                 imap.logout()
@@ -5597,14 +5599,21 @@ class ImapEngine:
             len(creds), enabled=not self.use_json, indent=4, bar_indent=4,
         )
         progress.kickoff(self._imap_brute_label(creds[0]))
-        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None, "block": None, "tried": 0}
+        state = {
+            "downs": 0, "saw_reply": False, "blocked": False, "tested": False,
+            "note": None, "block": None, "tried": 0, "first_proof": None, "proof": None,
+        }
         lock = threading.Lock()
 
         def work(cred: Creds, output) -> str:
-            kind, note, block = self._imap_brute_one(cred, output, method)
+            kind, note, block, proof = self._imap_brute_one(cred, output, method)
             with lock:
                 if kind in ("ok", "fail", "blocked"):
                     state["tried"] += 1
+                if proof:
+                    if state["first_proof"] is None:
+                        state["first_proof"] = proof
+                    state["proof"] = proof
                 if kind == "ok":
                     found.add(cred)
                     state["saw_reply"] = True
@@ -5626,6 +5635,8 @@ class ImapEngine:
                     self._brute_stop.set()
                 elif kind == "down":
                     state["downs"] += 1
+                    if block:
+                        state["block"] = state["block"] or block
                     if state["saw_reply"] and state["downs"] >= 3:
                         state["blocked"] = True
                         self._brute_stop.set()
@@ -5647,10 +5658,14 @@ class ImapEngine:
             self._brute_guessing_detail = state["note"] or (
                 "Could not connect. Password guessing was not tested."
             )
-        if self._brute_guessing in ("not_limited", "stopped") and state["tried"] < 50:
+        # Fifty completed replies are required only before saying the server
+        # did not stop the attack. A block is a result even when it happens sooner.
+        if self._brute_guessing == "not_limited" and state["tried"] < 50:
             self._brute_guessing = "insufficient"
-        if self._brute_guessing == "not_limited" and getattr(self, "_brute_proof", None):
-            self.note_poc(VULNS.Brute.value, *self._brute_proof)
+        if self._brute_guessing == "not_limited" and state.get("first_proof") and state.get("proof"):
+            following = max(0, state["tried"] - 1)
+            text = format_brute_poc(state["first_proof"], state["proof"], following)
+            self._vuln_poc.setdefault(VULNS.Brute.value, text)
         self.results.creds = found
         return found
 
@@ -6913,11 +6928,19 @@ class ImapEngine:
             info = getattr(ntlm, "ntlm", None) if ntlm is not None else None
             if info is None:
                 return ""
-            recv = (
-                f"NetBios domain: {info.netbios_domain}; "
-                f"DNS computer: {info.dns_computer}"
+            rows = (
+                ("Target name", info.target_name),
+                ("NetBios domain name", info.netbios_domain),
+                ("NetBios computer name", info.netbios_computer),
+                ("DNS domain name", info.dns_domain),
+                ("DNS computer name", info.dns_computer),
+                ("DNS tree", info.dns_tree),
+                ("OS version", info.os_version),
             )
-            return self._poc_pair("AUTHENTICATE NTLM", recv)
+            lines = [f"**{label}: {value}**" for label, value in rows if value]
+            if not lines:
+                return ""
+            return self._poc_pair("AUTHENTICATE NTLM", "\n".join(lines))
         if code == VULNS.UserEnumLogin.value:
             blocks = [
                 self._usrenum_poc(self.results.imap_usrenum, "LOGIN"),

@@ -35,6 +35,16 @@ def run(ctx):
             ctx.out(part, "TEXT", indent=8)
 
     ctx.report.update_properties(ntlmInfoStatus="ok")
-    if result.proof:
-        ctx.report.note_poc(VULNS.NTLM.value, *result.proof)
+    revealed = (
+        ("Target name", result.ntlm.target_name),
+        ("NetBios domain name", result.ntlm.netbios_domain),
+        ("NetBios computer name", result.ntlm.netbios_computer),
+        ("DNS domain name", result.ntlm.dns_domain),
+        ("DNS computer name", result.ntlm.dns_computer),
+        ("DNS tree", result.ntlm.dns_tree),
+        ("OS version", result.ntlm.os_version),
+    )
+    revealed_lines = [f"**{label}: {value}**" for label, value in revealed if value]
+    if revealed_lines:
+        ctx.report.note_poc(VULNS.NTLM.value, ("AUTH NTLM", "\n".join(revealed_lines)))
     ctx.report.add_vulnerability(vuln_code=VULNS.NTLM.value)

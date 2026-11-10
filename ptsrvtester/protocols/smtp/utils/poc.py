@@ -37,6 +37,21 @@ def format_poc(*pairs: tuple[str, str]) -> str:
     return "\r\n\r\n".join(blocks)
 
 
+def format_brute_poc(first: tuple[tuple[str, str], ...], last: tuple[tuple[str, str], ...], following: int) -> str:
+    """First authorization exchange, how many came after it, and the last of those."""
+    first_body = format_poc(*first)
+    if following <= 0:
+        return "First request to authorization:\r\n" + first_body
+    last_body = format_poc(*last)
+    return (
+        "First request to authorization:\r\n"
+        f"{first_body}\r\n\r\n"
+        f"Send next {following} request to authorization\r\n\r\n"
+        f"Last request to authorization from {following} requests\r\n"
+        f"{last_body}"
+    )
+
+
 def smtp_multiline(code: str, body: str, token: str | None = None) -> str:
     """Rebuild a ``250-`` / ``250 `` reply and wrap the line whose first word is ``token``."""
     lines = [

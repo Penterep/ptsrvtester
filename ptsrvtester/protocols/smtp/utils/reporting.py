@@ -360,11 +360,19 @@ class ReportingMixin:
             info = getattr(ntlm, "ntlm", None) if ntlm is not None else None
             if info is None:
                 return ""
-            recv = (
-                f"NetBios domain: {info.netbios_domain}; "
-                f"DNS computer: {info.dns_computer}"
+            rows = (
+                ("Target name", info.target_name),
+                ("NetBios domain name", info.netbios_domain),
+                ("NetBios computer name", info.netbios_computer),
+                ("DNS domain name", info.dns_domain),
+                ("DNS computer name", info.dns_computer),
+                ("DNS tree", info.dns_tree),
+                ("OS version", info.os_version),
             )
-            return self._poc_pair("AUTH NTLM", recv)
+            lines = [f"**{label}: {value}**" for label, value in rows if value]
+            if not lines:
+                return ""
+            return self._poc_pair("AUTH NTLM", "\n".join(lines))
         if code == VULNS.Blacklist.value:
             listed = self.results.blacklist
             if listed is None or not listed.results:

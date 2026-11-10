@@ -18,6 +18,7 @@ from typing import Callable
 from ptlibs.ptprinthelper import out_if
 
 from .capa import bytes_to_text
+from .poc import format_brute_poc
 from .helpers import Creds, brute_passwords, get_mode, shown_password, text_or_file
 from .progress import ThreadedProgress, clear_raw_line, paint_raw_line
 from .results import (
@@ -546,8 +547,11 @@ def _pop3_brute_one(args, cred: Creds, output, stop, *, debug: bool, json_mode: 
     try:
         pop3 = connect_pop3(args)
     except OSError as e:
+        raw = str(e)
         trace("Send: (connect)")
-        trace(f"Receive: {_snip(str(e))}")
+        trace(f"Receive: {_snip(raw)}")
+        if "connection refused" in raw.lower() or getattr(e, "errno", None) == 111:
+            return "down", None, "connection refused", None
         return "down", None, None, None
     try:
         try:
@@ -625,7 +629,10 @@ def login_bruteforce(ctx) -> set[Creds]:
     progress = ThreadedProgress(len(creds), enabled=not json_mode, indent=4, bar_indent=4)
     first = creds[0].user
     progress.kickoff(first if len(first) <= 24 else first[:21] + "...")
-    state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "note": None, "block": None, "tried": 0}
+    state = {
+        "downs": 0, "saw_reply": False, "blocked": False, "tested": False,
+        "note": None, "block": None, "tried": 0, "first_proof": None, "proof": None,
+    }
     lock = threading.Lock()
 
     def work(cred: Creds, output) -> str:
@@ -646,6 +653,8 @@ def login_bruteforce(ctx) -> set[Creds]:
             if kind in ("ok", "fail", "blocked"):
                 state["tried"] += 1
             if state_pairs:
+                if state["first_proof"] is None:
+                    state["first_proof"] = state_pairs
                 state["proof"] = state_pairs
             if kind == "ok":
                 found.add(cred)
@@ -667,6 +676,8 @@ def login_bruteforce(ctx) -> set[Creds]:
                 stop.set()
             elif kind == "down":
                 state["downs"] += 1
+                if block:
+                    state["block"] = state["block"] or block
                 if state["saw_reply"] and state["downs"] >= 3:
                     state["blocked"] = True
                     stop.set()
@@ -687,10 +698,14 @@ def login_bruteforce(ctx) -> set[Creds]:
     else:
         ctx._brute_guessing = "not_tested"
         ctx._brute_guessing_detail = state["note"] or "Could not connect. Password guessing was not tested."
-    if ctx._brute_guessing in ("not_limited", "stopped") and state["tried"] < 50:
+    # Fifty completed replies are required only before saying the server
+    # did not stop the attack. A block is a result even when it happens sooner.
+    if ctx._brute_guessing == "not_limited" and state["tried"] < 50:
         ctx._brute_guessing = "insufficient"
-    if ctx._brute_guessing == "not_limited" and state.get("proof"):
-        ctx.report.note_poc(VULNS.Brute.value, *state["proof"])
+    if ctx._brute_guessing == "not_limited" and state.get("first_proof") and state.get("proof"):
+        following = max(0, state["tried"] - 1)
+        text = format_brute_poc(state["first_proof"], state["proof"], following)
+        ctx.report._vuln_poc.setdefault(VULNS.Brute.value, text)
     if ctx._brute_guessing is not None:
         ctx.report.update_properties(pop3PasswordGuessing=ctx._brute_guessing)
     return found

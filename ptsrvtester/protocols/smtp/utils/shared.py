@@ -13,6 +13,7 @@ from ..._base import Out
 from .ptprinthelper import get_colored_text
 from .progress import ThreadedProgress
 from .helpers import Creds, get_mode, text_or_file
+from .poc import format_brute_poc
 from .smtp_fingerprints import ServerIdentifyResult
 from .behavior_profiles import PROFILE_MISSING_HINTS
 
@@ -1313,17 +1314,20 @@ class SharedMixin:
             return "AUTH requires encryption. Password guessing was not tested."
         return "AUTH could not be used. Password guessing was not tested."
 
-    def _smtp_brute_one(self, cred: Creds, output) -> tuple[str, str | None, str | None]:
-        """One AUTH. Returns kind, note, and a block label such as ``421 rate limiting``."""
+    def _smtp_brute_one(self, cred: Creds, output) -> tuple[str, str | None, str | None, tuple | None]:
+        """One AUTH. Returns kind, note, a block label, and the real AUTH exchange."""
         if self._brute_stop.is_set():
-            return "skip", None, None
+            return "skip", None, None, None
         shown = cred.user if len(cred.user) <= 32 else cred.user[:29] + "..."
         try:
             smtp, status, banner = self.connect(timeout=10, fatal=False)
         except Exception as e:
+            raw = str(e)
             self._smtp_brute_line(output, f"Send: Connect {shown}")
-            self._smtp_brute_line(output, f"Receive: {self._snip(str(e)) if hasattr(self, '_snip') else str(e)}")
-            return "down", None, None
+            self._smtp_brute_line(output, f"Receive: {self._snip(raw) if hasattr(self, '_snip') else raw}")
+            if "connection refused" in raw.lower() or getattr(e, "errno", None) == 111:
+                return "down", None, "connection refused", None
+            return "down", None, None, None
         try:
             banner_s = self._smtp_brute_text(banner)
             if status == 421 or self._SMTP_BRUTE_LOCK_RE.search(banner_s):
@@ -1335,22 +1339,22 @@ class SharedMixin:
                     note = "Connection rate limit. Password guessing was not tested."
                 else:
                     note = "Server closed the connection before AUTH. Password guessing was not tested."
-                return "limited", note, self._smtp_brute_block_paren(int(status), banner_s)
+                return "limited", note, self._smtp_brute_block_paren(int(status), banner_s), None
             if status != 220:
                 self._smtp_brute_line(output, "Send: Connect")
                 self._smtp_brute_line(output, f"Receive: {status} {banner_s}".strip())
-                return "down", None, None
+                return "down", None, None, None
             try:
                 smtp.ehlo()
             except Exception as e:
                 self._smtp_brute_line(output, "Send: EHLO")
                 self._smtp_brute_line(output, f"Receive: {e}")
-                return "down", None, None
+                return "down", None, None, None
             mech = self._smtp_brute_mech(smtp)
             if mech is None:
                 self._smtp_brute_line(output, "Send: EHLO")
                 self._smtp_brute_line(output, "Receive: AUTH not offered")
-                return "unsupported", "AUTH is not offered. Password guessing was not tested.", None
+                return "unsupported", "AUTH is not offered. Password guessing was not tested.", None, None
             send = f"AUTH {mech} {shown}"
             if cred.passw == "":
                 send += ' ""'
@@ -1384,9 +1388,10 @@ class SharedMixin:
                 ) else "down"
             self._smtp_brute_line(output, f"Send: {send}")
             self._smtp_brute_line(output, f"Receive: {shown_reply}")
+            proof = None
             if kind in ("ok", "fail"):
                 secret = '""' if cred.passw == "" else cred.passw
-                self._brute_proof = ((f"AUTH {mech} {cred.user} {secret}", shown_reply),)
+                proof = ((f"AUTH {mech} {cred.user} {secret}", shown_reply),)
             if kind == "ok":
                 secret = '""' if cred.passw == "" else cred.passw
                 self.note_poc(
@@ -1414,7 +1419,7 @@ class SharedMixin:
                 block_code == 421 or "rate" in (shown_reply or "").lower()
             ):
                 self.end_if_blocked(block_code or 421, shown_reply)
-            return kind, note, block
+            return kind, note, block, proof
         finally:
             try:
                 smtp.close()
@@ -1517,7 +1522,11 @@ class SharedMixin:
             len(creds), enabled=not self.use_json, indent=4, bar_indent=4,
         )
         progress.kickoff(self._smtp_brute_label(creds[0]))
-        state = {"downs": 0, "saw_reply": False, "blocked": False, "tested": False, "limited": False, "note": None, "block": None, "tried": 0}
+        state = {
+            "downs": 0, "saw_reply": False, "blocked": False, "tested": False,
+            "limited": False, "note": None, "block": None, "tried": 0,
+            "first_proof": None, "proof": None,
+        }
         lock = threading.Lock()
 
         def _promote_limit() -> None:
@@ -1525,10 +1534,14 @@ class SharedMixin:
                 state["blocked"] = True
 
         def work(cred: Creds, output) -> str:
-            kind, note, block = self._smtp_brute_one(cred, output)
+            kind, note, block, proof = self._smtp_brute_one(cred, output)
             with lock:
                 if kind in ("ok", "fail", "blocked"):
                     state["tried"] += 1
+                if proof:
+                    if state["first_proof"] is None:
+                        state["first_proof"] = proof
+                    state["proof"] = proof
                 if kind == "ok":
                     found.add(cred)
                     state["saw_reply"] = True
@@ -1562,6 +1575,8 @@ class SharedMixin:
                     self._brute_stop.set()
                 elif kind == "down":
                     state["downs"] += 1
+                    if block:
+                        state["block"] = state["block"] or block
                     if state["saw_reply"] and state["downs"] >= 3:
                         state["blocked"] = True
                         self._brute_stop.set()
@@ -1585,10 +1600,14 @@ class SharedMixin:
             )
             self.results.creds = found
             return found
-        if self._brute_guessing in ("not_limited", "stopped") and state["tried"] < 50:
+        # Fifty completed replies are required only before saying the server
+        # did not stop the attack. A block is a result even when it happens sooner.
+        if self._brute_guessing == "not_limited" and state["tried"] < 50:
             self._brute_guessing = "insufficient"
-        if self._brute_guessing == "not_limited" and getattr(self, "_brute_proof", None):
-            self.note_poc(VULNS.Brute.value, *self._brute_proof)
+        if self._brute_guessing == "not_limited" and state.get("first_proof") and state.get("proof"):
+            following = max(0, state["tried"] - 1)
+            text = format_brute_poc(state["first_proof"], state["proof"], following)
+            self._vuln_poc.setdefault(VULNS.Brute.value, text)
         self.results.creds = found
         return found
 

@@ -51,7 +51,8 @@ setuptools.setup(
     "XWindows>=0.0.7",
     "netifaces>=0.11.0",
     "ptthreads",
-    "icmplib>=3.0.4"
+    "icmplib>=3.0.4",
+    "PyMySQL",
 ],
     entry_points={"console_scripts": ["ptsrvtester = ptsrvtester.ptsrvtester:main"]},
     include_package_data=True,

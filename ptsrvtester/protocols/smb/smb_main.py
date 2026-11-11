@@ -19,14 +19,7 @@ import socket
 
 from .._base import BaseMain, BaseArgs
 from .smb_utils.cli import SMBArgs
-
-from impacket.smbconnection import (
-    SMB_DIALECT,
-    SMB2_DIALECT_002,
-    SMB2_DIALECT_21,
-    SMB2_DIALECT_30,
-    SMB2_DIALECT_311,
-)
+from .smb_utils.helpers import SMBResults
 
 
 class SMB(BaseMain):
@@ -36,7 +29,6 @@ class SMB(BaseMain):
     @staticmethod
     def module_args() -> BaseArgs:
         return SMBArgs()
-        raise NotImplementedError
 
     def _import_module_file(self, name: str, path: str):
         """Import as a real package member so ``from ..smb_utils`` works in modules.
@@ -70,6 +62,7 @@ class SMB(BaseMain):
                 )
         self.target_host = host
         self.target = (ip, target.port)
+        self.userpass = (self.args.username, self.args.password)
 
     def build_context(self) -> dict:
         """Protocol handles injected onto every module's ``ctx`` (besides core fields).
@@ -78,24 +71,6 @@ class SMB(BaseMain):
         """
         return {
             "host": self.target_host,
-            # "ip": self.target[0],
-            # "port": self.target[1],
-            "mapping": {  # bool represents if dialect has been tried
-                SMB_DIALECT:        False,
-                SMB2_DIALECT_002:   False,
-                SMB2_DIALECT_21:    False,
-                SMB2_DIALECT_30:    False,
-                SMB2_DIALECT_311:   False,
-            },
-            "server_name": "",
-            "os_version": "",
-            "dns_domain_name": "",
-            "dns_host_name": "",
-            "ntlmv2_support": None,
-            "login_required": None,
-            "signing_required": None,
-            "successful_dialects": [],
-            "v30_encryption": "",
-            "v311_encryption": "",
-            "error": None
+            "userpass": self.userpass,
+            "output": SMBResults()
         }

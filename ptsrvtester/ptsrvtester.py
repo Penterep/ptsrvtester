@@ -49,6 +49,7 @@ MODULES: dict[str, tuple[str, str]] = {
     "rsync": ("ptsrvtester.protocols.rsync:Rsync", "Rsync testing module"),
     "ntp":   ("ptsrvtester.protocols.ntp:NTP",     "NTP testing module"),
     "upnp":  ("ptsrvtester.protocols.upnp:UPnP",   "UPnP/SSDP testing module"),
+    "mysql": ("ptsrvtester.protocols.mysql:MySQL", "MySQL testing module")
 }
 
 

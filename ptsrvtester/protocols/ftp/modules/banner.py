@@ -5,7 +5,7 @@ __ORDER__ = 10
 
 from ._common import ensure_info
 def run(ctx):
-    e = ensure_info(ctx, get_commands=True)
+    e = ensure_info(ctx, get_commands=False)
     e.results.banner_requested = True
     if getattr(e.results, "info_error", None):
         return

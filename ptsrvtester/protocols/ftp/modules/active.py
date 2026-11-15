@@ -16,4 +16,6 @@ def run(ctx):
         e.results.active_audit_error = str(ex)
         ctx.out(f"ACTIVE failed: {ex}", "ERROR", indent=4)
         return
+    finally:
+        e._modes_vv_indent = None
     e._stream_active_audit_result()

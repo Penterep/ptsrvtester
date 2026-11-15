@@ -8,20 +8,34 @@ def eng(ctx):
     return ctx.engine.bind_ctx(ctx)
 
 
+def _info_needs_commands(info) -> bool:
+    return info.help_response is None and info.syst is None and info.stat is None
+
+
 def ensure_info(ctx, *, get_commands: bool = True):
     e = eng(ctx)
-    if e.results.info is not None or getattr(e.results, "info_error", None):
+    if getattr(e.results, "info_error", None):
         return e
-    try:
-        e._dbg("Initial server information")
-        e.ftp = e.connect(trace=True)
-        e.results.info = e.info(get_commands=get_commands)
-    except Exception as ex:
-        msg = str(ex)
-        e._dbg(f"Initial server probe failed: {e._snip(msg)}")
-        e.results.info_error = msg
-        ctx.report.set_connect_error(msg)
-        ctx.out(msg, "ERROR", indent=4)
+    if e.results.info is None:
+        try:
+            e._dbg("Initial server information", indent=int(getattr(e, "_modes_vv_indent", 0) or 4))
+            e.ftp = e.connect(trace=True)
+            e.results.info = e.info(get_commands=get_commands)
+        except Exception as ex:
+            msg = str(ex)
+            e._dbg(f"Initial server probe failed: {e._snip(msg)}")
+            e.results.info_error = msg
+            ctx.report.set_connect_error(msg)
+            ctx.out(msg, "ERROR", indent=4)
+        return e
+    # Banner keeps the greeting only. HELP / SYST / STAT belong under FTP commands.
+    if get_commands and _info_needs_commands(e.results.info):
+        try:
+            if e.ftp is None:
+                e.ftp = e.connect(trace=True)
+            e.results.info = e.info(get_commands=True)
+        except Exception as ex:
+            e._dbg(f"Command probe failed: {e._snip(str(ex))}")
     return e
 
 

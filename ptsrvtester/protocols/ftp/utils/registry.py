@@ -49,10 +49,13 @@ FTP_TESTS: dict[str, dict] = {
     },
     "ACCESS": {
         "desc": "Read/write access check (listing, bounce)",
-        "long": ["Check read/write access using anonymous or supplied credentials;",
-                 "optional directory listing and FTP bounce attack."],
+        "long": ["List the login directory. A file from that listing is read,",
+                 "overwritten and deleted. If the listing is refused, that file",
+                 "is tested only when -f is given. A random new name is always",
+                 "written, read and deleted."],
         "requires": ["-A/--anonymous or -u/-p (credentials)"],
         "mods": [
+            ["-f", "--file", "<name>", "Remote file name when the directory listing is refused"],
             ["-l", "--access-list", "", "Display root directory listing"],
             ["-B", "--bounce", "<ip:port>", "FTP bounce attack to given service"],
             ["", "--bounce-file", "<file>", "File with request to send in bounce"],
@@ -145,13 +148,13 @@ FTP_TESTS: dict[str, dict] = {
         "desc": "Passive data port spread audit",
         "long": ["Read the data port from PASV 227 and EPSV 229, before login.",
                  "With -A or -u/-p, repeat after login. A 530 reply assigns no port.",
-                 "LIST is not required to measure the range."],
+                 "LIST is not required. Span ≤ 200 is limited, 201-500 is wide,",
+                 "and a span above 500 is not limited."],
         "mods": [
+            ["-c", "--count", "<n>", "Sessions to sample (default: 20)"],
             ["-A", "--anonymous", "", "Also measure the range after anonymous login"],
             ["-u", "--user", "<name>", "Also measure the range after this login"],
             ["-p", "--password", "[password]", "Password"],
-            ["", "--pasv-port-audit-samples", "<n>", "Samples (default: 8, min 4)"],
-            ["", "--pasv-port-audit-max-span", "<n>", "Max acceptable port span (default: 8192)"],
         ],
     },
     "ACTIVE": {
@@ -182,7 +185,7 @@ FTP_TESTS: dict[str, dict] = {
         "long": ["Connection-count and idle-time probes; with -u/-p also probes",
                  "parallel logins, post-login idle and PASV allocation."],
         "mods": [
-            ["", "--count", "<n>", "Max concurrent connections in ramp-up (default: 100)"],
+            ["-c", "--count", "<n>", "Max concurrent connections in ramp-up (default: 100)"],
             ["", "--duration", "<sec>", "How long idle/ban probes wait (default: 300)"],
             ["-t", "--threads", "<n>", "Parallel connect threads (default: 1)"],
             ["-u", "--user", "<name>", "Username for authenticated probes (optional)"],

@@ -22,7 +22,7 @@ from difflib import SequenceMatcher
 from enum import Enum
 from io import BytesIO
 from ssl import SSLSocket
-from string import ascii_uppercase
+from string import ascii_lowercase, ascii_uppercase, digits
 from typing import Any, Callable, NamedTuple
 
 from ptlibs.ptprinthelper import out_if
@@ -55,6 +55,7 @@ from .ftp_types import (  # noqa: F401
     _conn_limits_pasv_post_suspect,
     _conn_limits_pasv_pre_suspect,
     _ftp_list_line_directory_rel_name,
+    _ftp_list_line_file_name,
 )
 
 
@@ -395,124 +396,260 @@ class FtpEngine:
             self.note_poc(VULNS.Anonymous.value, ("USER anonymous", str(user_reply).strip()), ("PASS anonymous@", str(resp).strip()))
         return str(resp).startswith("2")
 
+    def _access_mark(self, mark: str, text: str, *, indent: int) -> None:
+        if self.use_json:
+            return
+        color = "OK" if mark == "O" else "WARNING"
+        self._tprint(f"{get_colored_text('[' + mark + ']', color)} {text}", "TEXT", indent=indent)
+
+    def _access_fact_line(self, label: str, ok: bool, *, warn_on_yes: bool, indent: int) -> None:
+        mark = "W" if warn_on_yes and ok else "O"
+        value = "yes" if ok else "No"
+        self._access_mark(mark, f"{label:<8} {value}", indent=indent)
+
+    def _access_who_line(self, creds: Creds) -> None:
+        if self.use_json:
+            return
+        if creds.user.lower() == "anonymous":
+            shown = f" {creds.passw}" if creds.passw else ""
+            text = f"Anonymous access (user: anonymous, password:{shown})"
+        else:
+            text = f"Authorized access (user: {creds.user})"
+        self._tprint(text, "TITLE", indent=4)
+
+    def _access_vv_recv(self, reply: str) -> None:
+        text = str(reply).strip()
+        if not text:
+            return
+        indent = int(getattr(self, "_modes_vv_indent", 0) or 4)
+        first, *rest = [line for line in text.splitlines() if line.strip()]
+        self._user_enum_trace(f"Receive: {first}", None, indent=indent)
+        for line in rest:
+            self._user_enum_trace(line, None, indent=indent)
+
+    def _access_trace_session(self, ftp) -> None:
+        """Print each real control command under the current section."""
+        original_sendcmd = ftp.sendcmd
+        original_putcmd = ftp.putcmd
+        original_voidresp = ftp.voidresp
+        pending = {"cmd": None}
+        inside = {"send": 0}
+
+        def sendcmd(cmd):
+            inside["send"] += 1
+            try:
+                try:
+                    resp = original_sendcmd(cmd)
+                except ftplib.all_errors as exc:
+                    self._ftp_vv_io(cmd, str(exc).strip() or type(exc).__name__)
+                    raise
+                self._ftp_vv_io(cmd, resp)
+                return resp
+            finally:
+                inside["send"] -= 1
+                pending["cmd"] = None
+
+        def putcmd(line):
+            if not inside["send"]:
+                pending["cmd"] = line
+            return original_putcmd(line)
+
+        def voidresp():
+            cmd = pending["cmd"]
+            pending["cmd"] = None
+            try:
+                resp = original_voidresp()
+            except ftplib.all_errors as exc:
+                text = str(exc).strip() or type(exc).__name__
+                if cmd:
+                    self._ftp_vv_io(cmd, text)
+                else:
+                    self._access_vv_recv(text)
+                raise
+            if cmd:
+                self._ftp_vv_io(cmd, resp)
+            else:
+                self._access_vv_recv(resp)
+            return resp
+
+        ftp._access_raw_sendcmd = original_sendcmd
+        ftp._access_raw_putcmd = original_putcmd
+        ftp._access_raw_voidresp = original_voidresp
+        ftp.sendcmd = sendcmd
+        ftp.putcmd = putcmd
+        ftp.voidresp = voidresp
+
+    def _access_try_read(self, ftp, name: str) -> bool:
+        try:
+            sock = ftp.transfercmd("RETR " + name)
+        except ftplib.all_errors:
+            return False
+        try:
+            sock.settimeout(10)
+            sock.recv(4096)
+        except Exception:
+            pass
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        try:
+            ftp.voidresp()
+        except ftplib.all_errors:
+            pass
+        return True
+
+    def _access_try_write(self, ftp, name: str) -> bool:
+        try:
+            ftp.storbinary("STOR " + name, BytesIO(b"ptsrvtester\n"))
+        except ftplib.all_errors:
+            return False
+        return True
+
+    def _access_try_delete(self, ftp, name: str) -> bool:
+        try:
+            ftp.delete(name)
+        except ftplib.all_errors:
+            return False
+        return True
+
+    def _access_random_name(self) -> str:
+        alphabet = ascii_lowercase + digits
+        return "".join(random.choices(alphabet, k=9)) + ".txt"
+
+    def _access_probe_account(self, creds: Creds) -> AccessPermissions:
+        """List the login directory, then probe one existing name and one new name."""
+        self._access_who_line(creds)
+        self._modes_vv_indent = 8
+        try:
+            ftp = self.connect(trace=True)
+        except OSError as exc:
+            text = self._snip(str(exc)) or "Could not connect."
+            self._access_mark("W", text, indent=8)
+            return AccessPermissions(creds, login_error=text)
+        self._access_trace_session(ftp)
+        try:
+            try:
+                ftp.login(creds.user, creds.passw)
+            except Exception as exc:
+                text = self._snip(str(exc)) or "Login failed."
+                self._access_mark("W", text, indent=8)
+                return AccessPermissions(creds, login_error=text)
+
+            listing_ok = False
+            lines: list[str] = []
+            helper = AccessCheckHelper()
+            try:
+                ftp.dir(helper.read_callback)
+                listing_ok = True
+                lines = list(helper.lines_read or [])
+            except Exception:
+                pass
+            self._access_mark(
+                "O", f"Directory listing: {'yes' if listing_ok else 'no'}", indent=8
+            )
+
+            named: str | None = None
+            if listing_ok:
+                for line in lines:
+                    named = _ftp_list_line_file_name(line)
+                    if named:
+                        break
+            elif (given := getattr(self.args, "access_file", None)):
+                named = str(given).strip() or None
+
+            named_read = named_rewrite = named_delete = None
+            self._modes_vv_indent = 12
+            if named:
+                self._tprint(f"Filename for test: {named}", "INFO", indent=8)
+                named_read = self._access_try_read(ftp, named)
+                self._access_fact_line("Read:", named_read, warn_on_yes=False, indent=12)
+                named_rewrite = self._access_try_write(ftp, named)
+                self._access_fact_line("Rewrite:", named_rewrite, warn_on_yes=True, indent=12)
+                named_delete = self._access_try_delete(ftp, named)
+                self._access_fact_line("Delete:", named_delete, warn_on_yes=True, indent=12)
+
+            random_name = self._access_random_name()
+            self._tprint(f"Filename for test (random): {random_name}", "INFO", indent=8)
+            random_write = self._access_try_write(ftp, random_name)
+            self._access_fact_line("Write:", random_write, warn_on_yes=True, indent=12)
+            random_read = self._access_try_read(ftp, random_name)
+            self._access_fact_line("Read:", random_read, warn_on_yes=False, indent=12)
+            random_delete = self._access_try_delete(ftp, random_name)
+            self._access_fact_line("Delete:", random_delete, warn_on_yes=True, indent=12)
+
+            read_path = named if named_read else (random_name if random_read else None)
+            delete_path = named if named_delete else (random_name if random_delete else None)
+            return AccessPermissions(
+                creds,
+                lines if listing_ok else None,
+                random_name if random_write else None,
+                read_path,
+                delete_path,
+                listing_ok,
+                named,
+                named_read,
+                named_rewrite,
+                named_delete,
+                random_name,
+                random_write,
+                random_read,
+                random_delete,
+            )
+        finally:
+            ftp.sendcmd = getattr(ftp, "_access_raw_sendcmd", ftp.sendcmd)
+            ftp.putcmd = getattr(ftp, "_access_raw_putcmd", ftp.putcmd)
+            ftp.voidresp = getattr(ftp, "_access_raw_voidresp", ftp.voidresp)
+            try:
+                ftp.quit()
+            except Exception:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+
     def access_check(self) -> AccessCheckResult:
-        """
-        Attempts to login with all available valid credentials
-        (including anonymous) and perform:
-        - directory listing
-        - file write
-        - file read
-        - file delete (just cleanup)
-
-        Returns:
-            AccessCheckResult: results
-        """
+        """List the login directory, probe one existing file, then one new file."""
         access_permissions: list[AccessPermissions] = []
-
-        # Construct a list of all valid credentials
         all_creds: list[Creds] = []
-
-        if self.results.anonymous:
+        if self.results.anonymous or getattr(self.args, "anonymous", False):
             all_creds.append(Creds("anonymous", ""))
-
         if self.results.creds is not None:
             all_creds.extend(self.results.creds)
-
+        for creds in getattr(self, "_access_direct", ()) or ():
+            if creds not in all_creds:
+                all_creds.append(creds)
         if len(all_creds) == 0:
             self._dbg("Access check skipped: no valid credentials")
             return AccessCheckResult([self._missing_login_line()], None)
 
-        # Check all credentials
+        if not self.use_json:
+            self._access_streamed = True
         errors: list[str] = []
-        for creds in all_creds:
-            self._dbg(f"Access check as {creds.user!r}")
-            ftp = self.connect()
-            try:
-                ftp.login(creds.user, creds.passw)
-                self._dbg(f"LOGIN {creds.user!r} → OK")
-            except Exception as e:
-                self._dbg(f"LOGIN {creds.user!r} → failed: {self._snip(str(e))}")
-                # Valid creds but server-side error
-                errors.append(str(e))
-                access_permissions.append(AccessPermissions(creds, None, None, None, None))
-                continue
-
-            write, read, delete = None, None, None
-            ach = AccessCheckHelper()
-
-            # Directory listing
-            try:
-                ftp.dir(ach.read_callback)
-                nlines = len(ach.lines_read or [])
-                self._dbg(f"LIST → {nlines} line(s)")
-            except Exception as e:
-                # Unexpected error, maybe timeout or similar
-                errors.append(str(e))
-                access_permissions.append(AccessPermissions(creds, None, None, None, None))
-                continue
-
-            # Root and top-level directories from LIST (format varies by server/OS)
-            directories: list[str] = [""]
-            if ach.lines_read is not None:
-                for l in ach.lines_read:
-                    if not l or l[0] != "d":
-                        continue
-                    dir_name = _ftp_list_line_directory_rel_name(l)
-                    if dir_name:
-                        directories.append(dir_name)
-
-            text = BytesIO(b"FILE WRITE TEST")
-            filename = "".join(random.choices(ascii_uppercase, k=15)) + ".txt"
-
-            # Check permissions in parsed directories
-            for dir in directories:
-                # Record only the first successful hit
-                if write is not None:
-                    break
-
-                text.seek(0)
-                filepath = dir + "/" + filename
-
-                # Write
-                try:
-                    ftp.storlines("STOR " + filepath, text)
-                    write = filepath
-                    self._dbg(f"STOR {filepath!r} → OK")
-                except ftplib.Error as e:
-                    self._dbg(f"STOR {filepath!r} → failed: {self._snip(str(e))}")
-
-                # Read
-                if write:
-                    try:
-                        ftp.retrlines("RETR " + filepath, nop_callback)
-                        read = filepath
-                        self._dbg(f"RETR {filepath!r} → OK")
-                    except ftplib.Error as e:
-                        self._dbg(f"RETR {filepath!r} → failed: {self._snip(str(e))}")
-
-                # Delete
-                if write:
-                    try:
-                        ftp.delete(filepath)
-                        delete = filepath
-                        self._dbg(f"DELE {filepath!r} → OK")
-                    except ftplib.Error as e:
-                        self._dbg(f"DELE {filepath!r} → failed: {self._snip(str(e))}")
-
-            access_permissions.append(
-                AccessPermissions(
-                    creds,
-                    ach.lines_read,
-                    write,
-                    read,
-                    delete,
-                )
-            )
-
-        if len(errors) == 0:
+        try:
+            for index, creds in enumerate(all_creds):
+                if index and not self.use_json:
+                    print()
+                perm = self._access_probe_account(creds)
+                access_permissions.append(perm)
+                if perm.login_error:
+                    errors.append(perm.login_error)
+                    if creds.user.lower() == "anonymous" and self.results.anonymous is None:
+                        self.results.anonymous = False
+                    continue
+                if creds.user.lower() == "anonymous":
+                    if self.results.anonymous is None:
+                        self.results.anonymous = True
+                elif getattr(self, "_access_direct", None):
+                    if self.results.creds is None:
+                        self.results.creds = set()
+                    self.results.creds.add(creds)
+        finally:
+            self._modes_vv_indent = None
+        if not errors:
             return AccessCheckResult(None, access_permissions)
-        else:
-            return AccessCheckResult(errors, access_permissions)
+        return AccessCheckResult(errors, access_permissions)
 
     @staticmethod
     def _eicar_reply_suggests_missing(msg: str) -> bool:
@@ -543,9 +680,58 @@ class FtpEngine:
             or "unsupported" in m and "size" in m
         )
 
+    def _eicar_who(self, creds: Creds) -> None:
+        if self.use_json:
+            return
+        if creds.user.lower() == "anonymous":
+            shown = f" {creds.passw}" if creds.passw else ""
+            text = f"Anonymous access (user: anonymous, password:{shown})"
+        else:
+            text = f"Authorized access (user: {creds.user})"
+        self._tprint(text, "TITLE", indent=4)
+        self._modes_vv_indent = 8
+
+    def _eicar_verdict(self, row: FtpEicarRow) -> None:
+        if self.use_json:
+            return
+        for bullet, text in self._eicar_lines(row):
+            self._tprint(text.split(": ", 1)[-1], bullet, indent=8)
+        self._eicar_streamed = True
+
+    def _eicar_session_login(self, ftp: ftplib.FTP, creds: Creds) -> None:
+        user_cmd = f"USER {creds.user}"
+        try:
+            user_reply = ftp.sendcmd(user_cmd)
+        except ftplib.Error as e:
+            self._ftp_vv_io(user_cmd, str(e).strip())
+            raise
+        self._ftp_vv_io(user_cmd, user_reply)
+        if str(user_reply).startswith("2"):
+            if creds.user.lower() == "anonymous":
+                self.note_poc(VULNS.Anonymous.value, (user_cmd, str(user_reply).strip()))
+            return
+        secret = creds.passw
+        if creds.user.lower() == "anonymous" and secret in ("", "-"):
+            secret = "anonymous@"
+        pass_cmd = f"PASS {secret}"
+        try:
+            pass_reply = ftp.sendcmd(pass_cmd)
+        except ftplib.Error as e:
+            self._ftp_vv_io(pass_cmd, str(e).strip())
+            raise
+        self._ftp_vv_io(pass_cmd, pass_reply)
+        if not str(pass_reply).startswith("2"):
+            raise ftplib.error_perm(pass_reply)
+        if creds.user.lower() == "anonymous":
+            self.note_poc(
+                VULNS.Anonymous.value,
+                (user_cmd, str(user_reply).strip()),
+                (pass_cmd, str(pass_reply).strip()),
+            )
+
     def _eicar_probe_one_account(self, creds: Creds, delay: float) -> FtpEicarRow:
         """Upload EICAR, wait, verify presence via SIZE/RETR, DELE cleanup."""
-        ftp = self.connect()
+        ftp = self.connect(trace=True)
 
         def _fail_early(stor_error: str | None) -> FtpEicarRow:
             try:
@@ -574,10 +760,19 @@ class FtpEngine:
             )
 
         try:
-            ftp.login(creds.user, creds.passw)
-            self._dbg(f"LOGIN {creds.user!r} → OK")
+            self._eicar_session_login(ftp, creds)
+            if creds.user.lower() == "anonymous":
+                if self.results.anonymous is None:
+                    self.results.anonymous = True
+            else:
+                if self.results.creds is None:
+                    self.results.creds = set()
+                self.results.creds.add(creds)
         except Exception as e:
-            self._dbg(f"LOGIN {creds.user!r} → failed: {self._snip(str(e))}")
+            if creds.user.lower() == "anonymous" and self.results.anonymous is None:
+                self.results.anonymous = False
+            if not isinstance(e, ftplib.Error):
+                self._ftp_vv_io(f"USER {creds.user}", str(e).strip())
             try:
                 ftp.close()
             except Exception:
@@ -625,13 +820,13 @@ class FtpEngine:
             filepath = dir + "/" + filename
             bio = BytesIO(EICAR_STANDARD_TEST_FILE)
             try:
-                ftp.storbinary("STOR " + filepath, bio)
+                done = ftp.storbinary("STOR " + filepath, bio)
                 stor_ok = True
                 used_path = filepath
-                self._dbg(f"STOR {filepath!r} (EICAR) → OK")
-            except ftplib.Error as e:
+                self._ftp_vv_io("STOR " + filepath, done or "")
+            except (ftplib.Error, OSError) as e:
                 stor_err = str(e)
-                self._dbg(f"STOR {filepath!r} (EICAR) → failed: {self._snip(str(e))}")
+                self._ftp_vv_io("STOR " + filepath, stor_err)
 
         if not stor_ok:
             return _fail_early(stor_err)
@@ -644,27 +839,35 @@ class FtpEngine:
         size_bytes: int | None = None
         size_err: str | None = None
         try:
-            size_bytes = ftp.size(used_path)
-            self._dbg(f"SIZE {used_path!r} → {size_bytes}")
+            size_resp = ftp.sendcmd("SIZE " + used_path)
         except ftplib.error_perm as e:
             size_err = str(e)
-            self._dbg(f"SIZE {used_path!r} → {self._snip(str(e))}")
+            self._ftp_vv_io("SIZE " + used_path, size_err)
         except ftplib.Error as e:
             size_err = str(e)
-            self._dbg(f"SIZE {used_path!r} → {self._snip(str(e))}")
+            self._ftp_vv_io("SIZE " + used_path, size_err)
+        else:
+            self._ftp_vv_io("SIZE " + used_path, size_resp)
+            if str(size_resp).startswith("213"):
+                try:
+                    size_bytes = int(str(size_resp)[3:].strip())
+                except ValueError:
+                    size_err = str(size_resp)
+            else:
+                size_err = str(size_resp)
 
         buf = BytesIO()
         retr_ok = False
         retr_match: bool | None = None
         retr_err: str | None = None
         try:
-            ftp.retrbinary("RETR " + used_path, buf.write)
+            done = ftp.retrbinary("RETR " + used_path, buf.write)
             retr_ok = True
             retr_match = buf.getvalue() == EICAR_STANDARD_TEST_FILE
-            self._dbg(f"RETR {used_path!r} → OK match={retr_match}")
+            self._ftp_vv_io("RETR " + used_path, done or "")
         except ftplib.Error as e:
             retr_err = str(e)
-            self._dbg(f"RETR {used_path!r} → failed: {self._snip(str(e))}")
+            self._ftp_vv_io("RETR " + used_path, retr_err)
 
         size_vanished = (
             bool(size_err)
@@ -688,11 +891,12 @@ class FtpEngine:
         delete_err: str | None = None
         delete_note: str | None = None
         try:
-            ftp.delete(used_path)
+            done = ftp.delete(used_path)
             delete_ok = True
-            self._dbg(f"DELE {used_path!r} → OK")
+            self._ftp_vv_io("DELE " + used_path, done or "")
         except ftplib.error_perm as e:
             delete_err = str(e)
+            self._ftp_vv_io("DELE " + used_path, delete_err)
             if self._eicar_reply_suggests_missing(str(e)):
                 delete_note = (
                     "DELE failed with missing-file style reply — file likely already removed "
@@ -700,6 +904,7 @@ class FtpEngine:
                 )
         except ftplib.Error as e:
             delete_err = str(e)
+            self._ftp_vv_io("DELE " + used_path, delete_err)
             if self._eicar_reply_suggests_missing(str(e)):
                 delete_note = (
                     "DELE failed with missing-file style reply — file likely already removed "
@@ -738,15 +943,29 @@ class FtpEngine:
         """EICAR upload audit (PTL-SVC-FTP-ANTIVIRUS): delayed verify for on-access scanners."""
         delay = max(0.0, float(getattr(self.args, "eicar_post_stor_delay", 0.5) or 0.0))
         all_creds: list[Creds] = []
-        if self.results.anonymous:
+        if self.results.anonymous or (
+            getattr(self.args, "anonymous", False) and self.results.anonymous is None
+        ):
             all_creds.append(Creds("anonymous", ""))
         if self.results.creds is not None:
             all_creds.extend(self.results.creds)
+        for creds in getattr(self, "_eicar_direct", ()) or ():
+            if creds not in all_creds:
+                all_creds.append(creds)
         if not all_creds:
             self._dbg("EICAR skipped: no logged-in account")
             detail = self._missing_login_line()
             return FtpEicarAuditResult(delay, tuple(), detail, False, False)
-        rows = tuple(self._eicar_probe_one_account(c, delay) for c in all_creds)
+        rows_list: list[FtpEicarRow] = []
+        try:
+            for creds in all_creds:
+                self._eicar_who(creds)
+                row = self._eicar_probe_one_account(creds, delay)
+                rows_list.append(row)
+                self._eicar_verdict(row)
+        finally:
+            self._modes_vv_indent = None
+        rows = tuple(rows_list)
         risky = any(
             r.stor_ok and r.retr_payload_match is True and not r.vanished_after_stor_suspected
             for r in rows
@@ -1585,6 +1804,11 @@ class FtpEngine:
 
     def _ftp_vv_io(self, send: str | None, recv, output=None) -> None:
         """Real FTP line. Logged always; printed on ``-vv`` above the progress bar."""
+        cap = getattr(self, "_encryption_capture", None)
+        if cap is not None:
+            if send:
+                cap.append((send, recv))
+            return
         if not send:
             return
         if recv in (None, ""):
@@ -1592,10 +1816,14 @@ class FtpEngine:
         else:
             text = str(recv).replace("\r\n", "\n").replace("\r", "\n")
             recv_s = "\r\n".join(line.rstrip() for line in text.split("\n") if line.strip())
-        self._user_enum_trace(f"Send: {send}", output)
-        self._user_enum_trace(f"Receive: {recv_s}", output)
+        indent = int(getattr(self, "_modes_vv_indent", 0) or 4)
+        self._user_enum_trace(f"Send: {send}", output, indent=indent)
+        lines = [line for line in recv_s.splitlines() if line.strip()] or ["(no reply)"]
+        self._user_enum_trace(f"Receive: {lines[0]}", output, indent=indent)
+        for extra in lines[1:]:
+            self._user_enum_trace(extra, output, indent=indent)
 
-    def _user_enum_trace(self, msg: str, output) -> None:
+    def _user_enum_trace(self, msg: str, output, *, indent: int = 4) -> None:
         if not msg:
             return
         if self.use_json:
@@ -1604,7 +1832,7 @@ class FtpEngine:
         if not getattr(self.args, "debug", False):
             return
         if output is None:
-            self._dbg(msg)
+            self._dbg(msg, indent=indent)
             return
         line = out_if(msg, "ADDITIONS", True, colortext=True, indent=0)
         if line:
@@ -2290,6 +2518,164 @@ class FtpEngine:
                 except Exception:
                     pass
 
+    def _modes_show_probe(self, probe: ModeCommandProbe) -> None:
+        if self.use_json:
+            return
+        self._tprint(self._modes_probe_text(probe), self._modes_probe_bullet(probe), indent=12)
+
+    def _modes_show_transfer(self, family: str, status: str | None, timeout: bool) -> None:
+        if self.use_json or not status:
+            return
+        if family == "passive":
+            if status == "available":
+                self._tprint("Passive transfer: available", "NOTVULN", indent=8)
+            else:
+                self._tprint("Passive transfer was not confirmed", "WARNING", indent=8)
+            return
+        if status == "available":
+            self._tprint("Active transfer: available", "NOTVULN", indent=8)
+            return
+        self._tprint("Active transfer was not confirmed", "WARNING", indent=8)
+        if timeout:
+            self._tprint(
+                "Active mode was not confirmed. A timeout can also mean the tester is behind NAT or a firewall.",
+                "WARNING",
+                indent=8,
+            )
+
+    def _modes_note_shown_leak(self, reply: str | None, leak: dict, target_ip: str) -> None:
+        previous = leak.get("ip")
+        self._modes_note_leak(reply, leak, target_ip)
+        found = leak.get("ip")
+        if self.use_json or not found or found == previous:
+            return
+        self._tprint(f"PASV Internal IP Leak: server advertised {found}", "VULN", indent=12)
+
+    def _modes_commands_for(self, ftp, family: str) -> list[tuple[str, str]]:
+        names = ("PASV", "EPSV") if family == "passive" else ("PORT", "EPRT")
+        return [item for item in self._modes_support_commands(ftp) if item[0] in names]
+
+    def _modes_probe_commands(
+        self,
+        ftp,
+        phase: str,
+        family: str,
+        creds: Creds | None,
+        leak: dict,
+        target_ip: str,
+    ) -> tuple[list[ModeCommandProbe], object]:
+        probes: list[ModeCommandProbe] = []
+        commands = self._modes_commands_for(ftp, family) if ftp is not None else []
+        if ftp is None:
+            for label in (("PASV", "EPSV") if family == "passive" else ("PORT", "EPRT")):
+                probe = ModeCommandProbe(phase, label, None, None, "unconfirmed")
+                probes.append(probe)
+                self._modes_show_probe(probe)
+            return probes, None
+        for label, command in commands:
+            if ftp is None:
+                probe = ModeCommandProbe(phase, label, None, None, "unconfirmed")
+                probes.append(probe)
+                self._modes_show_probe(probe)
+                continue
+            code, reply = self._modes_send(ftp, command)
+            probe = ModeCommandProbe(phase, label, code, reply, self._modes_kind(label, code))
+            probes.append(probe)
+            self._modes_show_probe(probe)
+            if label == "PASV":
+                self._modes_note_shown_leak(reply, leak, target_ip)
+            if code is not None:
+                continue
+            try:
+                ftp.close()
+            except Exception:
+                pass
+            try:
+                ftp = self.connect(trace=True)
+                if creds is not None:
+                    self._modes_login(ftp, creds)
+            except OSError:
+                ftp = None
+        return probes, ftp
+
+    def _modes_close(self, ftp) -> None:
+        if ftp is None:
+            return
+        try:
+            ftp.close()
+        except Exception:
+            pass
+
+    def _modes_run_section(
+        self,
+        family: str,
+        title: str,
+        creds: Creds | None,
+        login_note: str | None,
+        leak: dict,
+        target_ip: str,
+    ) -> tuple[list[ModeCommandProbe], str | None, str | None, bool, str | None]:
+        """One mode: before login, after login, then one LIST. Prints as it goes."""
+        if not self.use_json:
+            if family == "active":
+                print()
+            self._tprint(title, "INFO", indent=4)
+            self._tprint("Before login", "INFO", indent=8)
+        probes: list[ModeCommandProbe] = []
+        try:
+            ftp = self.connect(trace=True)
+        except OSError as exc:
+            text = str(exc).strip()
+            if "could not connect" in text.lower():
+                if not self.use_json:
+                    self._tprint("Could not connect. Data modes were not tested.", "WARNING", indent=12)
+                return probes, None, None, False, "__connect__"
+            if not self.use_json:
+                self._tprint(self._snip(text) or "Could not connect.", "WARNING", indent=12)
+            return probes, None, None, False, text
+        probes, ftp = self._modes_probe_commands(ftp, "before", family, None, leak, target_ip)
+        self._modes_close(ftp)
+        if not self.use_json:
+            self._tprint("After login", "INFO", indent=8)
+        if creds is None:
+            note = login_note or self._missing_login_line()
+            if not self.use_json:
+                self._tprint(note, "WARNING", indent=12)
+            return probes, None, None, False, note
+        try:
+            ftp = self.connect(trace=True)
+            self._modes_login(ftp, creds)
+        except OSError as exc:
+            text = str(exc).strip()
+            if "could not connect" in text.lower():
+                note = "Could not connect. After login was not tested."
+            else:
+                note = self._snip(text) or "Login failed."
+            if not self.use_json:
+                self._tprint(note, "WARNING", indent=12)
+            return probes, None, None, False, note
+        after, ftp = self._modes_probe_commands(ftp, "after", family, creds, leak, target_ip)
+        probes.extend(after)
+        status = reply = None
+        timeout = False
+        supported = [probe for probe in after if probe.kind == "supported"]
+        if supported:
+            try:
+                if ftp is None:
+                    status, reply, timeout = self._modes_run_transfer(creds, after, family)
+                elif family == "passive":
+                    extended = not any(probe.command == "PASV" and probe.kind == "supported" for probe in after)
+                    status, reply, timeout = self._modes_passive_transfer(ftp, extended)
+                else:
+                    extended = not any(probe.command == "PORT" and probe.kind == "supported" for probe in after)
+                    status, reply, timeout = self._modes_active_transfer(ftp, extended)
+            except OSError as exc:
+                text = str(exc).strip()
+                status, reply, timeout = "unconfirmed", text, self._modes_timed_out(text)
+            self._modes_show_transfer(family, status, timeout)
+        self._modes_close(ftp)
+        return probes, status, reply, timeout, None
+
     def test_modes(
         self,
         creds: Creds | None = None,
@@ -2297,7 +2683,7 @@ class FtpEngine:
         login_note: str | None = None,
         resolve_login=None,
     ) -> ModesResult:
-        """PASV, EPSV, PORT and EPRT before login. After login, repeat them and try one transfer."""
+        """PASV and EPSV, then PORT and EPRT. After login, one LIST in each mode."""
         target_ip = self.args.target.ip
         try:
             ipaddress.ip_address(target_ip)
@@ -2307,31 +2693,38 @@ class FtpEngine:
             except Exception:
                 target_ip = ""
         leak: dict[str, str | None] = {"ip": None, "reply": None}
-        try:
-            before = self._modes_probe_phase("before", None, leak, target_ip)
-        except OSError:
-            return ModesResult(connect_error="Could not connect. Data modes were not tested.")
         if resolve_login is not None:
             creds, login_note = resolve_login()
-        after: list[ModeCommandProbe] = []
+        live = not self.use_json
+        if live:
+            self._modes_streamed = True
+            self._modes_vv_indent = 12
+        probes: list[ModeCommandProbe] = []
         note = login_note
         passive_transfer = active_transfer = None
         passive_reply = active_reply = None
         active_timeout = False
-        if creds is not None:
-            try:
-                after = self._modes_probe_phase("after", creds, leak, target_ip)
-            except OSError as exc:
-                text = str(exc).strip()
-                if "could not connect" in text.lower():
-                    note = "Could not connect. After login was not tested."
-                else:
-                    note = self._snip(text) or "Login failed."
-            else:
-                passive_transfer, passive_reply, _ignored = self._modes_run_transfer(creds, after, "passive")
-                active_transfer, active_reply, active_timeout = self._modes_run_transfer(creds, after, "active")
+        try:
+            passive, passive_transfer, passive_reply, _ignored, passive_note = self._modes_run_section(
+                "passive", "Passive mode", creds, note, leak, target_ip
+            )
+            if passive_note == "__connect__" and not passive:
+                return ModesResult(connect_error="Could not connect. Data modes were not tested.")
+            probes.extend(passive)
+            if passive_note and passive_note != "__connect__":
+                note = passive_note
+            active, active_transfer, active_reply, active_timeout, active_note = self._modes_run_section(
+                "active", "Active mode", creds, note, leak, target_ip
+            )
+            if active_note == "__connect__" and not probes and not active:
+                return ModesResult(connect_error="Could not connect. Data modes were not tested.")
+            probes.extend(active)
+            if active_note and active_note != "__connect__":
+                note = active_note
+        finally:
+            self._modes_vv_indent = None
         return ModesResult(
-            probes=tuple(before + after),
+            probes=tuple(probes),
             passive_transfer=passive_transfer,
             active_transfer=active_transfer,
             passive_transfer_reply=passive_reply,
@@ -2410,9 +2803,22 @@ class FtpEngine:
                 if port is None:
                     kind = "unconfirmed"
             samples.append(PasvPortSample(phase, command, index, code, reply, port, kind))
+            if port is not None and (self.use_json or getattr(self.args, "debug", False)):
+                self._dbg(f"Port {port}", indent=12)
             if code is None:
                 break
         return samples
+
+    _PASVPORT_OK_SPAN = 200
+    _PASVPORT_WARN_SPAN = 500
+
+    def _pasvport_band(self, span: int) -> tuple[str, bool]:
+        """≤200 ok, 201-500 warning, above 500 is the vulnerability."""
+        if span <= self._PASVPORT_OK_SPAN:
+            return "ok", False
+        if span <= self._PASVPORT_WARN_SPAN:
+            return "warn", False
+        return "error", True
 
     def _pasvport_summarize(
         self,
@@ -2421,10 +2827,12 @@ class FtpEngine:
         threshold: int,
         minimum: int,
     ) -> PasvPortPhase:
+        del threshold
         ports = tuple(sample.data_port for sample in samples if sample.data_port is not None)
         if len(ports) >= minimum:
             lo, hi = min(ports), max(ports)
             span = hi - lo
+            level, wide = self._pasvport_band(span)
             return PasvPortPhase(
                 phase=phase,
                 samples=tuple(samples),
@@ -2432,9 +2840,10 @@ class FtpEngine:
                 min_port=lo,
                 max_port=hi,
                 observed_span=span,
-                wide=span > threshold,
+                wide=wide,
                 status="measured",
-                detail=f"{phase} min={lo} max={hi} span={span} threshold={threshold}",
+                detail=f"{phase} min={lo} max={hi} span={span} level={level}",
+                level=level,
             )
         kinds = {sample.kind for sample in samples}
         if not ports and kinds and kinds <= {"login"}:
@@ -2455,6 +2864,7 @@ class FtpEngine:
             wide=False,
             status=status,
             detail=f"{phase} ports={len(ports)} status={status}",
+            level="ok",
         )
 
     def _pasvport_collect(
@@ -2526,50 +2936,69 @@ class FtpEngine:
     def test_pasv_port_range_audit(
         self,
         sample_count: int,
-        max_span_threshold: int,
+        max_span_threshold: int | None = None,
         *,
         resolve_login=None,
     ) -> PasvPortRangeResult:
         """Port numbers from PASV 227 and EPSV 229. LIST is not required."""
-        minimum = 4
+        del max_span_threshold
+        minimum = min(4, max(1, sample_count))
+        live = not self.use_json
+        if live:
+            self._pasvport_streamed = True
+            self._modes_vv_indent = 12
         try:
-            before = self._pasvport_collect("before", None, sample_count, max_span_threshold, minimum)
-        except OSError:
-            result = PasvPortRangeResult(
-                phases=(),
-                max_span_threshold=max_span_threshold,
-                min_samples_for_verdict=minimum,
-                connect_error="Could not connect. Passive port range was not tested.",
-            )
-            self._pasvport_report(result)
-            return result
-        creds = None
-        login_note = None
-        if resolve_login is not None:
-            creds, login_note = resolve_login()
-        phases = [before]
-        if creds is not None:
+            if live:
+                self._tprint("Before login", "INFO", indent=4)
             try:
-                phases.append(
-                    self._pasvport_collect("after", creds, sample_count, max_span_threshold, minimum)
+                before = self._pasvport_collect("before", None, sample_count, self._PASVPORT_WARN_SPAN, minimum)
+            except OSError:
+                if live:
+                    self._tprint("Could not connect. Passive port range was not tested.", "WARNING", indent=8)
+                return PasvPortRangeResult(
+                    phases=(),
+                    max_span_threshold=self._PASVPORT_WARN_SPAN,
+                    min_samples_for_verdict=minimum,
+                    connect_error="Could not connect. Passive port range was not tested.",
                 )
-            except OSError as exc:
-                text = str(exc).strip()
-                if "could not connect" in text.lower():
-                    login_note = "Could not connect. After login was not tested."
+            self._pasvport_verdict(before)
+            creds = None
+            login_note = None
+            if resolve_login is not None:
+                creds, login_note = resolve_login()
+            phases = [before]
+            if creds is not None:
+                if live:
+                    print()
+                    self._tprint("After login", "INFO", indent=4)
+                try:
+                    after = self._pasvport_collect("after", creds, sample_count, self._PASVPORT_WARN_SPAN, minimum)
+                except OSError as exc:
+                    text = str(exc).strip()
+                    if "could not connect" in text.lower():
+                        login_note = "Could not connect. After login was not tested."
+                    else:
+                        login_note = self._snip(text) or "Login failed."
+                    if live:
+                        self._tprint(login_note, "WARNING", indent=8)
                 else:
-                    login_note = self._snip(text) or "Login failed."
-        finding = self._pasvport_finding_phase(phases)
-        if finding is not None:
-            self._pasvport_note_poc(finding)
-        result = PasvPortRangeResult(
-            phases=tuple(phases),
-            max_span_threshold=max_span_threshold,
-            min_samples_for_verdict=minimum,
-            login_note=login_note,
-        )
-        self._pasvport_report(result)
-        return result
+                    phases.append(after)
+                    self._pasvport_verdict(after)
+            elif login_note and live:
+                print()
+                self._tprint("After login", "INFO", indent=4)
+                self._tprint(login_note, "WARNING", indent=8)
+            finding = self._pasvport_finding_phase(phases)
+            if finding is not None:
+                self._pasvport_note_poc(finding)
+            return PasvPortRangeResult(
+                phases=tuple(phases),
+                max_span_threshold=self._PASVPORT_WARN_SPAN,
+                min_samples_for_verdict=minimum,
+                login_note=login_note,
+            )
+        finally:
+            self._modes_vv_indent = None
 
     def _pasvport_line(self, text: str, bullet: str, indent: int = 4) -> None:
         if self.use_json:
@@ -2577,40 +3006,58 @@ class FtpEngine:
         self._tprint(text, bullet, indent=indent)
         self._pasvport_streamed = True
 
+    def _pasvport_verdict(self, phase: PasvPortPhase) -> None:
+        if self.use_json:
+            return
+        if phase.status == "login":
+            self._pasvport_line("Passive port was not assigned. Login is required.", "WARNING", indent=8)
+        elif phase.status == "unsupported":
+            self._pasvport_line("PASV and EPSV are not supported.", "NOTVULN", indent=8)
+        elif phase.status != "measured":
+            self._pasvport_line(
+                f"Passive port range was not confirmed ({len(phase.ports)}/{len(phase.samples)} samples)",
+                "WARNING",
+                indent=8,
+            )
+        elif phase.level == "error":
+            self._pasvport_line(
+                f"Passive port range {phase.min_port}-{phase.max_port} is not limited "
+                f"(span {phase.observed_span} > {self._PASVPORT_WARN_SPAN})",
+                "VULN",
+                indent=8,
+            )
+        elif phase.level == "warn":
+            self._pasvport_line(
+                f"Passive port range {phase.min_port}-{phase.max_port} is wide "
+                f"(span {phase.observed_span}, {self._PASVPORT_OK_SPAN}-{self._PASVPORT_WARN_SPAN})",
+                "WARNING",
+                indent=8,
+            )
+        else:
+            self._pasvport_line(
+                f"Passive port range {phase.min_port}-{phase.max_port} is limited "
+                f"(span {phase.observed_span} ≤ {self._PASVPORT_OK_SPAN})",
+                "NOTVULN",
+                indent=8,
+            )
+
     def _pasvport_report(self, ppr: PasvPortRangeResult) -> None:
-        """One verdict per phase. The replies are already in the -vv trace."""
+        """Fallback when the test did not print as it went."""
+        if self.use_json or getattr(self, "_pasvport_streamed", False):
+            return
         if ppr.connect_error:
             self._pasvport_line(ppr.connect_error, "WARNING")
             return
-        for phase in ppr.phases:
+        for index, phase in enumerate(ppr.phases):
+            if index:
+                print()
             title = "Before login" if phase.phase == "before" else "After login"
-            self._tprint(title, "TEXT")
-            if phase.status == "login":
-                self._pasvport_line("Passive port was not assigned. Login is required.", "WARNING", indent=8)
-            elif phase.status == "unsupported":
-                self._pasvport_line("PASV and EPSV are not supported.", "NOTVULN", indent=8)
-            elif phase.status != "measured":
-                self._pasvport_line(
-                    f"Passive port range was not confirmed ({len(phase.ports)}/{len(phase.samples)} samples)",
-                    "WARNING",
-                    indent=8,
-                )
-            elif phase.wide:
-                self._pasvport_line(
-                    f"Passive port range {phase.min_port}-{phase.max_port} is not limited "
-                    f"(span {phase.observed_span} > {ppr.max_span_threshold})",
-                    "VULN",
-                    indent=8,
-                )
-            else:
-                self._pasvport_line(
-                    f"Passive port range {phase.min_port}-{phase.max_port} is limited "
-                    f"(span {phase.observed_span} ≤ {ppr.max_span_threshold})",
-                    "NOTVULN",
-                    indent=8,
-                )
+            self._tprint(title, "INFO", indent=4)
+            self._pasvport_verdict(phase)
         if ppr.login_note and not any(phase.phase == "after" for phase in ppr.phases):
-            self._pasvport_line(ppr.login_note, "WARNING")
+            print()
+            self._tprint("After login", "INFO", indent=4)
+            self._pasvport_line(ppr.login_note, "WARNING", indent=8)
 
     def _conn_limits_read220_quit(self, sock: socket.socket) -> tuple[bool, str | None]:
         sock.settimeout(12.0)
@@ -3798,8 +4245,54 @@ class FtpEngine:
 
         return None, None
 
+    def _active_reset(self) -> None:
+        self._active_policy = False
+        self._active_pre = False
+        self._active_post = False
+        self._active_bounce = False
+        self._active_steps_streamed = False
+
+    def _active_begin(self, phase: str, name: str) -> None:
+        """Section heading before this step's exchange."""
+        if self.use_json:
+            return
+        if not getattr(self, "_active_policy", False):
+            self._ptprint("Active mode policy", Out.INFO)
+            self._active_policy = True
+        if phase == "preAuth" and not getattr(self, "_active_pre", False):
+            self._ptprint("Pre-authentication checks", Out.INFO)
+            self._active_pre = True
+        if phase == "postAuth" and not getattr(self, "_active_post", False):
+            self._ptprint("Post-authentication checks", Out.INFO)
+            self._active_post = True
+        if (
+            phase == "postAuth"
+            and name in ("port_foreign_list", "port_foreign")
+            and not getattr(self, "_active_bounce", False)
+        ):
+            self._ptprint("FTP bounce (foreign IP)", Out.INFO)
+            self._active_bounce = True
+        self._modes_vv_indent = 8
+
+    def _active_emit(self, step: ActiveAuditStep) -> None:
+        """Verdict for one step. The exchange was already printed under the heading."""
+        if self.use_json:
+            return
+        self._active_steps_streamed = True
+        v_col, v_msg = self._active_audit_step_verdict(step, None)  # type: ignore[arg-type]
+        if v_msg and v_col:
+            self._tprint(v_msg, v_col, indent=8)
+        elif step.interpretation:
+            self._ptprint(f"        hint: {step.interpretation}", Out.TEXT)
+        cmd_s = step.command if step.command else "(no command)"
+        if step.note and not (cmd_s == "(skipped)" and v_msg):
+            self._ptprint(f"        note: {step.note}", Out.TEXT)
+
     def _print_active_audit_terminal(self, aa: ActiveAuditResult) -> None:
         """Structured terminal output for active mode policy audit (aligned with other FTP sections)."""
+        if getattr(self, "_active_steps_streamed", False):
+            self._active_print_summary(aa)
+            return
         bounce_header = False
         printed_pre = False
         post_header = False
@@ -3842,6 +4335,9 @@ class FtpEngine:
             if s.note and not (cmd_s == "(skipped)" and v_msg):
                 self._ptprint(f"        note: {s.note}", Out.TEXT)
 
+        self._active_print_summary(aa)
+
+    def _active_print_summary(self, aa: ActiveAuditResult) -> None:
         if not aa.post_auth_ran:
             self._tprint(
                 self._missing_login_line(),
@@ -4048,13 +4544,18 @@ class FtpEngine:
         Full PTL-SVC-FTP-ACTIVE methodology: isolated sessions, interpretation hints,
         D0 raw LIST, PORT+LIST per variant, multiple low ports.
         """
-        self._dbg("Active-mode full methodology")
+        self._active_reset()
         doc_net_ip = "192.0.2.1"
         foreign_data_port = 7 * 256 + 138
         local_high_port = 40123
         low_ports = self._parse_active_audit_low_ports(low_ports_spec)
 
         steps: list[ActiveAuditStep] = []
+
+        def push(step: ActiveAuditStep) -> None:
+            steps.append(step)
+            self._active_emit(step)
+
         foreign_accepted = False
         low_accepted_ports: list[int] = []
         list_after_own_ok: bool | None = None
@@ -4062,9 +4563,10 @@ class FtpEngine:
         # --- Pre-auth (single connection) ---
         pre = self.connect()
         try:
+            self._active_begin("preAuth", "pasv")
             pasv_r = self._ftp_send_cmd(pre, "PASV")
             pc = self._reply_code(pasv_r)
-            steps.append(
+            push(
                 ActiveAuditStep(
                     "preAuth",
                     "pasv",
@@ -4081,9 +4583,10 @@ class FtpEngine:
             if local_pre:
                 for pname, port_n in (("port_own_high", local_high_port), ("port_own_1930", foreign_data_port)):
                     cmd = self._format_port_command(local_pre, port_n)
+                    self._active_begin("preAuth", pname)
                     pr = self._ftp_send_cmd(pre, cmd)
                     c = self._reply_code(pr)
-                    steps.append(
+                    push(
                         ActiveAuditStep(
                             "preAuth",
                             pname,
@@ -4097,7 +4600,8 @@ class FtpEngine:
                         )
                     )
             else:
-                steps.append(
+                self._active_begin("preAuth", "port_own")
+                push(
                     ActiveAuditStep(
                         "preAuth",
                         "port_own",
@@ -4112,9 +4616,10 @@ class FtpEngine:
                 )
 
             fcmd = self._format_port_command(doc_net_ip, foreign_data_port)
+            self._active_begin("preAuth", "port_foreign")
             fr = self._ftp_send_cmd(pre, fcmd)
             fc = self._reply_code(fr)
-            steps.append(
+            push(
                 ActiveAuditStep(
                     "preAuth",
                     "port_foreign",
@@ -4150,6 +4655,7 @@ class FtpEngine:
         post_ran = True
 
         def session_pasv_list() -> None:
+            self._active_begin("postAuth", "pasv_list")
             ftp = self.connect()
             try:
                 ftp.login(creds.user, creds.passw)
@@ -4162,7 +4668,12 @@ class FtpEngine:
                 except ftplib.Error as e:
                     ok = False
                     lr = str(e).strip()
-                steps.append(
+                last = getattr(ftp, "lastresp", None)
+                if not ok and lr:
+                    self._ftp_vv_io("LIST", lr)
+                elif last:
+                    self._ftp_vv_io("LIST", last)
+                push(
                     ActiveAuditStep(
                         "postAuth",
                         "pasv_list",
@@ -4182,11 +4693,13 @@ class FtpEngine:
                     pass
 
         def session_d0() -> None:
+            self._active_begin("postAuth", "d0_list_raw")
             ftp = self.connect()
             try:
                 ftp.login(creds.user, creds.passw)
                 resp, code = self._raw_list_without_pasv_port(ftp)
-                steps.append(
+                self._ftp_vv_io("LIST", resp)
+                push(
                     ActiveAuditStep(
                         "postAuth",
                         "d0_list_raw",
@@ -4220,7 +4733,8 @@ class FtpEngine:
                 pass
 
         if not local:
-            steps.append(
+            self._active_begin("postAuth", "port_sessions")
+            push(
                 ActiveAuditStep(
                     "postAuth",
                     "port_sessions",
@@ -4245,13 +4759,16 @@ class FtpEngine:
 
         def run_port_list_session(step_name: str, data_port: int, foreign: bool) -> None:
             nonlocal foreign_accepted, list_after_own_ok
+            self._active_begin("postAuth", step_name)
             ftp = self.connect()
             try:
                 ftp.login(creds.user, creds.passw)
                 if foreign:
                     pr, pc, lr, lc = self._foreign_port_then_list(ftp, doc_net_ip, data_port)
                     hint = self._hint_port_preauth_foreign(pc)
-                    steps.append(
+                    if lr:
+                        self._ftp_vv_io("LIST", lr)
+                    push(
                         ActiveAuditStep(
                             "postAuth",
                             step_name,
@@ -4269,6 +4786,8 @@ class FtpEngine:
                     return
 
                 pr, pc, lr, lc, data_ok, err_note = self._active_port_list_plaintext(ftp, local, data_port)
+                if lr:
+                    self._ftp_vv_io("LIST", lr)
                 if step_name == "port_own_high_list" and data_ok:
                     list_after_own_ok = True
                 hint = None
@@ -4288,7 +4807,7 @@ class FtpEngine:
                     inter = "Active PORT+LIST completed for high/ephemeral data port."
                 elif pc == 200 and data_port >= 1000 and not data_ok:
                     inter = "PORT accepted but data transfer incomplete (timeout/NAT/firewall possible)."
-                steps.append(
+                push(
                     ActiveAuditStep(
                         "postAuth",
                         step_name,
@@ -4329,7 +4848,7 @@ class FtpEngine:
         PTL-SVC-FTP-ACTIVE: PASV/PORT policy (pre- and post-login), foreign IP and low-port PORT.
         Uses 192.0.2.1 (RFC 5737 TEST-NET-1) as non-client address for bounce-style checks.
         """
-        self._dbg("Active-mode policy audit")
+        self._active_reset()
         # RFC 5737 documentation block — must not target real third parties
         doc_net_ip = "192.0.2.1"
         foreign_data_port = 7 * 256 + 138  # 1930, example from audit methodology
@@ -4337,6 +4856,11 @@ class FtpEngine:
         low_test_port = 80  # < 1000 per test spec; RFC 2577 recommends rejecting < 1024
 
         steps: list[ActiveAuditStep] = []
+
+        def push(step: ActiveAuditStep) -> None:
+            steps.append(step)
+            self._active_emit(step)
+
         foreign_accepted = False
         low_port_accepted = False
         list_after_own_port_ok: bool | None = None
@@ -4344,8 +4868,9 @@ class FtpEngine:
         # --- Pre-authentication ---
         pre_ftp = self.connect()
         try:
+            self._active_begin("preAuth", "pasv")
             pasv_reply = self._ftp_send_cmd(pre_ftp, "PASV")
-            steps.append(
+            push(
                 ActiveAuditStep(
                     "preAuth",
                     "pasv",
@@ -4358,13 +4883,15 @@ class FtpEngine:
             local_pre = self._local_control_ipv4(pre_ftp)
             if local_pre:
                 port_cmd = self._format_port_command(local_pre, local_high_port)
+                self._active_begin("preAuth", "port_own_high")
                 pr = self._ftp_send_cmd(pre_ftp, port_cmd)
                 code = self._reply_code(pr)
-                steps.append(
+                push(
                     ActiveAuditStep("preAuth", "port_own_high", port_cmd, pr, code, None)
                 )
             else:
-                steps.append(
+                self._active_begin("preAuth", "port_own_high")
+                push(
                     ActiveAuditStep(
                         "preAuth",
                         "port_own_high",
@@ -4376,9 +4903,10 @@ class FtpEngine:
                 )
 
             fcmd = self._format_port_command(doc_net_ip, foreign_data_port)
+            self._active_begin("preAuth", "port_foreign")
             fr = self._ftp_send_cmd(pre_ftp, fcmd)
             fc = self._reply_code(fr)
-            steps.append(ActiveAuditStep("preAuth", "port_foreign", fcmd, fr, fc, None))
+            push(ActiveAuditStep("preAuth", "port_foreign", fcmd, fr, fc, None))
             if fc == 200:
                 foreign_accepted = True
         finally:
@@ -4406,6 +4934,7 @@ class FtpEngine:
             ftp = self.connect()
             try:
                 ftp.login(creds.user, creds.passw)
+                self._active_begin("postAuth", name)
                 reply = self._ftp_send_cmd(ftp, cmd)
                 return ActiveAuditStep(
                     "postAuth",
@@ -4421,7 +4950,7 @@ class FtpEngine:
                 except Exception:
                     pass
 
-        steps.append(run_post("pasv", "PASV"))
+        push(run_post("pasv", "PASV"))
 
         local = None
         ftp_one = self.connect()
@@ -4437,20 +4966,21 @@ class FtpEngine:
         if local:
             pcmd_own = self._format_port_command(local, local_high_port)
             st = run_post("port_own_high", pcmd_own)
-            steps.append(st)
+            push(st)
 
             pcmd_foreign = self._format_port_command(doc_net_ip, foreign_data_port)
             st_f = run_post("port_foreign", pcmd_foreign)
-            steps.append(st_f)
+            push(st_f)
             if self._reply_code(st_f.reply) == 200:
                 foreign_accepted = True
 
             pcmd_low = self._format_port_command(local, low_test_port)
             st_l = run_post("port_low", pcmd_low)
-            steps.append(st_l)
+            push(st_l)
             if self._reply_code(st_l.reply) == 200:
                 low_port_accepted = True
 
+            self._active_begin("postAuth", "list_active")
             ftp_l = self.connect()
             try:
                 ftp_l.login(creds.user, creds.passw)
@@ -4463,12 +4993,17 @@ class FtpEngine:
                 except Exception as e:
                     list_after_own_port_ok = False
                     list_err = str(e).strip()
+                last = getattr(ftp_l, "lastresp", None)
+                if list_err:
+                    self._ftp_vv_io("LIST", list_err)
+                elif last:
+                    self._ftp_vv_io("LIST", last)
             finally:
                 try:
                     ftp_l.close()
                 except Exception:
                     pass
-            steps.append(
+            push(
                 ActiveAuditStep(
                     "postAuth",
                     "list_active",
@@ -4479,7 +5014,8 @@ class FtpEngine:
                 )
             )
         else:
-            steps.append(
+            self._active_begin("postAuth", "port_skipped")
+            push(
                 ActiveAuditStep(
                     "postAuth",
                     "port_skipped",
@@ -5783,6 +6319,31 @@ class FtpEngine:
         host = self.args.target.ip
         port = self.args.target.port
         timeout = 10.0
+        _ssl_ctx = ssl._create_unverified_context()
+        tls_only_port = port == 990
+        self._encryption_log = {}
+        self._encryption_capture = None
+
+        try:
+            return self._encryption_run(
+                host,
+                port,
+                timeout,
+                _ssl_ctx,
+                tls_only_port,
+            )
+        finally:
+            self._encryption_capture = None
+            self._modes_vv_indent = None
+
+    def _encryption_run(
+        self,
+        host: str,
+        port: int,
+        timeout: float,
+        _ssl_ctx,
+        tls_only_port: bool,
+    ) -> EncryptionResult:
         plaintext_ok = False
         plaintext_banner: str | None = None
         auth_tls_ok = False
@@ -5790,11 +6351,10 @@ class FtpEngine:
         plaintext_incomplete = False
         auth_tls_incomplete = False
         tls_incomplete = False
-        _ssl_ctx = ssl._create_unverified_context()
-        tls_only_port = port == 990
 
         if not tls_only_port:
             # 1. Plaintext (no TLS)
+            self._encryption_capture = self._encryption_log.setdefault("Plaintext", [])
             try:
                 ftp = ftplib.FTP()
                 ftp.connect(host, port, timeout=timeout)
@@ -5813,6 +6373,7 @@ class FtpEngine:
                 self._ftp_vv_io("(connect)", str(e))
 
             # 2. AUTH TLS (explicit: plain connect, then AUTH TLS + TLS handshake)
+            self._encryption_capture = self._encryption_log.setdefault("AUTH TLS", [])
             try:
                 ftp = ftplib.FTP_TLS()
                 ftp.connect(host, port, timeout=timeout)
@@ -5826,6 +6387,7 @@ class FtpEngine:
                 self._ftp_vv_io("AUTH TLS", str(e).strip())
 
         # 3. Implicit TLS (port 990)
+        self._encryption_capture = self._encryption_log.setdefault("Implicit TLS", [])
         _connect_timeout = 15.0 if tls_only_port else timeout
 
         def _try_implicit_tls(sni):
@@ -5865,7 +6427,7 @@ class FtpEngine:
         except Exception:
             pass
 
-        return EncryptionResult(
+        result = EncryptionResult(
             plaintext_ok,
             auth_tls_ok,
             tls_ok,
@@ -5874,6 +6436,59 @@ class FtpEngine:
             tls_incomplete,
             plaintext_banner,
         )
+        self._encryption_capture = None
+        self._encryption_replay(result)
+        return result
+
+    def _encryption_replay(self, enc: EncryptionResult) -> None:
+        """Heading, the real exchange, then that mode's verdict."""
+        log: dict = getattr(self, "_encryption_log", None) or {}
+        any_ok = enc.plaintext_ok or enc.auth_tls_ok or enc.tls_ok
+        any_inc = enc.plaintext_incomplete or enc.auth_tls_incomplete or enc.tls_incomplete
+        plaintext_only = (
+            enc.plaintext_ok and not enc.auth_tls_ok and not enc.tls_ok and not any_inc
+        )
+
+        def plain_verdict() -> tuple[str, str]:
+            if enc.plaintext_ok and plaintext_only:
+                return "VULN", "Plaintext only"
+            if enc.plaintext_ok:
+                bullet = "WARNING" if (enc.auth_tls_ok or enc.tls_ok or any_inc) else "NOTVULN"
+                return bullet, "Plaintext"
+            if enc.plaintext_incomplete:
+                return "WARNING", "Plaintext timed out (not confirmed)"
+            if any_ok or any_inc:
+                return "NOTVULN", "Plaintext is not available"
+            return "WARNING", "Could not connect. Encryption was not tested."
+
+        def tls_verdict(ok: bool, incomplete: bool, label: str) -> tuple[str, str]:
+            if ok:
+                return "NOTVULN", label
+            if incomplete:
+                return "WARNING", f"{label} timed out (not confirmed)"
+            return "NOTVULN", f"{label} is not available"
+
+        sections = (
+            ("Plaintext", plain_verdict),
+            ("AUTH TLS", lambda: tls_verdict(enc.auth_tls_ok, enc.auth_tls_incomplete, "AUTH TLS")),
+            ("Implicit TLS", lambda: tls_verdict(enc.tls_ok, enc.tls_incomplete, "Implicit TLS")),
+        )
+        shown = [(title, verdict()) for title, verdict in sections if log.get(title)]
+        if not shown:
+            return
+        if self.use_json:
+            for title, _verdict in shown:
+                for send, recv in log[title]:
+                    self._ftp_vv_io(send, recv)
+            return
+        for title, (bullet, text) in shown:
+            self._tprint(title, "INFO", indent=4)
+            self._modes_vv_indent = 8
+            for send, recv in log[title]:
+                self._ftp_vv_io(send, recv)
+            self._tprint(text, bullet, indent=8)
+        self._encryption_streamed = True
+        self._modes_vv_indent = None
 
     def _stream_banner_result(self) -> None:
         """Stream banner + Service Identification immediately (thread-safe)."""
@@ -6056,7 +6671,9 @@ class FtpEngine:
                     )
         self._commands_streamed = True
 
-    def _stream_command_rows(self, help_text: str | None, syst: str | None, stat: str | None) -> None:
+    def _stream_command_rows(
+        self, help_text: str | None, syst: str | None, stat: str | None, *, indent: int = 4
+    ) -> None:
         rows = self._ftp_command_rows(help_text, syst, stat)
         if rows:
             for label, level in rows:
@@ -6064,7 +6681,7 @@ class FtpEngine:
                     label,
                     bullet_type=self._ftp_command_bullet(level),
                     condition=True,
-                    indent=4,
+                    indent=indent,
                 )
             return
         if help_text and help_text.strip().startswith("530"):
@@ -6072,15 +6689,24 @@ class FtpEngine:
                 "Command list was not returned. Login is required.",
                 bullet_type="WARNING",
                 condition=True,
-                indent=4,
+                indent=indent,
             )
             return
         self._ptprint_raw(
             "Command list was not returned.",
             bullet_type="WARNING",
             condition=True,
-            indent=4,
+            indent=indent,
         )
+
+    def _stream_site_names(self, *, indent: int = 8) -> None:
+        for name in tuple(getattr(self.results, "site_extensions", ()) or ()):
+            self._ptprint_raw(
+                name,
+                bullet_type=self._ftp_command_bullet(self._ftp_site_level(name)),
+                condition=True,
+                indent=indent,
+            )
 
     def _commands_reread(self, creds) -> None:
         """After a login, read HELP, SYST and STAT again. A 530 reply is not a command list."""
@@ -6091,7 +6717,7 @@ class FtpEngine:
         reuse = ftp is not None and creds.user == "anonymous" and self.results.anonymous
         if not reuse:
             try:
-                ftp = self.connect()
+                ftp = self.connect(trace=True)
             except Exception as ex:
                 self._ftp_vv_io("(connect)", str(ex))
                 self._commands_login_note = "Could not connect. Commands after login were not tested."
@@ -6237,7 +6863,7 @@ class FtpEngine:
         ftp = getattr(self, "ftp", None)
         try:
             if ftp is None:
-                ftp = self.connect()
+                ftp = self.connect(trace=True)
                 self.ftp = ftp
             reply = self._ftp_send_cmd(ftp, "SITE HELP")
         except Exception as ex:
@@ -6257,6 +6883,8 @@ class FtpEngine:
 
     def _stream_encryption_result(self) -> None:
         """Stream encryption test result to terminal (thread-safe)."""
+        if getattr(self, "_encryption_streamed", False):
+            return
         pp = self._ptprint_raw
         show = not self.use_json
         with self._output_lock:
@@ -6320,6 +6948,8 @@ class FtpEngine:
 
     def _stream_access_check_terminal(self) -> None:
         """Print --access results under [+] Access check."""
+        if self.use_json or getattr(self, "_access_streamed", False):
+            return
         pp = self._ptprint_raw
         show = not self.use_json
         access = self.results.access
@@ -7142,6 +7772,8 @@ class FtpEngine:
         return [uploaded, ("WARNING", f"{who}Deletion was not confirmed")]
 
     def _print_eicar_audit_terminal(self, ea: FtpEicarAuditResult) -> None:
+        if getattr(self, "_eicar_streamed", False):
+            return
         if not ea.rows:
             self._tprint(ea.detail, "WARNING")
             return

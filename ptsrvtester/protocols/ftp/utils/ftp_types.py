@@ -103,6 +103,26 @@ def _ftp_list_line_directory_rel_name(line: str) -> str | None:
         return None
 
 
+def _ftp_list_line_file_name(line: str) -> str | None:
+    """File name from one LIST row. Directories and the total line are skipped."""
+    stripped = (line or "").rstrip("\r\n").strip()
+    if not stripped or stripped.lower().startswith("total "):
+        return None
+    if stripped[0] == "d" or "<DIR>" in stripped.upper():
+        return None
+    if stripped[0] == "-":
+        parts = stripped.split()
+        if len(parts) >= 9:
+            tok7 = parts[7]
+            if (len(tok7) == 4 and tok7.isdigit()) or ":" in tok7:
+                name = " ".join(parts[8:]).strip()
+                if name and name not in (".", ".."):
+                    return name
+    if " " not in stripped and stripped not in (".", ".."):
+        return stripped
+    return None
+
+
 # endregion
 
 
@@ -167,6 +187,16 @@ class AccessPermissions:
     write: str | None = None
     read: str | None = None
     delete: str | None = None
+    listing_ok: bool | None = None
+    named_file: str | None = None
+    named_read: bool | None = None
+    named_rewrite: bool | None = None
+    named_delete: bool | None = None
+    random_name: str | None = None
+    random_write: bool | None = None
+    random_read: bool | None = None
+    random_delete: bool | None = None
+    login_error: str | None = None
 
 
 class AccessCheckResult(NamedTuple):
@@ -484,6 +514,7 @@ class PasvPortPhase:
     wide: bool
     status: str
     detail: str
+    level: str = "ok"
 
 
 @dataclass

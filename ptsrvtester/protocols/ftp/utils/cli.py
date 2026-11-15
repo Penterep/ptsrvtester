@@ -21,14 +21,15 @@ class FTPArgs(ArgsWithBruteforce):
     module_threads: int
     anonymous: bool
     access_list: bool
+    access_file: str | None
     bounce: Target | None
     bounce_file: str | None
     paths_wordlist: str | None
     enum_files: str | None
     enum_depth: int
     base_path: str
-    pasv_port_audit_samples: int
-    pasv_port_audit_max_span: int
+    pasv_port_audit_samples: int | None
+    pasv_port_audit_max_span: int | None
     conn_limit_count: int | None
     conn_limit_duration: float | None
     active_audit_low_ports: str
@@ -137,15 +138,16 @@ class FTPArgs(ArgsWithBruteforce):
 
         mods = parser.add_argument_group("TEST OPTIONS")
         mods.add_argument("-l", "--access-list", action="store_true", help="ACCESS: display root directory listing")
+        mods.add_argument("-f", "--file", type=str, dest="access_file", metavar="<name>", help="ACCESS: remote file name when listing is refused")
         mods.add_argument("-B", "--bounce", type=valid_target_bounce, help="ACCESS: FTP bounce to IP:PORT / HOST:PORT")
         mods.add_argument("--bounce-file", type=str, help="ACCESS: file with request for bounce")
         mods.add_argument("-w", "--paths-wordlist", type=str, dest="paths_wordlist", help="ENUMPATH: directory names, one per line")
         mods.add_argument("--files", type=str, dest="enum_files", metavar="<file>", help="ENUMPATH: file names to try inside each directory entered")
         mods.add_argument("--depth", type=int, default=1, dest="enum_depth", metavar="<n>", help="ENUMPATH: how many directory levels to walk (default: 1)")
         mods.add_argument("--base-path", type=str, default="", dest="base_path", help="ENUMPATH: start directory")
-        mods.add_argument("--pasv-port-audit-samples", type=int, default=8, dest="pasv_port_audit_samples", metavar="<n>")
-        mods.add_argument("--pasv-port-audit-max-span", type=int, default=8192, dest="pasv_port_audit_max_span", metavar="<n>")
-        mods.add_argument("--count", type=int, default=None, dest="conn_limit_count", metavar="<n>", help=argparse.SUPPRESS)
+        mods.add_argument("--pasv-port-audit-samples", type=int, default=None, dest="pasv_port_audit_samples", metavar="<n>", help=argparse.SUPPRESS)
+        mods.add_argument("--pasv-port-audit-max-span", type=int, default=None, dest="pasv_port_audit_max_span", metavar="<n>", help=argparse.SUPPRESS)
+        mods.add_argument("-c", "--count", type=int, default=None, dest="conn_limit_count", metavar="<n>", help=argparse.SUPPRESS)
         mods.add_argument("--duration", type=float, default=None, dest="conn_limit_duration", metavar="<sec>", help=argparse.SUPPRESS)
         mods.add_argument("--active-audit-low-ports", type=str, default="80,443,21", dest="active_audit_low_ports")
         mods.add_argument("--user-enum-wordlist", type=str, dest="user_enum_wordlist", metavar="<file>")
@@ -172,6 +174,13 @@ def validate_ftp_selection(args) -> None:
     th = getattr(args, "threads", None)
     if th is not None and int(th) < 1:
         raise argparse.ArgumentError(None, "-t/--threads must be >= 1")
+    for name, label in (
+        ("conn_limit_count", "-c/--count"),
+        ("pasv_port_audit_samples", "--pasv-port-audit-samples"),
+    ):
+        raw = getattr(args, name, None)
+        if raw is not None and int(raw) < 1:
+            raise argparse.ArgumentError(None, f"{label} must be >= 1")
     codes = _codes(args)
     if not codes or "ALL" in codes:
         return

@@ -32,6 +32,11 @@ SNMP_TESTS: dict[str, dict] = {
         "long": "",
         "flags": {"v1_walk": True}
     },
+    "V1WRITE": {
+        "desc": "Test SNMPv1 write permissions",
+        "long": "",
+        "flags": {"v2_walk": True}
+    },
     "V2BRUTE": {
         "desc": "SNMPv2 dictionary attack",
         "long": "",

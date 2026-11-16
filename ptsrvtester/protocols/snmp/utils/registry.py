@@ -8,6 +8,7 @@ from pysnmp.hlapi.v3arch.asyncio import *
 
 SNMP_TEST_GROUPS = [
     ("General", ["VERSION"]),
+    ("SNMPv1", ["V1WALK"]),
     ("SNMPv2", ["V2BRUTE", "V2WRITE", "V2WALK"]),
     ("SNMPv3", ["V3ENUM", "V3BRUTE", "V3WALK", "V3WRITE"])
 ]
@@ -25,6 +26,11 @@ SNMP_TESTS: dict[str, dict] = {
         "desc": "Detect SNMP versions",
         "long": "",
         "flags": {"version_detection": True}
+    },
+    "V1WALK": {
+        "desc": "SNMPv1 MIB walk",
+        "long": "",
+        "flags": {"v1_walk": True}
     },
     "V2BRUTE": {
         "desc": "SNMPv2 dictionary attack",

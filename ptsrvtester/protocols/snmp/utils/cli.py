@@ -9,6 +9,7 @@ __all__ = ['SNMPArgs']
 
 SNMP_TEST_GROUPS = [
     ("General", ["VERSION"]),
+    ("SNMPv1", ["V1WALK"]),
     ("SNMPv2", ["V2BRUTE", "V2WRITE", "V2WALK"]),
     ("SNMPv3", ["V3ENUM", "V3BRUTE", "V3WALK", "V3WRITE"])
 ]
@@ -30,6 +31,26 @@ SNMP_TESTS: dict[str, dict] = {
           ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
         ],
         "usage": ["-tg 192.168.15.53:161"]
+    },
+    "V1WALK": {
+        "desc": "SNMPv1 MIB walk",
+        "long": "",
+        "flags": {"v1_walk": True},
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+            ["-c", "--single-community", "", "Single community string"],
+            ["-cf", "--community-file", "", "File containing community strings"]
+        ],
+        "mods": [
+            ["-o", "--oid", "<oid>", "OID to start from. Default: 1.3.6"],
+            ["-of", "--oid-format", "", "Use human readable OID format"],
+            ["-w", "--write-to-file", "<file>", "File to write output to"]
+        ],
+        "usage": [
+            "-tg 192.168.15.53:161 -c public",
+            "-tg 192.168.15.53:161 -cf c_strings.txt",
+            "-tg 192.168.15.53:161 -c public -o 1.3.8 -of",
+        ]
     },
     "V2BRUTE": {
         "desc": "Find SNMPv2 communities with read or write access",
@@ -310,9 +331,14 @@ class SNMPArgs(ArgsWithBruteforce):
         snmpv2_write_parser.add_argument("-val", "--value", default="Testvalue123",
                                          help="Value to write to the specified OID (default: 'Testvalue123')")
 
+        # SNMPv1 GetNext (Walk)
+        snmp_subparsers.add_argument_group("v1walk", description="SNMPv1 MIB walk")
+
         # SNMPv2 GetBulk (Walk)
         snmpv2_getbulk_parser = snmp_subparsers.add_argument_group("v2walk", description="SNMPv2 MIB walk")
-        snmpv2_getbulk_parser.add_argument("-oid", "--oid", default="1.3.6", help="OID to start from")
+        snmpv2_getbulk_parser.add_argument(
+            "-o", "-oid", "--oid", default="1.3.6", help="OID to start from"
+        )
         snmpv2_getbulk_parser.add_argument("-of", "--oid-format", action="store_true",
                                            help="Use human readable OID format")
 

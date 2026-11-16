@@ -9,7 +9,7 @@ __all__ = ['SNMPArgs']
 
 SNMP_TEST_GROUPS = [
     ("General", ["VERSION"]),
-    ("SNMPv1", ["V1WALK", "V1WRITE"]),
+    ("SNMPv1", ["V1WALK", "V1WRITE", "V1BRUTE"]),
     ("SNMPv2", ["V2BRUTE", "V2WRITE", "V2WALK"]),
     ("SNMPv3", ["V3ENUM", "V3BRUTE", "V3WALK", "V3WRITE"])
 ]
@@ -68,6 +68,24 @@ SNMP_TESTS: dict[str, dict] = {
             "-tg 192.168.15.53:161 -c private",
             "-tg 192.168.15.53:161 -cf c_strings.txt",
             "-tg 192.168.15.53:161 -c private -v Value55"
+        ]
+    },
+    "V1BRUTE": {
+        "desc": "Find SNMPv1 communities with read or write access",
+        "long": "",
+        "flags": {"v1_brute_force": True},
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+            ["-c", "--single-community", "", "Single community string"],
+            ["-cf", "--community-file", "", "File containing community strings"]
+        ],
+        "mods": [
+            ["-w", "--write-to-file", "<file>", "File to write output to"]
+        ],
+        "usage": [
+            "-tg 192.168.15.53:161 -c private",
+            "-tg 192.168.15.53:161 -cf c_strings.txt",
+            "-tg 192.168.15.53:161 -c private -o creds.txt"
         ]
     },
     "V2BRUTE": {

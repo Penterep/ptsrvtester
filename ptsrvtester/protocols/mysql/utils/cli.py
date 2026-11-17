@@ -7,7 +7,8 @@ __all__ = ['MySQLArgs']
 
 
 MYSQL_TEST_GROUPS = [
-    ("Enumeration", ["VERSION"])
+    ("Enumeration", ["VERSION", "ENCRYPT"]),
+    ("Users & Privileges", ["SUPERUSERS"])
 ]
 
 # Per-test definitions:
@@ -24,6 +25,30 @@ MYSQL_TESTS: dict[str, dict] = {
         "long": ["Query the MySQL server for its version."],
         "requires": [
           ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "usage": ["-tg 192.168.1.1:3306"],
+        "mods": [
+            ["-u", "--username", "", "Username to authenticate as"],
+            ["-p", "--password", "", "Password to authenticate with"]
+        ],
+    },
+    "ENCRYPT": {
+        "desc": "MySQL TLS/SSL detection",
+        "long": ["Query the MySQL server to see if it's running over TLS/SSL."],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "usage": ["-tg 192.168.1.1:3306"],
+        "mods": [
+            ["-u", "--username", "", "Username to authenticate as"],
+            ["-p", "--password", "", "Password to authenticate with"]
+        ],
+    },
+    "SUPERUSERS": {
+        "desc": "Grab MySQL super-users",
+        "long": ["Query the MySQL server for users with the SUPER privilege."],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
         ],
         "usage": ["-tg 192.168.1.1:3306"],
         "mods": [

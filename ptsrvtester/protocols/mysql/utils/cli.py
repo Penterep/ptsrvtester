@@ -7,7 +7,8 @@ __all__ = ['MySQLArgs']
 
 
 MYSQL_TEST_GROUPS = [
-    ("Enumeration", ["VERSION", "ENCRYPT"])
+    ("Enumeration", ["VERSION", "ENCRYPT"]),
+    ("Users & Privileges", ["SUPERUSERS"])
 ]
 
 # Per-test definitions:
@@ -42,7 +43,19 @@ MYSQL_TESTS: dict[str, dict] = {
             ["-u", "--username", "", "Username to authenticate as"],
             ["-p", "--password", "", "Password to authenticate with"]
         ],
-    }
+    },
+    "SUPERUSERS": {
+        "desc": "Grab MySQL super-users",
+        "long": ["Query the MySQL server for users with the SUPER privilege."],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "usage": ["-tg 192.168.1.1:3306"],
+        "mods": [
+            ["-u", "--username", "", "Username to authenticate as"],
+            ["-p", "--password", "", "Password to authenticate with"]
+        ],
+    },
 }
 
 

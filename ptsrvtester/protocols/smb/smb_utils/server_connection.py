@@ -9,6 +9,7 @@ from impacket.smbconnection import (
 
 from .helpers import get_flag, get_if_available
 from .helpers import SMBResults, SMBv1Flags, SMBv23Flags
+from .enumeration import enumerate_shares
 import nmap
 
 
@@ -78,6 +79,7 @@ class ServerConnection():
             self.ctx.debug(f"Login failed")
         return False
     
+    # Deprecated, keeping as reference
     def try_tree_connection(self, smb_client: SMBConnection, share = "IPC$") -> bool:
         # TODO: Add ability to connect to specific folder
         self.ctx.debug(f"Attempting connection to: {share}")
@@ -141,15 +143,10 @@ class ServerConnection():
                 timeout=timeout
             )
 
-            if self.login(smb_client, username, password):
+            if self.login(smb_client, username, password) or (not empty_login and self.login(smb_client, "", "")):
                 output.successful_login = True
                 output.guest_session = bool(smb_client.isGuestSession())
-                self.try_tree_connection(smb_client)
-            elif not empty_login:
-                self.login(smb_client, "", "")
-                output.successful_login = True
-                output.guest_session = bool(smb_client.isGuestSession())
-                self.try_tree_connection(smb_client)
+                output.shares = enumerate_shares(smb_client)
 
             smb_client.close()
         except Exception as e:

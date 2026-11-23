@@ -134,6 +134,7 @@ class SMBResults:
     encryption_support: bool | None = None
     session_encryption_requirement: bool | None = None
     null_session: bool | None = None
+    shares: dict | None = None
 
 
 def get_if_available(getter):

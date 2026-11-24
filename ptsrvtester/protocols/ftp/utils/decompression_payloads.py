@@ -28,7 +28,7 @@ BILLION_LAUGHS_XML: str = """<?xml version="1.0" encoding="utf-8"?>
 
 
 def build_minimal_zip_bomb() -> bytes:
-    """Flat DEFLATE of zeros: 20 × 10 KiB, about 200 KiB expanded. Not used by the FTP DoS probe."""
+    """Flat DEFLATE of zeros: 20 × 10 KiB, about 200 KiB expanded."""
     bio = BytesIO()
     data = b"\x00" * (10 * 1024)
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:

@@ -181,6 +181,37 @@ class BounceResult(NamedTuple):
 
 
 @dataclass
+class AccessDirProbe:
+    """One directory visited by ACCESS."""
+
+    path: str
+    entered: bool = False
+    listing_ok: bool = False
+    lines: tuple[str, ...] = ()
+    names: tuple[str, ...] = ()
+    subdirs: tuple[str, ...] = ()
+    read: bool = False
+    write: bool = False
+    delete: bool = False
+    rename: bool = False
+    mkdir: bool = False
+    rmdir: bool = False
+    proofs: tuple[tuple[str, str, str], ...] = ()
+    named_file: str | None = None
+    named_read: bool | None = None
+    named_rewrite: bool | None = None
+    named_delete: bool | None = None
+    random_name: str | None = None
+    random_write: bool | None = None
+    random_read: bool | None = None
+    random_delete: bool | None = None
+    write_path: str | None = None
+    read_path: str | None = None
+    delete_path: str | None = None
+    live_path: str = ""
+
+
+@dataclass
 class AccessPermissions:
     creds: Creds
     dirlist: list[str] | None = None
@@ -197,6 +228,7 @@ class AccessPermissions:
     random_read: bool | None = None
     random_delete: bool | None = None
     login_error: str | None = None
+    directories: tuple[AccessDirProbe, ...] = ()
 
 
 class AccessCheckResult(NamedTuple):
@@ -733,6 +765,8 @@ class VULNS(Enum):
     DefAcc = "PTV-SVC-AUTH-DEFACC"
     DefAccPw = "PTV-SVC-AUTH-DEFACCPW"
     Bounce = "PTV-SVC-FTP-BOUNCE"
+    FtpAnonAccess = "PTV-SVC-FTP-ANONACCESS"
+    FtpWrite = "PTV-SVC-FTP-WRITE"
     WeakCredentials = "PTV-SVC-WEAKCREDENTIALS"
     WeakCreds = "PTV-SVC-AUTH-WEAK"
     Brute = "PTV-SVC-AUTH-BRUTE"

@@ -16,6 +16,7 @@ import statistics
 import sys
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -31,7 +32,7 @@ from .ptprinthelper import get_colored_text
 from ptlibs.threads import ptthreads
 
 from .progress import ThreadedProgress
-from .poc import format_brute_poc, format_poc
+from .poc import format_access_poc, format_brute_poc, format_pasvport_poc, format_poc
 from .helpers import (
     ArgsWithBruteforce,
     Creds,
@@ -49,7 +50,12 @@ from .helpers import (
     vendor_from_cpe,
 )
 from .service_identification import identify_service
-from .decompression_payloads import BILLION_LAUGHS_XML, build_full_zip_bomb, build_huge_zip_bomb
+from .decompression_payloads import (
+    BILLION_LAUGHS_XML,
+    build_full_zip_bomb,
+    build_huge_zip_bomb,
+    build_minimal_zip_bomb,
+)
 from .ftp_types import *  # noqa: F403
 from .ftp_types import (  # noqa: F401
     _conn_limits_pasv_post_suspect,
@@ -402,10 +408,12 @@ class FtpEngine:
         color = "OK" if mark == "O" else "WARNING"
         self._tprint(f"{get_colored_text('[' + mark + ']', color)} {text}", "TEXT", indent=indent)
 
-    def _access_fact_line(self, label: str, ok: bool, *, warn_on_yes: bool, indent: int) -> None:
+    def _access_fact_line(
+        self, label: str, ok: bool, *, warn_on_yes: bool, indent: int, width: int = 8
+    ) -> None:
         mark = "W" if warn_on_yes and ok else "O"
         value = "yes" if ok else "No"
-        self._access_mark(mark, f"{label:<8} {value}", indent=indent)
+        self._access_mark(mark, f"{label:<{width}} {value}", indent=indent)
 
     def _access_who_line(self, creds: Creds) -> None:
         if self.use_json:
@@ -479,11 +487,11 @@ class FtpEngine:
         ftp.putcmd = putcmd
         ftp.voidresp = voidresp
 
-    def _access_try_read(self, ftp, name: str) -> bool:
+    def _access_try_read(self, ftp, name: str) -> tuple[bool, str]:
         try:
             sock = ftp.transfercmd("RETR " + name)
-        except ftplib.all_errors:
-            return False
+        except ftplib.all_errors as exc:
+            return False, str(exc).strip()
         try:
             sock.settimeout(10)
             sock.recv(4096)
@@ -495,31 +503,365 @@ class FtpEngine:
             except Exception:
                 pass
         try:
-            ftp.voidresp()
-        except ftplib.all_errors:
-            pass
-        return True
+            reply = ftp.voidresp()
+        except ftplib.all_errors as exc:
+            return True, str(exc).strip()
+        return True, str(reply or getattr(ftp, "lastresp", "") or "")
 
-    def _access_try_write(self, ftp, name: str) -> bool:
+    def _access_try_write(self, ftp, name: str) -> tuple[bool, str]:
         try:
-            ftp.storbinary("STOR " + name, BytesIO(b"ptsrvtester\n"))
-        except ftplib.all_errors:
-            return False
-        return True
+            reply = ftp.storbinary("STOR " + name, BytesIO(b"ptsrvtester\n"))
+        except ftplib.all_errors as exc:
+            return False, str(exc).strip()
+        return True, str(reply or getattr(ftp, "lastresp", "") or "")
 
-    def _access_try_delete(self, ftp, name: str) -> bool:
+    def _access_try_delete(self, ftp, name: str) -> tuple[bool, str]:
         try:
-            ftp.delete(name)
-        except ftplib.all_errors:
-            return False
-        return True
+            reply = ftp.delete(name)
+        except ftplib.all_errors as exc:
+            return False, str(exc).strip()
+        return True, str(reply or "")
+
+    def _access_try_mkd(self, ftp, name: str) -> tuple[bool, str]:
+        try:
+            reply = ftp.sendcmd("MKD " + name)
+        except ftplib.all_errors as exc:
+            return False, str(exc).strip()
+        return True, str(reply or "")
 
     def _access_random_name(self) -> str:
         alphabet = ascii_lowercase + digits
         return "".join(random.choices(alphabet, k=9)) + ".txt"
 
+    def _access_token(self, length: int = 6) -> str:
+        return "".join(random.choices(ascii_lowercase + digits, k=length))
+
+    def _access_norm_path(self, path: str) -> str:
+        text = (path or "/").strip().replace("\\", "/") or "/"
+        if not text.startswith("/"):
+            text = "/" + text
+        while "//" in text:
+            text = text.replace("//", "/")
+        if len(text) > 1:
+            text = text.rstrip("/")
+        return text or "/"
+
+    def _access_child_path(self, parent: str, name: str) -> str:
+        cleaned = name.strip().strip("/")
+        if parent == "/":
+            return "/" + cleaned
+        return parent.rstrip("/") + "/" + cleaned
+
+    def _access_place(self, directory: str, name: str | None) -> str | None:
+        if not name:
+            return None
+        if directory in ("", "/"):
+            return name
+        return directory.rstrip("/") + "/" + name
+
+    def _access_form_names(self, probe: AccessDirProbe) -> list[str]:
+        forms: list[str] = []
+        if probe.read:
+            forms.append("read")
+        if probe.write:
+            forms.append("write")
+        if probe.delete:
+            forms.append("delete")
+        if probe.rename:
+            forms.append("rename")
+        return forms
+
+    def _access_add_proof(
+        self, probe: AccessDirProbe, form: str, pairs: list[tuple[str, str]]
+    ) -> None:
+        if not pairs or any(item[0] == form for item in probe.proofs):
+            return
+        extra = tuple((form, send, recv or "(no reply)") for send, recv in pairs if send)
+        if extra:
+            probe.proofs = probe.proofs + extra
+
+    def _access_listing_names(self, lines: list[str]) -> tuple[list[str], list[str], list[str]]:
+        files: list[str] = []
+        dirs: list[str] = []
+        shown: list[str] = []
+        for line in lines:
+            directory = _ftp_list_line_directory_rel_name(line)
+            if directory and directory not in (".", "..") and "/" not in directory and "\\" not in directory:
+                dirs.append(directory)
+                shown.append(directory + "/")
+                continue
+            filename = _ftp_list_line_file_name(line)
+            if filename and "/" not in filename and "\\" not in filename:
+                files.append(filename)
+                shown.append(filename)
+        return files, dirs, shown
+
+    def _access_probe_dir(self, ftp, path: str, *, use_file: bool) -> AccessDirProbe:
+        """List one directory, then test a file, a new file and MKD."""
+        probe = AccessDirProbe(path=path, live_path=path)
+        try:
+            cwd_reply = str(ftp.cwd(path) or "")
+        except ftplib.all_errors as exc:
+            self._access_mark(
+                "W", self._snip(str(exc).strip()) or "Could not enter the directory.", indent=12
+            )
+            return probe
+        probe.entered = True
+        lines: list[str] = []
+        listing_ok = False
+        list_reply = ""
+        helper = AccessCheckHelper()
+        try:
+            list_reply = str(ftp.dir(helper.read_callback) or "")
+            listing_ok = True
+            lines = list(helper.lines_read or [])
+        except ftplib.all_errors:
+            listing_ok = False
+        self._access_mark("O", f"Directory listing: {'yes' if listing_ok else 'no'}", indent=12)
+        files: list[str] = []
+        dirs: list[str] = []
+        shown: list[str] = []
+        if listing_ok:
+            files, dirs, shown = self._access_listing_names(lines)
+            for name in shown:
+                self._tprint(name, "TEXT", indent=16)
+            if not shown:
+                for line in lines:
+                    text = line.strip()
+                    if text and not text.lower().startswith("total"):
+                        self._tprint(text, "TEXT", indent=16)
+        probe.listing_ok = listing_ok
+        probe.lines = tuple(lines)
+        probe.names = tuple(shown)
+        probe.subdirs = tuple(dirs)
+
+        named: str | None = None
+        if listing_ok:
+            named = files[0] if files else None
+        elif use_file and (given := getattr(self.args, "access_file", None)):
+            named = str(given).strip() or None
+
+        named_read = named_rewrite = named_delete = None
+        allow_delete = bool(getattr(self.args, "access_delete", False))
+        if named:
+            self._tprint(f"Filename for test: {named}", "INFO", indent=12)
+            self._modes_vv_indent = 16
+            named_read, reply = self._access_try_read(ftp, named)
+            if named_read:
+                self._access_add_proof(probe, "read", [("RETR " + named, reply)])
+            self._access_fact_line("Read:", named_read, warn_on_yes=False, indent=16)
+            named_rewrite, reply = self._access_try_write(ftp, named)
+            if named_rewrite:
+                self._access_add_proof(probe, "write", [("STOR " + named, reply)])
+            self._access_fact_line("Rewrite:", named_rewrite, warn_on_yes=True, indent=16)
+            if allow_delete:
+                named_delete, reply = self._access_try_delete(ftp, named)
+                if named_delete:
+                    self._access_add_proof(probe, "delete", [("DELE " + named, reply)])
+                self._access_fact_line("Delete:", named_delete, warn_on_yes=True, indent=16)
+
+        random_name = self._access_random_name()
+        self._tprint(f"Filename for test (random): {random_name}", "INFO", indent=12)
+        self._modes_vv_indent = 16
+        random_write, reply = self._access_try_write(ftp, random_name)
+        if random_write:
+            self._access_add_proof(probe, "write", [("STOR " + random_name, reply)])
+        self._access_fact_line("Write:", random_write, warn_on_yes=True, indent=16)
+        random_read, reply = self._access_try_read(ftp, random_name)
+        if random_read:
+            self._access_add_proof(probe, "read", [("RETR " + random_name, reply)])
+        self._access_fact_line("Read:", random_read, warn_on_yes=False, indent=16)
+        random_delete, reply = self._access_try_delete(ftp, random_name)
+        if random_delete:
+            self._access_add_proof(probe, "delete", [("DELE " + random_name, reply)])
+        self._access_fact_line("Delete:", random_delete, warn_on_yes=True, indent=16)
+
+        self._modes_vv_indent = 12
+        dirname = "ptsrv" + self._access_token()
+        mkdir_ok, reply = self._access_try_mkd(ftp, dirname)
+        if mkdir_ok:
+            self._access_add_proof(probe, "write", [("MKD " + dirname, reply)])
+        self._access_fact_line("Create directory:", mkdir_ok, warn_on_yes=True, indent=12, width=18)
+        if mkdir_ok:
+            try:
+                ftp.rmd(dirname)
+            except ftplib.all_errors as exc:
+                self._access_mark(
+                    "W",
+                    self._snip(str(exc).strip()) or "Could not remove the directory created by this test.",
+                    indent=12,
+                )
+
+        if listing_ok and not any(item[0] == "read" for item in probe.proofs):
+            pairs: list[tuple[str, str]] = []
+            if cwd_reply:
+                pairs.append((f"CWD {path}", cwd_reply))
+            if list_reply:
+                pairs.append(("LIST", list_reply))
+            self._access_add_proof(probe, "read", pairs)
+
+        probe.read = bool(listing_ok or named_read or random_read)
+        probe.write = bool(named_rewrite or random_write or mkdir_ok)
+        probe.delete = bool(named_delete or random_delete)
+        probe.mkdir = mkdir_ok
+        probe.named_file = named
+        probe.named_read = named_read
+        probe.named_rewrite = named_rewrite
+        probe.named_delete = named_delete
+        probe.random_name = random_name
+        probe.random_write = random_write
+        probe.random_read = random_read
+        probe.random_delete = random_delete
+        if random_write:
+            probe.write_path = self._access_place(path, random_name)
+        elif named_rewrite:
+            probe.write_path = self._access_place(path, named)
+        elif mkdir_ok:
+            probe.write_path = self._access_place(path, dirname)
+        if named_read:
+            probe.read_path = self._access_place(path, named)
+        elif random_read:
+            probe.read_path = self._access_place(path, random_name)
+        if named_delete:
+            probe.delete_path = self._access_place(path, named)
+        elif random_delete:
+            probe.delete_path = self._access_place(path, random_name)
+        return probe
+
+    def _access_rename_dir(self, ftp, probe: AccessDirProbe) -> bool:
+        """Rename the directory and put the original name back.
+
+        Returns True when later steps can still use the original path.
+        """
+        path = probe.live_path or probe.path
+        suffix = self._access_token()
+        if path == "/":
+            parent = "/"
+            new_path = "/ptsrv" + suffix
+        else:
+            parent, _, _name = path.rpartition("/")
+            parent = parent or "/"
+            new_path = path + "_ptsrv" + suffix
+        self._modes_vv_indent = 12
+        try:
+            if path != "/":
+                ftp.cwd(parent)
+            rnfr = ftp.sendcmd("RNFR " + path)
+            rnto = ftp.sendcmd("RNTO " + new_path)
+        except ftplib.all_errors:
+            self._access_fact_line("Rename directory:", False, warn_on_yes=True, indent=12, width=18)
+            return True
+        probe.rename = True
+        self._access_add_proof(
+            probe, "rename", [("RNFR " + path, str(rnfr)), ("RNTO " + new_path, str(rnto))]
+        )
+        self._access_fact_line("Rename directory:", True, warn_on_yes=True, indent=12, width=18)
+        try:
+            ftp.sendcmd("RNFR " + new_path)
+            ftp.sendcmd("RNTO " + path)
+        except ftplib.all_errors as exc:
+            probe.live_path = new_path
+            self._access_mark(
+                "W",
+                "Could not rename the directory back: " + (self._snip(str(exc).strip()) or "failed"),
+                indent=12,
+            )
+            return False
+        probe.live_path = path
+        return True
+
+    def _access_delete_dir(self, ftp, probe: AccessDirProbe) -> None:
+        path = probe.live_path or probe.path
+        self._modes_vv_indent = 12
+        if path == "/":
+            parent = "/"
+            name = "/"
+        else:
+            parent, _, name = path.rpartition("/")
+            parent = parent or "/"
+        try:
+            if path != "/":
+                ftp.cwd(parent)
+            reply = ftp.rmd(name if path != "/" else "/")
+        except ftplib.all_errors:
+            self._access_fact_line("Delete directory:", False, warn_on_yes=True, indent=12, width=18)
+            return
+        probe.rmdir = True
+        probe.delete = True
+        if not probe.delete_path:
+            probe.delete_path = path
+        sent = "RMD " + (name if path != "/" else "/")
+        self._access_add_proof(probe, "delete", [(sent, str(reply or ""))])
+        self._access_fact_line("Delete directory:", True, warn_on_yes=True, indent=12, width=18)
+
+    def _access_walk(
+        self, ftp, path: str, depth_left: int, *, use_file: bool, seen: set[str]
+    ) -> list[AccessDirProbe]:
+        path = self._access_norm_path(path)
+        if path in seen:
+            return []
+        seen.add(path)
+        self._tprint(path, "INFO", indent=8)
+        self._modes_vv_indent = 12
+        try:
+            probe = self._access_probe_dir(ftp, path, use_file=use_file)
+        except ftplib.all_errors as exc:
+            self._access_mark(
+                "W", self._snip(str(exc).strip()) or "The directory test did not finish.", indent=12
+            )
+            return [AccessDirProbe(path=path, live_path=path)]
+        if not probe.entered:
+            return [probe]
+        try:
+            back = self._access_rename_dir(ftp, probe)
+        except ftplib.all_errors as exc:
+            self._access_mark(
+                "W", self._snip(str(exc).strip()) or "The directory test did not finish.", indent=12
+            )
+            back = True
+        children: list[AccessDirProbe] = []
+        recursive = bool(getattr(self.args, "access_recursive", False))
+        if back and recursive and depth_left > 0 and probe.listing_ok:
+            for name in probe.subdirs:
+                child = self._access_child_path(path, name)
+                children.extend(
+                    self._access_walk(ftp, child, depth_left - 1, use_file=False, seen=seen)
+                )
+        if getattr(self.args, "access_delete", False):
+            if children:
+                self._tprint(probe.live_path or probe.path, "INFO", indent=8)
+            try:
+                self._access_delete_dir(ftp, probe)
+            except ftplib.all_errors as exc:
+                self._access_mark(
+                    "W", self._snip(str(exc).strip()) or "Could not delete the directory.", indent=12
+                )
+        return [probe, *children]
+
+    def _access_permissions_from(self, creds: Creds, probes: list[AccessDirProbe]) -> AccessPermissions:
+        start = probes[0] if probes else None
+        if start is None:
+            return AccessPermissions(creds, directories=())
+        return AccessPermissions(
+            creds,
+            list(start.lines) if start.listing_ok else None,
+            start.write_path,
+            start.read_path,
+            start.delete_path,
+            start.listing_ok,
+            start.named_file,
+            start.named_read,
+            start.named_rewrite,
+            start.named_delete,
+            start.random_name,
+            start.random_write,
+            start.random_read,
+            start.random_delete,
+            directories=tuple(probes),
+        )
+
     def _access_probe_account(self, creds: Creds) -> AccessPermissions:
-        """List the login directory, then probe one existing name and one new name."""
+        """Test --path, and with --recursive each nested directory down to --depth."""
         self._access_who_line(creds)
         self._modes_vv_indent = 8
         try:
@@ -536,67 +878,18 @@ class FtpEngine:
                 text = self._snip(str(exc)) or "Login failed."
                 self._access_mark("W", text, indent=8)
                 return AccessPermissions(creds, login_error=text)
-
-            listing_ok = False
-            lines: list[str] = []
-            helper = AccessCheckHelper()
+            raw_path = getattr(self.args, "access_path", "/") or "/"
             try:
-                ftp.dir(helper.read_callback)
-                listing_ok = True
-                lines = list(helper.lines_read or [])
-            except Exception:
-                pass
-            self._access_mark(
-                "O", f"Directory listing: {'yes' if listing_ok else 'no'}", indent=8
+                depth = int(getattr(self.args, "enum_depth", 1) or 1)
+            except (TypeError, ValueError):
+                depth = 1
+            if depth < 1:
+                depth = 1
+            depth_left = depth if getattr(self.args, "access_recursive", False) else 0
+            probes = self._access_walk(
+                ftp, self._access_norm_path(raw_path), depth_left, use_file=True, seen=set()
             )
-
-            named: str | None = None
-            if listing_ok:
-                for line in lines:
-                    named = _ftp_list_line_file_name(line)
-                    if named:
-                        break
-            elif (given := getattr(self.args, "access_file", None)):
-                named = str(given).strip() or None
-
-            named_read = named_rewrite = named_delete = None
-            self._modes_vv_indent = 12
-            if named:
-                self._tprint(f"Filename for test: {named}", "INFO", indent=8)
-                named_read = self._access_try_read(ftp, named)
-                self._access_fact_line("Read:", named_read, warn_on_yes=False, indent=12)
-                named_rewrite = self._access_try_write(ftp, named)
-                self._access_fact_line("Rewrite:", named_rewrite, warn_on_yes=True, indent=12)
-                named_delete = self._access_try_delete(ftp, named)
-                self._access_fact_line("Delete:", named_delete, warn_on_yes=True, indent=12)
-
-            random_name = self._access_random_name()
-            self._tprint(f"Filename for test (random): {random_name}", "INFO", indent=8)
-            random_write = self._access_try_write(ftp, random_name)
-            self._access_fact_line("Write:", random_write, warn_on_yes=True, indent=12)
-            random_read = self._access_try_read(ftp, random_name)
-            self._access_fact_line("Read:", random_read, warn_on_yes=False, indent=12)
-            random_delete = self._access_try_delete(ftp, random_name)
-            self._access_fact_line("Delete:", random_delete, warn_on_yes=True, indent=12)
-
-            read_path = named if named_read else (random_name if random_read else None)
-            delete_path = named if named_delete else (random_name if random_delete else None)
-            return AccessPermissions(
-                creds,
-                lines if listing_ok else None,
-                random_name if random_write else None,
-                read_path,
-                delete_path,
-                listing_ok,
-                named,
-                named_read,
-                named_rewrite,
-                named_delete,
-                random_name,
-                random_write,
-                random_read,
-                random_delete,
-            )
+            return self._access_permissions_from(creds, probes)
         finally:
             ftp.sendcmd = getattr(ftp, "_access_raw_sendcmd", ftp.sendcmd)
             ftp.putcmd = getattr(ftp, "_access_raw_putcmd", ftp.putcmd)
@@ -609,8 +902,44 @@ class FtpEngine:
                 except Exception:
                     pass
 
+    def _access_publish_vulns(self, perms: list[AccessPermissions]) -> None:
+        """One code if any tested directory allows that access. PoC names each one."""
+        self._access_anon_summary = ""
+        self._access_write_summary = ""
+        anon_rows: list[tuple[str, list[str], tuple]] = []
+        write_rows: list[tuple[str, list[str], tuple]] = []
+        seen_anon: set[str] = set()
+        seen_write: set[str] = set()
+        for perm in perms:
+            if perm.login_error or not perm.directories:
+                continue
+            anonymous = perm.creds.user.lower() == "anonymous"
+            for probe in perm.directories:
+                if anonymous:
+                    forms = self._access_form_names(probe)
+                    if not forms or probe.path in seen_anon:
+                        continue
+                    seen_anon.add(probe.path)
+                    anon_rows.append((probe.path, forms, probe.proofs))
+                elif probe.write and probe.path not in seen_write:
+                    seen_write.add(probe.path)
+                    proofs = tuple(item for item in probe.proofs if item[0] == "write")
+                    write_rows.append((probe.path, ["write"], proofs))
+        if anon_rows:
+            self._access_anon_summary = "\n".join(
+                f"{path}: {', '.join(forms)}" for path, forms, _proofs in anon_rows
+            )
+            text = format_access_poc(anon_rows)
+            if text:
+                self._vuln_poc.setdefault(VULNS.FtpAnonAccess.value, text)
+        if write_rows:
+            self._access_write_summary = "\n".join(f"{path}: write" for path, _forms, _proofs in write_rows)
+            text = format_access_poc(write_rows)
+            if text:
+                self._vuln_poc.setdefault(VULNS.FtpWrite.value, text)
+
     def access_check(self) -> AccessCheckResult:
-        """List the login directory, probe one existing file, then one new file."""
+        """Test list, read, write and delete in --path and, with --recursive, below it."""
         access_permissions: list[AccessPermissions] = []
         all_creds: list[Creds] = []
         if self.results.anonymous or getattr(self.args, "anonymous", False):
@@ -645,6 +974,7 @@ class FtpEngine:
                     if self.results.creds is None:
                         self.results.creds = set()
                     self.results.creds.add(creds)
+            self._access_publish_vulns(access_permissions)
         finally:
             self._modes_vv_indent = None
         if not errors:
@@ -691,12 +1021,35 @@ class FtpEngine:
         self._tprint(text, "TITLE", indent=4)
         self._modes_vv_indent = 8
 
-    def _eicar_verdict(self, row: FtpEicarRow) -> None:
+    def _eicar_verdict(self, row: FtpEicarRow, *, indent: int = 8) -> None:
         if self.use_json:
             return
         for bullet, text in self._eicar_lines(row):
-            self._tprint(text.split(": ", 1)[-1], bullet, indent=8)
+            self._tprint(text.split(": ", 1)[-1], bullet, indent=indent)
         self._eicar_streamed = True
+
+    @staticmethod
+    def _eicar_reply_suggests_malware(msg: str | None) -> bool:
+        low = (msg or "").lower()
+        return any(word in low for word in ("virus", "malware", "infected", "quarantine", "trojan", "antivirus"))
+
+    def _eicar_zip_bytes(self, inner_name: str, payload: bytes) -> bytes:
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(inner_name, payload)
+        return buf.getvalue()
+
+    def _eicar_payloads(self) -> list[tuple[str, bytes]]:
+        """Official EICAR set: plain file, renamed file, zip, and zip of that zip."""
+        raw = EICAR_STANDARD_TEST_FILE
+        single = self._eicar_zip_bytes("eicar.com", raw)
+        nested = self._eicar_zip_bytes("eicar.com.zip", single)
+        return [
+            ("eicar.com", raw),
+            ("eicar.com.txt", raw),
+            ("eicar.com.zip", single),
+            ("eicar.com-2.zip", nested),
+        ]
 
     def _eicar_session_login(self, ftp: ftplib.FTP, creds: Creds) -> None:
         user_cmd = f"USER {creds.user}"
@@ -729,11 +1082,204 @@ class FtpEngine:
                 (pass_cmd, str(pass_reply).strip()),
             )
 
-    def _eicar_probe_one_account(self, creds: Creds, delay: float) -> FtpEicarRow:
-        """Upload EICAR, wait, verify presence via SIZE/RETR, DELE cleanup."""
+    def _eicar_file_present(self, ftp, name: str) -> tuple[bool | None, str]:
+        """True only when SIZE, or NLST if SIZE is unsupported, can see the file."""
+        cmd = "SIZE " + name
+        try:
+            reply = str(ftp.sendcmd(cmd)).strip()
+        except ftplib.all_errors as exc:
+            reply = str(exc).strip()
+            self._ftp_vv_io(cmd, reply)
+            code, _line = self._ftp_parse_reply_line(reply)
+            if code in (500, 502, 504):
+                return self._eicar_nlst_present(ftp, name)
+            if code is not None and code >= 400:
+                return False, reply
+            return None, reply
+        self._ftp_vv_io(cmd, reply)
+        code, _line = self._ftp_parse_reply_line(reply)
+        if code is not None and 200 <= code < 300:
+            return True, reply
+        if code is not None and code >= 400:
+            return False, reply
+        return None, reply
+
+    def _eicar_nlst_present(self, ftp, name: str) -> tuple[bool | None, str]:
+        cmd = "NLST " + name
+        found: list[str] = []
+        try:
+            reply = str(ftp.retrlines(cmd, found.append) or "").strip()
+        except ftplib.all_errors as exc:
+            reply = str(exc).strip()
+            self._ftp_vv_io(cmd, reply)
+            code, _line = self._ftp_parse_reply_line(reply)
+            if code is not None and code >= 400:
+                return False, reply
+            return None, reply
+        self._ftp_vv_io(cmd, reply or "(no reply)")
+        leaf = name.rsplit("/", 1)[-1]
+        if any(line.strip().rsplit("/", 1)[-1] == leaf for line in found):
+            return True, reply
+        return False, reply
+
+    def _eicar_stopped_row(
+        self,
+        creds: Creds,
+        delay: float,
+        remote: str,
+        error: str | None,
+        *,
+        detected: bool = False,
+    ) -> FtpEicarRow:
+        return FtpEicarRow(
+            creds,
+            remote,
+            False,
+            error,
+            delay,
+            None,
+            None,
+            False,
+            None,
+            None,
+            detected,
+            detected,
+            False,
+            None,
+            None,
+        )
+
+    def _eicar_probe_file(
+        self,
+        ftp,
+        creds: Creds,
+        delay: float,
+        directory: str,
+        filename: str,
+        payload: bytes,
+    ) -> FtpEicarRow:
+        """STOR one EICAR file, then accept it only when RETR returns the same bytes."""
+        used_path = filename if directory == "/" else directory.rstrip("/") + "/" + filename
+        if not self.use_json:
+            self._tprint(filename, "TITLE", indent=8)
+        self._modes_vv_indent = 12
+        stor_cmd = "STOR " + filename
+        try:
+            done = str(ftp.storbinary(stor_cmd, BytesIO(payload)) or "").strip()
+        except (ftplib.Error, OSError) as e:
+            stor_err = str(e).strip()
+            self._ftp_vv_io(stor_cmd, stor_err)
+            detected = self._eicar_reply_suggests_malware(stor_err)
+            return self._eicar_stopped_row(creds, delay, used_path, stor_err, detected=detected)
+        self._ftp_vv_io(stor_cmd, done or "(no reply)")
+        if not done.startswith("2"):
+            detected = self._eicar_reply_suggests_malware(done)
+            return self._eicar_stopped_row(creds, delay, used_path, done or "was not confirmed", detected=detected)
+
+        present, present_reply = self._eicar_file_present(ftp, filename)
+        if present is not True:
+            reply = present_reply or "was not confirmed"
+            detected = self._eicar_reply_suggests_malware(done) or self._eicar_reply_suggests_malware(reply)
+            return self._eicar_stopped_row(creds, delay, used_path, reply, detected=detected)
+
+        try:
+            time.sleep(max(0.0, delay))
+        except Exception:
+            pass
+
+        size_bytes: int | None = None
+        size_err: str | None = None
+        try:
+            size_resp = ftp.sendcmd("SIZE " + filename)
+        except ftplib.error_perm as e:
+            size_err = str(e)
+            self._ftp_vv_io("SIZE " + filename, size_err)
+        except ftplib.Error as e:
+            size_err = str(e)
+            self._ftp_vv_io("SIZE " + filename, size_err)
+        else:
+            self._ftp_vv_io("SIZE " + filename, size_resp)
+            if str(size_resp).startswith("213"):
+                try:
+                    size_bytes = int(str(size_resp)[3:].strip())
+                except ValueError:
+                    size_err = str(size_resp)
+            else:
+                size_err = str(size_resp)
+
+        buf = BytesIO()
+        retr_ok = False
+        retr_match: bool | None = None
+        retr_err: str | None = None
+        try:
+            retr_done = ftp.retrbinary("RETR " + filename, buf.write)
+            retr_ok = True
+            retr_match = buf.getvalue() == payload
+            self._ftp_vv_io("RETR " + filename, retr_done or "")
+        except ftplib.Error as e:
+            retr_err = str(e)
+            self._ftp_vv_io("RETR " + filename, retr_err)
+
+        size_vanished = (
+            bool(size_err)
+            and not self._eicar_size_unsupported(size_err)
+            and self._eicar_reply_suggests_missing(size_err)
+        )
+        retr_missing = retr_err is not None and self._eicar_reply_suggests_missing(retr_err)
+        retr_unconfirmed = bool(retr_err) and (
+            self._ftp_text_is_unconfirmed(retr_err) or not self._ftp_server_reply(retr_err)
+        )
+        size_wrong = (
+            size_bytes is not None
+            and size_bytes != len(payload)
+            and (retr_ok or retr_missing)
+            and not retr_unconfirmed
+        )
+        retr_bad = bool(retr_ok and retr_match is False)
+        vanished = size_vanished or size_wrong or retr_missing or retr_bad
+
+        delete_ok = False
+        delete_err: str | None = None
+        delete_note: str | None = None
+        try:
+            deleted = ftp.delete(filename)
+            delete_ok = True
+            self._ftp_vv_io("DELE " + filename, deleted or "")
+        except ftplib.error_perm as e:
+            delete_err = str(e)
+            self._ftp_vv_io("DELE " + filename, delete_err)
+            if self._eicar_reply_suggests_missing(str(e)) or self._eicar_reply_suggests_malware(str(e)):
+                delete_note = "File was already gone when DELE ran."
+        except ftplib.Error as e:
+            delete_err = str(e)
+            self._ftp_vv_io("DELE " + filename, delete_err)
+            if self._eicar_reply_suggests_missing(str(e)) or self._eicar_reply_suggests_malware(str(e)):
+                delete_note = "File was already gone when DELE ran."
+
+        on_access = vanished or (delete_note is not None) or self._eicar_reply_suggests_malware(retr_err)
+        return FtpEicarRow(
+            creds,
+            used_path,
+            True,
+            None,
+            delay,
+            size_bytes,
+            size_err,
+            retr_ok,
+            retr_match,
+            retr_err,
+            vanished,
+            on_access,
+            delete_ok,
+            delete_err,
+            delete_note,
+        )
+
+    def _eicar_probe_one_account(self, creds: Creds, delay: float) -> list[FtpEicarRow]:
+        """Upload the EICAR set into --path and verify each file can still be read."""
         ftp = self.connect(trace=True)
 
-        def _fail_early(stor_error: str | None) -> FtpEicarRow:
+        def _close() -> None:
             try:
                 ftp.quit()
             except Exception:
@@ -741,23 +1287,6 @@ class FtpEngine:
                     ftp.close()
                 except Exception:
                     pass
-            return FtpEicarRow(
-                creds,
-                "",
-                False,
-                stor_error,
-                delay,
-                None,
-                None,
-                False,
-                None,
-                None,
-                False,
-                False,
-                False,
-                None,
-                None,
-            )
 
         try:
             self._eicar_session_login(ftp, creds)
@@ -777,167 +1306,34 @@ class FtpEngine:
                 ftp.close()
             except Exception:
                 pass
-            return FtpEicarRow(
-                creds,
-                "",
-                False,
-                str(e),
-                delay,
-                None,
-                None,
-                False,
-                None,
-                None,
-                False,
-                False,
-                False,
-                None,
-                None,
-            )
+            row = self._eicar_stopped_row(creds, delay, "", str(e))
+            self._eicar_verdict(row)
+            return [row]
 
-        ach = AccessCheckHelper()
-        directories: list[str] = [""]
+        directory = self._access_norm_path(getattr(self.args, "access_path", "/") or "/")
+        cwd_cmd = "CWD " + directory
         try:
-            ftp.dir(ach.read_callback)
-            if ach.lines_read is not None:
-                for l in ach.lines_read:
-                    if not l or l[0] != "d":
-                        continue
-                    dn = _ftp_list_line_directory_rel_name(l)
-                    if dn:
-                        directories.append(dn)
-        except Exception:
-            directories = [""]
+            cwd_reply = ftp.sendcmd(cwd_cmd)
+        except ftplib.all_errors as e:
+            cwd_reply = str(e).strip()
+            self._ftp_vv_io(cwd_cmd, cwd_reply)
+            _close()
+            row = self._eicar_stopped_row(creds, delay, "", cwd_reply)
+            self._eicar_verdict(row)
+            return [row]
+        self._ftp_vv_io(cwd_cmd, cwd_reply)
 
-        filename = "EICAR_" + "".join(random.choices(ascii_uppercase, k=8)) + ".com"
-        stor_ok = False
-        stor_err: str | None = None
-        used_path = ""
-
-        for dir in directories:
-            if stor_ok:
+        rows: list[FtpEicarRow] = []
+        for filename, payload in self._eicar_payloads():
+            row = self._eicar_probe_file(ftp, creds, delay, directory, filename, payload)
+            rows.append(row)
+            self._eicar_verdict(row, indent=12)
+            if row.stor_error and (
+                self._ftp_text_is_unconfirmed(row.stor_error) or not self._ftp_server_reply(row.stor_error)
+            ):
                 break
-            filepath = dir + "/" + filename
-            bio = BytesIO(EICAR_STANDARD_TEST_FILE)
-            try:
-                done = ftp.storbinary("STOR " + filepath, bio)
-                stor_ok = True
-                used_path = filepath
-                self._ftp_vv_io("STOR " + filepath, done or "")
-            except (ftplib.Error, OSError) as e:
-                stor_err = str(e)
-                self._ftp_vv_io("STOR " + filepath, stor_err)
-
-        if not stor_ok:
-            return _fail_early(stor_err)
-
-        try:
-            time.sleep(max(0.0, delay))
-        except Exception:
-            pass
-
-        size_bytes: int | None = None
-        size_err: str | None = None
-        try:
-            size_resp = ftp.sendcmd("SIZE " + used_path)
-        except ftplib.error_perm as e:
-            size_err = str(e)
-            self._ftp_vv_io("SIZE " + used_path, size_err)
-        except ftplib.Error as e:
-            size_err = str(e)
-            self._ftp_vv_io("SIZE " + used_path, size_err)
-        else:
-            self._ftp_vv_io("SIZE " + used_path, size_resp)
-            if str(size_resp).startswith("213"):
-                try:
-                    size_bytes = int(str(size_resp)[3:].strip())
-                except ValueError:
-                    size_err = str(size_resp)
-            else:
-                size_err = str(size_resp)
-
-        buf = BytesIO()
-        retr_ok = False
-        retr_match: bool | None = None
-        retr_err: str | None = None
-        try:
-            done = ftp.retrbinary("RETR " + used_path, buf.write)
-            retr_ok = True
-            retr_match = buf.getvalue() == EICAR_STANDARD_TEST_FILE
-            self._ftp_vv_io("RETR " + used_path, done or "")
-        except ftplib.Error as e:
-            retr_err = str(e)
-            self._ftp_vv_io("RETR " + used_path, retr_err)
-
-        size_vanished = (
-            bool(size_err)
-            and not self._eicar_size_unsupported(size_err)
-            and self._eicar_reply_suggests_missing(size_err)
-        )
-        retr_missing = retr_err is not None and self._eicar_reply_suggests_missing(retr_err)
-        retr_unconfirmed = bool(retr_err) and (
-            self._ftp_text_is_unconfirmed(retr_err) or not self._ftp_server_reply(retr_err)
-        )
-        size_wrong = (
-            size_bytes is not None
-            and size_bytes != len(EICAR_STANDARD_TEST_FILE)
-            and (retr_ok or retr_missing)
-            and not retr_unconfirmed
-        )
-        retr_bad = bool(retr_ok and retr_match is False)
-        vanished = size_vanished or size_wrong or retr_missing or retr_bad
-
-        delete_ok = False
-        delete_err: str | None = None
-        delete_note: str | None = None
-        try:
-            done = ftp.delete(used_path)
-            delete_ok = True
-            self._ftp_vv_io("DELE " + used_path, done or "")
-        except ftplib.error_perm as e:
-            delete_err = str(e)
-            self._ftp_vv_io("DELE " + used_path, delete_err)
-            if self._eicar_reply_suggests_missing(str(e)):
-                delete_note = (
-                    "DELE failed with missing-file style reply — file likely already removed "
-                    "(on-access AV / quarantine); treated as protection signal, not test failure."
-                )
-        except ftplib.Error as e:
-            delete_err = str(e)
-            self._ftp_vv_io("DELE " + used_path, delete_err)
-            if self._eicar_reply_suggests_missing(str(e)):
-                delete_note = (
-                    "DELE failed with missing-file style reply — file likely already removed "
-                    "(on-access AV / quarantine); treated as protection signal, not test failure."
-                )
-
-        on_access = vanished or (delete_note is not None)
-
-        try:
-            ftp.quit()
-        except Exception:
-            try:
-                ftp.close()
-            except Exception:
-                pass
-
-        return FtpEicarRow(
-            creds,
-            used_path,
-            True,
-            None,
-            delay,
-            size_bytes,
-            size_err,
-            retr_ok,
-            retr_match,
-            retr_err,
-            vanished,
-            on_access,
-            delete_ok,
-            delete_err,
-            delete_note,
-        )
+        _close()
+        return rows
 
     def test_eicar_antivirus_probe(self) -> FtpEicarAuditResult:
         """EICAR upload audit (PTL-SVC-FTP-ANTIVIRUS): delayed verify for on-access scanners."""
@@ -960,9 +1356,7 @@ class FtpEngine:
         try:
             for creds in all_creds:
                 self._eicar_who(creds)
-                row = self._eicar_probe_one_account(creds, delay)
-                rows_list.append(row)
-                self._eicar_verdict(row)
+                rows_list.extend(self._eicar_probe_one_account(creds, delay))
         finally:
             self._modes_vv_indent = None
         rows = tuple(rows_list)
@@ -975,7 +1369,7 @@ class FtpEngine:
         n_van = sum(1 for r in rows if r.vanished_after_stor_suspected)
         n_onacc = sum(1 for r in rows if r.on_access_scan_suspected)
         detail = (
-            f"Accounts tested: {len(rows)}; STOR ok: {n_stor}; "
+            f"Files tested: {len(rows)}; STOR ok: {n_stor}; "
             f"vanished_after_stor_suspected: {n_van}; on_access_signals: {n_onacc}; "
             f"EICAR still retrievable unchanged after delay: {'yes' if risky else 'no'}."
         )
@@ -1076,26 +1470,80 @@ class FtpEngine:
             return True
         return False
 
+    def _ftp_dos_confirm_stored(self, ftp, name: str) -> tuple[bool | None, str]:
+        """True only when the server can see the file after STOR."""
+        try:
+            reply = str(ftp.sendcmd("SIZE " + name)).strip()
+        except ftplib.all_errors as exc:
+            reply = str(exc).strip()
+            code, _line = self._ftp_parse_reply_line(reply)
+            if code in (500, 502, 504):
+                return self._ftp_dos_confirm_nlst(ftp, name)
+            if code is not None and code >= 400:
+                return False, reply
+            return None, reply
+        code, _line = self._ftp_parse_reply_line(reply)
+        if code is not None and 200 <= code < 300:
+            return True, reply
+        if code is not None and code >= 400:
+            return False, reply
+        return None, reply
+
+    def _ftp_dos_confirm_nlst(self, ftp, name: str) -> tuple[bool | None, str]:
+        found: list[str] = []
+        try:
+            ftp.retrlines("NLST " + name, found.append)
+        except ftplib.all_errors as exc:
+            reply = str(exc).strip()
+            code, _line = self._ftp_parse_reply_line(reply)
+            if code is not None and code >= 400:
+                return False, reply
+            return None, reply
+        leaf = name.rsplit("/", 1)[-1]
+        if any(line.strip().rsplit("/", 1)[-1] == leaf for line in found):
+            return True, "NLST " + name
+        return False, "NLST " + name
+
     def _ftp_dos_probe_row(
         self,
         ftp: ftplib.FTP | ftplib.FTP_TLS | FTP_TLS_implicit,
         *,
         probe_label: str,
         remote_filename: str,
+        display_name: str,
         payload: bytes,
     ) -> FtpDosProbeRow:
+        if not self.use_json:
+            self._tprint(self._ftp_dos_title(probe_label, display_name), "TITLE")
+            self._tprint(display_name, "TEXT", indent=8)
+            self._modes_vv_indent = 12
         o = self._ftp_stor_binary_timed(ftp, "STOR " + remote_filename, payload)
-        stor_line = (o.reply_line or o.error or "").strip() or None
-        blocked = False
-        if o.ok:
-            blocked = self._ftp_dos_policy_block_hit(o.reply_code, o.reply_line)
+        confirmed: bool | None = None
+        confirm_reply = ""
+        stored = bool(o.ok and (o.reply_code is None or o.reply_code < 400))
+        if stored:
+            confirmed, confirm_reply = self._ftp_dos_confirm_stored(ftp, remote_filename)
+            stored = confirmed is True
+        if o.ok and confirmed is False:
+            stor_line = confirm_reply.strip() or None
+            stor_error = confirm_reply.strip() or None
+            reply_code, _parsed = self._ftp_parse_reply_line(confirm_reply)
+        elif o.ok and confirmed is None:
+            stor_line = (o.reply_line or "").strip() or None
+            stor_error = "was not confirmed"
+            reply_code = o.reply_code
         else:
-            blocked = self._ftp_dos_policy_block_hit(o.reply_code, o.error)
+            stor_line = (o.reply_line or o.error or "").strip() or None
+            stor_error = None if stored else (o.error or stor_line)
+            reply_code = o.reply_code
+        blocked = self._ftp_dos_policy_block_hit(reply_code, stor_line or stor_error)
+        if stored:
+            blocked = False
 
         noop_ok: bool | None = None
         noop_err: str | None = None
         noop_elapsed: float | None = None
-        if o.ok and not blocked:
+        if stored:
             t_n0 = time.perf_counter()
             try:
                 ftp.voidcmd("NOOP")
@@ -1112,7 +1560,7 @@ class FtpEngine:
 
         delete_ok = False
         delete_err: str | None = None
-        if o.ok:
+        if stored:
             try:
                 ftp.delete(remote_filename)
                 delete_ok = True
@@ -1123,7 +1571,7 @@ class FtpEngine:
         suspected = False
         if o.timed_out:
             suspected = True
-        elif o.ok and not blocked:
+        elif stored:
             if delta is not None and delta >= FTP_DOS_DELTA_WARN_SEC:
                 suspected = True
             if noop_elapsed is not None and noop_elapsed >= FTP_DOS_NOOP_WARN_SEC:
@@ -1133,18 +1581,18 @@ class FtpEngine:
 
         row = FtpDosProbeRow(
             probe_label,
-            remote_filename,
+            display_name,
             len(payload),
-            o.ok,
-            o.error,
+            stored,
+            stor_error,
             stor_line,
-            o.reply_code,
+            reply_code,
             o.total_seconds,
             delta,
             noop_ok,
             noop_err,
             noop_elapsed,
-            blocked,
+            blocked and not stored,
             suspected,
             o.timed_out,
             delete_ok,
@@ -1153,15 +1601,17 @@ class FtpEngine:
         self._ftp_dos_emit_probe(row)
         return row
 
-    def _ftp_dos_section_title(self, r: FtpDosProbeRow) -> str:
-        label = r.probe_label or ""
-        if "XML" in label:
+    def _ftp_dos_title(self, label: str, filename: str) -> str:
+        if "XML" in (label or ""):
             return "XML entity expansion"
-        if "Overlap" in label:
+        if "Overlap" in (label or ""):
             return "Large zip bomb"
-        if "Decompression" in label or r.remote_filename.endswith(".zip"):
+        if "Decompression" in (label or "") or filename.endswith(".zip"):
             return "Zip bomb"
-        return r.remote_filename
+        return filename
+
+    def _ftp_dos_section_title(self, r: FtpDosProbeRow) -> str:
+        return self._ftp_dos_title(r.probe_label, r.remote_filename)
 
     def _ftp_dos_reply(self, r: FtpDosProbeRow) -> tuple[str, str]:
         """Indented server reply. Color only when the transfer stalled or was not confirmed."""
@@ -1174,15 +1624,15 @@ class FtpEngine:
                 base = f"{base} (rejected)"
             return "TEXT", base
         if not r.stor_ok:
-            if self._ftp_text_is_unconfirmed(r.stor_error):
+            if (r.stor_error or "") == "was not confirmed" or self._ftp_text_is_unconfirmed(r.stor_error):
                 return "WARNING", "was not confirmed"
             detail = self._snip(snippet or r.stor_error or "failed")
-            if r.reply_code is not None and not detail.startswith(str(r.reply_code)):
+            if r.reply_code is not None and detail and not detail.startswith(str(r.reply_code)):
                 detail = f"{r.reply_code} {detail}".strip()
             return "WARNING", detail
-        base = snippet or (
-            f"{r.reply_code} Transfer complete" if r.reply_code is not None else "226 Transfer complete"
-        )
+        base = snippet
+        if not base:
+            return "WARNING", "was not confirmed"
         extra: list[str] = []
         bullet = "TEXT"
         if r.background_processing_suspected:
@@ -1225,18 +1675,34 @@ class FtpEngine:
         if r.stor_ok and not r.delete_ok:
             self._tprint("Cleanup failed", "WARNING", indent=12)
 
+    def _ftp_dos_print_verdict(self, r: FtpDosProbeRow) -> None:
+        bullet, text = self._ftp_dos_reply(r)
+        self._tprint(text, bullet, indent=12)
+        if r.stor_ok and not r.delete_ok:
+            self._tprint("Cleanup failed", "WARNING", indent=12)
+
     def _ftp_dos_emit_probe(self, r: FtpDosProbeRow) -> None:
         if self.use_json:
             return
-        self._ftp_dos_print_probe(r, debug=True)
+        self._ftp_dos_print_verdict(r)
         self._dos_probes_emitted = True
 
     def test_ftp_processing_resilience_probes(self) -> FtpDosAuditResult:
-        """PTL-SVC-FTP-PROC-DOS: one login, sequential STOR probes, timing + NOOP stability."""
+        """XML upload, plus a zip bomb only when its size switch is set."""
         self._dos_probes_emitted = False
         tmo = float(getattr(self.args, "ftp_dos_timeout", 30.0) or 30.0)
-        large = bool(getattr(self.args, "ftp_dos_large", False))
-        zip_mode = "overlap" if large else "deflate"
+        small = bool(getattr(self.args, "ftp_dos_zip_small", False))
+        medium = bool(getattr(self.args, "ftp_dos_zip_medium", False))
+        large = bool(getattr(self.args, "ftp_dos_zip_large", False))
+        modes = ["xml"]
+        if small:
+            modes.append("small")
+        if medium:
+            modes.append("medium")
+        if large:
+            modes.append("large")
+        zip_mode = ",".join(modes)
+        directory = self._access_norm_path(getattr(self.args, "access_path", "/") or "/")
         creds = self._get_path_enum_creds()
         if creds is None:
             self._dbg("DOS skipped: no credentials")
@@ -1250,82 +1716,91 @@ class FtpEngine:
                 False,
             )
 
-        ftp = self.connect()
-
+        live = not self.use_json
+        if live:
+            self._modes_vv_indent = 8
         try:
-            ftp.login(creds.user, creds.passw)
-            self._dbg(f"LOGIN {creds.user!r} → OK")
-        except Exception as e:
-            self._dbg(f"LOGIN {creds.user!r} → failed: {self._snip(str(e))}")
-            try:
-                ftp.close()
-            except Exception:
-                pass
-            return FtpDosAuditResult(
-                tmo,
-                zip_mode,
-                creds.user,
-                tuple(),
-                f"LOGIN failed: {e}",
-                False,
-                False,
-            )
-
-        if getattr(ftp, "sock", None) is not None:
-            ftp.sock.settimeout(tmo)
-
-        rows: list[FtpDosProbeRow] = []
-        rows.append(
-            self._ftp_dos_probe_row(
-                ftp,
-                probe_label="billion_laughs.xml (XML DoS)",
-                remote_filename="billion_laughs.xml",
-                payload=BILLION_LAUGHS_XML.encode("utf-8"),
-            )
-        )
-        rows.append(
-            self._ftp_dos_probe_row(
-                ftp,
-                probe_label=(
-                    "zipbomb-overlap.zip (Overlap DoS)"
-                    if large
-                    else "zipbomb.zip (Decompression DoS)"
-                ),
-                remote_filename="zipbomb-overlap.zip" if large else "zipbomb.zip",
-                payload=build_huge_zip_bomb() if large else build_full_zip_bomb(),
-            )
-        )
-
+            ftp = self.connect(trace=live)
+        except OSError as exc:
+            self._modes_vv_indent = None
+            return FtpDosAuditResult(tmo, zip_mode, creds.user, tuple(), self._snip(str(exc)) or "Could not connect.", False, False)
+        if live:
+            self._access_trace_session(ftp)
         try:
-            ftp.quit()
-        except Exception:
             try:
-                ftp.close()
+                ftp.login(creds.user, creds.passw)
+            except Exception as exc:
+                return FtpDosAuditResult(
+                    tmo,
+                    zip_mode,
+                    creds.user,
+                    tuple(),
+                    str(exc).strip() or "Login failed.",
+                    False,
+                    False,
+                )
+            if getattr(ftp, "sock", None) is not None:
+                ftp.sock.settimeout(tmo)
+            try:
+                ftp.cwd(directory)
+            except ftplib.all_errors as exc:
+                return FtpDosAuditResult(
+                    tmo,
+                    zip_mode,
+                    creds.user,
+                    tuple(),
+                    str(exc).strip() or "Could not enter the directory.",
+                    False,
+                    False,
+                )
+
+            jobs: list[tuple[str, str, bytes]] = [
+                ("billion_laughs.xml (XML DoS)", "billion_laughs.xml", BILLION_LAUGHS_XML.encode("utf-8")),
+            ]
+            if small:
+                jobs.append(("zipbomb-small.zip (Zip bomb)", "zipbomb-small.zip", build_minimal_zip_bomb()))
+            if medium:
+                jobs.append(("zipbomb.zip (Decompression DoS)", "zipbomb.zip", build_full_zip_bomb()))
+            if large:
+                jobs.append(("zipbomb-overlap.zip (Overlap DoS)", "zipbomb-overlap.zip", build_huge_zip_bomb()))
+
+            rows: list[FtpDosProbeRow] = []
+            for label, name, payload in jobs:
+                shown = name if directory == "/" else directory.rstrip("/") + "/" + name
+                rows.append(
+                    self._ftp_dos_probe_row(
+                        ftp,
+                        probe_label=label,
+                        remote_filename=name,
+                        display_name=shown,
+                        payload=payload,
+                    )
+                )
+            probes_t = tuple(rows)
+            all_blocked = bool(probes_t) and all(r.blocked_by_policy for r in probes_t)
+            suspected = any(r.background_processing_suspected for r in probes_t)
+            if all_blocked:
+                suspected = False
+            nb = sum(1 for r in probes_t if r.blocked_by_policy)
+            nsus = sum(1 for r in probes_t if r.background_processing_suspected)
+            ntimeout = sum(1 for r in probes_t if r.timed_out)
+            detail = (
+                f"{tmo}s cap per socket op; probes={zip_mode}; count={len(probes_t)}; "
+                f"policy_blocked={nb}; post_processing_signals={nsus}; STOR_timeouts={ntimeout}."
+            )
+            return FtpDosAuditResult(tmo, zip_mode, creds.user, probes_t, detail, suspected, all_blocked)
+        finally:
+            ftp.sendcmd = getattr(ftp, "_access_raw_sendcmd", ftp.sendcmd)
+            ftp.putcmd = getattr(ftp, "_access_raw_putcmd", ftp.putcmd)
+            ftp.voidresp = getattr(ftp, "_access_raw_voidresp", ftp.voidresp)
+            self._modes_vv_indent = None
+            try:
+                ftp.quit()
             except Exception:
-                pass
-
-        probes_t = tuple(rows)
-        all_blocked = bool(probes_t) and all(r.blocked_by_policy for r in probes_t)
-        suspected = any(r.background_processing_suspected for r in probes_t)
-        if all_blocked:
-            suspected = False
-
-        nb = sum(1 for r in probes_t if r.blocked_by_policy)
-        nsus = sum(1 for r in probes_t if r.background_processing_suspected)
-        ntimeout = sum(1 for r in probes_t if r.timed_out)
-        detail = (
-            f"{tmo}s cap per socket op; ZIP={zip_mode}; probes={len(probes_t)}; "
-            f"policy_blocked={nb}; post_processing_signals={nsus}; STOR_timeouts={ntimeout}."
-        )
-        return FtpDosAuditResult(
-            tmo,
-            zip_mode,
-            creds.user,
-            probes_t,
-            detail,
-            suspected,
-            all_blocked,
-        )
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
 
     def _on_brute_success(self, cred: Creds) -> None:
         """Callback for real-time streaming of found credentials (thread-safe).
@@ -2792,9 +3267,17 @@ class FtpEngine:
             return None
         return parsed[1]
 
-    def _pasvport_commands_on(self, ftp, phase: str, index: int) -> list[PasvPortSample]:
+    def _pasvport_commands_on(
+        self, ftp, phase: str, index: int, commands: tuple[str, ...]
+    ) -> list[PasvPortSample]:
+        """One passive command per connection once a port was assigned.
+
+        A 227/229 leaves the server waiting for a data connection. EPSV or QUIT
+        on that socket then sits there until the client timeout. MODES avoids
+        that by closing the socket instead of waiting for another reply.
+        """
         samples: list[PasvPortSample] = []
-        for command in ("PASV", "EPSV"):
+        for command in commands:
             code, reply = self._modes_send(ftp, command)
             kind = self._modes_kind(command, code)
             port = None
@@ -2805,7 +3288,7 @@ class FtpEngine:
             samples.append(PasvPortSample(phase, command, index, code, reply, port, kind))
             if port is not None and (self.use_json or getattr(self.args, "debug", False)):
                 self._dbg(f"Port {port}", indent=12)
-            if code is None:
+            if port is not None or code is None:
                 break
         return samples
 
@@ -2877,6 +3360,7 @@ class FtpEngine:
     ) -> PasvPortPhase:
         """Separate control connections. Stop when the server assigns no port."""
         samples: list[PasvPortSample] = []
+        commands: tuple[str, ...] = ("PASV", "EPSV")
         for index in range(sample_count):
             try:
                 ftp = self.connect(trace=True)
@@ -2887,40 +3371,44 @@ class FtpEngine:
             try:
                 if creds is not None:
                     self._modes_login(ftp, creds)
-                batch = self._pasvport_commands_on(ftp, phase, index)
+                batch = self._pasvport_commands_on(ftp, phase, index, commands)
             except OSError:
                 if samples:
                     break
                 raise
             finally:
-                try:
-                    ftp.quit()
-                except Exception:
-                    try:
-                        ftp.close()
-                    except Exception:
-                        pass
+                self._modes_close(ftp)
             samples.extend(batch)
-            if any(sample.data_port is not None for sample in batch):
+            if any(self._modes_timed_out(sample.reply) or sample.code is None for sample in batch):
+                break
+            got = next((sample.command for sample in batch if sample.data_port is not None), None)
+            if got is not None:
+                commands = (got,)
                 continue
             if {sample.kind for sample in batch} <= {"login", "unsupported"}:
                 break
         return self._pasvport_summarize(phase, samples, threshold, minimum)
 
     def _pasvport_note_poc(self, phase: PasvPortPhase) -> None:
-        if not phase.wide:
+        if not phase.wide or phase.min_port is None or phase.max_port is None or phase.observed_span is None:
             return
-        pairs: list[tuple[str, str]] = []
-        seen: set[int] = set()
-        for sample in phase.samples:
-            if sample.data_port not in (phase.min_port, phase.max_port) or not sample.reply:
-                continue
-            if sample.data_port in seen:
-                continue
-            seen.add(sample.data_port)
-            pairs.append((sample.command, sample.reply))
-        if pairs:
-            self.note_poc(VULNS.FtpPassivePortRange.value, *pairs)
+        low = next((sample for sample in phase.samples if sample.data_port == phase.min_port and sample.reply), None)
+        high = next((sample for sample in phase.samples if sample.data_port == phase.max_port and sample.reply), None)
+        if low is None or high is None or low.reply is None or high.reply is None:
+            return
+        connections = len({sample.sample_index for sample in phase.samples})
+        text = format_pasvport_poc(
+            connections,
+            low.command,
+            low.reply,
+            phase.min_port,
+            high.command,
+            high.reply,
+            phase.max_port,
+            phase.observed_span,
+        )
+        if text:
+            self._vuln_poc.setdefault(VULNS.FtpPassivePortRange.value, text)
 
     @staticmethod
     def _pasvport_finding_phase(phases: tuple[PasvPortPhase, ...] | list[PasvPortPhase]) -> PasvPortPhase | None:
@@ -7760,16 +8248,23 @@ class FtpEngine:
 
     def _eicar_lines(self, r: FtpEicarRow) -> list[tuple[str, str]]:
         who = f"{r.creds.user}: " if r.creds and r.creds.user else ""
+        leaf = (r.remote_path or "").rsplit("/", 1)[-1]
+        label = f"{leaf}: " if leaf and "." in leaf else ""
         if not r.stor_ok:
             if self._ftp_text_is_unconfirmed(r.stor_error):
-                return [("WARNING", f"{who}EICAR was not confirmed")]
-            return [("NOTVULN", f"{who}EICAR upload was refused")]
-        uploaded = ("VULN", f"{who}EICAR was uploaded")
+                return [("WARNING", f"{who}{label}EICAR was not confirmed")]
+            if not label:
+                detail = self._snip(r.stor_error or "Login failed.")
+                return [("WARNING", f"{who}{detail}")]
+            if r.on_access_scan_suspected:
+                return [("NOTVULN", f"{who}{label}EICAR was deleted")]
+            return [("NOTVULN", f"{who}{label}EICAR upload was refused")]
+        uploaded = ("VULN", f"{who}{label}EICAR was uploaded")
         if r.vanished_after_stor_suspected:
-            return [uploaded, ("NOTVULN", f"{who}EICAR was deleted")]
+            return [uploaded, ("NOTVULN", f"{who}{label}EICAR was deleted")]
         if r.retr_ok and r.retr_payload_match:
-            return [uploaded, ("VULN", f"{who}EICAR was not deleted")]
-        return [uploaded, ("WARNING", f"{who}Deletion was not confirmed")]
+            return [uploaded, ("VULN", f"{who}{label}EICAR was not deleted")]
+        return [uploaded, ("WARNING", f"{who}{label}Deletion was not confirmed")]
 
     def _print_eicar_audit_terminal(self, ea: FtpEicarAuditResult) -> None:
         if getattr(self, "_eicar_streamed", False):
@@ -8153,6 +8648,25 @@ class FtpEngine:
                         "vuln_response": response_str,
                     }
                 )
+
+        anon_summary = getattr(self, "_access_anon_summary", "") or ""
+        if anon_summary:
+            deferred_vulns.append(
+                {
+                    "vuln_code": VULNS.FtpAnonAccess.value,
+                    "vuln_request": "Anonymous directory access",
+                    "vuln_response": anon_summary,
+                }
+            )
+        write_summary = getattr(self, "_access_write_summary", "") or ""
+        if write_summary:
+            deferred_vulns.append(
+                {
+                    "vuln_code": VULNS.FtpWrite.value,
+                    "vuln_request": "Authenticated directory write",
+                    "vuln_response": write_summary,
+                }
+            )
 
         # --access without working anonymous: access_check still ran but UI above skipped (anonymous unset or False)
         if (
@@ -8693,7 +9207,7 @@ class FtpEngine:
                 deferred_vulns.append(
                     {
                         "vuln_code": VULNS.FtpAntivirusEicar.value,
-                        "vuln_request": "FTP STOR of EICAR test file + delayed SIZE/RETR (--eicar)",
+                        "vuln_request": "FTP STOR of eicar.com, eicar.com.txt, eicar.com.zip and eicar.com-2.zip, then SIZE/RETR",
                         "vuln_response": (
                             ea.detail
                             + " EICAR remained retrievable after post-STOR delay — treat as missing or weak "
@@ -8742,8 +9256,18 @@ class FtpEngine:
                     {
                         "vuln_code": VULNS.FtpProcessingResilience.value,
                         "vuln_request": (
-                            "FTP STOR of billion-laughs XML + ZIP bomb in one session (--ftp-dos-probes); "
-                            "timing last-byte→226 + NOOP/PWD stability"
+                            "FTP STOR of "
+                            + " + ".join(
+                                name
+                                for name, flag in (
+                                    ("billion-laughs XML", "xml"),
+                                    ("small zip bomb", "small"),
+                                    ("zip bomb", "medium"),
+                                    ("large zip bomb", "large"),
+                                )
+                                if flag in (dos.zip_mode or "xml").split(",")
+                            )
+                            + "; timing last-byte→226 + NOOP/PWD stability"
                         ),
                         "vuln_response": dos.detail
                         + " Elevated control latency, timeout, or unstable session after STOR hints at synchronous "

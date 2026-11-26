@@ -91,14 +91,7 @@ def _clean_name_list(raw: list[str]) -> list[str]:
 
 
 def load_paths_wordlist(args) -> list[str]:
-    path = getattr(args, "paths_wordlist", None)
-    if not path:
-        return []
-    return _clean_name_list(text_or_file(None, path))
-
-
-def load_enum_files(args) -> list[str]:
-    path = getattr(args, "enum_files", None)
+    path = getattr(args, "wordlist", None)
     if not path:
         return []
     return _clean_name_list(text_or_file(None, path))

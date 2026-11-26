@@ -125,6 +125,12 @@ class ThreadedProgress:
                 self._last_label = label
             self._paint_unlocked()
 
+    def add_total(self, count: int) -> None:
+        """Count work that appears only after a directory is found."""
+        with self._lock:
+            self.total += max(0, int(count))
+            self._paint_unlocked()
+
     def advance(self, label: str = "") -> None:
         with self._lock:
             self._done += 1

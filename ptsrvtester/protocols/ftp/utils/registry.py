@@ -6,12 +6,12 @@ from ptsrvtester.protocols._shared.utils.cli import rate_limit_test_spec
 FTP_TEST_GROUPS: list[tuple[str, list[str]]] = [
     ("Recon & fingerprint", ["BANNER", "CMD", "ENCRYPT"]),
     ("Authentication & access", ["ANON", "ACCESS", "BRUTE", "WEAK", "RECYKL", "USRENUM"]),
-    ("Enumeration", ["ENUMPATH"]),
+    ("Enumeration", ["FILEENUM"]),
     ("Data channel & modes", ["MODES", "PASVPORT", "ACTIVE", "ACTIVEFULL"]),
     ("Command surface & validation", ["CMDAUDITACTIVE", "INVCMD"]),
     ("Rate limiting & stress", ["CONNLIM", "RATELIMIT"]),
     ("Access control", ["CHROOT"]),
-    ("Content security", ["EICAR", "DOS"]),
+    ("Content security", ["EICAR", "ZIPXXE"]),
 ]
 
 FTP_DEFAULT_SUITE: tuple[str, ...] = ("BANNER", "CMD", "ANON")
@@ -129,17 +129,20 @@ FTP_TESTS: dict[str, dict] = {
             ["", "--user-enum-timing", "", "Also compare how long PASS takes"],
         ],
     },
-    "ENUMPATH": {
-        "desc": "Path / directory dictionary enumeration",
-        "long": ["Directory names from -w, file names from --files. Files are tried",
-                 "in the login directory and in each directory actually entered."],
-        "requires": ["-w/--paths-wordlist or --files", "credentials (-A or -u/-p)"],
+    "FILEENUM": {
+        "desc": "File and directory enumeration",
+        "long": ["Try each name from -w with the suffixes from --extension.",
+                 "A suffix without a dot gets one. An empty suffix tries the name as a directory.",
+                 "With --recurse, the same names are tried inside each directory that is found,",
+                 "down to --depth (default: 5)."],
+        "requires": ["-w/--wordlist", "credentials (-A or -u/-p)"],
         "mods": [
-            ["-w", "--paths-wordlist", "<folder>", "Directory names, one per line"],
-            ["", "--files", "<file>", "File names to try inside each directory entered"],
-            ["", "--depth", "<n>", "Directory levels to walk (default: 1)"],
+            ["-w", "--wordlist", "<file>", "Names to try, one per line"],
+            ["", "--extension", "<ext> …", "Suffixes, comma or space separated. \"\" tries a directory"],
+            ["", "--recurse", "", "Search inside directories that are found"],
+            ["", "--depth", "<n>", "How deep --recurse descends (default: 5)"],
             ["-t", "--threads", "<n>", "Threads (default: 5)"],
-            ["", "--base-path", "<path>", "Start directory for enumeration (default: login CWD)"],
+            ["", "--base-path", "<path>", "Start directory (default: login directory)"],
         ],
     },
     "MODES": {
@@ -201,15 +204,18 @@ FTP_TESTS: dict[str, dict] = {
             ["-p", "--password", "<pass>", "Password for authenticated probes (optional)"],
         ],
     },
-    "DOS": {
-        "desc": "XML / ZIP processing-resilience (DoS) probes",
-        "long": ["Upload a Billion Laughs XML file. A zip bomb is uploaded only",
-                 "when its size switch is set."],
+    "ZIPXXE": {
+        "desc": "XML / ZIP processing-resilience probes",
+        "long": ["Check that a small text file can be uploaded into --path, then",
+                 "upload a Billion Laughs XML file. A zip bomb is uploaded only",
+                 "when its size switch is set. With --delete, the uploaded files",
+                 "are removed after --delay."],
         "requires": ["credentials (-A or -u/-p)"],
         "mods": [
             ["", "--path", "<dir>", "Directory to upload into (default: /)"],
-            ["", "--ftp-dos-timeout", "<sec>", "Per-operation socket timeout (default: 30)"],
-            ["", "--zipxxe-timeout", "<sec>", "Per-operation socket timeout (default: 30)"],
+            ["", "--timeout", "<sec>", "Per-operation socket timeout (default: 30)"],
+            ["", "--delay", "<sec>", "Wait after all uploads before deleting them (default: 30). Used only with --delete"],
+            ["", "--delete", "", "Delete the uploaded files after --delay"],
             ["", "--zipxxe-zip-bomb-small", "", "Also upload the small zip bomb (~200 KB expanded)"],
             ["", "--zipxxe-zip-bomb-medium", "", "Also upload the medium zip bomb (~100 MB expanded)"],
             ["", "--zipxxe-zip-bomb-large", "", "Also upload the large zip bomb (~1 TB expanded, isolated labs)"],
@@ -224,13 +230,14 @@ FTP_TESTS: dict[str, dict] = {
     },
     "EICAR": {
         "desc": "EICAR antivirus probe (upload + verify)",
-        "long": ["Upload eicar.com, eicar.com.txt, eicar.com.zip and eicar.com-2.zip",
-                 "into --path. A finding is reported only when the same bytes",
-                 "can still be downloaded."],
+        "long": ["Check that a small text file can be uploaded into --path, then",
+                 "store the EICAR files. After --delay, a finding is reported only",
+                 "when the same bytes can still be downloaded."],
         "requires": ["credentials (-A or -u/-p)"],
         "mods": [
             ["", "--path", "<dir>", "Directory to upload into (default: /)"],
-            ["", "--eicar-post-stor-delay", "<sec>", "Wait after STOR before verify (default: 0.5)"],
+            ["", "--delay", "<sec>", "Wait after upload before checking the file (default: 1)"],
+            ["", "--delete", "", "Delete the uploaded EICAR files afterwards"],
         ],
     },
     "RATELIMIT": rate_limit_test_spec(),
@@ -238,7 +245,7 @@ FTP_TESTS: dict[str, dict] = {
 
 # Login is required (-A or -u/-p). Shown in Options, not only in Requires.
 _FTP_CRED_TESTS = frozenset({
-    "ACCESS", "ENUMPATH", "CMDAUDITACTIVE", "DOS", "CHROOT", "EICAR",
+    "ACCESS", "FILEENUM", "CMDAUDITACTIVE", "ZIPXXE", "CHROOT", "EICAR",
 })
 _FTP_LOGIN_OPTS = (
     ["-A", "--anonymous", "", "Anonymous login"],

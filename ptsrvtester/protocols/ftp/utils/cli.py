@@ -27,9 +27,10 @@ class FTPArgs(ArgsWithBruteforce):
     access_delete: bool
     bounce: Target | None
     bounce_file: str | None
-    paths_wordlist: str | None
-    enum_files: str | None
-    enum_depth: int
+    wordlist: str | None
+    file_extensions: list[str] | None
+    file_recurse: bool
+    enum_depth: int | None
     base_path: str
     pasv_port_audit_samples: int | None
     pasv_port_audit_max_span: int | None
@@ -72,7 +73,7 @@ class FTPArgs(ArgsWithBruteforce):
             ["-p", "--password", "[password] …", "Password(s), space or comma separated. No value or \"\" tests an empty password"],
             ["-P", "--passwords", "<wordlist>", "Password wordlist"],
             ["", "--spray", "", "Try one password against all users"],
-            ["-t", "--threads", "<n>", "Threads (BRUTE default: 10, ENUMPATH default: 5, USRENUM default: 1)"],
+            ["-t", "--threads", "<n>", "Threads (BRUTE default: 10, FILEENUM default: 5, USRENUM default: 1)"],
             *rate_limit_help_rows(get_colored_text),
             ["", "", "", ""],
             [get_colored_text("Output", "TITLE")],
@@ -90,9 +91,9 @@ class FTPArgs(ArgsWithBruteforce):
                 "ptsrvtester ftp -ts ANON,ACCESS -l -tg 127.0.0.1",
                 "ptsrvtester ftp -ts BRUTE -u admin harry -P passwords.txt -tg 127.0.0.1:21",
                 "ptsrvtester ftp -ts USRENUM -u user admin nobody -tg 127.0.0.1",
-                "ptsrvtester ftp -ts ENUMPATH -w paths.txt -u user -p pass -tg 127.0.0.1",
+                "ptsrvtester ftp -ts FILEENUM -w paths.txt --extension txt,php --recurse -u user -p pass -tg 127.0.0.1",
                 "ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1",
-                "ptsrvtester ftp -ts CONNLIM,DOS -u user -p pass -tg 127.0.0.1",
+                "ptsrvtester ftp -ts CONNLIM,ZIPXXE -u user -p pass -tg 127.0.0.1",
                 "ptsrvtester ftp -ts RATELIMIT -tg 127.0.0.1",
                 "ptsrvtester ftp -ts USRENUM -h",
             ]},
@@ -144,15 +145,16 @@ class FTPArgs(ArgsWithBruteforce):
         mods = parser.add_argument_group("TEST OPTIONS")
         mods.add_argument("-l", "--access-list", action="store_true", help="ACCESS: display root directory listing")
         mods.add_argument("-f", "--file", type=str, dest="access_file", metavar="<name>", help="ACCESS: remote file name when listing is refused")
-        mods.add_argument("--path", type=str, default="/", dest="access_path", metavar="<dir>", help="ACCESS/DOS/EICAR: directory to test or upload into (default: /)")
+        mods.add_argument("--path", type=str, default="/", dest="access_path", metavar="<dir>", help="ACCESS/ZIPXXE/EICAR: directory to test or upload into (default: /)")
         mods.add_argument("--recursive", action="store_true", dest="access_recursive", help="ACCESS: also test nested directories")
-        mods.add_argument("--delete", action="store_true", dest="access_delete", help="ACCESS: also delete an existing file and the tested directory")
+        mods.add_argument("--delete", action="store_true", dest="access_delete", help="ACCESS: also delete an existing file and the tested directory. EICAR: delete the uploaded files afterwards. ZIPXXE: delete the uploaded files after --delay")
         mods.add_argument("-B", "--bounce", type=valid_target_bounce, help="ACCESS: FTP bounce to IP:PORT / HOST:PORT")
         mods.add_argument("--bounce-file", type=str, help="ACCESS: file with request for bounce")
-        mods.add_argument("-w", "--paths-wordlist", type=str, dest="paths_wordlist", help="ENUMPATH: directory names, one per line")
-        mods.add_argument("--files", type=str, dest="enum_files", metavar="<file>", help="ENUMPATH: file names to try inside each directory entered")
-        mods.add_argument("--depth", type=int, default=1, dest="enum_depth", metavar="<n>", help="Directory levels for ENUMPATH and ACCESS --recursive (default: 1)")
-        mods.add_argument("--base-path", type=str, default="", dest="base_path", help="ENUMPATH: start directory")
+        mods.add_argument("-w", "--wordlist", type=str, dest="wordlist", metavar="<file>", help="FILEENUM: names to try, one per line")
+        mods.add_argument("--extension", nargs="+", dest="file_extensions", metavar="<ext>", help="FILEENUM: suffixes, comma or space separated. An empty suffix tries the name as a directory")
+        mods.add_argument("--recurse", action="store_true", dest="file_recurse", help="FILEENUM: also search inside directories that are found")
+        mods.add_argument("--depth", type=int, default=None, dest="enum_depth", metavar="<n>", help="FILEENUM --recurse depth (default: 5). ACCESS --recursive depth (default: 1)")
+        mods.add_argument("--base-path", type=str, default="", dest="base_path", help="FILEENUM: start directory")
         mods.add_argument("--pasv-port-audit-samples", type=int, default=None, dest="pasv_port_audit_samples", metavar="<n>", help=argparse.SUPPRESS)
         mods.add_argument("--pasv-port-audit-max-span", type=int, default=None, dest="pasv_port_audit_max_span", metavar="<n>", help=argparse.SUPPRESS)
         mods.add_argument("-c", "--count", type=int, default=None, dest="conn_limit_count", metavar="<n>", help=argparse.SUPPRESS)
@@ -163,9 +165,12 @@ class FTPArgs(ArgsWithBruteforce):
         mods.add_argument("--user-enum-keep-alive", action="store_true", dest="user_enum_keep_alive")
         mods.add_argument("--user-enum-timing", action="store_true", dest="user_enum_timing")
         mods.add_argument("--user-enum-max", type=int, default=0, dest="user_enum_max", metavar="<n>")
-        mods.add_argument("--eicar-post-stor-delay", type=float, default=0.5, dest="eicar_post_stor_delay", metavar="<sec>")
         mods.add_argument(
-            "--ftp-dos-timeout", "--zipxxe-timeout", type=float, default=30.0,
+            "--delay", "--eicar-post-stor-delay", type=float, default=None,
+            dest="eicar_post_stor_delay", metavar="<sec>",
+        )
+        mods.add_argument(
+            "--timeout", type=float, default=30.0,
             dest="ftp_dos_timeout", metavar="<sec>",
         )
         mods.add_argument("--zipxxe-zip-bomb-small", action="store_true", dest="ftp_dos_zip_small")
@@ -197,11 +202,10 @@ def validate_ftp_selection(args) -> None:
         if raw is not None and int(raw) < 1:
             raise argparse.ArgumentError(None, f"{label} must be >= 1")
     codes = _codes(args)
-    if codes and ("ALL" in codes or "ENUMPATH" in codes or "ACCESS" in codes):
-        depth = getattr(args, "enum_depth", 1)
-        if depth is None:
-            depth = 1
-        if int(depth) < 1:
+    if codes and getattr(args, "enum_depth", None) is not None and (
+        "ALL" in codes or "FILEENUM" in codes or "ACCESS" in codes
+    ):
+        if int(args.enum_depth) < 1:
             raise argparse.ArgumentError(None, "--depth must be >= 1")
     if not codes or "ALL" in codes:
         return
@@ -209,9 +213,13 @@ def validate_ftp_selection(args) -> None:
         getattr(args, "user", None) or getattr(args, "users", None) or getattr(args, "user_enum_wordlist", None)
     ):
         raise argparse.ArgumentError(None, "USRENUM requires -u/--user or -U/--users")
-    if "ENUMPATH" in codes and not getattr(args, "paths_wordlist", None) and not getattr(args, "enum_files", None):
-        raise argparse.ArgumentError(None, "ENUMPATH requires -w/--paths-wordlist or --files")
-    need_creds = {"ACCESS", "ENUMPATH", "CMDAUDITACTIVE", "DOS", "CHROOT", "EICAR"} & set(codes)
+    if "FILEENUM" in codes and not getattr(args, "wordlist", None):
+        raise argparse.ArgumentError(None, "FILEENUM requires -w/--wordlist")
+    if "FILEENUM" not in codes and getattr(args, "file_extensions", None):
+        raise argparse.ArgumentError(None, "--extension requires -ts FILEENUM")
+    if "FILEENUM" not in codes and getattr(args, "file_recurse", False):
+        raise argparse.ArgumentError(None, "--recurse requires -ts FILEENUM")
+    need_creds = {"ACCESS", "FILEENUM", "CMDAUDITACTIVE", "ZIPXXE", "CHROOT", "EICAR"} & set(codes)
     # ACCESS/EICAR etc. may rely on -ts ANON in the same run (results.anonymous) — allow ANON+ACCESS
     if need_creds and not _has_creds(args) and "ANON" not in codes:
         raise argparse.ArgumentError(
@@ -224,14 +232,14 @@ def validate_ftp_selection(args) -> None:
     if "ACCESS" not in codes:
         if getattr(args, "access_recursive", False):
             raise argparse.ArgumentError(None, "--recursive requires -ts ACCESS")
-        if getattr(args, "access_delete", False):
-            raise argparse.ArgumentError(None, "--delete requires -ts ACCESS")
+        if getattr(args, "access_delete", False) and "EICAR" not in codes and "ZIPXXE" not in codes:
+            raise argparse.ArgumentError(None, "--delete requires -ts ACCESS, -ts EICAR or -ts ZIPXXE")
         path = getattr(args, "access_path", "/") or "/"
-        if path not in ("/", "") and "DOS" not in codes and "EICAR" not in codes:
-            raise argparse.ArgumentError(None, "--path requires -ts ACCESS, -ts DOS or -ts EICAR")
-    if "DOS" not in codes and (
+        if path not in ("/", "") and "ZIPXXE" not in codes and "EICAR" not in codes:
+            raise argparse.ArgumentError(None, "--path requires -ts ACCESS, -ts ZIPXXE or -ts EICAR")
+    if "ZIPXXE" not in codes and (
         getattr(args, "ftp_dos_zip_small", False)
         or getattr(args, "ftp_dos_zip_medium", False)
         or getattr(args, "ftp_dos_zip_large", False)
     ):
-        raise argparse.ArgumentError(None, "zip bomb switches require -ts DOS")
+        raise argparse.ArgumentError(None, "zip bomb switches require -ts ZIPXXE")

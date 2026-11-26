@@ -679,16 +679,23 @@ class ChrootCwdProbeRow:
     success: bool
     pwd_after: str | None
     error_or_reply: str | None
+    command: str | None = None
+    reply: str | None = None
+    pwd_reply: str | None = None
 
 
 @dataclass
 class ChrootDotdotResult:
-    """Repeated CWD .. from post-login directory."""
+    """Repeated CDUP from the post-login directory."""
 
     steps_ok: int
     pwd_initial: str
     pwd_final: str | None
     stopped_reason: str
+    pwd_initial_reply: str | None = None
+    last_command: str | None = None
+    last_reply: str | None = None
+    pwd_final_reply: str | None = None
 
 
 @dataclass
@@ -715,6 +722,7 @@ class ChrootAuditResult:
     passwd_retr_relative_ok: bool = False
     shadow_retr_relative_ok: bool = False
     write_escape_ok: bool = False
+    proofs: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass

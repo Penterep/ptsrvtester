@@ -405,8 +405,7 @@ class FtpEngine:
     def _access_mark(self, mark: str, text: str, *, indent: int) -> None:
         if self.use_json:
             return
-        color = "OK" if mark == "O" else "WARNING"
-        self._tprint(f"{get_colored_text('[' + mark + ']', color)} {text}", "TEXT", indent=indent)
+        self._tprint(text, "NOTVULN" if mark == "O" else "WARNING", indent=indent)
 
     def _access_fact_line(
         self, label: str, ok: bool, *, warn_on_yes: bool, indent: int, width: int = 8
@@ -419,8 +418,7 @@ class FtpEngine:
         if self.use_json:
             return
         if creds.user.lower() == "anonymous":
-            shown = f" {creds.passw}" if creds.passw else ""
-            text = f"Anonymous access (user: anonymous, password:{shown})"
+            text = "Anonymous access (user: anonymous)"
         else:
             text = f"Authorized access (user: {creds.user})"
         self._tprint(text, "TITLE", indent=4)
@@ -1014,8 +1012,7 @@ class FtpEngine:
         if self.use_json:
             return
         if creds.user.lower() == "anonymous":
-            shown = f" {creds.passw}" if creds.passw else ""
-            text = f"Anonymous access (user: anonymous, password:{shown})"
+            text = "Anonymous access (user: anonymous)"
         else:
             text = f"Authorized access (user: {creds.user})"
         self._tprint(text, "TITLE", indent=4)
@@ -1149,6 +1146,41 @@ class FtpEngine:
             None,
         )
 
+    def _eicar_delete_uploaded(self, ftp, name: str, *, force: bool = False) -> bool:
+        if not force and not getattr(self.args, "access_delete", False):
+            return False
+        cmd = "DELE " + name
+        try:
+            reply = str(ftp.delete(name) or "").strip()
+        except ftplib.all_errors as exc:
+            self._ftp_vv_io(cmd, str(exc).strip())
+            return False
+        self._ftp_vv_io(cmd, reply or "(no reply)")
+        return True
+
+    def _eicar_write_probe(self, ftp) -> bool | None:
+        """True when a small text file was stored, False when write is refused, None when unconfirmed."""
+        name = "ptsrv" + self._access_token() + ".txt"
+        cmd = "STOR " + name
+        try:
+            done = str(ftp.storbinary(cmd, BytesIO(b"write check\n")) or "").strip()
+        except (ftplib.Error, OSError) as exc:
+            text = str(exc).strip()
+            self._ftp_vv_io(cmd, text)
+            if self._ftp_text_is_unconfirmed(text) or not self._ftp_server_reply(text):
+                return None
+            return False
+        self._ftp_vv_io(cmd, done or "(no reply)")
+        if not done.startswith("2"):
+            return False
+        present, _reply = self._eicar_file_present(ftp, name)
+        self._eicar_delete_uploaded(ftp, name, force=True)
+        if present is True:
+            return True
+        if present is False:
+            return False
+        return None
+
     def _eicar_probe_file(
         self,
         ftp,
@@ -1176,36 +1208,42 @@ class FtpEngine:
             detected = self._eicar_reply_suggests_malware(done)
             return self._eicar_stopped_row(creds, delay, used_path, done or "was not confirmed", detected=detected)
 
-        present, present_reply = self._eicar_file_present(ftp, filename)
-        if present is not True:
-            reply = present_reply or "was not confirmed"
-            detected = self._eicar_reply_suggests_malware(done) or self._eicar_reply_suggests_malware(reply)
-            return self._eicar_stopped_row(creds, delay, used_path, reply, detected=detected)
-
         try:
             time.sleep(max(0.0, delay))
         except Exception:
             pass
 
+        present, present_reply = self._eicar_file_present(ftp, filename)
+        if present is not True:
+            reply = present_reply or "was not confirmed"
+            if present is False or self._eicar_reply_suggests_missing(reply) or self._eicar_reply_suggests_malware(reply):
+                removed = self._eicar_delete_uploaded(ftp, filename)
+                return FtpEicarRow(
+                    creds,
+                    used_path,
+                    True,
+                    None,
+                    delay,
+                    None,
+                    reply,
+                    False,
+                    None,
+                    reply,
+                    True,
+                    True,
+                    removed,
+                    None if removed else reply,
+                    None,
+                )
+            return self._eicar_stopped_row(creds, delay, used_path, reply)
+
         size_bytes: int | None = None
         size_err: str | None = None
-        try:
-            size_resp = ftp.sendcmd("SIZE " + filename)
-        except ftplib.error_perm as e:
-            size_err = str(e)
-            self._ftp_vv_io("SIZE " + filename, size_err)
-        except ftplib.Error as e:
-            size_err = str(e)
-            self._ftp_vv_io("SIZE " + filename, size_err)
-        else:
-            self._ftp_vv_io("SIZE " + filename, size_resp)
-            if str(size_resp).startswith("213"):
-                try:
-                    size_bytes = int(str(size_resp)[3:].strip())
-                except ValueError:
-                    size_err = str(size_resp)
-            else:
-                size_err = str(size_resp)
+        if str(present_reply).startswith("213"):
+            try:
+                size_bytes = int(str(present_reply)[3:].strip())
+            except ValueError:
+                size_err = str(present_reply)
 
         buf = BytesIO()
         retr_ok = False
@@ -1241,20 +1279,10 @@ class FtpEngine:
         delete_ok = False
         delete_err: str | None = None
         delete_note: str | None = None
-        try:
-            deleted = ftp.delete(filename)
-            delete_ok = True
-            self._ftp_vv_io("DELE " + filename, deleted or "")
-        except ftplib.error_perm as e:
-            delete_err = str(e)
-            self._ftp_vv_io("DELE " + filename, delete_err)
-            if self._eicar_reply_suggests_missing(str(e)) or self._eicar_reply_suggests_malware(str(e)):
-                delete_note = "File was already gone when DELE ran."
-        except ftplib.Error as e:
-            delete_err = str(e)
-            self._ftp_vv_io("DELE " + filename, delete_err)
-            if self._eicar_reply_suggests_missing(str(e)) or self._eicar_reply_suggests_malware(str(e)):
-                delete_note = "File was already gone when DELE ran."
+        if getattr(self.args, "access_delete", False):
+            delete_ok = self._eicar_delete_uploaded(ftp, filename)
+            if not delete_ok:
+                delete_err = "delete failed"
 
         on_access = vanished or (delete_note is not None) or self._eicar_reply_suggests_malware(retr_err)
         return FtpEicarRow(
@@ -1323,6 +1351,15 @@ class FtpEngine:
             return [row]
         self._ftp_vv_io(cwd_cmd, cwd_reply)
 
+        writable = self._eicar_write_probe(ftp)
+        if writable is not True:
+            if not self.use_json:
+                msg = "Upload was not confirmed" if writable is None else "Upload is not allowed"
+                self._tprint(msg, "WARNING", indent=8)
+            self._eicar_streamed = True
+            _close()
+            return []
+
         rows: list[FtpEicarRow] = []
         for filename, payload in self._eicar_payloads():
             row = self._eicar_probe_file(ftp, creds, delay, directory, filename, payload)
@@ -1337,7 +1374,7 @@ class FtpEngine:
 
     def test_eicar_antivirus_probe(self) -> FtpEicarAuditResult:
         """EICAR upload audit (PTL-SVC-FTP-ANTIVIRUS): delayed verify for on-access scanners."""
-        delay = max(0.0, float(getattr(self.args, "eicar_post_stor_delay", 0.5) or 0.0))
+        delay = self._configured_delay(1.0)
         all_creds: list[Creds] = []
         if self.results.anonymous or (
             getattr(self.args, "anonymous", False) and self.results.anonymous is None
@@ -1560,12 +1597,6 @@ class FtpEngine:
 
         delete_ok = False
         delete_err: str | None = None
-        if stored:
-            try:
-                ftp.delete(remote_filename)
-                delete_ok = True
-            except ftplib.Error as e:
-                delete_err = str(e)
 
         delta = o.delta_last_byte_to_226_seconds
         suspected = False
@@ -1672,13 +1703,13 @@ class FtpEngine:
                     self._dbg(f"DELE {r.remote_filename} → {self._snip(r.delete_error)}", indent=12)
         bullet, text = self._ftp_dos_reply(r)
         self._tprint(text, bullet, indent=12)
-        if r.stor_ok and not r.delete_ok:
+        if r.delete_error:
             self._tprint("Cleanup failed", "WARNING", indent=12)
 
     def _ftp_dos_print_verdict(self, r: FtpDosProbeRow) -> None:
         bullet, text = self._ftp_dos_reply(r)
         self._tprint(text, bullet, indent=12)
-        if r.stor_ok and not r.delete_ok:
+        if r.delete_error:
             self._tprint("Cleanup failed", "WARNING", indent=12)
 
     def _ftp_dos_emit_probe(self, r: FtpDosProbeRow) -> None:
@@ -1686,6 +1717,64 @@ class FtpEngine:
             return
         self._ftp_dos_print_verdict(r)
         self._dos_probes_emitted = True
+
+    def _configured_delay(self, default: float) -> float:
+        """--delay. EICAR defaults to 1s, ZIPXXE to 30s, unless the user set a value."""
+        raw = getattr(self.args, "eicar_post_stor_delay", None)
+        if raw is None:
+            return default
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return default
+
+    def _zipxxe_write_probe(self, ftp) -> bool | None:
+        """True when a small text file was stored, False when write is refused, None when unconfirmed."""
+        name = "ptsrv" + self._access_token() + ".txt"
+        try:
+            done = str(ftp.storbinary("STOR " + name, BytesIO(b"write check\n")) or "").strip()
+        except (ftplib.Error, OSError) as exc:
+            text = str(exc).strip()
+            if self._ftp_text_is_unconfirmed(text) or not self._ftp_server_reply(text):
+                return None
+            return False
+        if not str(done).startswith("2"):
+            return False
+        present, _reply = self._ftp_dos_confirm_stored(ftp, name)
+        try:
+            ftp.delete(name)
+        except ftplib.all_errors:
+            pass
+        if present is True:
+            return True
+        if present is False:
+            return False
+        return None
+
+    def _zipxxe_delete_uploaded(self, ftp, rows: list[FtpDosProbeRow]) -> list[FtpDosProbeRow]:
+        """With --delete, wait --delay after every upload, then remove the stored files."""
+        if not getattr(self.args, "access_delete", False) or not any(r.stor_ok for r in rows):
+            return rows
+        try:
+            time.sleep(self._configured_delay(30.0))
+        except Exception:
+            pass
+        updated: list[FtpDosProbeRow] = []
+        failed = False
+        for row in rows:
+            if not row.stor_ok:
+                updated.append(row)
+                continue
+            try:
+                ftp.delete(row.remote_filename)
+            except ftplib.all_errors as exc:
+                failed = True
+                updated.append(row._replace(delete_ok=False, delete_error=str(exc).strip() or "delete failed"))
+            else:
+                updated.append(row._replace(delete_ok=True, delete_error=None))
+        if failed and not self.use_json:
+            self._tprint("Cleanup failed", "WARNING")
+        return updated
 
     def test_ftp_processing_resilience_probes(self) -> FtpDosAuditResult:
         """XML upload, plus a zip bomb only when its size switch is set."""
@@ -1754,6 +1843,14 @@ class FtpEngine:
                     False,
                 )
 
+            writable = self._zipxxe_write_probe(ftp)
+            if writable is not True:
+                msg = "Upload was not confirmed" if writable is None else "Upload is not allowed"
+                if not self.use_json:
+                    self._tprint(msg, "WARNING")
+                self._dos_probes_emitted = True
+                return FtpDosAuditResult(tmo, zip_mode, creds.user, tuple(), msg, False, False)
+
             jobs: list[tuple[str, str, bytes]] = [
                 ("billion_laughs.xml (XML DoS)", "billion_laughs.xml", BILLION_LAUGHS_XML.encode("utf-8")),
             ]
@@ -1776,6 +1873,7 @@ class FtpEngine:
                         payload=payload,
                     )
                 )
+            rows = self._zipxxe_delete_uploaded(ftp, rows)
             probes_t = tuple(rows)
             all_blocked = bool(probes_t) and all(r.blocked_by_policy for r in probes_t)
             suspected = any(r.background_processing_suspected for r in probes_t)
@@ -1822,6 +1920,24 @@ class FtpEngine:
     def _enum_show(self, lines: list[str], row: PathEnumResult | None) -> None:
         """-vv lines, then the hit. One path stays together across threads."""
         if self.use_json:
+            return
+        progress = getattr(self, "_enum_progress", None)
+        output = getattr(getattr(self, "_enum_tls", None), "output", None)
+        if progress is not None and output is not None and progress.enabled:
+            if getattr(self.args, "debug", False):
+                for line in lines:
+                    rendered = out_if(line, "ADDITIONS", True, colortext=True, indent=0)
+                    if rendered:
+                        output.add_string_to_output(rendered.rstrip("\n"))
+            if row is not None:
+                rendered = out_if(self._enumpath_text(row), "VULN", True, colortext=True, indent=0)
+                if rendered:
+                    output.add_string_to_output(rendered.rstrip("\n"))
+                if row.cleanup_failed:
+                    warning = out_if("Cleanup failed", "WARNING", True, colortext=True, indent=0)
+                    if warning:
+                        output.add_string_to_output(warning.rstrip("\n"))
+                self._enumpath_streamed = True
             return
         lock = getattr(self, "_enumpath_lock", None)
         if lock is None:
@@ -1978,8 +2094,8 @@ class FtpEngine:
         except Exception as exc:
             notes.append(f"CWD {parent!r} → {self._snip(str(exc))}")
 
-    def _enum_login_directory(self, creds: Creds, files: list[str]) -> list[PathEnumResult]:
-        """Write/delete once in the start directory, then the file wordlist there."""
+    def _enum_login_directory(self, creds: Creds) -> list[PathEnumResult]:
+        """Write/delete once in the start directory."""
         ftp = self.connect()
         notes: list[str] = []
         rows: list[PathEnumResult] = []
@@ -2016,10 +2132,6 @@ class FtpEngine:
                 else:
                     self._enum_show(notes, None)
                     notes = []
-            for name in files:
-                hit = self._enum_try_file(ftp, pwd, name)
-                if hit is not None:
-                    rows.append(hit)
             return rows
         except Exception as exc:
             notes.append(f"Login directory → {self._snip(str(exc))}")
@@ -2083,82 +2195,8 @@ class FtpEngine:
             notes.append(f"RETR {path!r} → {self._snip(str(exc))}")
             return False
 
-    def _enum_enter_dirs(
-        self,
-        ftp: ftplib.FTP,
-        here: str,
-        dir_names: list[str],
-        file_names: list[str],
-        depth_left: int,
-        out: list[PathEnumResult],
-    ) -> None:
-        """Try directory names from the current directory, then step back with CDUP."""
-        if depth_left < 1:
-            return
-        here_n = self._chroot_norm_pwd(here)
-        for name in dir_names:
-            notes: list[str] = []
-            try:
-                ftp.cwd(name)
-                try:
-                    pwd_after = ftp.pwd()
-                except (ftplib.Error, AttributeError):
-                    pwd_after = ""
-            except ftplib.error_perm as exc:
-                notes.append(f"CWD {name!r} → {self._snip(str(exc))}")
-                self._enum_show(notes, None)
-                continue
-            except ftplib.Error as exc:
-                notes.append(f"CWD {name!r} → {self._snip(str(exc))}")
-                self._enum_show(notes, None)
-                continue
-            expect = self._enum_expect_pwd(here_n, name)
-            landed = bool(pwd_after) and self._chroot_norm_pwd(pwd_after) == expect
-            if not landed:
-                shown = pwd_after or "unknown"
-                notes.append(f"CWD {name!r} → pwd={shown} (not {expect})")
-                self._enum_show(notes, None)
-                back: list[str] = []
-                self._enum_leave(ftp, here_n, back)
-                self._enum_show(back, None)
-                continue
-            if not self._enum_mark_seen(pwd_after):
-                notes.append(f"CWD {name!r} → pwd={pwd_after} (already visited)")
-                self._enum_show(notes, None)
-                back = []
-                self._enum_leave(ftp, here_n, back)
-                self._enum_show(back, None)
-                continue
-            notes.append(f"CWD {name!r} → directory pwd={pwd_after}")
-            writable = deletable = cleanup_failed = False
-            if self._enum_claim_dir(pwd_after):
-                probe = ".ptsrvtester_probe_" + secrets.token_hex(4)
-                writable, deletable, cleanup_failed = self._enum_write_delete(ftp, probe, notes)
-            row = PathEnumResult(
-                path=self._chroot_norm_pwd(pwd_after),
-                exists=True,
-                is_directory=True,
-                size=None,
-                writable=writable,
-                deletable=deletable,
-                cleanup_failed=cleanup_failed,
-            )
-            self._enum_show(notes, row)
-            out.append(row)
-            for fname in file_names:
-                hit = self._enum_try_file(ftp, pwd_after, fname)
-                if hit is not None:
-                    out.append(hit)
-            if depth_left > 1:
-                self._enum_enter_dirs(ftp, pwd_after, dir_names, file_names, depth_left - 1, out)
-            back = []
-            self._enum_leave(ftp, here_n, back)
-            self._enum_show(back, None)
-
-    def _path_enum_worker(
-        self, chunk: list[str], creds: Creds, files: list[str], depth: int
-    ) -> list[PathEnumResult]:
-        """One connection. Directory names from the start directory, then CDUP back."""
+    def _path_enum_worker(self, chunk: list[str], creds: Creds, depth: int) -> list[PathEnumResult]:
+        """One connection. Names from the start directory, then CDUP back."""
         results: list[PathEnumResult] = []
         ftp = self.connect()
         try:
@@ -2173,7 +2211,7 @@ class FtpEngine:
                 here = ftp.pwd()
             except (ftplib.Error, AttributeError):
                 here = base_path or "/"
-            self._enum_enter_dirs(ftp, here, chunk, files, depth, results)
+            self._fileenum_scan(ftp, here, chunk, depth, results)
         finally:
             try:
                 ftp.close()
@@ -2181,45 +2219,195 @@ class FtpEngine:
                 pass
         return results
 
-    def path_enumeration(
-        self, creds: Creds, directories: list[str], files: list[str], depth: int
-    ) -> list[PathEnumResult]:
-        """Directory wordlist from the start directory. Files inside each directory entered."""
-        if not directories and not files:
+    def _fileenum_extensions(self) -> list[str]:
+        """Suffixes from -e. An empty suffix tries the bare name as a directory."""
+        raw = getattr(self.args, "file_extensions", None) or []
+        parts: list[str] = []
+        for item in raw:
+            parts.extend(re.split(r"[\s,]+", str(item)))
+        if not any(part.strip() for part in parts) and not any(part == "" for part in parts):
+            return [""]
+        out: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            text = part.strip().strip('"').strip("'")
+            if text == "":
+                ext = ""
+            elif text.startswith("."):
+                ext = text
+            else:
+                ext = "." + text
+            if ext not in seen:
+                seen.add(ext)
+                out.append(ext)
+        return out or [""]
+
+    @staticmethod
+    def _fileenum_variants(stem: str, extensions: list[str]) -> list[tuple[str, bool]]:
+        name = stem.replace("\\", "/").strip().strip("/")
+        if not name or name in (".", ".."):
             return []
-        depth = max(1, int(depth))
+        variants: list[tuple[str, bool]] = []
+        for ext in extensions:
+            if ext == "":
+                variants.append((name, True))
+            else:
+                variants.append((name + ext, False))
+        return variants
+
+    def _fileenum_label(self, name: str) -> str:
+        if len(name) > 24:
+            return name[:21] + "..."
+        return name
+
+    def _fileenum_flush(self, name: str) -> None:
+        progress = getattr(self, "_enum_progress", None)
+        output = getattr(getattr(self, "_enum_tls", None), "output", None)
+        if progress is None or output is None:
+            return
+        progress.flush(output, repaint=False)
+        progress.advance(self._fileenum_label(name))
+
+    def _fileenum_enter(self, ftp: ftplib.FTP, here: str, name: str) -> PathEnumResult | None:
+        """CWD into one directory name. Stay there only when it is a new directory."""
+        notes: list[str] = []
+        here_n = self._chroot_norm_pwd(here)
+        try:
+            ftp.cwd(name)
+            try:
+                pwd_after = ftp.pwd()
+            except (ftplib.Error, AttributeError):
+                pwd_after = ""
+        except ftplib.error_perm as exc:
+            notes.append(f"CWD {name!r} → {self._snip(str(exc))}")
+            self._enum_show(notes, None)
+            return None
+        except ftplib.Error as exc:
+            notes.append(f"CWD {name!r} → {self._snip(str(exc))}")
+            self._enum_show(notes, None)
+            return None
+        expect = self._enum_expect_pwd(here_n, name)
+        landed = bool(pwd_after) and self._chroot_norm_pwd(pwd_after) == expect
+        if not landed or not self._enum_mark_seen(pwd_after or expect):
+            shown = pwd_after or "unknown"
+            if not landed:
+                notes.append(f"CWD {name!r} → pwd={shown} (not {expect})")
+            else:
+                notes.append(f"CWD {name!r} → pwd={pwd_after} (already visited)")
+            self._enum_show(notes, None)
+            back: list[str] = []
+            self._enum_leave(ftp, here_n, back)
+            self._enum_show(back, None)
+            return None
+        notes.append(f"CWD {name!r} → directory pwd={pwd_after}")
+        writable = deletable = cleanup_failed = False
+        if self._enum_claim_dir(pwd_after):
+            probe = ".ptsrvtester_probe_" + secrets.token_hex(4)
+            writable, deletable, cleanup_failed = self._enum_write_delete(ftp, probe, notes)
+        row = PathEnumResult(
+            path=self._chroot_norm_pwd(pwd_after),
+            exists=True,
+            is_directory=True,
+            size=None,
+            writable=writable,
+            deletable=deletable,
+            cleanup_failed=cleanup_failed,
+        )
+        self._enum_show(notes, row)
+        return row
+
+    def _fileenum_scan(
+        self,
+        ftp: ftplib.FTP,
+        here: str,
+        names: list[str],
+        depth_left: int,
+        out: list[PathEnumResult],
+    ) -> None:
+        """Try wordlist names here. With --recurse, enter each directory that is found."""
+        extensions = getattr(self, "_fileenum_exts", None) or [""]
+        recurse = bool(getattr(self, "_fileenum_recurse", False))
+        all_names = getattr(self, "_fileenum_names", None) or names
+        here_n = self._chroot_norm_pwd(here)
+        for stem in names:
+            for remote, is_directory in self._fileenum_variants(stem, extensions):
+                progress = getattr(self, "_enum_progress", None)
+                if progress is not None:
+                    self._enum_tls.output = progress.new_output()
+                if is_directory:
+                    row = self._fileenum_enter(ftp, here_n, remote)
+                    self._fileenum_flush(remote)
+                    if row is None:
+                        continue
+                    out.append(row)
+                    if recurse and depth_left > 0:
+                        if progress is not None:
+                            progress.add_total(len(all_names) * len(extensions))
+                        self._fileenum_scan(ftp, row.path, all_names, depth_left - 1, out)
+                    back: list[str] = []
+                    if progress is not None:
+                        self._enum_tls.output = progress.new_output()
+                    self._enum_leave(ftp, here_n, back)
+                    self._enum_show(back, None)
+                    if progress is not None:
+                        progress.flush(self._enum_tls.output, repaint=False)
+                    continue
+                hit = self._enum_try_file(ftp, here_n, remote)
+                self._fileenum_flush(remote)
+                if hit is not None:
+                    out.append(hit)
+
+    def path_enumeration(self, creds: Creds, names: list[str], depth: int) -> list[PathEnumResult]:
+        """Wordlist names in the start directory. -r continues inside directories that exist."""
+        if not names:
+            return []
+        depth = max(0, int(depth))
+        extensions = self._fileenum_extensions()
+        self._fileenum_exts = extensions
+        self._fileenum_names = list(names)
+        self._fileenum_recurse = bool(getattr(self.args, "file_recurse", False))
         self._enumpath_lock = threading.Lock()
         self._enum_write_seen = set()
         self._enum_visited = set()
         self._enumpath_streamed = False
+        self._enum_tls = threading.local()
         enum_threads = max(1, int(getattr(self.args, "threads", None) or 5))
+        total = len(names) * len(extensions)
+        progress = ThreadedProgress(total, enabled=not self.use_json)
+        self._enum_progress = progress
         self._dbg(
-            f"Path enumeration: {len(directories)} directories, {len(files)} files, "
-            f"depth={depth}, threads={enum_threads}"
+            f"File enumeration: {len(names)} names, extensions={extensions}, "
+            f"recurse={self._fileenum_recurse}, depth={depth}, threads={enum_threads}"
         )
-        flat: list[PathEnumResult] = list(self._enum_login_directory(creds, files))
-        if not directories:
+        try:
+            first = names[0] if names else ""
+            progress.kickoff(self._fileenum_label(first))
+            self._enum_tls.output = progress.new_output()
+            flat: list[PathEnumResult] = list(self._enum_login_directory(creds))
+            progress.flush(self._enum_tls.output, repaint=False)
+            k, m = divmod(len(names), enum_threads)
+            chunks = [
+                names[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)]
+                for i in range(enum_threads)
+            ]
+            chunks = [c for c in chunks if c]
+
+            def worker(chunk: list[str]) -> list[PathEnumResult]:
+                return self._path_enum_worker(chunk, creds, depth)
+
+            pt = ptthreads.PtThreads(print_errors=False)
+            raw_returns = pt.threads(chunks, worker, min(len(chunks), enum_threads)) or []
+            seen = {row.path for row in flat}
+            for r in raw_returns:
+                if isinstance(r, list):
+                    for p in r:
+                        if p.path not in seen:
+                            seen.add(p.path)
+                            flat.append(p)
             return flat
-        k, m = divmod(len(directories), enum_threads)
-        chunks = [
-            directories[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)]
-            for i in range(enum_threads)
-        ]
-        chunks = [c for c in chunks if c]
-
-        def worker(chunk: list[str]) -> list[PathEnumResult]:
-            return self._path_enum_worker(chunk, creds, files, depth)
-
-        pt = ptthreads.PtThreads(print_errors=False)
-        raw_returns = pt.threads(chunks, worker, min(len(chunks), enum_threads)) or []
-        seen = {row.path for row in flat}
-        for r in raw_returns:
-            if isinstance(r, list):
-                for p in r:
-                    if p.path not in seen:
-                        seen.add(p.path)
-                        flat.append(p)
-        return flat
+        finally:
+            progress.finalize()
+            self._enum_progress = None
 
     @staticmethod
     def _norm_ftp_reply_text(s: str) -> str:
@@ -2851,6 +3039,50 @@ class FtpEngine:
             return ftp.context.wrap_socket(sock, server_hostname=host)
         return sock
 
+    def _modes_control_reply(self, ftp, wait: float) -> str | None:
+        """Next control reply. None when nothing arrives within wait.
+
+        A 226 can already sit in the control buffer while the data socket is still open.
+        """
+        try:
+            ftp.sock.settimeout(wait)
+        except Exception:
+            return None
+        try:
+            reply = str(ftp.getresp()).strip()
+        except ftplib.all_errors as exc:
+            text = str(exc).strip()
+            if self._modes_timed_out(text) or not self._ftp_server_reply(text):
+                return None
+            return text or None
+        return reply or None
+
+    def _modes_finish_list(self, ftp, data: socket.socket) -> str | None:
+        """Read the listing until EOF or until the server sends the final reply."""
+        deadline = time.monotonic() + 10
+        try:
+            data.settimeout(0.4)
+        except Exception:
+            pass
+        while time.monotonic() < deadline:
+            try:
+                block = data.recv(8192)
+            except (TimeoutError, socket.timeout):
+                block = None
+            except OSError as exc:
+                if not self._modes_timed_out(str(exc)):
+                    return str(exc).strip() or type(exc).__name__
+                block = None
+            if block:
+                continue
+            reply = self._modes_control_reply(ftp, 0.2)
+            code = self._modes_code(reply)
+            if reply is not None and (code is None or code >= 200):
+                return reply
+            if block == b"":
+                break
+        return self._modes_control_reply(ftp, 2)
+
     def _modes_read_list(self, ftp, data: socket.socket) -> tuple[str, str | None, bool]:
         try:
             try:
@@ -2870,25 +3102,15 @@ class FtpEngine:
             if opened_code is None or opened_code < 100 or opened_code >= 200:
                 self._ftp_vv_io("LIST", opened)
                 return "unconfirmed", opened, self._modes_timed_out(opened)
-            try:
-                data.settimeout(10)
-                while data.recv(8192):
-                    pass
-            except Exception as exc:
-                text = str(exc).strip() or type(exc).__name__
-                self._ftp_vv_io("LIST", f"{opened}\n{text}")
-                return "unconfirmed", text, self._modes_timed_out(text)
-            try:
-                done = str(ftp.getresp()).strip()
-            except ftplib.all_errors as exc:
-                done = str(exc).strip() or type(exc).__name__
-                self._ftp_vv_io("LIST", f"{opened}\n{done}")
-                return "unconfirmed", done, self._modes_timed_out(done)
+            done = self._modes_finish_list(ftp, data)
+            if done is None:
+                self._ftp_vv_io("LIST", f"{opened}\ntimed out")
+                return "unconfirmed", "timed out", True
             self._ftp_vv_io("LIST", f"{opened}\n{done}")
             done_code = self._modes_code(done)
             if done_code is not None and 200 <= done_code < 300:
                 return "available", done, False
-            return "unconfirmed", done, False
+            return "unconfirmed", done, self._modes_timed_out(done)
         finally:
             try:
                 data.close()
@@ -4189,20 +4411,70 @@ class FtpEngine:
             return False
         return self._chroot_norm_pwd(row.pwd_after) == self._chroot_norm_pwd(path)
 
+    def _chroot_poc_text(self, pairs: tuple[tuple[str, str], ...] | list[tuple[str, str]]) -> str:
+        """PoC envelope. A multiline reply keeps the proving 2xx line marked."""
+        cleaned: list[tuple[str, str]] = []
+        for send, recv in pairs:
+            if not send or not recv or not self._ftp_server_reply(recv):
+                continue
+            text = self._chroot_reply_text(recv)
+            lines = [line for line in text.split("\n") if line.strip()]
+            if not lines:
+                continue
+            if len(lines) > 1 and not any("**" in line for line in lines):
+                for index in range(len(lines) - 1, -1, -1):
+                    if lines[index].startswith("2"):
+                        lines[index] = f"**{lines[index]}**"
+                        break
+                else:
+                    lines[-1] = f"**{lines[-1]}**"
+            cleaned.append((send, "\n".join(lines)))
+        if not cleaned:
+            return ""
+        return format_poc(*cleaned)
+
+    @staticmethod
+    def _chroot_reply_text(*parts: str | None) -> str:
+        lines: list[str] = []
+        for part in parts:
+            text = str(part or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+            for line in text.split("\n"):
+                if line.strip():
+                    lines.append(line.strip())
+        return "\n".join(lines)
+
+    @staticmethod
+    def _chroot_path_from_257(reply: str) -> str:
+        try:
+            return ftplib.parse257(reply) or ""
+        except Exception:
+            return ""
+
     def _chroot_probe_cwd_fresh(self, creds: Creds, path: str, probe_id: str) -> ChrootCwdProbeRow:
         ftp = self.connect()
+        command = f"CWD {path}"
         try:
             ftp.login(creds.user, creds.passw)
-            ftp.cwd(path)
-            pa = ftp.pwd()
-            self._dbg(f"CWD {path!r} → OK pwd={pa}")
-            return ChrootCwdProbeRow(probe_id, path, True, pa, None)
-        except ftplib.error_perm as e:
-            self._dbg(f"CWD {path!r} → {self._snip(str(e))}")
-            return ChrootCwdProbeRow(probe_id, path, False, None, str(e).strip()[:400])
+            try:
+                reply = ftp.voidcmd(command)
+            except Exception as e:
+                text = str(e).strip()[:400]
+                self._ftp_vv_io(command, text)
+                return ChrootCwdProbeRow(probe_id, path, False, None, text, command, text, None)
+            self._ftp_vv_io(command, reply)
+            try:
+                pwd_reply = ftp.voidcmd("PWD")
+            except Exception as e:
+                text = str(e).strip()[:400]
+                self._ftp_vv_io("PWD", text)
+                return ChrootCwdProbeRow(probe_id, path, False, None, text, command, reply, None)
+            self._ftp_vv_io("PWD", pwd_reply)
+            landed = self._chroot_path_from_257(pwd_reply)
+            return ChrootCwdProbeRow(probe_id, path, True, landed or None, None, command, reply, pwd_reply)
         except Exception as e:
-            self._dbg(f"CWD {path!r} → {self._snip(str(e))}")
-            return ChrootCwdProbeRow(probe_id, path, False, None, str(e).strip()[:400])
+            text = str(e).strip()[:400]
+            self._ftp_vv_io(command, text)
+            return ChrootCwdProbeRow(probe_id, path, False, None, text, command, text, None)
         finally:
             try:
                 ftp.close()
@@ -4223,23 +4495,65 @@ class FtpEngine:
             return False
         return not landed_n.startswith(login_n.rstrip("/") + "/")
 
-    def _chroot_probe_retr_fresh(self, creds: Creds, path: str) -> tuple[bool, str | None, int]:
-        """RETR the path and discard the body. Success is a completed transfer."""
+    def _chroot_probe_retr_fresh(self, creds: Creds, path: str) -> tuple[bool, str | None, int, str | None]:
+        """RETR the path and discard the body. Success is a completed transfer. The last value is the server reply."""
         ftp = self.connect()
+        command = "RETR " + path
         try:
             ftp.login(creds.user, creds.passw)
+            try:
+                ftp.voidcmd("TYPE I")
+            except Exception as e:
+                text = str(e).strip()[:240]
+                self._ftp_vv_io("TYPE I", text)
+                return False, text, 0, None
+            try:
+                if ftp.passiveserver:
+                    host, port = ftp.makepasv()
+                    conn = socket.create_connection(
+                        (host, port), ftp.timeout, source_address=ftp.source_address
+                    )
+                    try:
+                        opening = ftp.sendcmd(command)
+                        if opening[:1] == "2":
+                            opening = ftp.getresp()
+                        if opening[:1] != "1":
+                            raise ftplib.error_reply(opening)
+                    except Exception:
+                        conn.close()
+                        raise
+                else:
+                    conn, _size = ftp.ntransfercmd(command)
+                    opening = str(getattr(ftp, "lastresp", "") or "")
+            except Exception as e:
+                text = str(e).strip()[:240]
+                self._ftp_vv_io(command, text)
+                return False, text, 0, None
             total = 0
-
-            def _take(chunk: bytes) -> None:
-                nonlocal total
-                total += len(chunk)
-
-            ftp.retrbinary("RETR " + path, _take)
-            self._dbg(f"RETR {path!r} → {total} bytes")
-            return True, None, total
+            try:
+                while True:
+                    chunk = conn.recv(8192)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            try:
+                done = ftp.voidresp()
+            except Exception as e:
+                text = str(e).strip()[:240]
+                self._ftp_vv_io(command, self._chroot_reply_text(opening, text))
+                return False, text, total, None
+            reply = self._chroot_reply_text(opening, done)
+            self._ftp_vv_io(command, reply)
+            return True, None, total, reply or None
         except Exception as e:
-            self._dbg(f"RETR {path!r} → {self._snip(str(e))}")
-            return False, str(e).strip()[:240], 0
+            text = str(e).strip()[:240]
+            self._ftp_vv_io(command, text)
+            return False, text, 0, None
         finally:
             try:
                 ftp.close()
@@ -4261,12 +4575,13 @@ class FtpEngine:
         try:
             ftp.login(creds.user, creds.passw)
             for path in targets:
+                command = f"RMD {path}"
                 try:
-                    ftp.rmd(path)
-                    self._dbg(f"RMD {path!r} → OK")
+                    reply = ftp.voidcmd(command)
+                    self._ftp_vv_io(command, reply)
                     return True
                 except Exception as e:
-                    self._dbg(f"RMD {path!r} → {self._snip(str(e))}")
+                    self._ftp_vv_io(command, str(e).strip()[:400])
             return False
         finally:
             try:
@@ -4274,35 +4589,43 @@ class FtpEngine:
             except Exception:
                 pass
 
-    def _chroot_probe_mkd_escape(self, creds: Creds, login_pwd: str) -> bool:
+    def _chroot_probe_mkd_escape(self, creds: Creds, login_pwd: str) -> tuple[bool, tuple[tuple[str, str], ...]]:
         """MKD a throwaway directory via ../. Remove it. A line is printed only when it landed outside."""
         name = ".ptsrvtester_probe_" + secrets.token_hex(4)
         rel = self._chroot_rel_path(name)
+        mkd_command = f"MKD {rel}"
+        cwd_command = f"CWD {rel}"
         ftp = self.connect()
         created = False
         outside = False
         landed: str | None = None
+        proofs: list[tuple[str, str]] = []
         try:
             ftp.login(creds.user, creds.passw)
             try:
-                made = ftp.mkd(rel)
+                mkd_reply = ftp.voidcmd(mkd_command)
                 created = True
-                shown = made.strip() if isinstance(made, str) else "OK"
-                self._dbg(f"MKD {rel!r} → {shown}")
-                if isinstance(made, str) and made.strip():
-                    landed = made.strip().strip('"').strip("'")
+                self._ftp_vv_io(mkd_command, mkd_reply)
+                parsed = self._chroot_path_from_257(mkd_reply)
+                if parsed:
+                    landed = parsed
+                proofs.append((mkd_command, mkd_reply))
             except Exception as e:
-                self._dbg(f"MKD {rel!r} → {self._snip(str(e))}")
-                return False
+                self._ftp_vv_io(mkd_command, str(e).strip()[:400])
+                return False, ()
             try:
-                ftp.cwd(rel)
-                pwd_now = ftp.pwd()
-                self._dbg(f"CWD {rel!r} → OK pwd={pwd_now}")
-                if self._chroot_write_outside(login_pwd, pwd_now, name):
+                cwd_reply = ftp.voidcmd(cwd_command)
+                self._ftp_vv_io(cwd_command, cwd_reply)
+                pwd_reply = ftp.voidcmd("PWD")
+                self._ftp_vv_io("PWD", pwd_reply)
+                pwd_now = self._chroot_path_from_257(pwd_reply)
+                proofs.append((cwd_command, cwd_reply))
+                proofs.append(("PWD", pwd_reply))
+                if pwd_now and self._chroot_write_outside(login_pwd, pwd_now, name):
                     outside = True
                     landed = pwd_now
             except Exception as e:
-                self._dbg(f"CWD {rel!r} → {self._snip(str(e))}")
+                self._ftp_vv_io(cwd_command, str(e).strip()[:400])
             if landed and self._chroot_write_outside(login_pwd, landed, name):
                 outside = True
         finally:
@@ -4312,12 +4635,14 @@ class FtpEngine:
                 pass
         if outside:
             self._chroot_line("../" + name, "VULN")
+        else:
+            proofs = []
         if not created:
-            return False
+            return False, ()
         removed = self._chroot_rmd_probe(creds, [rel, landed or ""], name)
         if not removed:
             self._chroot_line("Cleanup failed", "WARNING")
-        return outside
+        return outside, tuple(proofs)
 
     def _chroot_dotdot_chain(self, creds: Creds, max_steps: int | None = None) -> ChrootDotdotResult:
         """
@@ -4327,36 +4652,66 @@ class FtpEngine:
         cap = max_steps if max_steps is not None else self._CHROOT_DOTDOT_MAX_STEPS
         ftp = self.connect()
         p0 = ""
+        p0_reply: str | None = None
+        last_command: str | None = None
+        last_reply: str | None = None
+        pwd_final_reply: str | None = None
         try:
             ftp.login(creds.user, creds.passw)
-            p0 = ftp.pwd()
-            self._dbg(f"PWD initial={p0!r}")
+            p0_reply = ftp.voidcmd("PWD")
+            self._ftp_vv_io("PWD", p0_reply)
+            p0 = self._chroot_path_from_257(p0_reply)
             last = p0
             steps = 0
             reason = "max_steps_cap"
             for _ in range(cap):
+                sent = "CDUP"
                 try:
-                    ftp.cwd("..")
-                except ftplib.error_perm:
-                    reason = "cwd_dotdot_rejected"
-                    break
+                    reply = ftp.voidcmd("CDUP")
+                except ftplib.error_perm as e:
+                    text = str(e).strip()
+                    if text[:3] == "500":
+                        sent = "CWD .."
+                        try:
+                            reply = ftp.voidcmd(sent)
+                        except ftplib.error_perm as e2:
+                            self._ftp_vv_io(sent, str(e2).strip()[:400])
+                            reason = "cwd_dotdot_rejected"
+                            break
+                        except Exception as e2:
+                            self._ftp_vv_io(sent, str(e2).strip()[:400])
+                            reason = f"error:{type(e2).__name__}"
+                            break
+                    else:
+                        self._ftp_vv_io(sent, text[:400])
+                        reason = "cwd_dotdot_rejected"
+                        break
                 except Exception as e:
+                    self._ftp_vv_io(sent, str(e).strip()[:400])
                     reason = f"error:{type(e).__name__}"
                     break
+                self._ftp_vv_io(sent, reply)
                 try:
-                    pn = ftp.pwd()
-                except Exception:
+                    pwd_reply = ftp.voidcmd("PWD")
+                except Exception as e:
+                    self._ftp_vv_io("PWD", str(e).strip()[:400])
                     reason = "pwd_failed"
                     break
+                self._ftp_vv_io("PWD", pwd_reply)
+                pn = self._chroot_path_from_257(pwd_reply)
                 if self._chroot_norm_pwd(pn) == self._chroot_norm_pwd(last):
                     reason = "pwd_unchanged"
                     break
                 last = pn
+                last_command = sent
+                last_reply = reply
+                pwd_final_reply = pwd_reply
                 steps += 1
-            self._dbg(f"CWD .. chain: steps={steps} reason={reason} pwd_final={last!r}")
-            return ChrootDotdotResult(steps, p0, last, reason)
+            return ChrootDotdotResult(
+                steps, p0, last, reason, p0_reply, last_command, last_reply, pwd_final_reply
+            )
         except Exception as e:
-            return ChrootDotdotResult(0, p0 or "?", None, str(e)[:160])
+            return ChrootDotdotResult(0, p0 or "?", None, str(e)[:160], p0_reply)
         finally:
             try:
                 ftp.close()
@@ -4375,7 +4730,11 @@ class FtpEngine:
         pwd_initial: str
         try:
             ftp0.login(creds.user, creds.passw)
-            pwd_initial = ftp0.pwd()
+            pwd_reply = ftp0.voidcmd("PWD")
+            self._ftp_vv_io("PWD", pwd_reply)
+            pwd_initial = self._chroot_path_from_257(pwd_reply)
+            if not pwd_initial:
+                pwd_initial = ftp0.pwd()
         finally:
             try:
                 ftp0.close()
@@ -4437,31 +4796,33 @@ class FtpEngine:
             if self._chroot_cwd_landed(r.path, r) and r.path in self._CHROOT_STRONG_CWD_PATHS:
                 strong_hits.append(r.path)
 
-        passwd_ok, passwd_err, passwd_sz = self._chroot_probe_retr_fresh(creds, "/etc/passwd")
+        passwd_ok, passwd_err, passwd_sz, passwd_reply = self._chroot_probe_retr_fresh(creds, "/etc/passwd")
         if passwd_ok or not self._ftp_text_is_unconfirmed(passwd_err):
             confirmed = True
         if passwd_ok:
             self._chroot_line("/etc/passwd", "VULN")
-        passwd_rel_ok, passwd_rel_err, passwd_rel_sz = self._chroot_probe_retr_fresh(
-            creds, self._chroot_rel_path("etc/passwd")
+        passwd_rel = self._chroot_rel_path("etc/passwd")
+        passwd_rel_ok, passwd_rel_err, passwd_rel_sz, passwd_rel_reply = self._chroot_probe_retr_fresh(
+            creds, passwd_rel
         )
         if passwd_rel_ok or not self._ftp_text_is_unconfirmed(passwd_rel_err):
             confirmed = True
         if passwd_rel_ok and not passwd_ok:
             self._chroot_line("../etc/passwd", "VULN")
-        shadow_ok, shadow_err, shadow_sz = self._chroot_probe_retr_fresh(creds, "/etc/shadow")
+        shadow_ok, shadow_err, shadow_sz, shadow_reply = self._chroot_probe_retr_fresh(creds, "/etc/shadow")
         if shadow_ok or not self._ftp_text_is_unconfirmed(shadow_err):
             confirmed = True
         if shadow_ok:
             self._chroot_line("/etc/shadow", "VULN")
-        shadow_rel_ok, shadow_rel_err, shadow_rel_sz = self._chroot_probe_retr_fresh(
-            creds, self._chroot_rel_path("etc/shadow")
+        shadow_rel = self._chroot_rel_path("etc/shadow")
+        shadow_rel_ok, shadow_rel_err, shadow_rel_sz, shadow_rel_reply = self._chroot_probe_retr_fresh(
+            creds, shadow_rel
         )
         if shadow_rel_ok or not self._ftp_text_is_unconfirmed(shadow_rel_err):
             confirmed = True
         if shadow_rel_ok and not shadow_ok:
             self._chroot_line("../etc/shadow", "VULN")
-        write_outside = self._chroot_probe_mkd_escape(creds, pwd_initial)
+        write_outside, mkd_proofs = self._chroot_probe_mkd_escape(creds, pwd_initial)
         if not confirmed:
             self._chroot_line("Could not connect. Isolation was not tested.", "WARNING")
         elif not getattr(self, "_chroot_streamed", False):
@@ -4495,7 +4856,7 @@ class FtpEngine:
             parts.append("MKD via ../ created a directory outside the login directory.")
         if dotdot_escape:
             parts.append(
-                f"Repeated CWD .. reached strict parent of login directory (final PWD ~ {pwd_fn!r}, steps={dot.steps_ok})."
+                f"Repeated CDUP reached a parent of the login directory (final PWD ~ {pwd_fn!r}, steps={dot.steps_ok})."
             )
         if not parts:
             parts.append(
@@ -4503,6 +4864,47 @@ class FtpEngine:
             )
 
         detail = " ".join(parts)
+        proofs: list[tuple[str, str]] = []
+        if broken:
+            showed_strong = False
+            for row in rows:
+                if not self._chroot_cwd_landed(row.path, row):
+                    continue
+                strong = row.path in self._CHROOT_STRONG_CWD_PATHS
+                home = row.path == "/home" and home_parent_ok
+                if strong and showed_strong:
+                    continue
+                if not strong and not home:
+                    continue
+                if row.command and row.reply and self._ftp_server_reply(row.reply):
+                    proofs.append((row.command, row.reply))
+                if row.pwd_reply and self._ftp_server_reply(row.pwd_reply):
+                    proofs.append(("PWD", row.pwd_reply))
+                if strong:
+                    showed_strong = True
+            if dotdot_escape:
+                if dot.pwd_initial_reply and self._ftp_server_reply(dot.pwd_initial_reply):
+                    proofs.append(("PWD", dot.pwd_initial_reply))
+                if dot.last_command and dot.last_reply and self._ftp_server_reply(dot.last_reply):
+                    proofs.append((dot.last_command, dot.last_reply))
+                if dot.pwd_final_reply and self._ftp_server_reply(dot.pwd_final_reply):
+                    proofs.append(("PWD", dot.pwd_final_reply))
+            retr_pairs = []
+            if passwd_ok:
+                retr_pairs.append(("RETR /etc/passwd", passwd_reply))
+            elif passwd_rel_ok:
+                retr_pairs.append((f"RETR {passwd_rel}", passwd_rel_reply))
+            if shadow_ok:
+                retr_pairs.append(("RETR /etc/shadow", shadow_reply))
+            elif shadow_rel_ok:
+                retr_pairs.append((f"RETR {shadow_rel}", shadow_rel_reply))
+            for command, reply in retr_pairs:
+                if reply and self._ftp_server_reply(reply):
+                    proofs.append((command, reply))
+            if write_outside:
+                for command, reply in mkd_proofs:
+                    if command and reply and self._ftp_server_reply(reply):
+                        proofs.append((command, reply))
         return ChrootAuditResult(
             pwd_initial=pwd_initial,
             cwd_probes=tuple(rows),
@@ -4521,6 +4923,7 @@ class FtpEngine:
             passwd_retr_relative_ok=passwd_rel_ok,
             shadow_retr_relative_ok=shadow_rel_ok,
             write_escape_ok=write_outside,
+            proofs=tuple(proofs),
         )
 
     @staticmethod
@@ -8249,22 +8652,22 @@ class FtpEngine:
     def _eicar_lines(self, r: FtpEicarRow) -> list[tuple[str, str]]:
         who = f"{r.creds.user}: " if r.creds and r.creds.user else ""
         leaf = (r.remote_path or "").rsplit("/", 1)[-1]
-        label = f"{leaf}: " if leaf and "." in leaf else ""
+        is_file = bool(leaf and "." in leaf)
         if not r.stor_ok:
             if self._ftp_text_is_unconfirmed(r.stor_error):
-                return [("WARNING", f"{who}{label}EICAR was not confirmed")]
-            if not label:
+                return [("WARNING", f"{who}EICAR was not confirmed")]
+            if not is_file:
                 detail = self._snip(r.stor_error or "Login failed.")
                 return [("WARNING", f"{who}{detail}")]
             if r.on_access_scan_suspected:
-                return [("NOTVULN", f"{who}{label}EICAR was deleted")]
-            return [("NOTVULN", f"{who}{label}EICAR upload was refused")]
-        uploaded = ("VULN", f"{who}{label}EICAR was uploaded")
+                return [("NOTVULN", f"{who}EICAR was deleted")]
+            return [("NOTVULN", f"{who}EICAR upload was refused")]
+        uploaded = ("VULN", f"{who}File was uploaded")
         if r.vanished_after_stor_suspected:
-            return [uploaded, ("NOTVULN", f"{who}{label}EICAR was deleted")]
+            return [uploaded, ("NOTVULN", f"{who}EICAR was deleted")]
         if r.retr_ok and r.retr_payload_match:
-            return [uploaded, ("VULN", f"{who}{label}EICAR was not deleted")]
-        return [uploaded, ("WARNING", f"{who}{label}Deletion was not confirmed")]
+            return [uploaded, ("VULN", f"{who}EICAR was not deleted by antivirus")]
+        return [uploaded, ("WARNING", f"{who}Deletion was not confirmed")]
 
     def _print_eicar_audit_terminal(self, ea: FtpEicarAuditResult) -> None:
         if getattr(self, "_eicar_streamed", False):
@@ -8392,30 +8795,9 @@ class FtpEngine:
             return "\r\n".join(blocks)
         if code == VULNS.FtpChrootIsolation.value:
             ch = getattr(self.results, "chroot_audit", None)
-            if ch is None or not ch.isolation_broken_suspected:
+            if ch is None or not ch.isolation_broken_suspected or not ch.proofs:
                 return ""
-            home = self._chroot_norm_pwd(ch.pwd_initial)
-            blocks = []
-            for row in ch.cwd_probes:
-                path = row.path or ""
-                if not row.success or not row.pwd_after:
-                    continue
-                if not (path.startswith("/") or ".." in path):
-                    continue
-                if self._chroot_norm_pwd(row.pwd_after) == home and ".." not in path:
-                    continue
-                pwd = " ".join(row.pwd_after.split())
-                blocks.append(f"Send: CWD {path}\r\nSend: PWD\r\nReceive: {pwd}")
-                if len(blocks) >= 4:
-                    break
-            if (
-                not blocks
-                and ch.dotdot_parent_escape_suspected
-                and ch.dotdot is not None
-                and ch.dotdot.pwd_final
-            ):
-                blocks.append(self._poc_pair("PWD", ch.dotdot.pwd_final))
-            return "\r\n".join(blocks)
+            return self._chroot_poc_text(ch.proofs)
         if code == VULNS.FtpInvalidCommandHandling.value:
             inv = getattr(self.results, "invalid_cmd_audit", None)
             if inv is None:
@@ -8880,6 +9262,9 @@ class FtpEngine:
                         "success": r.success,
                         "pwdAfter": r.pwd_after,
                         "errorOrReply": r.error_or_reply,
+                        "command": r.command,
+                        "reply": r.reply,
+                        "pwdReply": r.pwd_reply,
                     }
                     for r in ch.cwd_probes
                 ],
@@ -8888,6 +9273,10 @@ class FtpEngine:
                     "pwdInitial": dd.pwd_initial,
                     "pwdFinal": dd.pwd_final,
                     "stoppedReason": dd.stopped_reason,
+                    "pwdInitialReply": dd.pwd_initial_reply,
+                    "lastCommand": dd.last_command,
+                    "lastReply": dd.last_reply,
+                    "pwdFinalReply": dd.pwd_final_reply,
                 },
                 "homeParentAccessible": ch.home_parent_accessible,
                 "systemPathsAccessible": list(ch.system_paths_accessible),

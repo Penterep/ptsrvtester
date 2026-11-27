@@ -7,7 +7,7 @@ __all__ = ['MySQLArgs']
 
 
 MYSQL_TEST_GROUPS = [
-    ("Enumeration", ["VERSION", "ENCRYPT"]),
+    ("Enumeration", ["VERSION", "ENCRYPT", "DUMP_CREDS"]),
     ("Users & Privileges", ["SUPERUSERS"])
 ]
 
@@ -47,6 +47,18 @@ MYSQL_TESTS: dict[str, dict] = {
     "SUPERUSERS": {
         "desc": "Grab MySQL super-users",
         "long": ["Query the MySQL server for users with the SUPER privilege."],
+        "requires": [
+            ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
+        ],
+        "usage": ["-tg 192.168.1.1:3306"],
+        "mods": [
+            ["-u", "--username", "", "Username to authenticate as"],
+            ["-p", "--password", "", "Password to authenticate with"]
+        ],
+    },
+    "DUMP_CREDS": {
+        "desc": "MySQL credential dumping module",
+        "long": ["Query the MySQL server to dump the users and their password hashes."],
         "requires": [
             ["-tg", "--target", "<host>", "Target IP[:PORT] or HOST[:PORT]"],
         ],

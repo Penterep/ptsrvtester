@@ -680,9 +680,25 @@ class FtpEngine:
         if mkdir_ok:
             self._access_add_proof(probe, "write", [("MKD " + dirname, reply)])
         self._access_fact_line("Create directory:", mkdir_ok, warn_on_yes=True, indent=12, width=18)
+        remove_name = dirname
         if mkdir_ok:
+            new_name = "ptsrv" + self._access_token()
             try:
-                ftp.rmd(dirname)
+                rnfr = ftp.sendcmd("RNFR " + dirname)
+                rnto = ftp.sendcmd("RNTO " + new_name)
+            except ftplib.all_errors:
+                self._access_fact_line("Rename directory:", False, warn_on_yes=True, indent=12, width=18)
+            else:
+                probe.rename = True
+                remove_name = new_name
+                self._access_add_proof(
+                    probe,
+                    "rename",
+                    [("RNFR " + dirname, str(rnfr)), ("RNTO " + new_name, str(rnto))],
+                )
+                self._access_fact_line("Rename directory:", True, warn_on_yes=True, indent=12, width=18)
+            try:
+                ftp.rmd(remove_name)
             except ftplib.all_errors as exc:
                 self._access_mark(
                     "W",
@@ -726,48 +742,6 @@ class FtpEngine:
             probe.delete_path = self._access_place(path, random_name)
         return probe
 
-    def _access_rename_dir(self, ftp, probe: AccessDirProbe) -> bool:
-        """Rename the directory and put the original name back.
-
-        Returns True when later steps can still use the original path.
-        """
-        path = probe.live_path or probe.path
-        suffix = self._access_token()
-        if path == "/":
-            parent = "/"
-            new_path = "/ptsrv" + suffix
-        else:
-            parent, _, _name = path.rpartition("/")
-            parent = parent or "/"
-            new_path = path + "_ptsrv" + suffix
-        self._modes_vv_indent = 12
-        try:
-            if path != "/":
-                ftp.cwd(parent)
-            rnfr = ftp.sendcmd("RNFR " + path)
-            rnto = ftp.sendcmd("RNTO " + new_path)
-        except ftplib.all_errors:
-            self._access_fact_line("Rename directory:", False, warn_on_yes=True, indent=12, width=18)
-            return True
-        probe.rename = True
-        self._access_add_proof(
-            probe, "rename", [("RNFR " + path, str(rnfr)), ("RNTO " + new_path, str(rnto))]
-        )
-        self._access_fact_line("Rename directory:", True, warn_on_yes=True, indent=12, width=18)
-        try:
-            ftp.sendcmd("RNFR " + new_path)
-            ftp.sendcmd("RNTO " + path)
-        except ftplib.all_errors as exc:
-            probe.live_path = new_path
-            self._access_mark(
-                "W",
-                "Could not rename the directory back: " + (self._snip(str(exc).strip()) or "failed"),
-                indent=12,
-            )
-            return False
-        probe.live_path = path
-        return True
-
     def _access_delete_dir(self, ftp, probe: AccessDirProbe) -> None:
         path = probe.live_path or probe.path
         self._modes_vv_indent = 12
@@ -810,15 +784,9 @@ class FtpEngine:
             return [AccessDirProbe(path=path, live_path=path)]
         if not probe.entered:
             return [probe]
-        try:
-            back = self._access_rename_dir(ftp, probe)
-        except ftplib.all_errors as exc:
-            self._access_mark(
-                "W", self._snip(str(exc).strip()) or "The directory test did not finish.", indent=12
-            )
-            back = True
+        back = True
         children: list[AccessDirProbe] = []
-        recursive = bool(getattr(self.args, "access_recursive", False))
+        recursive = bool(getattr(self.args, "recursive", False))
         if back and recursive and depth_left > 0 and probe.listing_ok:
             for name in probe.subdirs:
                 child = self._access_child_path(path, name)
@@ -883,7 +851,7 @@ class FtpEngine:
                 depth = 1
             if depth < 1:
                 depth = 1
-            depth_left = depth if getattr(self.args, "access_recursive", False) else 0
+            depth_left = depth if getattr(self.args, "recursive", False) else 0
             probes = self._access_walk(
                 ftp, self._access_norm_path(raw_path), depth_left, use_file=True, seen=set()
             )
@@ -1181,7 +1149,7 @@ class FtpEngine:
             return False
         return None
 
-    def _eicar_probe_file(
+    def _eicar_store_file(
         self,
         ftp,
         creds: Creds,
@@ -1190,9 +1158,9 @@ class FtpEngine:
         filename: str,
         payload: bytes,
     ) -> FtpEicarRow:
-        """STOR one EICAR file, then accept it only when RETR returns the same bytes."""
+        """Upload one EICAR file. The wait, the check and the delete happen after every file is stored."""
         used_path = filename if directory == "/" else directory.rstrip("/") + "/" + filename
-        if not self.use_json:
+        if not self.use_json and getattr(self.args, "debug", False):
             self._tprint(filename, "TITLE", indent=8)
         self._modes_vv_indent = 12
         stor_cmd = "STOR " + filename
@@ -1207,20 +1175,38 @@ class FtpEngine:
         if not done.startswith("2"):
             detected = self._eicar_reply_suggests_malware(done)
             return self._eicar_stopped_row(creds, delay, used_path, done or "was not confirmed", detected=detected)
+        return FtpEicarRow(
+            creds,
+            used_path,
+            True,
+            None,
+            delay,
+            None,
+            None,
+            False,
+            None,
+            None,
+            False,
+            False,
+            False,
+            None,
+            None,
+        )
 
-        try:
-            time.sleep(max(0.0, delay))
-        except Exception:
-            pass
-
+    def _eicar_verify_stored(self, ftp, row: FtpEicarRow, payload: bytes) -> FtpEicarRow:
+        """After the shared wait, see whether this uploaded file is still the same bytes."""
+        filename = (row.remote_path or "").rsplit("/", 1)[-1]
+        delay = row.post_stor_delay_seconds
+        if not self.use_json:
+            self._tprint(filename, "TITLE", indent=8)
+        self._modes_vv_indent = 12
         present, present_reply = self._eicar_file_present(ftp, filename)
         if present is not True:
             reply = present_reply or "was not confirmed"
             if present is False or self._eicar_reply_suggests_missing(reply) or self._eicar_reply_suggests_malware(reply):
-                removed = self._eicar_delete_uploaded(ftp, filename)
                 return FtpEicarRow(
-                    creds,
-                    used_path,
+                    row.creds,
+                    row.remote_path,
                     True,
                     None,
                     delay,
@@ -1231,11 +1217,11 @@ class FtpEngine:
                     reply,
                     True,
                     True,
-                    removed,
-                    None if removed else reply,
+                    False,
+                    None,
                     None,
                 )
-            return self._eicar_stopped_row(creds, delay, used_path, reply)
+            return self._eicar_stopped_row(row.creds, delay, row.remote_path, reply)
 
         size_bytes: int | None = None
         size_err: str | None = None
@@ -1276,18 +1262,10 @@ class FtpEngine:
         retr_bad = bool(retr_ok and retr_match is False)
         vanished = size_vanished or size_wrong or retr_missing or retr_bad
 
-        delete_ok = False
-        delete_err: str | None = None
-        delete_note: str | None = None
-        if getattr(self.args, "access_delete", False):
-            delete_ok = self._eicar_delete_uploaded(ftp, filename)
-            if not delete_ok:
-                delete_err = "delete failed"
-
-        on_access = vanished or (delete_note is not None) or self._eicar_reply_suggests_malware(retr_err)
+        on_access = vanished or self._eicar_reply_suggests_malware(retr_err)
         return FtpEicarRow(
-            creds,
-            used_path,
+            row.creds,
+            row.remote_path,
             True,
             None,
             delay,
@@ -1298,9 +1276,9 @@ class FtpEngine:
             retr_err,
             vanished,
             on_access,
-            delete_ok,
-            delete_err,
-            delete_note,
+            False,
+            None,
+            None,
         )
 
     def _eicar_probe_one_account(self, creds: Creds, delay: float) -> list[FtpEicarRow]:
@@ -1361,14 +1339,35 @@ class FtpEngine:
             return []
 
         rows: list[FtpEicarRow] = []
+        stored: list[tuple[FtpEicarRow, bytes]] = []
         for filename, payload in self._eicar_payloads():
-            row = self._eicar_probe_file(ftp, creds, delay, directory, filename, payload)
-            rows.append(row)
-            self._eicar_verdict(row, indent=12)
-            if row.stor_error and (
-                self._ftp_text_is_unconfirmed(row.stor_error) or not self._ftp_server_reply(row.stor_error)
-            ):
-                break
+            row = self._eicar_store_file(ftp, creds, delay, directory, filename, payload)
+            if not row.stor_ok:
+                rows.append(row)
+                self._eicar_verdict(row, indent=12)
+                if row.stor_error and (
+                    self._ftp_text_is_unconfirmed(row.stor_error) or not self._ftp_server_reply(row.stor_error)
+                ):
+                    break
+                continue
+            stored.append((row, payload))
+        if stored:
+            time.sleep(max(0.0, delay))
+            checked: list[FtpEicarRow] = []
+            for row, payload in stored:
+                checked.append(self._eicar_verify_stored(ftp, row, payload))
+                self._eicar_verdict(checked[-1], indent=12)
+            if getattr(self.args, "access_delete", False):
+                removed: list[FtpEicarRow] = []
+                for row in checked:
+                    name = (row.remote_path or "").rsplit("/", 1)[-1]
+                    delete_ok = bool(name) and self._eicar_delete_uploaded(ftp, name)
+                    removed.append(row._replace(
+                        delete_ok=delete_ok,
+                        delete_error=None if delete_ok else "delete failed",
+                    ))
+                checked = removed
+            rows.extend(checked)
         _close()
         return rows
 
@@ -2324,7 +2323,7 @@ class FtpEngine:
         depth_left: int,
         out: list[PathEnumResult],
     ) -> None:
-        """Try wordlist names here. With --recurse, enter each directory that is found."""
+        """Try wordlist names here. With -r/--recursive, enter each directory that is found."""
         extensions = getattr(self, "_fileenum_exts", None) or [""]
         recurse = bool(getattr(self, "_fileenum_recurse", False))
         all_names = getattr(self, "_fileenum_names", None) or names
@@ -2365,7 +2364,7 @@ class FtpEngine:
         extensions = self._fileenum_extensions()
         self._fileenum_exts = extensions
         self._fileenum_names = list(names)
-        self._fileenum_recurse = bool(getattr(self.args, "file_recurse", False))
+        self._fileenum_recurse = bool(getattr(self.args, "recursive", False))
         self._enumpath_lock = threading.Lock()
         self._enum_write_seen = set()
         self._enum_visited = set()
@@ -3039,20 +3038,73 @@ class FtpEngine:
             return ftp.context.wrap_socket(sock, server_hostname=host)
         return sock
 
+    def _modes_reopen_reader(self, ftp) -> None:
+        """Replace a control reader that a short timeout has killed.
+
+        After readline() times out, every later read fails at once, so a 226 that
+        arrives a moment later is never seen.
+        """
+        sock = getattr(ftp, "sock", None)
+        if sock is None:
+            return
+        try:
+            ftp.file = sock.makefile("r", encoding=getattr(ftp, "encoding", "utf-8") or "utf-8")
+        except Exception:
+            pass
+
+    def _modes_take_buffered_reply(self, ftp) -> str | None:
+        """Return a reply already sitting in the control buffer. None if it is not there yet."""
+        try:
+            ftp.sock.settimeout(0)
+        except Exception:
+            return None
+        try:
+            reply = str(ftp.getresp()).strip()
+        except EOFError:
+            return None
+        except ftplib.all_errors as exc:
+            text = str(exc).strip()
+            if self._modes_timed_out(text) or "timed out object" in text.lower():
+                self._modes_reopen_reader(ftp)
+            if self._ftp_server_reply(text):
+                return text
+            return None
+        return reply or None
+
     def _modes_control_reply(self, ftp, wait: float) -> str | None:
         """Next control reply. None when nothing arrives within wait.
 
-        A 226 can already sit in the control buffer while the data socket is still open.
+        The decision is the numeric code of whatever line the server sent.
+        A short timeout must not be raised inside readline(): that kills the
+        reader and the following 226 is lost. A line already buffered above the
+        socket is taken first; select waits for the next one.
         """
+        sock = getattr(ftp, "sock", None)
+        if sock is None:
+            return None
+        pending = self._modes_take_buffered_reply(ftp)
+        if pending is not None:
+            return pending
+        if wait <= 0:
+            return None
         try:
-            ftp.sock.settimeout(wait)
+            ready = bool(select.select([sock], [], [], wait)[0])
+        except Exception:
+            return None
+        if not ready:
+            return None
+        try:
+            sock.settimeout(max(float(wait), 2.0))
         except Exception:
             return None
         try:
             reply = str(ftp.getresp()).strip()
         except ftplib.all_errors as exc:
             text = str(exc).strip()
-            if self._modes_timed_out(text) or not self._ftp_server_reply(text):
+            if self._modes_timed_out(text) or "timed out object" in text.lower():
+                self._modes_reopen_reader(ftp)
+                return None
+            if not self._ftp_server_reply(text):
                 return None
             return text or None
         return reply or None
@@ -3080,7 +3132,8 @@ class FtpEngine:
             if reply is not None and (code is None or code >= 200):
                 return reply
             if block == b"":
-                break
+                remaining = deadline - time.monotonic()
+                return self._modes_control_reply(ftp, max(remaining, 2.0))
         return self._modes_control_reply(ftp, 2)
 
     def _modes_read_list(self, ftp, data: socket.socket) -> tuple[str, str | None, bool]:

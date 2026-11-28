@@ -23,13 +23,12 @@ class FTPArgs(ArgsWithBruteforce):
     access_list: bool
     access_file: str | None
     access_path: str
-    access_recursive: bool
+    recursive: bool
     access_delete: bool
     bounce: Target | None
     bounce_file: str | None
     wordlist: str | None
     file_extensions: list[str] | None
-    file_recurse: bool
     enum_depth: int | None
     base_path: str
     pasv_port_audit_samples: int | None
@@ -91,7 +90,7 @@ class FTPArgs(ArgsWithBruteforce):
                 "ptsrvtester ftp -ts ANON,ACCESS -l -tg 127.0.0.1",
                 "ptsrvtester ftp -ts BRUTE -u admin harry -P passwords.txt -tg 127.0.0.1:21",
                 "ptsrvtester ftp -ts USRENUM -u user admin nobody -tg 127.0.0.1",
-                "ptsrvtester ftp -ts FILEENUM -w paths.txt --extension txt,php --recurse -u user -p pass -tg 127.0.0.1",
+                "ptsrvtester ftp -ts FILEENUM -w paths.txt --extension txt,php --recursive -u user -p pass -tg 127.0.0.1",
                 "ptsrvtester ftp -ts EICAR -A -tg 127.0.0.1",
                 "ptsrvtester ftp -ts CONNLIM,ZIPXXE -u user -p pass -tg 127.0.0.1",
                 "ptsrvtester ftp -ts RATELIMIT -tg 127.0.0.1",
@@ -146,14 +145,13 @@ class FTPArgs(ArgsWithBruteforce):
         mods.add_argument("-l", "--access-list", action="store_true", help="ACCESS: display root directory listing")
         mods.add_argument("-f", "--file", type=str, dest="access_file", metavar="<name>", help="ACCESS: remote file name when listing is refused")
         mods.add_argument("--path", type=str, default="/", dest="access_path", metavar="<dir>", help="ACCESS/ZIPXXE/EICAR: directory to test or upload into (default: /)")
-        mods.add_argument("--recursive", action="store_true", dest="access_recursive", help="ACCESS: also test nested directories")
-        mods.add_argument("--delete", action="store_true", dest="access_delete", help="ACCESS: also delete an existing file and the tested directory. EICAR: delete the uploaded files afterwards. ZIPXXE: delete the uploaded files after --delay")
+        mods.add_argument("--delete", action="store_true", dest="access_delete", help="ACCESS: also delete an existing file and the tested directory. EICAR: delete the uploaded files together after --delay. ZIPXXE: delete the uploaded files after --delay")
         mods.add_argument("-B", "--bounce", type=valid_target_bounce, help="ACCESS: FTP bounce to IP:PORT / HOST:PORT")
         mods.add_argument("--bounce-file", type=str, help="ACCESS: file with request for bounce")
         mods.add_argument("-w", "--wordlist", type=str, dest="wordlist", metavar="<file>", help="FILEENUM: names to try, one per line")
-        mods.add_argument("--extension", nargs="+", dest="file_extensions", metavar="<ext>", help="FILEENUM: suffixes, comma or space separated. An empty suffix tries the name as a directory")
-        mods.add_argument("--recurse", action="store_true", dest="file_recurse", help="FILEENUM: also search inside directories that are found")
-        mods.add_argument("--depth", type=int, default=None, dest="enum_depth", metavar="<n>", help="FILEENUM --recurse depth (default: 5). ACCESS --recursive depth (default: 1)")
+        mods.add_argument("-e", "--extension", nargs="+", dest="file_extensions", metavar="<ext>", help="FILEENUM: suffixes, comma or space separated. An empty suffix tries the name as a directory")
+        mods.add_argument("-r", "--recursive", action="store_true", dest="recursive", help="ACCESS/FILEENUM: also continue inside directories that are found")
+        mods.add_argument("--depth", type=int, default=None, dest="enum_depth", metavar="<n>", help="FILEENUM -r/--recursive depth (default: 5). ACCESS -r/--recursive depth (default: 1)")
         mods.add_argument("--base-path", type=str, default="", dest="base_path", help="FILEENUM: start directory")
         mods.add_argument("--pasv-port-audit-samples", type=int, default=None, dest="pasv_port_audit_samples", metavar="<n>", help=argparse.SUPPRESS)
         mods.add_argument("--pasv-port-audit-max-span", type=int, default=None, dest="pasv_port_audit_max_span", metavar="<n>", help=argparse.SUPPRESS)
@@ -170,7 +168,7 @@ class FTPArgs(ArgsWithBruteforce):
             dest="eicar_post_stor_delay", metavar="<sec>",
         )
         mods.add_argument(
-            "--timeout", type=float, default=30.0,
+            "-T", "--timeout", type=float, default=30.0,
             dest="ftp_dos_timeout", metavar="<sec>",
         )
         mods.add_argument("--zipxxe-zip-bomb-small", action="store_true", dest="ftp_dos_zip_small")
@@ -217,8 +215,8 @@ def validate_ftp_selection(args) -> None:
         raise argparse.ArgumentError(None, "FILEENUM requires -w/--wordlist")
     if "FILEENUM" not in codes and getattr(args, "file_extensions", None):
         raise argparse.ArgumentError(None, "--extension requires -ts FILEENUM")
-    if "FILEENUM" not in codes and getattr(args, "file_recurse", False):
-        raise argparse.ArgumentError(None, "--recurse requires -ts FILEENUM")
+    if getattr(args, "recursive", False) and "ACCESS" not in codes and "FILEENUM" not in codes:
+        raise argparse.ArgumentError(None, "-r/--recursive requires -ts ACCESS or -ts FILEENUM")
     need_creds = {"ACCESS", "FILEENUM", "CMDAUDITACTIVE", "ZIPXXE", "CHROOT", "EICAR"} & set(codes)
     # ACCESS/EICAR etc. may rely on -ts ANON in the same run (results.anonymous) — allow ANON+ACCESS
     if need_creds and not _has_creds(args) and "ANON" not in codes:
@@ -230,8 +228,6 @@ def validate_ftp_selection(args) -> None:
     if getattr(args, "access_list", False) and "ACCESS" not in codes:
         raise argparse.ArgumentError(None, "--access-list requires -ts ACCESS")
     if "ACCESS" not in codes:
-        if getattr(args, "access_recursive", False):
-            raise argparse.ArgumentError(None, "--recursive requires -ts ACCESS")
         if getattr(args, "access_delete", False) and "EICAR" not in codes and "ZIPXXE" not in codes:
             raise argparse.ArgumentError(None, "--delete requires -ts ACCESS, -ts EICAR or -ts ZIPXXE")
         path = getattr(args, "access_path", "/") or "/"
